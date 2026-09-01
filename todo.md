@@ -54,19 +54,32 @@ as the manual override. What remains open:
   (`rows()[0]` where the elements are query rows). Rows have no
   refcount header — the array owns them outright — so the element
   cannot be retained past its container. Bind the array to a name first
-  and it reclaims normally.
+  and it reclaims normally. claude.md #224 scoped the real fix: a
+  per-table row-copy function is straightforward (mirrors the existing
+  per-table row-release function, using the already-existing
+  `festina_text_own`/`festina_retain` primitives column-by-column), but
+  it only closes the leak once paired with genuine scope-exit ownership
+  tracking for `TableType` locals generally — the same "always owned
+  once bound, always released at scope exit" symmetry `text` itself
+  needed six dedicated, individually-verified rounds to get right
+  (claude.md #11-16). A real fix is that size, not a quick patch.
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.
 - **A `throw` reached from a called function leaks that function's own
-  locals**, and, structurally the same issue, **`.toStruct()`/
-  `.toArr()` leak whatever they'd already built when a parse fails
-  partway through**, since neither the intermediate C stack frames a
-  `longjmp` skips nor codegen's own hand-written JSON-parsing functions
-  ever go through normal scope-exit tracking. Both are error-path-only
-  (a successful run leaks nothing) and bounded, never unbounded or
-  accumulating. A real fix would mean exception-safe cleanup for values
-  built mid-expression-evaluation generally — this language has no
+  locals**, structurally the same issue `.toStruct()`/`.toArr()` used
+  to have when a parse failed partway through (claude.md #223 fixed
+  that one specifically: every generated from-JSON function, and the
+  `.toStruct()`/`.toArr()` call site itself, now install their own
+  local `try`/`catch`). The general case remains open: an ARBITRARY
+  function that merely calls something which eventually throws, with
+  no `try`/`catch` of its own to wrap, never gets the chance to run its
+  own cleanup, because neither the intermediate C stack frames a
+  `longjmp` skips nor an ordinary Festina function's own generated body
+  ever go through scope-exit tracking on that path. Error-path-only (a
+  normal return leaks nothing) and bounded per throw, never unbounded
+  or accumulating. A real fix would mean exception-safe cleanup for
+  every function's own locals generally — this language has no
   RAII/unwind-table story at all today, and building one is a
   genuinely large undertaking.
 

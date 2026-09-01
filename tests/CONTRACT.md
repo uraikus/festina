@@ -2355,12 +2355,19 @@ declaration CREATES a real table (#28-31's schema sync), so a
 `sqliteInt`/`sqliteFloat`/`sqliteText` close that with no schema at all,
 sharing `sqlite()`'s own prepare-and-bind path and differing only in the
 stepping; no rows (or a SQL NULL) answers with null rather than failing.
-`tests/test_codegen.py::TestScalarQueries` (5 tests, one asserting the
-database ends up with only the declared table in it),
 `::TestCanvasPathsTransformsAndGradients` (7) and
 `::TestCanvasPathsRenderRealPixels` (1, which checks a point inside the
 triangle's bounding box but outside the triangle stays unpainted --
 proving a path is a real shape and not its bounds).
+
+  > **claude.md #219 removed `sqliteInt()`/`sqliteFloat()`/
+  > `sqliteText()`.** A `struct` (unlike a `table`) creates no real
+  > table when used as a query target, so `arr[SomeStruct] x =
+  > sqlite('SELECT count(*) AS n FROM ...')` already gave the identical
+  > schema-free single-value round trip through `sqlite()`'s own one
+  > path -- three near-duplicate builtins for what one already covered.
+  > `sqlite()` itself, `table`, and `DatabaseURL` are unaffected.
+  > `TestScalarQueries` was removed along with them.
 
 **claude.md #95**: drawing is now offscreen and `render()` puts it on
 screen. Drawing used to imply a window -- any `drawRect` opened one,
@@ -2912,7 +2919,7 @@ spelling on all four container kinds.
 **claude.md #113**: literal-SQL statement caching, WAL, and per-type
 leak isolation.
 
-A `sqlite()`/`sqliteInt()`/... call whose SQL is a string literal gets a
+A `sqlite()` call whose SQL is a string literal gets a
 per-call-site cache slot and is prepared once, reset+reused after — the
 sqlite counterpart of #85's regex literal cache, same compile-time fact
 (the text cannot change), same shape. Consumers are oblivious: a small

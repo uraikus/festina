@@ -546,10 +546,10 @@ class TestThreadLifecycleMethods:
 class TestThreadDatabaseUrl:
     """claude.md #199 Phase 5: `DatabaseURL = '<literal>'` as a thread's
     own first statement -- its own private sqlite handle (gating
-    sqlite()/sqliteInt()/sqliteFloat()/sqliteText() is covered by
-    TestThreadIsolation's own test above, since it's really an
-    isolation question), plus the whole-program compile-time conflict
-    check (main included). Every test here declares an obviously
+    sqlite() is covered by TestThreadIsolation's own test above, since
+    it's really an isolation question), plus the whole-program
+    compile-time conflict check (main included). Every test here
+    declares an obviously
     thread-specific literal path (never 'festina.sqlite') -- a bare
     parser.parse()/semantic.analyze() pair, unlike festina.imports.
     build_program, never sets Program.database_url at all, so the
@@ -875,6 +875,71 @@ class TestThreadPools:
         with pytest.raises(errors.CompileError, match="is an ordinary thread, not a pool"):
             semantic.analyze(parser.parse(source))
 
+    def test_an_auto_pool_resolves_to_cpu_count_with_no_other_threads(
+            self, parser, semantic, monkeypatch):
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 8)
+        program = parser.parse("thread pool[] { }")
+        semantic.analyze(program)
+        assert program.body[0].pool_size == 8
+
+    def test_an_auto_pool_subtracts_a_singleton_threads_own_one(
+            self, parser, semantic, monkeypatch):
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 8)
+        source = """
+        thread worker { on load() { } }
+        thread pool[] { }
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+        assert program.body[1].pool_size == 7
+
+    def test_an_auto_pool_subtracts_an_explicit_pools_own_n(
+            self, parser, semantic, monkeypatch):
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 8)
+        source = """
+        thread fixed[3] { }
+        thread pool[] { }
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+        assert program.body[1].pool_size == 5
+
+    def test_an_auto_pool_is_floored_at_one(self, parser, semantic, monkeypatch):
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 2)
+        source = """
+        thread a[3] { }
+        thread b[3] { }
+        thread pool[] { }
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+        assert program.body[2].pool_size == 1
+
+    def test_two_auto_pools_each_get_the_full_remaining_budget(
+            self, parser, semantic, monkeypatch):
+        # claude.md #220: auto pools don't divide the remaining budget
+        # between themselves -- each sizes independently against the
+        # same fixed total, so both land on the same number here.
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 8)
+        source = """
+        thread worker { on load() { } }
+        thread poolA[] { }
+        thread poolB[] { }
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+        assert program.body[1].pool_size == 7
+        assert program.body[2].pool_size == 7
+
+    def test_an_auto_pool_declaration_indexes_like_an_ordinary_pool(
+            self, parser, semantic, monkeypatch):
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 4)
+        source = """
+        thread pool[] { on message(worker:thread, msg:int) { } }
+        pool[0].postMessage(1)
+        """
+        semantic.analyze(parser.parse(source))
+
     def test_pool_isalive_kill_live_are_accepted_when_indexed(self, parser, semantic):
         source = """
         thread pool[2] { on load() { } }
@@ -1106,13 +1171,15 @@ class TestThreadPrivateFunctions:
 
 
 class TestThreadWiderBuiltinAccess:
-    """claude.md #211: `regex()`/`mkdir()`/`ls()` are unblocked
+    """claude.md #211: `regex()`/`mkdir()`/`ls()`/`exec()` are unblocked
     outright inside a thread body -- each confirmed by reading the
-    actual runtime C to touch no shared state at all. `exec` needs an
-    arity split instead of a flat removal: the blocking 1-argument
-    form is equally safe, but the non-blocking 2-argument form's own
-    callback always runs on MAIN's own OS thread regardless of which
-    thread dispatched it, a real cross-thread-isolation violation."""
+    actual runtime C to touch no shared state at all. `exec` originally
+    needed an arity split (the blocking 1-argument form was safe, but
+    the non-blocking 2-argument form's own callback always ran on
+    MAIN's own OS thread regardless of which thread dispatched it, a
+    real cross-thread-isolation violation); claude.md #221 removed that
+    2-argument form entirely, so `exec()` is unconditionally allowed
+    here now, the same as the other three."""
 
     def test_regex_is_accepted_inside_a_thread(self, parser, semantic):
         source = "thread w { on load() { regex r = /^ab/ } }"
@@ -1130,14 +1197,17 @@ class TestThreadWiderBuiltinAccess:
         source = "thread w { on load() { int code = exec(['true']) } }"
         semantic.analyze(parser.parse(source))
 
-    def test_exec_with_a_callback_is_still_rejected_inside_a_thread(
+    def test_exec_with_a_callback_is_rejected_inside_a_thread_too(
             self, parser, semantic, errors):
+        # claude.md #221: exec(args, callback) no longer exists at all
+        # (not just inside a thread) -- this now hits the ordinary
+        # "exec() expects 1 argument" arity error, the same one any
+        # other call site gets.
         source = """
         void func onDone(code:int) { }
         thread w { on load() { exec(['true'], onDone) } }
         """
-        with pytest.raises(errors.CompileError,
-                            match="its callback always runs on the main program's own OS thread"):
+        with pytest.raises(errors.CompileError, match="exec\\(\\) expects 1 argument"):
             semantic.analyze(parser.parse(source))
 
     def test_canvas_and_timer_builtins_are_still_rejected_inside_a_thread(

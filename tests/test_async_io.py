@@ -92,79 +92,28 @@ class TestAsyncIoSemantics:
         semantic.analyze(parser.parse("blob b"))
 
 
-class TestExecCallbackSemantics:
-    """claude.md #177: exec(args, callback) -- checked structurally the
-    same permissive way blob/img/aud's own `.callback()` is above (any
-    func[int]:void-typed EXPRESSION, not restricted to a bare declared-
-    function name)."""
+class TestExecArity:
+    """claude.md #150/#221: exec() takes exactly 1 argument (args).
+    claude.md #177's own non-blocking exec(args, callback) form was
+    removed in claude.md #221 -- its callback always ran on main's own
+    OS thread regardless of which thread dispatched it, a real cross-
+    thread-isolation hazard."""
 
     def test_one_arg_form_is_unaffected(self, parser, semantic):
         semantic.analyze(parser.parse("arr[text] cmd = ['ls']\nlog(exec(cmd))"))
 
-    def test_two_arg_form_analyzes(self, parser, semantic):
-        source = """
-        void func onDone(code:int) { log(code) }
-        arr[text] cmd = ['ls']
-        exec(cmd, onDone)
-        """
-        semantic.analyze(parser.parse(source))
-
-    def test_callback_works_on_any_func_int_void_expression(self, parser, semantic):
-        source = """
-        void func onDone(code:int) { log(code) }
-        func[int]:void cb = onDone
-        arr[text] cmd = ['ls']
-        exec(cmd, cb)
-        """
-        semantic.analyze(parser.parse(source))
-
-    def test_wrong_arity_is_rejected(self, parser, semantic, errors):
+    def test_two_arg_form_is_rejected(self, parser, semantic, errors):
         program = parser.parse("""
         void func onDone(code:int) { log(code) }
         arr[text] cmd = ['ls']
-        exec(cmd, onDone, onDone)
+        exec(cmd, onDone)
         """)
         with pytest.raises(errors.CompileError, match="exec\\(\\) expects 1 argument"):
             semantic.analyze(program)
 
     def test_first_argument_must_still_be_arr_text(self, parser, semantic, errors):
-        program = parser.parse("""
-        void func onDone(code:int) { log(code) }
-        exec('not an array', onDone)
-        """)
+        program = parser.parse("exec('not an array')")
         with pytest.raises(errors.CompileError, match="expects arr\\[text\\]"):
-            semantic.analyze(program)
-
-    def test_callback_rejects_a_non_func_argument(self, parser, semantic, errors):
-        program = parser.parse("arr[text] cmd = ['ls']\nexec(cmd, 'not a func')")
-        with pytest.raises(errors.CompileError, match="expects func\\[int\\]:void"):
-            semantic.analyze(program)
-
-    def test_callback_rejects_a_wrong_signature_func(self, parser, semantic, errors):
-        program = parser.parse("""
-        void func wrong(x:text) { }
-        arr[text] cmd = ['ls']
-        exec(cmd, wrong)
-        """)
-        with pytest.raises(errors.CompileError, match="expects func\\[int\\]:void"):
-            semantic.analyze(program)
-
-    def test_callback_rejects_a_wrong_arity_func(self, parser, semantic, errors):
-        program = parser.parse("""
-        void func wrong(x:int, y:int) { }
-        arr[text] cmd = ['ls']
-        exec(cmd, wrong)
-        """)
-        with pytest.raises(errors.CompileError, match="expects func\\[int\\]:void"):
-            semantic.analyze(program)
-
-    def test_callback_rejects_a_non_void_return(self, parser, semantic, errors):
-        program = parser.parse("""
-        int func wrong(x:int) { return x }
-        arr[text] cmd = ['ls']
-        exec(cmd, wrong)
-        """)
-        with pytest.raises(errors.CompileError, match="expects func\\[int\\]:void"):
             semantic.analyze(program)
 
 

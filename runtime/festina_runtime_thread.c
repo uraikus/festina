@@ -117,6 +117,16 @@ typedef struct FestinaPendingCallback {
     int64_t txn_id;
     void (*trampoline)(void *payload, void *user_fn);
     void *user_fn;
+    /* claude.md #222: true only for a WORKER's own registration of the
+     * BARE form (`postMessage(x).callback(fn)`, always targeting main
+     * -- semantic.py never allows the bare form anywhere else, so this
+     * is never set for a registration made on g_main_handle's own
+     * list). Read by festina_thread_dispatch_reply: a reply answering
+     * one of these must fire `fn` on MAIN's own OS thread, not the
+     * dispatching thread's -- see that function's own doc comment for
+     * why a worker's own dispatch loop otherwise runs it inline, on
+     * itself. */
+    int dispatch_on_main;
     struct FestinaPendingCallback *next;
 } FestinaPendingCallback;
 
@@ -328,15 +338,21 @@ int64_t festina_thread_alloc_txn_id(void) {
  * (see FestinaPendingCallback's own doc comment for why that needs no
  * lock). Called ahead of the actual send (festina_thread_post/
  * _post_outbound), so the slot already exists by the time any reply
- * could possibly arrive. */
+ * could possibly arrive. claude.md #222: `dispatch_on_main` is codegen's
+ * own compile-time-known "is this the bare form" fact (1 for
+ * `postMessage(x).callback(fn)`, always 0 for a NAME.postMessage one,
+ * and always 0 for anything main itself registers, since the bare form
+ * doesn't exist at main's own top level) -- see FestinaPendingCallback's
+ * own doc comment for what it changes at dispatch time. */
 void festina_thread_register_callback(FestinaThreadHandle *self, int64_t txn_id,
                                       void (*trampoline)(void *payload, void *user_fn),
-                                      void *user_fn) {
+                                      void *user_fn, int8_t dispatch_on_main) {
     FestinaPendingCallback *cb = malloc(sizeof(*cb));
     if (!cb) festina_fail("out of memory registering a reply callback");
     cb->txn_id = txn_id;
     cb->trampoline = trampoline;
     cb->user_fn = user_fn;
+    cb->dispatch_on_main = dispatch_on_main ? 1 : 0;
     cb->next = NULL;
     /* claude.md #218: append, don't prepend -- see FestinaPendingCallback's
      * own doc comment for the O(N^2)-vs-O(1) reasoning. */
@@ -398,23 +414,86 @@ void festina_thread_reply(FestinaThreadHandle *self, FestinaThreadHandle *dest, 
     }
 }
 
-/* claude.md #217: looks up and removes ONE pending callback from `h`'s
- * own list by txn_id (see FestinaPendingCallback's own doc comment on
- * why this needs no lock) -- returns 1 and runs it (unboxing/releasing
- * the payload, calling the user's own fn) if found, 0 (a defensive,
- * should-never-happen case: this runtime's own static enforcement --
- * semantic.py's ".callback() required" check -- guarantees every
- * REPLY-kind message's txn_id was genuinely registered by whoever sent
- * the original message) otherwise, in which case `payload` is
- * deliberately left unreleased rather than guessed at with the wrong
- * release function. */
+/* claude.md #222: carries one reply's own (trampoline, user_fn,
+ * payload) triple through festina_async_io_dispatch's generic
+ * (payload, work_fn, callback, release_fn) job shape -- see
+ * festina_thread_dispatch_reply's own doc comment for why a worker's
+ * bare-send-to-main callback needs marshaling onto main at all. */
+typedef struct FestinaPendingCallbackMarshal {
+    void (*trampoline)(void *payload, void *user_fn);
+    void *user_fn;
+    void *reply_payload;
+} FestinaPendingCallbackMarshal;
+
+/* work_fn: runs on an async-io WORKER thread -- there is genuinely no
+ * work to do here (the reply's own payload already arrived, fully
+ * formed, over this thread's own inbound queue), so this exists only
+ * because festina_async_io_dispatch's job shape always calls one. */
+static void festina_pending_callback_marshal_noop(void *payload) {
+    (void)payload;
+}
+
+/* callback: runs on MAIN's own OS thread once the (no-op) work above
+ * is marked done -- this is the actual point of marshaling: `trampoline`
+ * (which itself unboxes the payload, calls the user's real fn, and
+ * releases the box -- see _emit_reply_callback_trampoline in
+ * festina/codegen.py) now runs on main instead of on whichever thread
+ * originally sent the message. */
+static void festina_pending_callback_marshal_invoke(void *payload) {
+    FestinaPendingCallbackMarshal *m = (FestinaPendingCallbackMarshal *)payload;
+    m->trampoline(m->reply_payload, m->user_fn);
+}
+
+/* release_fn: runs on main right after callback -- frees only this
+ * marshal wrapper itself; the reply's own boxed payload was already
+ * released by `trampoline` above. */
+static void festina_pending_callback_marshal_free(void *payload) {
+    free(payload);
+}
+
+/* claude.md #217/#222: looks up and removes ONE pending callback from
+ * `h`'s own list by txn_id (see FestinaPendingCallback's own doc
+ * comment on why this needs no lock) -- returns 1 and runs it
+ * (unboxing/releasing the payload, calling the user's own fn) if
+ * found, 0 (a defensive, should-never-happen case: this runtime's own
+ * static enforcement -- semantic.py's ".callback() required" check --
+ * guarantees every REPLY-kind message's txn_id was genuinely
+ * registered by whoever sent the original message) otherwise, in
+ * which case `payload` is deliberately left unreleased rather than
+ * guessed at with the wrong release function.
+ *
+ * claude.md #222: a worker's own registration of the BARE form
+ * (`cb->dispatch_on_main`) is never invoked directly here -- this
+ * function can be called from EITHER the worker's own inbound-queue
+ * dispatch loop (festina_thread_try_dispatch_one, below) or main's own
+ * outbound-drain loop (festina_thread_drain_impl, further down), and
+ * calling `cb->trampoline` inline would run the user's `fn` on
+ * whichever of those two happened to be running -- for a worker's own
+ * bare send, that is the WORKER's thread, not main's, exactly the bug
+ * this fixes. Marshaling through festina_async_io_dispatch (the same
+ * cross-thread-safe mechanism blob/img/aud's own `.callback()` already
+ * uses) guarantees `fn` runs on main regardless of which thread called
+ * this function. A named send's own registration (`dispatch_on_main`
+ * false) is unaffected -- it already runs on the right thread, whichever
+ * called this function, so it stays a direct, unmarshaled call. */
 static int festina_thread_dispatch_reply(FestinaThreadHandle *h, int64_t txn_id, void *payload) {
     FestinaPendingCallback **link = &h->pending_callbacks;
     while (*link) {
         if ((*link)->txn_id == txn_id) {
             FestinaPendingCallback *cb = *link;
             *link = cb->next;
-            cb->trampoline(payload, cb->user_fn);
+            if (cb->dispatch_on_main) {
+                FestinaPendingCallbackMarshal *m = malloc(sizeof(*m));
+                if (!m) festina_fail("out of memory marshaling a reply callback onto main");
+                m->trampoline = cb->trampoline;
+                m->user_fn = cb->user_fn;
+                m->reply_payload = payload;
+                festina_async_io_dispatch(m, festina_pending_callback_marshal_noop,
+                                          festina_pending_callback_marshal_invoke,
+                                          festina_pending_callback_marshal_free);
+            } else {
+                cb->trampoline(payload, cb->user_fn);
+            }
             free(cb);
             return 1;
         }

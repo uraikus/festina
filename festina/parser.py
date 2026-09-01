@@ -721,16 +721,30 @@ class Parser:
         pool_size = None
         if self.at("LBRACK"):
             self.eat("LBRACK")
-            size_tok = self.eat("NUMBER")
-            if not isinstance(size_tok.value, int):
-                raise self.err(size_tok, "invalid syntax",
-                                "a thread pool's size must be a plain integer literal, "
-                                f"found '{size_tok.value}'")
-            pool_size = size_tok.value
-            if pool_size <= 0:
-                raise self.err(size_tok, "invalid syntax",
-                                f"a thread pool's size must be a positive integer, "
-                                f"found {pool_size}")
+            if self.at("RBRACK"):
+                # claude.md #220: `thread NAME[] { ... }` -- an
+                # explicitly EMPTY pair of brackets, no literal N at
+                # all, asks the compiler to size the pool itself
+                # (os.cpu_count() minus every other thread the program
+                # declares, floored at 1). "auto" is a sentinel only
+                # this parse step and semantic.py's own pre-pass (in
+                # analyze(), before any real analysis begins) ever see
+                # -- it resolves `pool_size` into a real positive int
+                # right there, so every later reader (the rest of
+                # semantic.py, all of codegen.py) sees an ordinary
+                # `thread NAME[N] { ... }` and needs no changes at all.
+                pool_size = "auto"
+            else:
+                size_tok = self.eat("NUMBER")
+                if not isinstance(size_tok.value, int):
+                    raise self.err(size_tok, "invalid syntax",
+                                    "a thread pool's size must be a plain integer literal, "
+                                    f"found '{size_tok.value}'")
+                pool_size = size_tok.value
+                if pool_size <= 0:
+                    raise self.err(size_tok, "invalid syntax",
+                                    f"a thread pool's size must be a positive integer, "
+                                    f"found {pool_size}")
             self.eat("RBRACK")
         body = self.parse_block()
         return ast.ThreadDecl(name_tok.value, body, t.line, t.column, pool_size=pool_size)

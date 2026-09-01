@@ -58,6 +58,18 @@ available (statically linked when possible — see
 [setup.md](setup.md#static-linking-sqlite3)), since automatic database
 support (`table`, `sqlite()`) is always on.
 
+## Imports
+
+```festina
+import database.f
+import graphics.f
+```
+
+Resolved recursively before compilation into one merged compilation
+unit; a file is never imported more than once even if multiple files
+depend on it; errors still point at the file a statement actually came
+from.
+
 ## Types
 
 ```text
@@ -764,6 +776,98 @@ only unchecked operation in the language.
 Arrays grow, and are searched, through the methods in
 [Growing arrays](#growing-arrays) below.
 
+### Growing arrays
+
+```festina
+arr[int] xs = [1, 2, 3]
+
+xs.push(4)          // -> new length
+xs.pop()            // -> last element, removed
+xs.shift()          // -> first element, removed
+xs.unshift(0)       // -> new length
+arr[int] cut = xs.splice(1, 2)   // remove 2 from index 1, return them
+xs.splice(1, 0, [8, 9])           // insert [8, 9] at index 1, remove nothing
+xs.indexOf(3)       // -> first index holding 3, or -1
+```
+
+`splice` clamps rather than failing — a negative start counts back from
+the end, and an oversized range clamps to what's actually there, so
+`splice(i, 1)` at a boundary is a no-op. It takes an optional third
+argument — `splice(start, count, insertArr)` — to insert as well as
+remove (Festina has no variadic calls, so the items to insert are one
+explicit `arr[T]` rather than a spread list); either way only the
+REMOVED elements are returned, never the inserted ones.
+
+`push()`/`unshift()`/`pop()`/`shift()`/`splice()` each resize the
+backing buffer to exactly the new length internally, not amortized —
+see [`amor` — amortized-growth arrays](#amor--amortized-growth-arrays)
+below if that matters for a specific array (a long run of pushes in
+particular).
+
+`pop()`/`shift()` on an empty array return `null` — not zero, so an
+empty pop is distinguishable from popping a real `0`:
+
+```festina
+arr[int] empty = []
+log(empty.pop() == null)     // true
+```
+
+`indexOf()` answers `-1` when the value isn't present, rather than
+`null` — an index is the kind of thing you compare or feed straight to
+`splice`, and both read naturally against `-1`:
+
+```festina
+if queue.indexOf(target) >= 0 { ... }
+queue.splice(queue.indexOf(target), 1)   // remove by value
+```
+
+What "the same value" means depends on the element type:
+
+- `int`, `float`, `bool` — **by value**.
+- `text` — **by content**, so a needle built at runtime finds a match:
+  `names.indexOf('gr' + 'ace')` is `1` for `['ada', 'grace']`. (Identity
+  would be useless here: text is copied on binding, so two equal strings
+  are almost always two different buffers.)
+- `struct`, `arr`, `map` — **by identity**. Two separately-declared
+  structs with identical fields are two different values; only the one
+  actually in the array is found.
+
+Elements are owned the same way any other binding owns them: pushing a
+`text` copies it, so the array and the variable don't share a buffer.
+Removing transfers ownership to whoever receives it. `indexOf()` takes
+no ownership at all — an index isn't a reference.
+
+### Sorting: `sort(cmpFn)`
+
+```festina
+int func byAsc(a:int, b:int) { return a - b }
+
+arr[int] xs = [5, 3, 8, 1]
+xs.sort(byAsc)         // in place -- xs is now [1,3,5,8]
+```
+
+`sort()` takes a comparator, `cmpFn:func[T,T]:int`, and sorts in place —
+JavaScript's/C `qsort()`'s convention: return negative if the first
+argument belongs before the second, positive if after, `0` if they're
+equal. Sorting is **stable** — two elements the comparator calls equal
+keep their original relative order, so sorting a list twice by two
+different keys ("sort by name, then re-sort by score" to get "score
+descending, ties broken by name") behaves the way it reads.
+
+The comparator can be any `func[T,T]:int`-typed expression, not just the
+bare name of a declared function — a variable holding a function value
+works too, the same first-class-function rule every other callback
+(`.callback()`) already follows.
+
+```festina
+struct Enemy { name:text y:int }
+
+int func byDepth(a:Enemy, b:Enemy) { return a.y - b.y }
+
+arr[Enemy] enemies = [...]
+enemies.sort(byDepth)   // back-to-front draw order by Y position
+```
+
 ## Maps
 
 ```festina
@@ -1025,6 +1129,50 @@ DatabaseURL = environment.DATABASE_URL
 statement is a compile-time error; it has no effect at all in an
 imported file (only the file actually passed to the compiler is
 checked).
+
+### Single-value queries
+
+A `struct` — unlike a `table` — declares only a shape, not a real
+table, so it costs nothing to use as a one-off landing spot for a
+value that would otherwise need a throwaway `table` sitting in your
+database forever just to receive a `count(*)`:
+
+```festina
+struct Total { total:int }
+struct Name  { name:text }
+struct Mean  { mean:float }
+
+arr[Total] t = sqlite(`SELECT count(*) AS total FROM Post`)
+int total = t[0].total
+
+arr[Name] n = sqlite(`SELECT title AS name FROM Post WHERE id = ?`, [2])
+text name = n[0].name
+
+arr[Mean] m = sqlite(`SELECT avg(score) AS mean FROM Post`)
+float mean = m[0].mean
+```
+
+Alias the column to match the struct's field name (`AS total`, `AS
+name`, ...) the same way any `sqlite()` query does. A query matching no
+rows comes back as an empty array (`arr.length == 0`) rather than a
+value — check that before indexing `[0]`.
+
+### JSON and full-text search
+
+Both are ordinary SQL, and `sqlite()` passes SQL through untouched — so
+SQLite's JSON1 and FTS5 work today with no extra language feature:
+
+```festina
+struct Name { name:text }
+arr[Name] n = sqlite(`SELECT json_extract(data, '$.name') AS name FROM Doc WHERE id = ?`, [1])
+log(n[0].name)
+
+sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
+sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
+struct Total { total:int }
+arr[Total] t = sqlite(`SELECT count(*) AS total FROM PostSearch WHERE PostSearch MATCH ?`, ['machine'])
+log(t[0].total)
+```
 
 ## Environment variables
 
@@ -2062,32 +2210,6 @@ unambiguous. Not available under `--target=wasm32-wasi` — WASI has no
 process model to spawn into — rejected at compile time rather than
 failing at runtime; see [wasm.md](wasm.md).
 
-### Running without blocking: `exec(args, callback)`
-
-`exec(cmd)` blocks the whole program until the child exits. Passing a
-second, `func[int]:void` argument instead dispatches the same spawn to
-a background thread and returns immediately — the real exit code
-arrives later, through `callback`, the same non-blocking shape
-`.callback()` gives `blob`/`img`/`aud` loads above:
-
-```festina
-void func onDone(code:int) {
-    log(`child exited with ${code}`)
-}
-
-arr[text] cmd = ['/bin/sh', '-c', 'sleep 1 && echo done']
-exec(cmd, onDone)
-log('dispatched')                     // logs BEFORE onDone ever runs
-```
-
-`callback` receives the exact same value the blocking form would have
-returned — the real exit code, or `-1` if the process never started at
-all. The 2-argument form itself returns nothing: there's no handle to
-hand back (an `int` can't be mutated in place the way a `blob` is) and
-no cancel/kill mechanism to justify one either. Not available under
-`--target=wasm32-wasi`, for the identical reason the blocking form
-isn't.
-
 ## HTTP and WebSocket servers
 
 ```festina
@@ -2859,127 +2981,6 @@ doTheWork()
 log(`took ${now() - started}ms`)
 ```
 
-### Single-value queries
-
-```festina
-int total  = sqliteInt(`SELECT count(*) FROM Post`)
-text name  = sqliteText(`SELECT title FROM Post WHERE id = ?`, [2])
-float mean = sqliteFloat(`SELECT avg(score) FROM Post`)
-```
-
-The first column of the first row. Use these instead of declaring a
-`table` just to receive a scalar — a `table` declaration *creates* a
-real table, so a throwaway one for a `count(*)` would sit in your
-database permanently.
-
-A query matching no rows (or whose value is SQL NULL) returns `null`,
-so it's something to test for rather than something that stops you.
-
-### JSON and full-text search
-
-Both are ordinary SQL, and `sqlite()` passes SQL through untouched — so
-SQLite's JSON1 and FTS5 work today with no extra language feature:
-
-```festina
-log(sqliteText(`SELECT json_extract(data, '$.name') FROM Doc WHERE id = ?`, [1]))
-
-sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
-sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
-log(sqliteInt(`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`, ['machine']))
-```
-
-## Growing arrays
-
-```festina
-arr[int] xs = [1, 2, 3]
-
-xs.push(4)          // -> new length
-xs.pop()            // -> last element, removed
-xs.shift()          // -> first element, removed
-xs.unshift(0)       // -> new length
-arr[int] cut = xs.splice(1, 2)   // remove 2 from index 1, return them
-xs.splice(1, 0, [8, 9])           // insert [8, 9] at index 1, remove nothing
-xs.indexOf(3)       // -> first index holding 3, or -1
-```
-
-`splice` clamps rather than failing — a negative start counts back from
-the end, and an oversized range clamps to what's actually there, so
-`splice(i, 1)` at a boundary is a no-op. It takes an optional third
-argument — `splice(start, count, insertArr)` — to insert as well as
-remove (Festina has no variadic calls, so the items to insert are one
-explicit `arr[T]` rather than a spread list); either way only the
-REMOVED elements are returned, never the inserted ones.
-
-`push()`/`unshift()`/`pop()`/`shift()`/`splice()` each resize the
-backing buffer to exactly the new length internally, not amortized —
-see [`amor` — amortized-growth arrays](#amor--amortized-growth-arrays)
-below if that matters for a specific array (a long run of pushes in
-particular).
-
-`pop()`/`shift()` on an empty array return `null` — not zero, so an
-empty pop is distinguishable from popping a real `0`:
-
-```festina
-arr[int] empty = []
-log(empty.pop() == null)     // true
-```
-
-`indexOf()` answers `-1` when the value isn't present, rather than
-`null` — an index is the kind of thing you compare or feed straight to
-`splice`, and both read naturally against `-1`:
-
-```festina
-if queue.indexOf(target) >= 0 { ... }
-queue.splice(queue.indexOf(target), 1)   // remove by value
-```
-
-What "the same value" means depends on the element type:
-
-- `int`, `float`, `bool` — **by value**.
-- `text` — **by content**, so a needle built at runtime finds a match:
-  `names.indexOf('gr' + 'ace')` is `1` for `['ada', 'grace']`. (Identity
-  would be useless here: text is copied on binding, so two equal strings
-  are almost always two different buffers.)
-- `struct`, `arr`, `map` — **by identity**. Two separately-declared
-  structs with identical fields are two different values; only the one
-  actually in the array is found.
-
-Elements are owned the same way any other binding owns them: pushing a
-`text` copies it, so the array and the variable don't share a buffer.
-Removing transfers ownership to whoever receives it. `indexOf()` takes
-no ownership at all — an index isn't a reference.
-
-### Sorting: `sort(cmpFn)`
-
-```festina
-int func byAsc(a:int, b:int) { return a - b }
-
-arr[int] xs = [5, 3, 8, 1]
-xs.sort(byAsc)         // in place -- xs is now [1,3,5,8]
-```
-
-`sort()` takes a comparator, `cmpFn:func[T,T]:int`, and sorts in place —
-JavaScript's/C `qsort()`'s convention: return negative if the first
-argument belongs before the second, positive if after, `0` if they're
-equal. Sorting is **stable** — two elements the comparator calls equal
-keep their original relative order, so sorting a list twice by two
-different keys ("sort by name, then re-sort by score" to get "score
-descending, ties broken by name") behaves the way it reads.
-
-The comparator can be any `func[T,T]:int`-typed expression, not just the
-bare name of a declared function — a variable holding a function value
-works too, the same first-class-function rule every other callback
-(`.callback()`, `exec(args, callback)`) already follows.
-
-```festina
-struct Enemy { name:text y:int }
-
-int func byDepth(a:Enemy, b:Enemy) { return a.y - b.y }
-
-arr[Enemy] enemies = [...]
-enemies.sort(byDepth)   // back-to-front draw order by Y position
-```
-
 ## Timers
 
 ```festina
@@ -3109,9 +3110,21 @@ be able to receive a reply that receiver might send. Chaining
 equally a compile error, for the same reason in reverse.
 
 This works in either direction — main replying to a worker, or a worker
-replying to main or to another worker. `fn` always runs back on
-whichever side originally sent the message, on that side's own OS
-thread.
+replying to main or to another worker. **`fn` runs on MAIN's own OS
+thread whenever the original send was addressed to main.** When main
+itself is the sender (`NAME.postMessage(x).callback(fn)` from main's
+own top-level code), that was always true — main is both the sender
+and the one draining the reply. When a WORKER sends bare
+(`postMessage(x).callback(fn)`, always addressed to main), `fn` is
+marshaled onto main through the same background mechanism
+`blob`/`img`/`aud`'s own
+[`.callback()`](#loading-in-the-background-callback) already uses,
+rather than running inline on the worker's own thread — so `fn` is
+never running concurrently with main's own top-level code or any other
+main-dispatched callback, regardless of which thread sent the original
+message. **`fn` runs on the SENDING worker's own OS thread when one
+worker messages another directly** — that send never touches main at
+all, so there is no main-thread hop to marshal through.
 
 Three details worth knowing:
 
@@ -3127,21 +3140,19 @@ Three details worth knowing:
   `.callback(fn)` still waiting on a reply from it, and any the thread
   itself was waiting on; those `fn`s simply never run.
 
-**`fn`'s own body is ordinary code, not thread-isolated — running it
-off main is a real responsibility, not just a detail.** `fn` is a plain
+**`fn`'s own body is ordinary code, not thread-isolated — the one
+remaining case where that's a real responsibility, not just a detail,
+is a worker messaging another worker directly.** `fn` is a plain
 top-level `func`, so it's free to read/write top-level variables;
 unlike a thread's own `on message` (which the compiler blocks from
 touching top-level state at all), nothing stops `fn` from doing so
-here, and when `fn` was registered by a worker's own send (the bare
-form, or one worker messaging another directly), it runs back on *that
-worker's* OS thread — genuinely concurrently with main and every other
-thread, not marshaled onto main the way `blob`/`img`/`aud`'s own
-[`.callback()`](#loading-in-the-background-callback) is. Two different
-callbacks touching the same top-level variable from two different
-threads is a real data race, caught directly during this feature's own
-development (a first draft of its own stress test raced on exactly this
-and was rewritten once ThreadSanitizer flagged it). Keep an `fn`
-registered by a worker's own send limited to state only that one
+here. For a bare send (or any send addressed to main), that's safe by
+construction — `fn` only ever runs from main's own event loop, one
+callback at a time. For one worker messaging ANOTHER worker, `fn` runs
+back on the *sending* worker's OS thread — genuinely concurrently with
+main and every other thread. Two different callbacks touching the same
+top-level variable from two different worker threads is a real data
+race; keep an `fn` registered this way limited to state only that one
 worker's own replies ever touch, or relay the result onward through
 another `postMessage` (itself always safe — every queue this runtime
 uses is its own plain mutex-protected structure) rather than writing to
@@ -3237,8 +3248,7 @@ process.
 A thread's body **may** call `log`/`fail`, string/array/map/struct/enum
 operations, `Math`, time functions, `blankImage()` plus `img`-method
 drawing/clip/resize/pixel calls (each touches only that one private
-image, never shared state), `regex()`/`mkdir()`/`ls()`, and
-`exec(args)` (the blocking, single-argument form).
+image, never shared state), `regex()`/`mkdir()`/`ls()`, and `exec()`.
 
 It may **not** call any canvas/window builtin (`drawRect`, `render`,
 `saveCanvas`, ...) or `setTimeout`/`setInterval`, and it may not call
@@ -3248,23 +3258,24 @@ any ordinary top-level `func` declared outside the thread — declare a
 
 Two builtins are allowed conditionally:
 
-- `sqlite()`/`sqliteInt()`/`sqliteFloat()`/`sqliteText()` — only for a
-  thread that declared its own `DatabaseURL`, see
-  [A thread's own database](#a-threads-own-database-databaseurl) below.
+- `sqlite()` — only for a thread that declared its own `DatabaseURL`,
+  see [A thread's own database](#a-threads-own-database-databaseurl)
+  below.
 - `openPort()`/`closePort()`/`openSecurePort()` — only for a thread
   that has already declared its own `on request`/`on upgrade`/
   `on socketMessage`/`on socketClose`, see
   [A thread's own HTTP context](#a-threads-own-http-context) below.
 
 <a name="thread-limitations"></a>
-**`exec(args, callback)` (the non-blocking form) is rejected inside a
-thread body** — unlike the blocking `exec(args)` form, its callback
-always runs on the *main* program's own OS thread, regardless of which
-thread dispatched it, so a thread handing it a closure over its own
-private state would be a real cross-thread violation. Use the blocking
-form instead. The non-blocking HTTP client form (`req.send()` with a
-`callback` field) is unavailable inside a thread body for the identical
-reason.
+**The non-blocking HTTP client form (`req.send()` with a `callback`
+field) is unavailable inside a thread body** — its callback always
+runs on the *main* program's own OS thread, regardless of which thread
+dispatched the request, so a thread handing it a closure over its own
+private state would be a real cross-thread violation. (`exec()` has no
+such hazard any more — claude.md #221 removed its own non-blocking
+`exec(args, callback)` form for exactly this reason, so only the
+always-safe blocking `exec(args)` remains, usable freely from any
+thread body.)
 
 ### A thread's own database: `DatabaseURL`
 
@@ -3285,11 +3296,11 @@ logger.postMessage('started up')
 
 A thread with its own `DatabaseURL` gets its own private sqlite handle
 — never shared with the main program or any other thread — and may
-call `sqlite()`/`sqliteInt()`/`sqliteFloat()`/`sqliteText()`; every
-`table` declared anywhere in the program is synced against it, the
-same as the main program's own database. A thread that did **not**
-declare its own `DatabaseURL` may not call any of the four at all — a
-clear compile error naming the fix. **Two contexts (a thread and the
+call `sqlite()`; every `table` declared anywhere in the program is
+synced against it, the same as the main program's own database. A
+thread that did **not** declare its own `DatabaseURL` may not call
+`sqlite()` at all — a clear compile error naming the fix. **Two
+contexts (a thread and the
 main program, or two threads) may never resolve to the same literal
 database file** — checked at compile time across the whole program,
 including the main program's own default (`'festina.sqlite'`, when it
@@ -3337,6 +3348,26 @@ but it does mean a pool costs `N` copies of its body's generated code
 (a ~12-line body measures around 136 lines of LLVM IR per instance), so
 a large `N` over a large body is a real compiled-size decision rather
 than a free one.
+
+**`thread NAME[] { ... }` — empty brackets — sizes the pool for you.**
+`N` becomes `os.cpu_count()` (read on the machine *compiling* the
+program — the resulting count is an ordinary literal baked into the
+binary, not re-measured wherever it later runs) minus every other
+thread the program declares, floored at 1:
+
+```festina
+thread logger { on load() { } }   // 1 thread
+thread pool[] { ... }             // gets cpu_count() - 1 instances
+```
+
+An ordinary singleton (`thread NAME { ... }`, no brackets at all)
+always counts as 1; an explicit `thread NAME[N] { ... }` counts as `N`.
+Two auto-sized pools in the same program don't split the remaining
+budget between them — each is sized independently against the same
+fixed total, so both get the same count. Once resolved, an auto-sized
+pool is in every other respect an ordinary `thread NAME[N] { ... }` —
+same indexing, same out-of-range-is-a-no-op behavior, same per-instance
+compiled-size cost above.
 
 **A pool may not declare its own `DatabaseURL`.** Every instance in a
 pool runs the identical body, so a `DatabaseURL = '<literal>'` there
@@ -3648,18 +3679,6 @@ alternative would be breaking a reservation you asked for.
 while any channel is playing that clip. To ask about a single
 playback, name its channel with `isAudioPlayerPlaying(n)` instead.
 
-## Imports
-
-```festina
-import database.f
-import graphics.f
-```
-
-Resolved recursively before compilation into one merged compilation
-unit; a file is never imported more than once even if multiple files
-depend on it; errors still point at the file a statement actually came
-from.
-
 ## `log()` / `fail()` / `close()`
 
 ```festina
@@ -3888,16 +3907,33 @@ supported (raw, un-escaped non-ASCII UTF-8 bytes in a JSON string are
 unaffected and parse completely normally — this only affects a
 producer that specifically chooses to `\u`-escape).
 
-**One real, honest limitation, the same structural class `throw`'s own
-limitation above already is.** A JSON value that fails to parse
-*partway through* being built — a struct whose third field turns out
-to be the wrong type, having already parsed the first two; an array
-whose fourth element fails, having already collected three — leaks
-whatever was already built for that one call. A **successful** parse
+**The partial-parse-failure leak above is fixed (claude.md #223).** A
+JSON value that fails to parse *partway through* being built — a
+struct whose third field turns out to be the wrong type, having
+already parsed the first two; an array whose fourth element fails,
+having already collected three — used to leak whatever was already
+built for that one call, the same structural class as `throw`'s own
+intermediate-frame limitation above. It no longer does: every generated
+`toStruct`/`toArr`/map-field parsing function now installs its own
+local `try`/`catch` around its own build loop, so a throw anywhere
+inside it — including several levels of nesting deep, and including the
+in-flight JSON key text a struct/map field read before its value threw
+— is caught and released right there before re-throwing outward, and
+the `.toStruct()`/`.toArr()` call site itself does the same for its own
+`cursor` and the receiver's own text. A **successful** parse still
 leaks nothing (measured directly under Valgrind, including 30 repeated
-calls in a loop) — this is strictly an
-error-path leak, bounded to at most one partially-built value per
-failed call, never unbounded or accumulating across successful ones.
+calls in a loop), and a **failed** one now leaks nothing either —
+verified under Valgrind across a flat struct, a nested struct field, an
+array, a `map[T]` field, a self-referencing struct, and malformed JSON
+syntax itself, 400 iterations of each (`tests/stress/
+json_parse_fail_churn.f`). Not verified under `scripts/leak_stress.sh`
+(AddressSanitizer) — this project's `try`/`throw` is built on
+`llvm.eh.sjlj.setjmp`/`longjmp`, which ASan cannot instrument through in
+this environment (confirmed: even a plain, pre-existing `try`/`catch`
+program with no JSON involved crashes with SIGILL under
+`-fsanitize=address`), which is exactly why `try`/`throw`'s own
+leak-freedom above was already stated as Valgrind-measured rather than
+ASan-measured.
 
 ## Error format
 
