@@ -142,7 +142,11 @@ class TestThreadIsolation:
         "render()",
         "saveCanvas()",
         "setTimeout(otherFunc, 100)",
-        "openPort(8080)",
+        # claude.md #212: openPort()/closePort()/openSecurePort()
+        # removed from this list -- no longer flatly disallowed, now
+        # gated on having declared an HTTP-shaped handler first (a
+        # DIFFERENT, more specific error than "cannot be called from
+        # inside a thread body" -- see TestThreadHttpContext).
     ])
     def test_disallowed_builtins_are_rejected_inside_a_thread(
             self, parser, semantic, errors, builtin_call):
@@ -961,3 +965,117 @@ class TestThreadWiderBuiltinAccess:
         source = "thread w { on load() { drawRect(0, 0, 1, 1) } }"
         with pytest.raises(errors.CompileError, match="cannot be called from inside a thread body"):
             semantic.analyze(parser.parse(source))
+
+
+class TestThreadHttpContext:
+    """claude.md #212: a thread's own private HTTP context --
+    openPort()/closePort()/openSecurePort() plus on request/on
+    upgrade/on socketMessage/on socketClose, all gated on this one
+    thread having already declared at least one of the four handlers
+    (mirroring the DatabaseURL-gates-sqlite() precedent exactly)."""
+
+    def test_a_thread_with_a_request_handler_may_call_openPort(self, parser, semantic):
+        source = """
+        thread w {
+            on load() { openPort(8080) }
+            on request(req:http) { req.ok() }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_openPort_without_any_http_handler_is_rejected(self, parser, semantic, errors):
+        source = "thread w { on load() { openPort(8080) } }"
+        with pytest.raises(errors.CompileError,
+                            match="hasn't declared an HTTP-shaped handler yet"):
+            semantic.analyze(parser.parse(source))
+
+    def test_closePort_without_any_http_handler_is_rejected(self, parser, semantic, errors):
+        source = "thread w { on load() { closePort(8080) } }"
+        with pytest.raises(errors.CompileError,
+                            match="hasn't declared an HTTP-shaped handler yet"):
+            semantic.analyze(parser.parse(source))
+
+    def test_openSecurePort_without_any_http_handler_is_rejected(self, parser, semantic, errors):
+        # the gate is checked (and raises) before openSecurePort's own
+        # argument types are looked at, so a bogus second argument here
+        # is fine -- it's never reached.
+        source = "thread w { on load() { openSecurePort(8443, 0) } }"
+        with pytest.raises(errors.CompileError,
+                            match="hasn't declared an HTTP-shaped handler yet"):
+            semantic.analyze(parser.parse(source))
+
+    def test_the_gate_does_not_care_about_textual_order(self, parser, semantic):
+        # claude.md #212: has_http_handler is hoisted, so `on load()`
+        # (which calls openPort()) may appear BEFORE `on request` --
+        # the most natural way to write this -- not just after it.
+        source = """
+        thread w {
+            on load() { openPort(8080) }
+            on request(req:http) { req.ok() }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_on_upgrade_alone_is_enough_to_unlock_openPort(self, parser, semantic):
+        source = """
+        thread w {
+            on load() { openPort(8080) }
+            on upgrade(s:socket) { }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_on_socketMessage_alone_is_enough_to_unlock_openPort(self, parser, semantic):
+        source = """
+        thread w {
+            on load() { openPort(8080) }
+            on socketMessage(s:socket, msg:blob) { }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_on_socketClose_alone_is_enough_to_unlock_openPort(self, parser, semantic):
+        source = """
+        thread w {
+            on load() { openPort(8080) }
+            on socketClose(s:socket) { }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_on_request_wrong_signature_is_rejected(self, parser, semantic, errors):
+        source = "thread w { on request(x:int) { } }"
+        with pytest.raises(errors.CompileError, match="must declare exactly"):
+            semantic.analyze(parser.parse(source))
+
+    def test_duplicate_on_request_is_rejected(self, parser, semantic, errors):
+        source = """
+        thread w {
+            on request(req:http) { }
+            on request(req2:http) { }
+        }
+        """
+        with pytest.raises(errors.CompileError, match="already declares 'on request'"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_pool_thread_may_also_declare_an_http_context(self, parser, semantic):
+        source = """
+        thread w[3] {
+            on load() { openPort(8080) }
+            on request(req:http) { req.ok() }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_a_bare_postMessage_still_works_inside_on_request(self, parser, semantic):
+        # claude.md #208/#212: an HTTP handler is just another place a
+        # thread's own body runs -- bare postMessage(x) still works
+        # from inside it exactly like from on_load/on_message.
+        source = """
+        on message(worker:thread, msg:int) { }
+        thread w {
+            on load() { openPort(8080) }
+            on request(req:http) { postMessage(1) }
+        }
+        """
+        semantic.analyze(parser.parse(source))

@@ -1571,6 +1571,20 @@ class CodeGen:
             # teardown) -- see _emit_thread_db_close_trampoline.
             "declare void @festina_thread_set_db_close(ptr, ptr)",
             "declare void @festina_thread_db_close(ptr)",
+            # claude.md #212 (Phase 4): the db_close hook's own shape,
+            # for a thread's own private HTTP context -- see
+            # festina_thread_set_http_context's own doc comment in
+            # festina_runtime.h. festina_thread_http_service_pass/
+            # _teardown are festina_runtime_http.c's own real
+            # functions, passed here purely as `ptr` values (never
+            # called by name from generated IR) -- declaring them
+            # non-opaque (with their real C parameter shape) would add
+            # nothing, so they're declared the same `ptr`-typed way
+            # every other function-pointer-valued argument already is
+            # in this file.
+            "declare void @festina_thread_set_http_context(ptr, ptr, ptr)",
+            "declare void @festina_thread_http_service_pass(i32)",
+            "declare void @festina_thread_http_teardown()",
             "declare void @festina_thread_kill(ptr)",
             "declare void @festina_thread_live(ptr, ptr)",
             "declare i8 @festina_thread_is_alive(ptr)",
@@ -3621,6 +3635,14 @@ class CodeGen:
         state_env = Env(self.global_env)
         state_inits = []  # [(ref, type_, ast.VarDecl)] needing a store, once, in on_load
         on_load_decl = on_message_decl = on_exit_decl = None
+        # claude.md #212 (Phase 4): the four HTTP-shaped handlers --
+        # collected the same way on_load/on_message/on_exit already
+        # are, just kept separate (rather than reusing those three
+        # names) since they're emitted through a different helper
+        # (_emit_thread_http_handler, below -- ordinary function-call
+        # parameter shape, no thread-queue unboxing) and registered
+        # conditionally, only for a thread that declares at least one.
+        on_request_decl = on_upgrade_decl = on_socketmessage_decl = on_socketclose_decl = None
         for stmt in decl.body.body:
             if isinstance(stmt, ast.VarDecl):
                 # claude.md #202: bare (unflagged) type -- see the
@@ -3640,6 +3662,14 @@ class CodeGen:
                     on_message_decl = stmt
                 elif stmt.name == "exit":
                     on_exit_decl = stmt
+                elif stmt.name == "request":
+                    on_request_decl = stmt
+                elif stmt.name == "upgrade":
+                    on_upgrade_decl = stmt
+                elif stmt.name == "socketMessage":
+                    on_socketmessage_decl = stmt
+                elif stmt.name == "socketClose":
+                    on_socketclose_decl = stmt
             # Nothing else can legally appear here EXCEPT a leading
             # `DatabaseURL = '<literal>'` (claude.md #199 Phase 5) --
             # semantic.py's own analyze_thread already validated and
@@ -3686,13 +3716,79 @@ class CodeGen:
         for stmt in private_func_decls:
             finfo = self.threads[decl.name]["funcs"][stmt.name]
             self._emit_func(stmt, symbol=finfo["symbol"], outer_env=state_env, thread_ctx=thread_ctx)
-        on_load_symbol = self._emit_thread_on_load(decl.name, state_inits, on_load_decl, state_env, thread_ctx)
+        # claude.md #212 (Phase 4): the four HTTP-shaped handlers --
+        # emitted BEFORE on_load (whose own registration prologue,
+        # below, needs their symbols), via a dedicated helper rather
+        # than the top-level _emit_event_handler (which hardcodes
+        # `body_env = Env(self.global_env)` and never sets
+        # _current_thread_ctx -- this thread's own state_env/thread_ctx
+        # need the identical wiring on_load/on_message/on_exit already
+        # get). None (not emitted at all) for a handler this thread
+        # never declared -- has_http_context (just below) is what
+        # decides whether ANY registration/combined-loop wiring
+        # happens at all, so an undeclared individual handler simply
+        # stays unregistered, the same "stays NULL, never called"
+        # no-op shape main's own four already have.
+        http_handler_symbols = {}
+        for handler_name, handler_decl in (
+                ("request", on_request_decl), ("upgrade", on_upgrade_decl),
+                ("socketMessage", on_socketmessage_decl), ("socketClose", on_socketclose_decl)):
+            if handler_decl is not None:
+                http_handler_symbols[handler_name] = self._emit_thread_http_handler(
+                    decl.name, handler_decl, state_env, thread_ctx)
+        has_http_context = bool(http_handler_symbols)
+        self.threads[decl.name]["has_http_context"] = has_http_context
+        on_load_symbol = self._emit_thread_on_load(
+            decl.name, state_inits, on_load_decl, state_env, thread_ctx, http_handler_symbols)
         on_message_symbol = self._emit_thread_on_message(
             decl.name, on_message_decl, info.inbound_type, state_env, thread_ctx)
         on_exit_symbol = self._emit_thread_on_exit(decl.name, on_exit_decl, state_env, thread_ctx)
         self.threads[decl.name]["on_load_symbol"] = on_load_symbol
         self.threads[decl.name]["on_message_symbol"] = on_message_symbol
         self.threads[decl.name]["on_exit_symbol"] = on_exit_symbol
+
+    def _emit_thread_http_handler(self, thread_name, decl, state_env, thread_ctx):
+        """claude.md #212: one of this thread's own on request/on
+        upgrade/on socketMessage/on socketClose -- structurally
+        _emit_event_handler's own shape (an ordinary void function
+        taking plain parameters, no thread-queue unboxing -- these
+        fire from festina_runtime_http.c's own dispatch calling
+        straight into this generated function, exactly like main's own
+        four do), but with `body_env = Env(state_env)` (this thread's
+        own state, not self.global_env) and `_current_thread_ctx` set
+        for the duration (so a bare postMessage(x)/private-func call
+        inside the body works, the same wiring on_load/on_message/
+        on_exit already get). Registered into festina_runtime_http.c's
+        own (now `__thread`) g_request_handler/etc only from THIS
+        thread's own on_load, via festina_register_request_handler and
+        friends -- see _emit_thread_on_load's own registration block."""
+        symbol = f"@__festina_thread_{thread_name}_on_{decl.name}"
+        param_types = [self._resolve(p.type_expr, decl) for p in decl.params]
+        params_ir = ", ".join(f"{_llvm_type(t)} %arg.{p.name}" for t, p in zip(param_types, decl.params))
+
+        body_env = Env(state_env)
+        body_lines = []
+        self._start_block(self.label("entry"), body_lines)
+        self._active_free_locals.append([])
+        escaping = self._emit_param_bindings(decl, param_types, body_env, body_lines)
+        saved_ctx = self._current_thread_ctx
+        self._current_thread_ctx = thread_ctx
+        try:
+            block = self._emit_analyzed_func_body(decl, body_env, None, body_lines, escaping)
+        finally:
+            self._current_thread_ctx = saved_ctx
+        if not block["terminated"]:
+            self._emit_free_active_locals(block["lines"], down_to=len(self._active_free_locals) - 1)
+            block["lines"].append("  ret void")
+        self._active_free_locals.pop()
+
+        func = [f"define void {symbol}({params_ir}) {{"]
+        func.extend(block["lines"])
+        func.append("}")
+        self.func_defs.extend(func)
+        self.func_defs.append("")
+        self.uses_http = True
+        return symbol
 
     def _emit_thread_pool_decl(self, decl):
         """claude.md #209: `thread NAME[N] { ... }` -- N fully
@@ -3752,10 +3848,35 @@ class CodeGen:
             "handles_array_global": handles_array_global,
         }
 
-    def _emit_thread_on_load(self, thread_name, state_inits, on_load_decl, state_env, thread_ctx):
+    def _emit_thread_on_load(self, thread_name, state_inits, on_load_decl, state_env, thread_ctx,
+                             http_handler_symbols=None):
         symbol = f"@__festina_thread_{thread_name}_on_load"
         lines = []
         self._start_block(self.label("entry"), lines)
+        # claude.md #212 (Phase 4): this thread's own HTTP handler
+        # pointers -- registered here, FIRST, before EVERYTHING else in
+        # this adapter (even the db_open block just below), on this
+        # thread's own OS thread, so festina_runtime_http.c's own
+        # (now `__thread`) g_request_handler/etc are never NULL for
+        # even a moment this thread could conceivably start accepting
+        # a connection (were openPort() itself allowed before this
+        # point -- it isn't, by construction, since openPort()/
+        # openSecurePort() only ever appear inside a handler/private
+        # func body, which can't run before on_load starts). Mirrors
+        # main()'s own prologue registration exactly (same four
+        # festina_register_*_handler calls, same "only emit the ones
+        # actually declared" conditionality), just placed on this
+        # thread's own OS thread instead of main's. A thread with no
+        # HTTP-shaped handler at all (http_handler_symbols empty/None)
+        # emits none of this, unchanged from before this phase.
+        for handler_name, register_fn in (
+                ("request", "festina_register_request_handler"),
+                ("upgrade", "festina_register_upgrade_handler"),
+                ("socketMessage", "festina_register_message_handler"),
+                ("socketClose", "festina_register_socketclose_handler")):
+            handler_symbol = (http_handler_symbols or {}).get(handler_name)
+            if handler_symbol is not None:
+                lines.append(f"  call void @{register_fn}(ptr {handler_symbol})")
         # claude.md #199 Phase 5: this thread's own private sqlite
         # handle -- opened here, once, on this thread's own OS thread,
         # before EVERYTHING else in this adapter (state var
@@ -12516,6 +12637,22 @@ class CodeGen:
                     main_lines.append(
                         f"  call void @festina_thread_set_db_close(ptr %__thread_{tname}, "
                         f"ptr {db_close_sym})")
+                # claude.md #212 (Phase 4): the db_close hook's own
+                # shape, registered the identical way -- only for a
+                # thread that declared at least one HTTP-shaped
+                # handler (tinfo["has_http_context"], set by
+                # _emit_thread_decl). festina_thread_http_service_pass/
+                # _teardown are festina_runtime_http.c's own real,
+                # non-static entry points -- codegen never names them
+                # anywhere else, so a program with threads but no http
+                # at all never references either symbol (see that
+                # file's own top-of-conversion note on why this is
+                # what keeps the two translation units independently
+                # linkable).
+                if tinfo.get("has_http_context"):
+                    main_lines.append(
+                        f"  call void @festina_thread_set_http_context(ptr %__thread_{tname}, "
+                        f"ptr @festina_thread_http_service_pass, ptr @festina_thread_http_teardown)")
                 main_lines.append(f"  call void @festina_thread_spawn(ptr %__thread_{tname})")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and

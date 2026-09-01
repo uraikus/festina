@@ -62,22 +62,38 @@ build_runtime() {
 build_runtime core festina_runtime.c $(pkg-config --cflags sqlite3) || exit 1
 build_runtime async festina_runtime_async.c || exit 1
 build_runtime thread festina_runtime_thread.c || exit 1
+# claude.md #212: openPort()/on request/... -- pure POSIX, no
+# pkg-config dependency of its own, so linked unconditionally, same as
+# core/async/thread just above. This is what makes a thread's own
+# private HTTP context -- two genuinely concurrent __thread-backed
+# connection tables -- reachable under ThreadSanitizer at all.
+build_runtime http festina_runtime_http.c || exit 1
 # claude.md #198 Phase 4: `thread`'s own blob/img/aud/url clone --
 # festina_runtime_graphics.c/_audio.c only, same conditional probe
 # leak_stress.sh already uses (these two are real, routinely-absent
 # system dependencies, unlike core/async/thread which are pure POSIX).
-GFX_OK=0; AUD_OK=0
+GFX_OK=0; AUD_OK=0; HTTPS_OK=0
 if pkg-config --exists cairo-xlib x11 libjpeg; then
     build_runtime graphics festina_runtime_graphics.c $(pkg-config --cflags cairo-xlib x11 libjpeg) && GFX_OK=1
 fi
 if pkg-config --exists alsa libmpg123; then
     build_runtime audio festina_runtime_audio.c $(pkg-config --cflags alsa libmpg123) && AUD_OK=1
 fi
+# claude.md #212: mbedTLS-backed -- probed the same way, needed by any
+# stress program using the http CLIENT form (`req.send()`), not only
+# openSecurePort() -- see leak_stress.sh's own identical comment on
+# why (api.md: the scheme is read from the url value at RUNTIME, so
+# both plain and TLS codepaths are always linked into any program
+# using the client form at all).
+if pkg-config --exists mbedtls mbedx509 mbedcrypto; then
+    build_runtime https festina_runtime_https.c $(pkg-config --cflags mbedtls mbedx509 mbedcrypto) && HTTPS_OK=1
+fi
 
 LIBS=(-lsqlite3 -lm -pthread)
-OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o" "$WORK/rt_thread.o")
+OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o" "$WORK/rt_thread.o" "$WORK/rt_http.o")
 [ $GFX_OK = 1 ] && { OBJS+=("$WORK/rt_graphics.o"); LIBS+=($(pkg-config --libs cairo-xlib x11 libjpeg)); }
 [ $AUD_OK = 1 ] && { OBJS+=("$WORK/rt_audio.o"); LIBS+=($(pkg-config --libs alsa libmpg123)); }
+[ $HTTPS_OK = 1 ] && { OBJS+=("$WORK/rt_https.o"); LIBS+=($(pkg-config --libs mbedtls mbedx509 mbedcrypto)); }
 
 PROGRAMS=("$@")
 if [ ${#PROGRAMS[@]} -eq 0 ]; then

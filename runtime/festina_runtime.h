@@ -1049,6 +1049,22 @@ void festina_http_service_ready(void);
  * only thing that ever calls through these hooks, and it's simply never
  * linked into a program that doesn't open a window. */
 void festina_register_http_service_hooks(void);
+/* claude.md #212 (Phase 4 -- private per-thread HTTP context): defined
+ * in festina_runtime_http.c; see festina_thread_set_http_context's own
+ * doc comment (festina_runtime_thread.c's declaration further down)
+ * for what these two do and when codegen wires them onto a specific
+ * thread's own FestinaThreadHandle. Declared here, not called
+ * directly anywhere in this header's own translation unit -- codegen
+ * passes their addresses (`ptr @festina_thread_http_service_pass`/
+ * `ptr @festina_thread_http_teardown`) straight into
+ * festina_thread_set_http_context, so festina_runtime_thread.c itself
+ * never needs to name them (and so never forces a program with
+ * threads but no http at all to link this translation unit) -- these
+ * prototypes exist purely so festina_runtime_http.c's own definitions
+ * are checked against a declared signature, the same as every other
+ * public function in this header. */
+void festina_thread_http_service_pass(int timeout_ms);
+void festina_thread_http_teardown(void);
 
 /* claude.md #195 Phase 2: `thread NAME { ... }` -- one pthread per
  * declared thread, two mutex+condvar-guarded FIFO queues (inbound,
@@ -1154,6 +1170,29 @@ void festina_set_global_message_handler(void (*handler)(void *sender, void *payl
  * fresh handle instead of leaking the old one, which is the actual
  * bug this closes. */
 void festina_thread_set_db_close(FestinaThreadHandle *h, void (*db_close)(void));
+/* claude.md #212 (Phase 4 -- private per-thread HTTP context): the
+ * db_close hook's own shape, reused for a thread that declared at
+ * least one HTTP-shaped handler (on request/on upgrade/on
+ * socketMessage/on socketClose) -- called at most once, right after
+ * festina_thread_register, ONLY for such a thread. `service_pass` is
+ * festina_thread_http_service_pass (festina_runtime_http.c), called
+ * repeatedly from festina_thread_main's own combined loop instead of
+ * blocking on this thread's inbound condvar forever, whenever nothing
+ * is currently queued to dispatch -- see that function's own doc
+ * comment for why this is a bounded POLL rather than the plain
+ * condvar-wait every other thread uses. `teardown` is
+ * festina_thread_http_teardown, called once, right before this
+ * thread's worker stops for good (mirroring db_close's own
+ * placement/reasoning exactly -- the identical "close it before
+ * nothing can ever reach it again" fix claude.md #207 already made
+ * for a thread's own sqlite handle, applied here to its own listeners/
+ * connections). A thread with no HTTP-shaped handler at all never
+ * gets this call, so both stay NULL and festina_thread_main's own
+ * checks below are plain no-ops for it, same as on_load/on_message/
+ * on_exit/db_close already are when undeclared. */
+void festina_thread_set_http_context(FestinaThreadHandle *h,
+                                     void (*service_pass)(int timeout_ms),
+                                     void (*teardown)(void));
 /* `NAME.kill()`: blocking -- signals the worker to stop, pthread_joins
  * it, then discards anything still sitting in its inbound queue
  * (a real, deliberate choice: "kill" means stop now, not "finish

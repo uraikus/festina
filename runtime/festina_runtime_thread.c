@@ -92,6 +92,20 @@ struct FestinaThreadHandle {
      * it, same shape on_load/on_message/on_exit already have. Set at
      * most once, right after registration, never from the worker. */
     void (*db_close)(void);
+    /* claude.md #212 (Phase 4 -- private per-thread HTTP context): the
+     * db_close pair's own shape, for a thread that declared its own
+     * on request/on upgrade/on socketMessage/on socketClose --
+     * festina_thread_set_http_context sets both together, at most
+     * once, right after registration, the same "set once before
+     * spawn, never touched again" timing db_close already has (so
+     * there is no window after the OS thread starts where either
+     * could still be NULL for a thread that DOES have an HTTP
+     * context). `http_service_pass` non-NULL is exactly what tells
+     * festina_thread_main to run the bounded-poll combined loop below
+     * instead of blocking forever on this thread's own inbound
+     * condvar -- see that function's own comment. */
+    void (*http_service_pass)(int timeout_ms);
+    void (*http_teardown)(void);
 
     struct FestinaThreadHandle *next; /* registry linked list */
 };
@@ -108,42 +122,103 @@ static void festina_thread_free_msg_list(FestinaThreadMsg *m, void (*release_fn)
     }
 }
 
+/* claude.md #212: the dequeue half of one inbound message's dispatch,
+ * factored out of festina_thread_main so both loop shapes below (the
+ * plain blocking wait, and the http-context combined poll loop) share
+ * the exact same lock/dequeue/dispatch/release sequence -- previously
+ * only the plain loop existed, so this is a pure refactor of that
+ * loop's own body, not a behavior change for a thread with no HTTP
+ * context. Returns 1 if a message was dequeued and dispatched (the
+ * caller should immediately look for another rather than wait/poll --
+ * draining a backlog fast), 0 if the queue was empty (nothing to do
+ * this call), and sets *killed_out if kill_requested was seen while
+ * holding the lock (the caller must stop, exactly like the old
+ * inline check did). */
+static int festina_thread_try_dispatch_one(FestinaThreadHandle *h, int *killed_out) {
+    pthread_mutex_lock(&h->in_lock);
+    if (h->kill_requested) {
+        /* claude.md #195 Phase 2: "kill" means stop now -- any message
+         * still queued is left for festina_thread_kill's own cleanup
+         * to discard, not drained first. */
+        pthread_mutex_unlock(&h->in_lock);
+        *killed_out = 1;
+        return 0;
+    }
+    FestinaThreadMsg *msg = h->in_head;
+    if (msg) {
+        h->in_head = msg->next;
+        if (!h->in_head) h->in_tail = NULL;
+    }
+    pthread_mutex_unlock(&h->in_lock);
+    if (!msg) return 0;
+
+    msg->next = NULL;
+    if (h->on_message) h->on_message(msg->sender, msg->payload);
+    h->in_release(msg->payload);
+    free(msg);
+    return 1;
+}
+
+/* claude.md #212: how long a bounded poll(), or nanosleep-equivalent
+ * (festina_thread_http_service_pass's own poll() call handles both --
+ * see its doc comment) may block before this loop comes back around
+ * to check for a newly posted message -- this thread never waits on
+ * its own inbound condvar while it has an HTTP context (see
+ * festina_thread_main below), so this bound is what stands in for
+ * that wakeup. Same 20ms granularity festina_run_timer_loop/
+ * festina_run_http_loop already use for their own "bounded, not
+ * instant" wakes elsewhere in this runtime. */
+#define FESTINA_THREAD_HTTP_POLL_MS 20
+
 /* claude.md #195/#197: the worker's own whole life, one function --
- * on_load() once, then block-and-dispatch messages forever until
- * killed. An uncaught throw inside on_load/on_message/on_exit is not
- * separately guarded here (unlike festina_runtime_http.c's own worker,
- * this file needs no __builtin_setjmp catch-frame machinery yet) --
- * cloning itself (codegen's own _clone_fn_for_*) can't throw for any
- * message type this runtime accepts today, and an uncaught
- * festina_throw from Festina code currently terminates the whole
- * process (see festina_throw's own comment) regardless of which
- * thread it happens on, so "only this thread dies" containment is
- * intentionally deferred rather than silently assumed here --
- * flagged as a real, documented follow-up, not a silent gap. */
+ * on_load() once, then dispatch messages forever until killed. An
+ * uncaught throw inside on_load/on_message/on_exit is not separately
+ * guarded here (unlike festina_runtime_http.c's own worker, this file
+ * needs no __builtin_setjmp catch-frame machinery yet) -- cloning
+ * itself (codegen's own _clone_fn_for_*) can't throw for any message
+ * type this runtime accepts today, and an uncaught festina_throw from
+ * Festina code currently terminates the whole process (see
+ * festina_throw's own comment) regardless of which thread it happens
+ * on, so "only this thread dies" containment is intentionally
+ * deferred rather than silently assumed here -- flagged as a real,
+ * documented follow-up, not a silent gap.
+ *
+ * claude.md #212 (Phase 4): a thread with its own HTTP context
+ * (http_service_pass non-NULL -- see festina_thread_set_http_context)
+ * takes a DIFFERENT loop shape here: rather than blocking forever on
+ * this thread's own inbound condvar (festina_thread_post's own
+ * pthread_cond_signal would never be able to interrupt that thread
+ * out of a concurrent poll() anyway), it dispatches anything already
+ * queued, then gives its own private http_service_pass a short,
+ * bounded timeout to service its own listeners/connections, then
+ * loops back around to check messages again -- the same "poll each
+ * source per-iteration with a short bound" shape this project's own
+ * main-thread combined graphics+http+timers loop already uses
+ * (festina_run_timer_loop/festina_run_http_loop, festina_runtime.c/
+ * festina_runtime_http.c), applied here to one thread's own private
+ * pair of event sources instead of main's several. A thread with NO
+ * HTTP context keeps the original, simpler blocking-condvar shape
+ * completely unchanged. */
 static void *festina_thread_main(void *arg) {
     FestinaThreadHandle *h = (FestinaThreadHandle *)arg;
     if (h->on_load) h->on_load();
-    for (;;) {
-        pthread_mutex_lock(&h->in_lock);
-        while (!h->in_head && !h->kill_requested) {
-            pthread_cond_wait(&h->in_cond, &h->in_lock);
+    if (h->http_service_pass) {
+        for (;;) {
+            int killed = 0;
+            if (festina_thread_try_dispatch_one(h, &killed)) continue;
+            if (killed) break;
+            h->http_service_pass(FESTINA_THREAD_HTTP_POLL_MS);
         }
-        if (h->kill_requested) {
-            /* claude.md #195 Phase 2: "kill" means stop now -- any
-             * message still queued is left for festina_thread_kill's
-             * own cleanup (below) to discard, not drained first. */
+    } else {
+        for (;;) {
+            pthread_mutex_lock(&h->in_lock);
+            while (!h->in_head && !h->kill_requested) {
+                pthread_cond_wait(&h->in_cond, &h->in_lock);
+            }
             pthread_mutex_unlock(&h->in_lock);
-            break;
+            int killed = 0;
+            if (!festina_thread_try_dispatch_one(h, &killed) && killed) break;
         }
-        FestinaThreadMsg *msg = h->in_head;
-        h->in_head = msg->next;
-        if (!h->in_head) h->in_tail = NULL;
-        pthread_mutex_unlock(&h->in_lock);
-
-        msg->next = NULL;
-        if (h->on_message) h->on_message(msg->sender, msg->payload);
-        h->in_release(msg->payload);
-        free(msg);
     }
     if (h->on_exit) h->on_exit(0);
     /* claude.md #207: this thread's own worker is genuinely stopping
@@ -158,8 +233,12 @@ static void *festina_thread_main(void *arg) {
      * reopen via on_load is still mid-close). A later NAME.live()
      * calls on_load again, which reopens a genuinely fresh handle --
      * this is what makes that kill()/live() cycle no longer leak the
-     * old one. */
+     * old one. claude.md #212: http_teardown gets the identical
+     * placement/reasoning, right alongside db_close, for the same
+     * class of resource (an OS-level handle nothing else in this
+     * runtime will ever close on this thread's behalf). */
     if (h->db_close) h->db_close();
+    if (h->http_teardown) h->http_teardown();
     pthread_mutex_lock(&h->in_lock);
     h->alive = 0;
     pthread_mutex_unlock(&h->in_lock);
@@ -233,6 +312,13 @@ void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload) {
 
 void festina_thread_set_db_close(FestinaThreadHandle *h, void (*db_close)(void)) {
     h->db_close = db_close;
+}
+
+void festina_thread_set_http_context(FestinaThreadHandle *h,
+                                     void (*service_pass)(int timeout_ms),
+                                     void (*teardown)(void)) {
+    h->http_service_pass = service_pass;
+    h->http_teardown = teardown;
 }
 
 void festina_thread_kill(FestinaThreadHandle *h) {

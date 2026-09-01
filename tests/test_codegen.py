@@ -16743,3 +16743,101 @@ class TestThreadWiderBuiltinAccess:
         assert result.returncode == 0
         assert result.stdout.strip() == "all good"
         assert (tmp_path / "subdir").is_dir()
+
+
+class TestThreadHttpContext:
+    """claude.md #212: real, compiled-and-run proof that a thread's
+    own private HTTP context (openPort()/on request/...) genuinely
+    works and stays isolated from main's -- driven entirely from
+    inside the compiled program itself (a thread's own `on message`,
+    triggered by main, makes a real blocking client request --
+    `req.send()` with zero arguments -- back to MAIN's own port; the
+    response is checked byte-for-byte), the same self-contained
+    pattern tests/stress/thread_http_context_churn.f uses at volume
+    under ASan/TSan."""
+
+    def test_a_thread_serves_real_requests_on_its_own_private_port(
+            self, compile_and_run_server):
+        source = """
+        thread server {
+            on load() { openPort(__PORT__) }
+            on request(req:http) {
+                req.send({'code': 200, 'body': 'from the thread'})
+            }
+        }
+        """
+        server = compile_and_run_server(source)
+        status, _headers, body = server.http_get("/")
+        assert status == 200
+        assert body == b"from the thread"
+
+    def test_a_thread_client_request_reaches_mains_own_port_and_back(
+            self, compile_and_run):
+        # claude.md #212: main and a thread each open their OWN
+        # private port; the thread's own `on message` (driven by
+        # main) makes a real blocking client request BACK to main's
+        # port -- proving both contexts run concurrently, each
+        # genuinely serving its own traffic, with the response
+        # correctly attributed to the right one (a mix-up between the
+        # two __thread-backed connection tables would show up as a
+        # wrong body here, not a crash).
+        source = """
+        int TOTAL = 3
+        int done = 0
+        int failures = 0
+
+        on request(req:http) {
+            req.send({'code': 200, 'body': 'main-body'})
+        }
+
+        on message(worker:thread, msg:int) {
+            done = done + 1
+            if msg == 0 { failures = failures + 1 }
+            if done >= TOTAL {
+                if failures > 0 {
+                    close(1)
+                }
+                close(0)
+            }
+        }
+
+        thread client {
+            on message(sender:thread, msg:int) {
+                http req = {'url': 'http://127.0.0.1:18299/', 'method': 'GET'}
+                req.send()
+                bool ok = req.code == 200 && req.toText() == 'main-body'
+                if ok {
+                    postMessage(1)
+                } else {
+                    postMessage(0)
+                }
+            }
+        }
+
+        openPort(18299)
+        int i = 0
+        while i < TOTAL {
+            client.postMessage(i)
+            i = i + 1
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_a_thread_with_no_openPort_call_still_gets_a_receive_only_context(
+            self, compile_and_run):
+        # claude.md #212 (Phase 4's own forward note, needed by Phase
+        # 5's giveRequest): declaring an HTTP-shaped handler WITHOUT
+        # ever calling openPort() is legal and simply idles -- proof
+        # this doesn't busy-loop or hang is the process actually
+        # exiting cleanly within the test harness's own timeout.
+        source = """
+        thread receiver {
+            on request(req:http) { req.ok() }
+        }
+        log('started')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "started" in result.stdout

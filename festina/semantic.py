@@ -768,7 +768,30 @@ _THREAD_EVENT_SIGNATURES = {
     "load": ((), "no parameters"),
     "message": (None, "(worker:thread, msg:T) -- worker is null when sent by main"),
     "exit": ((_INT,), "(code:int)"),
+    # claude.md #212 (Phase 4 -- private per-thread HTTP context): the
+    # SAME four names/signatures _EVENT_SIGNATURES already declares
+    # for main's own top-level http/websocket handlers -- a thread's
+    # own copy fires from that ONE thread's own private connection
+    # table (see festina_runtime_http.c's __thread conversion), never
+    # main's or another thread's. Declaring one of these here is what
+    # sets info.has_http_handler (below), which in turn gates
+    # openPort()/closePort()/openSecurePort() for this thread (see
+    # _infer_call) -- a thread that calls openPort() but never
+    # declares a handler here would silently sit accepting connections
+    # nothing responds to (see that gate's own comment for why this
+    # matters at RUNTIME, not just style).
+    "request": ((_HTTP,), "(req:http)"),
+    "upgrade": ((_SOCKET,), "(s:socket)"),
+    "socketMessage": ((_SOCKET, _BLOB), "(s:socket, msg:blob)"),
+    "socketClose": ((_SOCKET,), "(s:socket)"),
 }
+
+# claude.md #212: `on request`/`on upgrade`/`on socketMessage`/`on
+# socketClose` -- any one of these declared inside a thread body sets
+# has_http_handler, which _infer_call's own openPort/closePort/
+# openSecurePort gate (below) requires before allowing this thread to
+# call any of the three.
+_THREAD_HTTP_HANDLER_NAMES = frozenset({"request", "upgrade", "socketMessage", "socketClose"})
 
 
 def _check_message_handler_params(params, node, filename, structs, tables, enums, help_text):
@@ -859,7 +882,25 @@ def _check_message_handler_params(params, node, filename, structs, tables, enums
 # to whichever one thread's generated code contains that call site,
 # never shared; `mkdir`/`ls` are thin, purely local POSIX wrappers
 # (`mkdir()`/`opendir()`/`readdir()`/`closedir()`) touching no shared
-# global at all.
+# global at all. `openPort`/`closePort`/`openSecurePort` are ALSO NOT
+# here any more (claude.md #212 Phase 4) -- confirmed safe by
+# converting festina_runtime_http.c's own connection/listener/handler
+# state to `__thread` (the SAME storage class this file's own
+# g_http_send_header_buf/festina_runtime.c's catch-frame stack already
+# used), so a thread's own openPort() genuinely never shares so much
+# as one fd with main or another thread's own context. Each is instead
+# gated by its own dedicated check in _infer_call, mirroring the
+# sqlite one's own shape exactly: legal only for a thread that has
+# ALREADY declared at least one HTTP-shaped handler (on request/on
+# upgrade/on socketMessage/on socketClose -- see
+# _THREAD_HTTP_HANDLER_NAMES/info.has_http_handler), since that
+# declaration is what makes codegen give this thread's own worker loop
+# the bounded-poll shape that actually SERVICES a listener at all
+# (festina_thread_set_http_context/festina_thread_http_service_pass) --
+# without it, an accepted connection would just sit forever, nothing
+# ever polling for it. `close` (the close(code) process-exit builtin --
+# entirely unrelated to closePort/a socket's own .close()) stays
+# unconditionally disallowed, unchanged.
 _THREAD_DISALLOWED_BUILTINS = frozenset({
     "drawRect", "drawCircle", "drawText", "drawImage", "drawPixel",
     "clearRect", "clearCircle", "clearPixel", "clearCanvas",
@@ -876,7 +917,7 @@ _THREAD_DISALLOWED_BUILTINS = frozenset({
     "setMaxAudioPlayers", "maxAudioPlayers", "stopAudioPlayer",
     "isAudioPlayerPlaying",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
-    "openPort", "closePort", "openSecurePort", "close",
+    "close",
 })
 
 
@@ -1060,6 +1101,15 @@ class _ThreadInfo:
         # `inbound_type`/`database_url` to reason about regardless of
         # which index a particular send targets.
         self.pool_size = node.pool_size
+        # claude.md #212 (Phase 4 -- private per-thread HTTP context):
+        # true once this thread's own body declares at least one of
+        # on request/on upgrade/on socketMessage/on socketClose (see
+        # _THREAD_HTTP_HANDLER_NAMES) -- gates openPort()/closePort()/
+        # openSecurePort() for this thread (see _infer_call), the same
+        # "gate the builtin on a per-thread capability" shape
+        # `database_url` already gives sqlite()/sqliteInt()/
+        # sqliteFloat()/sqliteText().
+        self.has_http_handler = False
 
 
 class AnalyzedProgram:
@@ -2413,6 +2463,31 @@ def analyze(program, filename="<string>"):
                         f"program's own OS thread, regardless of which thread "
                         f"dispatched it; 'exec(args)' (the blocking, 1-argument "
                         f"form) is fine",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                if (name in ("openPort", "closePort", "openSecurePort")
+                        and not _current_thread[0].has_http_handler):
+                    # claude.md #212: mirrors the sqlite gate just
+                    # above exactly -- legal only for a thread that has
+                    # ALREADY declared at least one HTTP-shaped handler
+                    # (on request/on upgrade/on socketMessage/on
+                    # socketClose), since that declaration is what
+                    # gives this thread's own worker loop the bounded-
+                    # poll shape that actually services a listener at
+                    # all (see festina_thread_set_http_context) --
+                    # without one, an accepted connection would simply
+                    # sit forever, nothing ever polling for it. A
+                    # thread that HAS declared one falls through to
+                    # ordinary openPort()/closePort()/openSecurePort()
+                    # handling below, identical to main's own.
+                    raise CompileError(
+                        f"'{name}()' cannot be called from inside thread "
+                        f"'{_current_thread[0].node.name}' -- it hasn't declared "
+                        f"an HTTP-shaped handler yet (on request(req:http)/"
+                        f"on upgrade(s:socket)/on socketMessage(s:socket, msg:blob)/"
+                        f"on socketClose(s:socket)), so nothing would ever service "
+                        f"a connection accepted here",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
@@ -4344,6 +4419,22 @@ def analyze(program, filename="<string>"):
             info.database_url_node = stmt.expr
             thread_body = thread_body[1:]
             break
+        # claude.md #212: has_http_handler is hoisted -- a single scan
+        # for any of the four HTTP-shaped handler names, BEFORE the
+        # main per-statement loop below runs -- rather than set inline
+        # as each is encountered in textual order. Unlike the bare-
+        # postMessage-needs-a-textually-earlier-top-level-`on message`
+        # rule (a real whole-program ordering constraint), there is no
+        # reason to force `on request`/etc to appear before `on
+        # load()` just because openPort() happens to be called from
+        # inside it -- the whole thread body is known in full before
+        # any of it runs, so gating on textual order here would be a
+        # needless, surprising restriction on ordinary code (writing
+        # `on load()` first, `on request(...)` below it, is the most
+        # natural order to write this in).
+        info.has_http_handler = any(
+            isinstance(stmt, ast.EventHandler) and stmt.name in _THREAD_HTTP_HANDLER_NAMES
+            for stmt in thread_body)
         # claude.md #210: thread-private helper functions -- a `func`
         # declared directly in a thread's own body (a sibling of its
         # state vars/on load/on message/on exit, not nested inside one
@@ -4394,8 +4485,10 @@ def analyze(program, filename="<string>"):
                     if stmt.name not in _THREAD_EVENT_SIGNATURES:
                         raise CompileError(
                             f"'on {stmt.name}' is not a thread event -- a thread body "
-                            f"may only declare on load()/on message(p:T)/"
-                            f"on exit(code:int)",
+                            f"may only declare on load()/on message(worker:thread, msg:T)/"
+                            f"on exit(code:int), plus (claude.md #212) on request(req:http)/"
+                            f"on upgrade(s:socket)/on socketMessage(s:socket, msg:blob)/"
+                            f"on socketClose(s:socket)",
                             file=filename, line=stmt.line, column=stmt.column,
                             category="invalid declaration",
                         )
@@ -4406,6 +4499,9 @@ def analyze(program, filename="<string>"):
                             category="duplicate declaration",
                         )
                     seen_handlers.add(stmt.name)
+                    # claude.md #212: info.has_http_handler was already
+                    # set by the hoisting pre-scan just above, before
+                    # this loop started -- nothing to do here.
                     sig, help_text = _THREAD_EVENT_SIGNATURES[stmt.name]
                     if stmt.name == "message":
                         info.inbound_type = _check_message_handler_params(

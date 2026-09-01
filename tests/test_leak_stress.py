@@ -588,4 +588,15 @@ class TestLeakStress:
             # regex compilation, or a leaked directory-listing
             # accumulator would show up here.
             "thread_wider_builtins_churn.f",
+            # claude.md #212: a thread's own private HTTP context --
+            # main and a thread each with their own openPort()'d
+            # listener, plus the thread making real blocking CLIENT
+            # requests (`req.send()`) back to main's own port on every
+            # message, at real volume, so a leaked connection/listener
+            # table entry (or the __thread conversion itself somehow
+            # leaking across contexts) would show up here. This is
+            # also the first stress program to link
+            # festina_runtime_http.c (and, since it uses the client
+            # form, festina_runtime_https.c) at all.
+            "thread_http_context_churn.f",
         }

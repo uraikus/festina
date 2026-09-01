@@ -3111,13 +3111,17 @@ string/array/map/struct/enum operations, `Math`, time functions,
 touches only that one private image, never shared state),
 `regex()`/`mkdir()`/`ls()`, and `exec(args)` (the blocking,
 single-argument form — see below). It may **not** call any
-canvas/window builtin (`drawRect`, `render`, `saveCanvas`, ...),
-`setTimeout`/`setInterval`, `openPort()`/`openSecurePort()`, or any
-ordinary top-level `func` declared outside the thread — declare a
-`func` directly inside the thread instead if it only needs to be
-called from there (see [Thread-private functions](#threads) above).
+canvas/window builtin (`drawRect`, `render`, `saveCanvas`, ...) or
+`setTimeout`/`setInterval`, and it may not call any ordinary top-level
+`func` declared outside the thread — declare a `func` directly inside
+the thread instead if it only needs to be called from there (see
+[Thread-private functions](#threads) above).
 `sqlite()`/`sqliteInt()`/`sqliteFloat()`/`sqliteText()` are allowed
 **only** for a thread that declared its own `DatabaseURL` — see below.
+`openPort()`/`closePort()`/`openSecurePort()` are allowed **only** for
+a thread that has already declared its own `on request`/`on upgrade`/
+`on socketMessage`/`on socketClose` — see
+[Per-thread HTTP context](#threads) below.
 
 **`exec(args, callback)` (the non-blocking form) is still rejected
 inside a thread body** — unlike the blocking `exec(args)` form, its
@@ -3214,6 +3218,71 @@ reference to it by bare name) — it may only ever be called. Each pool
 instance (above) gets its own independent copy of every private func,
 closing over that ONE instance's own state, exactly like its handlers
 already do.
+
+**Per-thread HTTP context.** A thread may declare `on request(req:http)`/
+`on upgrade(s:socket)`/`on socketMessage(s:socket, msg:blob)`/
+`on socketClose(s:socket)` — the identical four handlers/signatures the
+main program's own top-level HTTP/WebSocket support already uses (see
+[HTTP & WebSocket servers](#http--websocket-servers) above) — and, once
+it has declared at least one of them, call `openPort()`/`closePort()`/
+`openSecurePort()` too:
+
+```festina
+thread server {
+    on load() {
+        openPort(8080)
+    }
+    on request(req:http) {
+        req.send({'code': 200, 'body': 'hello from a thread'})
+    }
+}
+```
+
+This gives the thread its own **fully private** connection table and
+listener set — never shared with the main program's own HTTP context,
+or with any other thread's — so a program can serve traffic on more
+than one port, from more than one OS thread, with no coordination
+needed between them. A request accepted on the main program's own port
+is never routed to a thread's `on request` and vice versa; two
+listeners on different ports (one on main, one on a thread, or two
+different threads) accept and respond to real, concurrent traffic
+completely independently. The gate on `openPort()`/`openSecurePort()`
+— declaring a handler first — exists because that declaration is what
+gives this thread's own message loop the ability to actually service a
+listener at all: a thread that only ever declares state/`on load`/
+`on message`/`on exit` blocks on its own inbound queue exactly as
+before, never polling for a connection even if one were somehow
+already open.
+
+A thread that declares an HTTP-shaped handler but never calls
+`openPort()` of its own still gets this private, receive-only context
+— it simply never accepts a connection on its own; nothing currently
+sends it one either (a program's only way to reach it is its own
+`openPort()`'d listener), so today this is only useful in combination
+with `on message`'s own inter-thread messaging. `postMessage` (bare or
+named) works from inside any of these four handlers exactly like it
+does from `on load`/`on message`/`on exit` or a private func.
+
+The http client form — `req.send()` with zero arguments — also works
+from inside a thread body (it touches no shared connection-table state
+at all, just a fresh outbound socket), including targeting the main
+program's own port or another thread's; it must never target its
+*own* listener from inside that same thread's own handler/on_load,
+though — a thread has only one OS thread servicing both its accept
+loop and any blocking call it makes, so a self-directed request would
+simply wait forever for a response nothing is left running to send.
+The non-blocking client form (`req.send()` with a `callback` field) is
+**not** supported from inside a thread body for the identical reason
+`exec(args, callback)` isn't (see above) — its callback always runs on
+the main program's own OS thread regardless of which thread dispatched
+it.
+
+`openPort()`/`openSecurePort()` don't check whether some other context
+already listens on the same port — two contexts (main and a thread, or
+two threads, including two instances of the same pool) racing to bind
+the identical port number fails exactly the way it would outside this
+language entirely (the OS refuses the second bind); give each its own
+port.
 
 ## Audio
 

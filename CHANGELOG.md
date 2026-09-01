@@ -9,6 +9,32 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.25] - 2026-09-01
+
+### Added
+
+- **Private per-thread HTTP context.** A `thread { }` may now declare
+  `on request(req:http)`/`on upgrade(s:socket)`/
+  `on socketMessage(s:socket, msg:blob)`/`on socketClose(s:socket)` --
+  the identical four handlers the main program's own top-level HTTP/
+  WebSocket support already has -- and, once it has declared at least
+  one, call `openPort()`/`closePort()`/`openSecurePort()`. This gives
+  the thread a fully private connection table and listener set, never
+  shared with the main program's own HTTP context or with any other
+  thread's, so a program can serve real, concurrent traffic on more
+  than one port from more than one OS thread with no coordination
+  needed between them. The blocking http client form (`req.send()`
+  with zero arguments) also works from inside a thread body, targeting
+  any other context's port; a thread must never target its own
+  listener from inside that same thread (a documented, structural
+  deadlock, not a bug) -- see api.md's new "Per-thread HTTP context"
+  section.
+
+See claude.md #212 for the full design, including the `__thread`
+conversion of `festina_runtime_http.c`'s own connection/listener/
+handler state and a real leak this phase's own sanitizer verification
+caught and fixed.
+
 ## [0.24] - 2026-09-01
 
 ### Added
