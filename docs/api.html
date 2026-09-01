@@ -37,6 +37,7 @@
         <a href="#cli">CLI</a>
         <a href="#compilation-pipeline">Compilation pipeline</a>
         <a class="sub" href="#binary-size">Binary size</a>
+        <a href="#imports">Imports</a>
       </div>
       <div class="nav-group">
         <div class="nav-group-title">Language</div>
@@ -59,6 +60,8 @@
         <a href="#arrays">Arrays</a>
         <a class="sub" href="#indexing-is-not-bounds-checked">Indexing is not bounds-checked</a>
         <a class="sub" href="#amor-arrays">amor -- amortized-growth arrays</a>
+        <a class="sub" href="#growing-arrays">Growing arrays</a>
+        <a class="sub" href="#sorting-sortcmpfn">Sorting: sort(cmpFn)</a>
         <a href="#maps">Maps</a>
       </div>
       <div class="nav-group">
@@ -70,6 +73,8 @@
         <a class="sub" href="#row-rowid">row.rowid</a>
         <a class="sub" href="#structs-as-query-targets">Structs as query targets</a>
         <a class="sub" href="#database-configuration">Database configuration</a>
+        <a class="sub" href="#single-value-queries">Single-value queries</a>
+        <a class="sub" href="#json-and-full-text-search">JSON and full-text search</a>
         <a href="#environment-variables">Environment variables</a>
         <a href="#command-line-arguments">Command-line arguments</a>
         <a href="#regex">Regex</a>
@@ -94,7 +99,6 @@
         <a class="sub" href="#blobs-in-the-database">Blobs in the database</a>
         <a href="#directories">Directories</a>
         <a href="#running-other-programs">Running other programs</a>
-        <a class="sub" href="#exec-callback">exec(args, callback)</a>
         <a href="#http-and-websocket-servers">HTTP and WebSocket servers</a>
         <a class="sub" href="#http-type">The http type</a>
         <a class="sub" href="#on-request">on request(req:http)</a>
@@ -115,10 +119,6 @@
         <a class="sub" href="#delete">delete</a>
         <a href="#saving-bytes-to-a-path">Saving bytes to a path</a>
         <a href="#time">Time</a>
-        <a class="sub" href="#single-value-queries">Single-value queries</a>
-        <a class="sub" href="#json-and-full-text-search">JSON and full-text search</a>
-        <a href="#growing-arrays">Growing arrays</a>
-        <a class="sub" href="#sorting-sortcmpfn">Sorting: sort(cmpFn)</a>
         <a href="#timers">Timers</a>
         <a href="#threads">Threads</a>
         <a class="sub" href="#thread-messaging">Sending and receiving</a>
@@ -141,7 +141,6 @@
       </div>
       <div class="nav-group">
         <div class="nav-group-title">Reference</div>
-        <a href="#imports">Imports</a>
         <a href="#log-fail">log() / fail() / close()</a>
         <a class="sub" href="#graceful-shutdown">Graceful shutdown</a>
         <a href="#troubleshoot">troubleshoot() -- structured logging</a>
@@ -218,6 +217,18 @@
           <code>libsqlite3</code> is always available (statically linked
           when possible), since automatic database support (<code>table</code>,
           <code>sqlite()</code>) is always on.
+        </p>
+      </section>
+
+      <section class="doc-section" id="imports">
+        <h2>Imports <a class="anchor" href="#imports">#</a></h2>
+        <pre class="code"><span class="kw">import</span> database.f
+<span class="kw">import</span> graphics.f</pre>
+        <p>
+          Resolved recursively before compilation into one merged
+          compilation unit; a file is never imported more than once even
+          if multiple files depend on it; errors still point at the file
+          a statement actually came from.
         </p>
       </section>
 
@@ -982,11 +993,96 @@ numbers[0] = 10</pre>
           which empties the amortized array into a fresh plain one) if
           you need to cross that boundary.
         </p>
+        <h3 id="growing-arrays">Growing arrays <a class="anchor" href="#growing-arrays">#</a></h3>
+        <pre class="code"><span class="kw">arr[int]</span> xs = [1, 2, 3]
+
+xs.push(4)          <span class="cm">// -&gt; new length</span>
+xs.pop()            <span class="cm">// -&gt; last element, removed</span>
+xs.shift()          <span class="cm">// -&gt; first element, removed</span>
+xs.unshift(0)       <span class="cm">// -&gt; new length</span>
+<span class="kw">arr[int]</span> cut = xs.splice(1, 2)   <span class="cm">// remove 2 from index 1, return them</span>
+xs.splice(1, 0, [8, 9])           <span class="cm">// insert [8, 9] at index 1, remove nothing</span>
+xs.indexOf(3)       <span class="cm">// -&gt; first index holding 3, or -1</span></pre>
         <p class="muted">
-          <strong>More on arrays, documented further down this page:</strong>
-          <a href="#growing-arrays">Growing arrays</a> (<code>push</code><wbr>/<code>pop</code><wbr>/<code>shift</code><wbr>/<code>unshift</code><wbr>/<code>splice</code><wbr>/<code>indexOf</code>)
-          and <a href="#sorting-sortcmpfn">Sorting: <code>sort(cmpFn)</code></a>.
+          <code>splice</code> clamps rather than failing — a negative
+          start counts back from the end, and an oversized range clamps
+          to what's actually there, so <code>splice(i, 1)</code> at a
+          boundary is a no-op. An optional third argument,
+          <code>splice(start, count, insertArr)</code>, inserts —
+          the items to insert are one explicit <code>arr[T]</code>
+          rather than a variadic list (Festina has no variadic calls);
+          either way only the <strong>removed</strong> elements come
+          back, never the inserted ones.
         </p>
+        <p class="muted">
+          <code>push()</code><wbr>/<code>unshift()</code><wbr>/<code>pop()</code><wbr>/<code>shift()</code><wbr>/<code>splice()</code>
+          each resize the backing buffer to exactly the new length
+          internally, not amortized — see
+          <a href="#amor-arrays">amor — amortized-growth arrays</a>
+          above if that matters for a specific array (a long run of
+          pushes in particular).
+        </p>
+        <p>
+          <code>pop()</code>/<code>shift()</code> on an empty array
+          return <code>null</code> — not zero, so an empty pop is
+          distinguishable from popping a real <code>0</code>:
+        </p>
+        <pre class="code"><span class="kw">arr[int]</span> empty = []
+log(empty.pop() == <span class="kw">null</span>)     <span class="cm">// true</span></pre>
+        <p>
+          <code>indexOf()</code> answers <code>-1</code> when the value
+          isn't present, rather than <code>null</code> — an index is the
+          kind of thing you compare or feed straight to
+          <code>splice</code>, and both read naturally against
+          <code>-1</code>:
+        </p>
+        <pre class="code"><span class="kw">if</span> queue.indexOf(target) &gt;= 0 { ... }
+queue.splice(queue.indexOf(target), 1)   <span class="cm">// remove by value</span></pre>
+        <p>What "the same value" means depends on the element type:</p>
+        <ul>
+          <li><code>int</code>, <code>float</code>, <code>bool</code> — <strong>by value</strong>.</li>
+          <li><code>text</code> — <strong>by content</strong>, so a needle built at runtime finds a match: <code>names.indexOf('gr' + 'ace')</code> is <code>1</code> for <code>['ada', 'grace']</code>. (Identity would be useless here: text is copied on binding, so two equal strings are almost always two different buffers.)</li>
+          <li><code>struct</code>, <code>arr</code>, <code>map</code> — <strong>by identity</strong>. Two separately-declared structs with identical fields are two different values; only the one actually in the array is found.</li>
+        </ul>
+        <p class="muted">
+          Elements are owned the same way any other binding owns them:
+          pushing a <code>text</code> copies it, so the array and the
+          variable don't share a buffer. Removing transfers ownership to
+          whoever receives it. <code>indexOf()</code> takes no ownership
+          at all — an index isn't a reference.
+        </p>
+
+        <h3 id="sorting-sortcmpfn">Sorting: sort(cmpFn) <a class="anchor" href="#sorting-sortcmpfn">#</a></h3>
+        <pre class="code"><span class="kw">int func</span> byAsc(a:<span class="kw">int</span>, b:<span class="kw">int</span>) { <span class="kw">return</span> a - b }
+
+<span class="kw">arr[int]</span> xs = [5, 3, 8, 1]
+xs.sort(byAsc)         <span class="cm">// in place -- xs is now [1,3,5,8]</span></pre>
+        <p>
+          <code>sort()</code> takes a comparator,
+          <code>cmpFn:func[T,T]:int</code>, and sorts in place —
+          JavaScript's/C <code>qsort()</code>'s convention: return
+          negative if the first argument belongs before the second,
+          positive if after, <code>0</code> if they're equal. Sorting is
+          <strong>stable</strong> — two elements the comparator calls
+          equal keep their original relative order, so sorting a list
+          twice by two different keys ("sort by name, then re-sort by
+          score" to get "score descending, ties broken by name") behaves
+          the way it reads.
+        </p>
+        <p class="muted">
+          The comparator can be any <code>func[T,T]:int</code>-typed
+          expression, not just the bare name of a declared function — a
+          variable holding a function value works too, the same
+          first-class-function rule every other callback
+          (<code>.callback()</code>) already follows.
+        </p>
+        <pre class="code"><span class="kw">struct</span> Enemy { name:<span class="kw">text</span> y:<span class="kw">int</span> }
+
+<span class="kw">int func</span> byDepth(a:Enemy, b:Enemy) { <span class="kw">return</span> a.y - b.y }
+
+<span class="kw">arr[Enemy]</span> enemies = [...]
+enemies.sort(byDepth)   <span class="cm">// back-to-front draw order by Y position</span></pre>
+
       </section>
 
       <section class="doc-section" id="maps">
@@ -1234,15 +1330,50 @@ log(query[0].whatever)</pre>
           (only the file actually passed to the compiler is checked).
         </div>
 
-        <p class="muted">
-          <strong>More SQLite, documented further down this page:</strong>
-          <a href="#single-value-queries">Single-value queries</a>
-          (<code>sqliteInt()</code><wbr>/<code>sqliteText()</code><wbr>/<code>sqliteFloat()</code>)
-          and <a href="#json-and-full-text-search">JSON and full-text
-          search</a>, plus
-          <a href="#thread-database">a thread's own private database</a>
-          for querying from off the main program's own thread.
+        <h3 id="single-value-queries">Single-value queries <a class="anchor" href="#single-value-queries">#</a></h3>
+        <p>
+          A <code>struct</code> — unlike a <code>table</code> —
+          declares only a shape, not a real table, so it costs nothing
+          to use as a one-off landing spot for a value that would
+          otherwise need a throwaway <code>table</code> sitting in your
+          database forever just to receive a <code>count(*)</code>:
         </p>
+        <pre class="code"><span class="kw">struct</span> Total { total:<span class="kw">int</span> }
+<span class="kw">struct</span> Name  { name:<span class="kw">text</span> }
+<span class="kw">struct</span> Mean  { mean:<span class="kw">float</span> }
+
+<span class="kw">arr[Total]</span> t = sqlite(<span class="str">`SELECT count(*) AS total FROM Post`</span>)
+<span class="kw">int</span> total = t[0].total
+
+<span class="kw">arr[Name]</span> n = sqlite(<span class="str">`SELECT title AS name FROM Post WHERE id = ?`</span>, [2])
+<span class="kw">text</span> name = n[0].name
+
+<span class="kw">arr[Mean]</span> m = sqlite(<span class="str">`SELECT avg(score) AS mean FROM Post`</span>)
+<span class="kw">float</span> mean = m[0].mean</pre>
+        <p class="muted">
+          Alias the column to match the struct's field name
+          (<code>AS total</code>, <code>AS name</code>, ...) the same
+          way any <code>sqlite()</code> query does. A query matching no
+          rows comes back as an empty array
+          (<code>arr.length == 0</code>) rather than a value — check
+          that before indexing <code>[0]</code>.
+        </p>
+
+        <h3 id="json-and-full-text-search">JSON and full-text search <a class="anchor" href="#json-and-full-text-search">#</a></h3>
+        <p>
+          Both are ordinary SQL, and <code>sqlite()</code> passes SQL
+          through untouched — so SQLite's JSON1 and FTS5 work today with
+          no extra language feature:
+        </p>
+        <pre class="code"><span class="kw">struct</span> Name { name:<span class="kw">text</span> }
+<span class="kw">arr[Name]</span> n = sqlite(<span class="str">`SELECT json_extract(data, '$.name') AS name FROM Doc WHERE id = ?`</span>, [1])
+log(n[0].name)
+
+sqlite(<span class="str">`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`</span>)
+sqlite(<span class="str">`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`</span>)
+<span class="kw">struct</span> Total { total:<span class="kw">int</span> }
+<span class="kw">arr[Total]</span> t = sqlite(<span class="str">`SELECT count(*) AS total FROM PostSearch WHERE PostSearch MATCH ?`</span>, [<span class="str">'machine'</span>])
+log(t[0].total)</pre>
       </section>
 
       <section class="doc-section" id="environment-variables">
@@ -2323,35 +2454,6 @@ log(status)                            <span class="cm">// 0</span></pre>
           <a href="wasm.html">wasm.md</a>.
         </p>
 
-        <h3 id="exec-callback">Running without blocking: exec(args, callback) <a class="anchor" href="#exec-callback">#</a></h3>
-        <p class="muted">
-          <code>exec(cmd)</code> blocks the whole program until the
-          child exits. Passing a second, <code>func[int]:void</code>
-          argument instead dispatches the same spawn to a background
-          thread and returns immediately — the real exit code arrives
-          later, through <code>callback</code>, the same non-blocking
-          shape <code>.callback()</code> gives
-          <code>blob</code>/<code>img</code>/<code>aud</code> loads
-          above:
-        </p>
-        <pre class="code"><span class="kw">void</span> func onDone(code:<span class="kw">int</span>) {
-    log(<span class="str">`child exited with ${code}`</span>)
-}
-
-<span class="kw">arr[text]</span> cmd = [<span class="str">'/bin/sh'</span>, <span class="str">'-c'</span>, <span class="str">'sleep 1 && echo done'</span>]
-exec(cmd, onDone)
-log(<span class="str">'dispatched'</span>)                     <span class="cm">// logs BEFORE onDone ever runs</span></pre>
-        <p class="muted">
-          <code>callback</code> receives the exact same value the
-          blocking form would have returned — the real exit code, or
-          <code>-1</code> if the process never started at all. The
-          2-argument form itself returns nothing: there's no handle to
-          hand back (an <code>int</code> can't be mutated in place the
-          way a <code>blob</code> is) and no cancel/kill mechanism to
-          justify one either. Not available under
-          <code>--target=wasm32-wasi</code>, for the identical reason
-          the blocking form isn't.
-        </p>
       </section>
 
       <section class="doc-section" id="http-and-websocket-servers">
@@ -3155,130 +3257,8 @@ log(formatTime(ms, <span class="str">'%Y-%m-%d %H:%M'</span>)) <span class="cm">
 doTheWork()
 log(<span class="str">`took ${now() - started}ms`</span>)</pre>
 
-        <h3 id="single-value-queries">Single-value queries <a class="anchor" href="#single-value-queries">#</a></h3>
-        <p class="muted">
-          A <a href="#built-in-sqlite">Built-in SQLite</a> topic — the
-          table declarations, schema sync and query rules it builds on
-          are documented there.
-        </p>
-        <pre class="code"><span class="kw">int</span> total  = sqliteInt(<span class="str">`SELECT count(*) FROM Post`</span>)
-<span class="kw">text</span> name  = sqliteText(<span class="str">`SELECT title FROM Post WHERE id = ?`</span>, [2])
-<span class="kw">float</span> mean = sqliteFloat(<span class="str">`SELECT avg(score) FROM Post`</span>)</pre>
-        <p class="muted">
-          The first column of the first row. Use these instead of
-          declaring a <code>table</code> just to receive a scalar — a
-          <code>table</code> declaration <em>creates</em> a real table,
-          so a throwaway one for a <code>count(*)</code> would sit in
-          your database permanently. A query matching no rows (or whose
-          value is SQL NULL) returns <code>null</code>, so it's something
-          to test for rather than something that stops you.
-        </p>
-
-        <h3 id="json-and-full-text-search">JSON and full-text search <a class="anchor" href="#json-and-full-text-search">#</a></h3>
-        <p>
-          Both are ordinary SQL, and <code>sqlite()</code> passes SQL
-          through untouched — so SQLite's JSON1 and FTS5 work today with
-          no extra language feature:
-        </p>
-        <pre class="code">log(sqliteText(<span class="str">`SELECT json_extract(data, '$.name') FROM Doc WHERE id = ?`</span>, [1]))
-
-sqlite(<span class="str">`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`</span>)
-sqlite(<span class="str">`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`</span>)
-log(sqliteInt(<span class="str">`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`</span>, [<span class="str">'machine'</span>]))</pre>
       </section>
 
-      <section class="doc-section" id="growing-arrays">
-        <h2>Growing arrays <a class="anchor" href="#growing-arrays">#</a></h2>
-        <pre class="code"><span class="kw">arr[int]</span> xs = [1, 2, 3]
-
-xs.push(4)          <span class="cm">// -&gt; new length</span>
-xs.pop()            <span class="cm">// -&gt; last element, removed</span>
-xs.shift()          <span class="cm">// -&gt; first element, removed</span>
-xs.unshift(0)       <span class="cm">// -&gt; new length</span>
-<span class="kw">arr[int]</span> cut = xs.splice(1, 2)   <span class="cm">// remove 2 from index 1, return them</span>
-xs.splice(1, 0, [8, 9])           <span class="cm">// insert [8, 9] at index 1, remove nothing</span>
-xs.indexOf(3)       <span class="cm">// -&gt; first index holding 3, or -1</span></pre>
-        <p class="muted">
-          <code>splice</code> clamps rather than failing — a negative
-          start counts back from the end, and an oversized range clamps
-          to what's actually there, so <code>splice(i, 1)</code> at a
-          boundary is a no-op. An optional third argument,
-          <code>splice(start, count, insertArr)</code>, inserts —
-          the items to insert are one explicit <code>arr[T]</code>
-          rather than a variadic list (Festina has no variadic calls);
-          either way only the <strong>removed</strong> elements come
-          back, never the inserted ones.
-        </p>
-        <p class="muted">
-          <code>push()</code><wbr>/<code>unshift()</code><wbr>/<code>pop()</code><wbr>/<code>shift()</code><wbr>/<code>splice()</code>
-          each resize the backing buffer to exactly the new length
-          internally, not amortized — see
-          <a href="#amor-arrays">amor — amortized-growth arrays</a>
-          above if that matters for a specific array (a long run of
-          pushes in particular).
-        </p>
-        <p>
-          <code>pop()</code>/<code>shift()</code> on an empty array
-          return <code>null</code> — not zero, so an empty pop is
-          distinguishable from popping a real <code>0</code>:
-        </p>
-        <pre class="code"><span class="kw">arr[int]</span> empty = []
-log(empty.pop() == <span class="kw">null</span>)     <span class="cm">// true</span></pre>
-        <p>
-          <code>indexOf()</code> answers <code>-1</code> when the value
-          isn't present, rather than <code>null</code> — an index is the
-          kind of thing you compare or feed straight to
-          <code>splice</code>, and both read naturally against
-          <code>-1</code>:
-        </p>
-        <pre class="code"><span class="kw">if</span> queue.indexOf(target) &gt;= 0 { ... }
-queue.splice(queue.indexOf(target), 1)   <span class="cm">// remove by value</span></pre>
-        <p>What "the same value" means depends on the element type:</p>
-        <ul>
-          <li><code>int</code>, <code>float</code>, <code>bool</code> — <strong>by value</strong>.</li>
-          <li><code>text</code> — <strong>by content</strong>, so a needle built at runtime finds a match: <code>names.indexOf('gr' + 'ace')</code> is <code>1</code> for <code>['ada', 'grace']</code>. (Identity would be useless here: text is copied on binding, so two equal strings are almost always two different buffers.)</li>
-          <li><code>struct</code>, <code>arr</code>, <code>map</code> — <strong>by identity</strong>. Two separately-declared structs with identical fields are two different values; only the one actually in the array is found.</li>
-        </ul>
-        <p class="muted">
-          Elements are owned the same way any other binding owns them:
-          pushing a <code>text</code> copies it, so the array and the
-          variable don't share a buffer. Removing transfers ownership to
-          whoever receives it. <code>indexOf()</code> takes no ownership
-          at all — an index isn't a reference.
-        </p>
-
-        <h3 id="sorting-sortcmpfn">Sorting: sort(cmpFn) <a class="anchor" href="#sorting-sortcmpfn">#</a></h3>
-        <pre class="code"><span class="kw">int func</span> byAsc(a:<span class="kw">int</span>, b:<span class="kw">int</span>) { <span class="kw">return</span> a - b }
-
-<span class="kw">arr[int]</span> xs = [5, 3, 8, 1]
-xs.sort(byAsc)         <span class="cm">// in place -- xs is now [1,3,5,8]</span></pre>
-        <p>
-          <code>sort()</code> takes a comparator,
-          <code>cmpFn:func[T,T]:int</code>, and sorts in place —
-          JavaScript's/C <code>qsort()</code>'s convention: return
-          negative if the first argument belongs before the second,
-          positive if after, <code>0</code> if they're equal. Sorting is
-          <strong>stable</strong> — two elements the comparator calls
-          equal keep their original relative order, so sorting a list
-          twice by two different keys ("sort by name, then re-sort by
-          score" to get "score descending, ties broken by name") behaves
-          the way it reads.
-        </p>
-        <p class="muted">
-          The comparator can be any <code>func[T,T]:int</code>-typed
-          expression, not just the bare name of a declared function — a
-          variable holding a function value works too, the same
-          first-class-function rule every other callback
-          (<code>.callback()</code>, <code>exec(args, callback)</code>)
-          already follows.
-        </p>
-        <pre class="code"><span class="kw">struct</span> Enemy { name:<span class="kw">text</span> y:<span class="kw">int</span> }
-
-<span class="kw">int func</span> byDepth(a:Enemy, b:Enemy) { <span class="kw">return</span> a.y - b.y }
-
-<span class="kw">arr[Enemy]</span> enemies = [...]
-enemies.sort(byDepth)   <span class="cm">// back-to-front draw order by Y position</span></pre>
-      </section>
 
       <section class="doc-section" id="timers">
         <h2>Timers <a class="anchor" href="#timers">#</a></h2>
@@ -3432,8 +3412,24 @@ worker.postMessage(21).callback(onDoubled)   <span class="cm">// logs 42</span><
         <p class="muted">
           This works in either direction — main replying to a worker,
           or a worker replying to main or to another worker.
-          <code>fn</code> always runs back on whichever side originally
-          sent the message, on that side's own OS thread.
+          <strong><code>fn</code> runs on MAIN's own OS thread whenever
+          the original send was addressed to main.</strong> When main
+          itself is the sender (<code>NAME.postMessage(x).callback(fn)</code>
+          from main's own top-level code), that was always true — main
+          is both the sender and the one draining the reply. When a
+          WORKER sends bare (<code>postMessage(x).callback(fn)</code>,
+          always addressed to main), <code>fn</code> is marshaled onto
+          main through the same background mechanism
+          <code>blob</code>/<code>img</code>/<code>aud</code>'s own
+          <a href="#loading-in-the-background"><code>.callback()</code></a>
+          already uses, rather than running inline on the worker's own
+          thread — so <code>fn</code> is never running concurrently
+          with main's own top-level code or any other main-dispatched
+          callback, regardless of which thread sent the original
+          message. <strong><code>fn</code> runs on the SENDING worker's
+          own OS thread when one worker messages another
+          directly</strong> — that send never touches main at all, so
+          there is no main-thread hop to marshal through.
         </p>
         <p>Three details worth knowing:</p>
         <ul>
@@ -3443,30 +3439,27 @@ worker.postMessage(21).callback(onDoubled)   <span class="cm">// logs 42</span><
         </ul>
         <div class="callout">
           <strong><code>fn</code>'s own body is ordinary code, not
-          thread-isolated — running it off main is a real
-          responsibility, not just a detail.</strong> <code>fn</code>
-          is a plain top-level <code>func</code>, so it's free to
-          read/write top-level variables; unlike a thread's own
+          thread-isolated — the one remaining case where that's a real
+          responsibility, not just a detail, is a worker messaging
+          another worker directly.</strong> <code>fn</code> is a plain
+          top-level <code>func</code>, so it's free to read/write
+          top-level variables; unlike a thread's own
           <code>on message</code> (which the compiler blocks from
           touching top-level state at all), nothing stops
-          <code>fn</code> from doing so here, and when <code>fn</code>
-          was registered by a worker's own send (the bare form, or one
-          worker messaging another directly), it runs back on
-          <em>that worker's</em> OS thread — genuinely concurrently
-          with main and every other thread, not marshaled onto main the
-          way <code>blob</code>/<code>img</code>/<code>aud</code>'s own
-          <a href="#loading-in-the-background"><code>.callback()</code></a>
-          is. Two different callbacks touching the same top-level
-          variable from two different threads is a real data race,
-          caught directly during this feature's own development (a
-          first draft of its own stress test raced on exactly this and
-          was rewritten once ThreadSanitizer flagged it). Keep an
-          <code>fn</code> registered by a worker's own send limited to
-          state only that one worker's own replies ever touch, or relay
-          the result onward through another <code>postMessage</code>
-          (itself always safe — every queue this runtime uses is its
-          own plain mutex-protected structure) rather than writing to
-          shared state directly.
+          <code>fn</code> from doing so here. For a bare send (or any
+          send addressed to main), that's safe by construction —
+          <code>fn</code> only ever runs from main's own event loop,
+          one callback at a time. For one worker messaging ANOTHER
+          worker, <code>fn</code> runs back on the <em>sending</em>
+          worker's OS thread — genuinely concurrently with main and
+          every other thread. Two different callbacks touching the same
+          top-level variable from two different worker threads is a
+          real data race; keep an <code>fn</code> registered this way
+          limited to state only that one worker's own replies ever
+          touch, or relay the result onward through another
+          <code>postMessage</code> (itself always safe — every queue
+          this runtime uses is its own plain mutex-protected structure)
+          rather than writing to shared state directly.
         </div>
 
         <h3 id="thread-private-state">Thread-private state <a class="anchor" href="#thread-private-state">#</a></h3>
@@ -3560,8 +3553,7 @@ log(worker.isAlive())        <span class="cm">// true</span></pre>
           <code>img</code>-method drawing/clip/resize/pixel calls (each
           touches only that one private image, never shared state),
           <code>regex()</code>/<code>mkdir()</code>/<code>ls()</code>,
-          and <code>exec(args)</code> (the blocking, single-argument
-          form).
+          and <code>exec()</code>.
         </p>
         <p>
           It may <strong>not</strong> call any canvas/window builtin
@@ -3576,20 +3568,22 @@ log(worker.isAlive())        <span class="cm">// true</span></pre>
         </p>
         <p>Two builtins are allowed conditionally:</p>
         <ul>
-          <li><code>sqlite()</code><wbr>/<code>sqliteInt()</code><wbr>/<code>sqliteFloat()</code><wbr>/<code>sqliteText()</code> — only for a thread that declared its own <code>DatabaseURL</code>, see <a href="#thread-database">A thread's own database</a> below.</li>
+          <li><code>sqlite()</code> — only for a thread that declared its own <code>DatabaseURL</code>, see <a href="#thread-database">A thread's own database</a> below.</li>
           <li><code>openPort()</code><wbr>/<code>closePort()</code><wbr>/<code>openSecurePort()</code> — only for a thread that has already declared its own <code>on request</code>/<code>on upgrade</code>/<code>on socketMessage</code>/<code>on socketClose</code>, see <a href="#thread-http">A thread's own HTTP context</a> below.</li>
         </ul>
         <div class="callout" id="thread-limitations">
-          <strong><code>exec(args, callback)</code> (the non-blocking
-          form) is rejected inside a thread body</strong> — unlike the
-          blocking <code>exec(args)</code> form, its callback always
-          runs on the <em>main</em> program's own OS thread, regardless
-          of which thread dispatched it, so a thread handing it a
-          closure over its own private state would be a real
-          cross-thread violation. Use the blocking form instead. The
-          non-blocking HTTP client form (<code>req.send()</code> with a
-          <code>callback</code> field) is unavailable inside a thread
-          body for the identical reason.
+          <strong>The non-blocking HTTP client form
+          (<code>req.send()</code> with a <code>callback</code> field)
+          is unavailable inside a thread body</strong> — its callback
+          always runs on the <em>main</em> program's own OS thread,
+          regardless of which thread dispatched the request, so a
+          thread handing it a closure over its own private state would
+          be a real cross-thread violation. (<code>exec()</code> has no
+          such hazard any more — its own non-blocking
+          <code>exec(args, callback)</code> form was removed for
+          exactly this reason, so only the always-safe blocking
+          <code>exec(args)</code> remains, usable freely from any
+          thread body.)
         </div>
 
         <h3 id="thread-database">A thread's own database: DatabaseURL <a class="anchor" href="#thread-database">#</a></h3>
@@ -3612,12 +3606,12 @@ logger.postMessage(<span class="str">'started up'</span>)</pre>
           A thread with its own <code>DatabaseURL</code> gets its own
           private sqlite handle — never shared with the main program
           or any other thread — and may call
-          <code>sqlite()</code><wbr>/<code>sqliteInt()</code><wbr>/<code>sqliteFloat()</code><wbr>/<code>sqliteText()</code>;
-          every <code>table</code> declared anywhere in the program is
-          synced against it, the same as the main program's own
-          database. A thread that did <strong>not</strong> declare its
-          own <code>DatabaseURL</code> may not call any of the four at
-          all — a clear compile error naming the fix.
+          <code>sqlite()</code>; every <code>table</code> declared
+          anywhere in the program is synced against it, the same as the
+          main program's own database. A thread that did
+          <strong>not</strong> declare its own <code>DatabaseURL</code>
+          may not call <code>sqlite()</code> at all — a clear compile
+          error naming the fix.
           <strong>Two contexts (a thread and the main program, or two
           threads) may never resolve to the same literal database
           file</strong> — checked at compile time across the whole
@@ -3676,6 +3670,30 @@ pool[3].postMessage(2)</pre>
           instance), so a large <code>N</code> over a large body is a
           real compiled-size decision rather than a free one.
         </p>
+        <p>
+          <strong><code>thread NAME[] { ... }</code> — empty brackets —
+          sizes the pool for you.</strong> <code>N</code> becomes
+          <code>os.cpu_count()</code> (read on the machine
+          <em>compiling</em> the program — the resulting count is an
+          ordinary literal baked into the binary, not re-measured
+          wherever it later runs) minus every other thread the program
+          declares, floored at 1:
+        </p>
+        <pre class="code"><span class="kw">thread</span> logger { <span class="kw">on</span> load() { } }   <span class="cm">// 1 thread</span>
+<span class="kw">thread</span> pool[] { ... }             <span class="cm">// gets cpu_count() - 1 instances</span></pre>
+        <p class="muted">
+          An ordinary singleton (<code>thread NAME { ... }</code>, no
+          brackets at all) always counts as 1; an explicit
+          <code>thread NAME[N] { ... }</code> counts as <code>N</code>.
+          Two auto-sized pools in the same program don't split the
+          remaining budget between them — each is sized independently
+          against the same fixed total, so both get the same count.
+          Once resolved, an auto-sized pool is in every other respect
+          an ordinary <code>thread NAME[N] { ... }</code> — same
+          indexing, same out-of-range-is-a-no-op behavior, same
+          per-instance compiled-size cost above.
+        </p>
+
         <div class="callout">
           <strong>A pool may not declare its own
           <code>DatabaseURL</code>.</strong> Every instance in a pool
@@ -4003,17 +4021,6 @@ stopAudioPlayer(0)                  <span class="cm">// stop that channel, relea
         </p>
       </section>
 
-      <section class="doc-section" id="imports">
-        <h2>Imports <a class="anchor" href="#imports">#</a></h2>
-        <pre class="code"><span class="kw">import</span> database.f
-<span class="kw">import</span> graphics.f</pre>
-        <p>
-          Resolved recursively before compilation into one merged
-          compilation unit; a file is never imported more than once even
-          if multiple files depend on it; errors still point at the file
-          a statement actually came from.
-        </p>
-      </section>
 
       <section class="doc-section" id="log-fail">
         <h2><code>log()</code> / <code>fail()</code> / <code>close()</code> <a class="anchor" href="#log-fail">#</a></h2>
@@ -4285,19 +4292,39 @@ log(head.next.next.n)   <span class="cm">// 3</span></pre>
           chooses to <code>\u</code>-escape).
         </div>
         <p class="muted">
-          <strong>One real, honest limitation, the same structural class
-          <code>throw</code>'s own limitation above already is.</strong>
-          A JSON value that fails to parse <em>partway through</em>
-          being built — a struct whose third field turns out to be the
-          wrong type, having already parsed the first two; an array
-          whose fourth element fails, having already collected three —
-          leaks whatever was already built for that one call. A
-          <strong>successful</strong> parse leaks nothing (confirmed
-          directly under Valgrind, including 30 repeated calls in a
-          loop, not just reasoned about) — this is strictly an
-          error-path leak, bounded to at most one partially-built value
-          per failed call, never unbounded or accumulating across
-          successful ones.
+          <strong>The partial-parse-failure leak this section used to
+          document is fixed.</strong> A JSON value that fails to parse
+          <em>partway through</em> being built — a struct whose third
+          field turns out to be the wrong type, having already parsed
+          the first two; an array whose fourth element fails, having
+          already collected three — used to leak whatever was already
+          built for that one call, the same structural class as
+          <code>throw</code>'s own intermediate-frame limitation above.
+          It no longer does: every generated
+          <code>toStruct</code>/<code>toArr</code>/map-field parsing
+          function now installs its own local
+          <code>try</code>/<code>catch</code> around its own build
+          loop, so a throw anywhere inside it — including several
+          levels of nesting deep, and including the in-flight JSON key
+          text a struct/map field read before its value threw — is
+          caught and released right there before re-throwing outward,
+          and the <code>.toStruct()</code>/<code>.toArr()</code> call
+          site itself does the same for its own <code>cursor</code> and
+          the receiver's own text. A <strong>successful</strong> parse
+          still leaks nothing (confirmed directly under Valgrind,
+          including 30 repeated calls in a loop), and a
+          <strong>failed</strong> one now leaks nothing either —
+          verified under Valgrind across a flat struct, a nested struct
+          field, an array, a <code>map[T]</code> field, a
+          self-referencing struct, and malformed JSON syntax itself,
+          400 iterations of each. Not verified under
+          <code>scripts/leak_stress.sh</code> (AddressSanitizer) — this
+          project's <code>try</code>/<code>throw</code> is built on
+          <code>llvm.eh.sjlj.setjmp</code>/<code>longjmp</code>, which
+          ASan cannot instrument through in this environment, which is
+          exactly why <code>try</code>/<code>throw</code>'s own
+          leak-freedom above was already stated as Valgrind-measured
+          rather than ASan-measured.
         </p>
       </section>
 
