@@ -1587,7 +1587,11 @@ class CodeGen:
             # message this answers, using the calling thread's own
             # ambient "which message am I currently handling" state.
             "declare i64 @festina_thread_alloc_txn_id()",
-            "declare void @festina_thread_register_callback(ptr, i64, ptr, ptr)",
+            # claude.md #222: the trailing i8 is dispatch_on_main -- see
+            # emit_register_and_send's own call site and
+            # festina_thread_register_callback's doc comment in
+            # runtime/festina_runtime.h.
+            "declare void @festina_thread_register_callback(ptr, i64, ptr, ptr, i8)",
             "declare void @festina_thread_reply(ptr, ptr, ptr, ptr)",
             # claude.md #208: replaces the old per-thread
             # festina_thread_set_out_callback -- ONE handler,
@@ -11006,9 +11010,17 @@ class CodeGen:
                     lines.append(f"  {self_handle} = load ptr, ptr {self._current_thread_ctx[1]}")
                 else:
                     lines.append(f"  {self_handle} = call ptr @festina_thread_get_main_handle()")
+                # claude.md #222: the 5th argument, `dispatch_on_main`,
+                # is `handle is None` (the bare form -- always targets
+                # main) -- compile-time known from this call site's own
+                # AST shape. It makes the eventual reply's own `fn` fire
+                # on MAIN's OS thread rather than the thread that made
+                # THIS send -- see festina_thread_dispatch_reply's own
+                # doc comment in runtime/festina_runtime_thread.c.
+                dispatch_on_main = "1" if handle is None else "0"
                 lines.append(
                     f"  call void @festina_thread_register_callback(ptr {self_handle}, i64 {txn}, "
-                    f"ptr {trampoline}, ptr {fn_val})")
+                    f"ptr {trampoline}, ptr {fn_val}, i8 {dispatch_on_main})")
                 if handle is None:
                     self._emit_bare_postmessage_send(pm_args, env, lines, txn_val=txn)
                 else:
@@ -11016,6 +11028,16 @@ class CodeGen:
                         handle, inbound_type, pm_args, env, lines, txn_val=txn)
 
             if isinstance(pm_callee, ast.Identifier):
+                # claude.md #222: the bare form's own reply is marshaled
+                # onto main via festina_async_io_dispatch when it
+                # arrives (festina_thread_dispatch_reply) -- that only
+                # actually runs on a background thread rather than
+                # falling back to an inline, same-thread call if the
+                # real async-io worker pool is linked and its hooks are
+                # registered, which is exactly what uses_async_io does
+                # (see _emit_main_and_entry's own
+                # festina_register_async_io_hooks() call site).
+                self.uses_async_io = True
                 emit_register_and_send(None, None)
             else:
                 pool_index_expr = None

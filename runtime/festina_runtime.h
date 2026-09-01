@@ -1178,11 +1178,21 @@ void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload, int64_t
  * used only to route a reply-to-main through THAT handle's own
  * outbound queue) to `dest` (the original sender), tagged with the
  * calling thread's own ambient "which message am I currently
- * handling" state -- never triggers on_message on the receiving end. */
+ * handling" state -- never triggers on_message on the receiving end.
+ * claude.md #222: `dispatch_on_main` is 1 only for a worker's own
+ * registration of the BARE form (`postMessage(x).callback(fn)`, which
+ * always targets main) -- codegen knows this at compile time from the
+ * call site's own AST shape. It makes `fn` fire on MAIN's own OS
+ * thread when the reply arrives, instead of on whichever thread
+ * originally sent the message (see festina_thread_dispatch_reply's own
+ * doc comment in festina_runtime_thread.c). Always 0 for a named
+ * `NAME.postMessage(x).callback(fn)` send, and for anything main
+ * itself registers (the bare form doesn't exist at main's own top
+ * level, so main's own registrations are never this). */
 int64_t festina_thread_alloc_txn_id(void);
 void festina_thread_register_callback(FestinaThreadHandle *self, int64_t txn_id,
                                       void (*trampoline)(void *payload, void *user_fn),
-                                      void *user_fn);
+                                      void *user_fn, int8_t dispatch_on_main);
 /* claude.md #218: `release` is how to free `payload` if this reply
  * turns out to have nothing to dispatch to -- the receiving side knows
  * only its OWN inbound type, never the sender's reply type, so the

@@ -16479,7 +16479,17 @@ class TestThreadReplyCallback:
     def test_worker_to_main_bare_reply_round_trip(self, compile_and_run):
         # a worker sends to main via the bare form with .callback;
         # main's own top-level on message fires normally, then replies
-        # -- the callback fires back on the WORKER's own OS thread.
+        # -- claude.md #222: the callback now fires back on MAIN's own
+        # OS thread (marshaled through festina_async_io_dispatch), not
+        # the worker's, closing a real cross-thread-isolation hazard.
+        # Festina exposes no OS-thread-identity primitive a test could
+        # check directly; the decisive proof is
+        # tests/stress/thread_reply_callback_churn.f under
+        # scripts/thread_tsan_stress.sh -- routing dispatch through a
+        # genuinely different thread is exactly what surfaced (and let
+        # this fix catch) a real, previously-latent data race in
+        # festina_runtime_async.c's own g_outstanding counter, which
+        # had never been written from any thread but main before.
         source = """
         void func onReply(r:int) {
             log(`worker reply: ${r}`)
@@ -16490,11 +16500,11 @@ class TestThreadReplyCallback:
         on message(worker:thread, msg:int) {
             log(`main got: ${msg}`)
             worker.reply(msg + 1)
-            // claude.md #217: the callback this send registered fires
-            // on the WORKER's own OS thread, asynchronously -- a short
-            // setTimeout (the same pattern this suite's own timer
-            // tests already use to let background work land before
-            // close()) gives it time to log before the process exits.
+            // The callback this send registered fires asynchronously,
+            // via main's own event loop -- a short setTimeout (the
+            // same pattern this suite's own timer tests already use
+            // to let background work land before close()) gives it
+            // time to run before the process exits.
             setTimeout(finish, 200)
         }
         thread worker {

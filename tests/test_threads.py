@@ -1171,13 +1171,15 @@ class TestThreadPrivateFunctions:
 
 
 class TestThreadWiderBuiltinAccess:
-    """claude.md #211: `regex()`/`mkdir()`/`ls()` are unblocked
+    """claude.md #211: `regex()`/`mkdir()`/`ls()`/`exec()` are unblocked
     outright inside a thread body -- each confirmed by reading the
-    actual runtime C to touch no shared state at all. `exec` needs an
-    arity split instead of a flat removal: the blocking 1-argument
-    form is equally safe, but the non-blocking 2-argument form's own
-    callback always runs on MAIN's own OS thread regardless of which
-    thread dispatched it, a real cross-thread-isolation violation."""
+    actual runtime C to touch no shared state at all. `exec` originally
+    needed an arity split (the blocking 1-argument form was safe, but
+    the non-blocking 2-argument form's own callback always ran on
+    MAIN's own OS thread regardless of which thread dispatched it, a
+    real cross-thread-isolation violation); claude.md #221 removed that
+    2-argument form entirely, so `exec()` is unconditionally allowed
+    here now, the same as the other three."""
 
     def test_regex_is_accepted_inside_a_thread(self, parser, semantic):
         source = "thread w { on load() { regex r = /^ab/ } }"

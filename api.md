@@ -3098,9 +3098,21 @@ be able to receive a reply that receiver might send. Chaining
 equally a compile error, for the same reason in reverse.
 
 This works in either direction — main replying to a worker, or a worker
-replying to main or to another worker. `fn` always runs back on
-whichever side originally sent the message, on that side's own OS
-thread.
+replying to main or to another worker. **`fn` runs on MAIN's own OS
+thread whenever the original send was addressed to main.** When main
+itself is the sender (`NAME.postMessage(x).callback(fn)` from main's
+own top-level code), that was always true — main is both the sender
+and the one draining the reply. When a WORKER sends bare
+(`postMessage(x).callback(fn)`, always addressed to main), `fn` is
+marshaled onto main through the same background mechanism
+`blob`/`img`/`aud`'s own
+[`.callback()`](#loading-in-the-background-callback) already uses,
+rather than running inline on the worker's own thread — so `fn` is
+never running concurrently with main's own top-level code or any other
+main-dispatched callback, regardless of which thread sent the original
+message. **`fn` runs on the SENDING worker's own OS thread when one
+worker messages another directly** — that send never touches main at
+all, so there is no main-thread hop to marshal through.
 
 Three details worth knowing:
 
@@ -3116,21 +3128,19 @@ Three details worth knowing:
   `.callback(fn)` still waiting on a reply from it, and any the thread
   itself was waiting on; those `fn`s simply never run.
 
-**`fn`'s own body is ordinary code, not thread-isolated — running it
-off main is a real responsibility, not just a detail.** `fn` is a plain
+**`fn`'s own body is ordinary code, not thread-isolated — the one
+remaining case where that's a real responsibility, not just a detail,
+is a worker messaging another worker directly.** `fn` is a plain
 top-level `func`, so it's free to read/write top-level variables;
 unlike a thread's own `on message` (which the compiler blocks from
 touching top-level state at all), nothing stops `fn` from doing so
-here, and when `fn` was registered by a worker's own send (the bare
-form, or one worker messaging another directly), it runs back on *that
-worker's* OS thread — genuinely concurrently with main and every other
-thread, not marshaled onto main the way `blob`/`img`/`aud`'s own
-[`.callback()`](#loading-in-the-background-callback) is. Two different
-callbacks touching the same top-level variable from two different
-threads is a real data race, caught directly during this feature's own
-development (a first draft of its own stress test raced on exactly this
-and was rewritten once ThreadSanitizer flagged it). Keep an `fn`
-registered by a worker's own send limited to state only that one
+here. For a bare send (or any send addressed to main), that's safe by
+construction — `fn` only ever runs from main's own event loop, one
+callback at a time. For one worker messaging ANOTHER worker, `fn` runs
+back on the *sending* worker's OS thread — genuinely concurrently with
+main and every other thread. Two different callbacks touching the same
+top-level variable from two different worker threads is a real data
+race; keep an `fn` registered this way limited to state only that one
 worker's own replies ever touch, or relay the result onward through
 another `postMessage` (itself always safe — every queue this runtime
 uses is its own plain mutex-protected structure) rather than writing to

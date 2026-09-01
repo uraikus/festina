@@ -9,6 +9,24 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.35] - 2026-09-01
+
+### Fixed
+
+- **`.callback(fn)` now fires on MAIN's own OS thread for a send
+  addressed to main.** A worker's own bare `postMessage(x).callback(fn)`
+  (always addressed to main) used to have `fn` fire back on the
+  SENDING worker's own OS thread once main replied -- a real
+  cross-thread-isolation hazard. It's now marshaled onto main, the
+  same mechanism `blob`/`img`/`aud`'s own `.callback()` already uses.
+  A worker messaging ANOTHER worker directly is unaffected -- `fn`
+  still fires on the sending worker's own thread there.
+- **A previously-latent data race in the async-io worker pool's own
+  outstanding-job counter**, exposed by the fix above the first time
+  that path was ever exercised from a thread other than main.
+
+See claude.md #222.
+
 ## [0.34] - 2026-09-01
 
 ### Removed
