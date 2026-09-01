@@ -3173,11 +3173,37 @@ pool must always be indexed. There is no `pool.length` — the size is
 whatever `N` the declaration itself used, known at every call site
 already.
 
-**Limitations.** There is no way to declare a thread-private *helper
-function* — every top-level `func` is either callable from every
-thread (if it never touches a global or an impure builtin) or from
-none at all; a `func` scoped to one particular thread's own body,
-closing over that thread's own state, isn't supported.
+**Thread-private functions.** A `func` declared directly in a thread's
+own body (a sibling of its state vars/`on load`/`on message`/
+`on exit`) is callable only from that one thread's own handlers and
+other private funcs, with direct read/write access to that thread's
+own state:
+
+```festina
+thread counter {
+    int total = 0
+    void func addToTotal(x:int) {
+        total = total + x
+    }
+    on message(worker:thread, msg:int) {
+        addToTotal(msg)
+        postMessage(total)
+    }
+}
+```
+
+Two private funcs may call each other regardless of which one is
+declared first (their names are all known before any body is checked,
+same as top-level functions). A private func may also `postMessage`
+like a handler can — both the bare form (to main) and `NAME.postMessage(x)`
+(to another thread). **An ordinary top-level `func` remains completely
+uncallable from inside a thread body** — declare the helper directly
+inside the thread instead if it only needs to be called from there. A
+private func has no first-class value form (no `func[...]:...`
+reference to it by bare name) — it may only ever be called. Each pool
+instance (above) gets its own independent copy of every private func,
+closing over that ONE instance's own state, exactly like its handlers
+already do.
 
 ## Audio
 

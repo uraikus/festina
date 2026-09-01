@@ -573,4 +573,12 @@ class TestLeakStress:
             # namespaced one, one instance's handle read/written by
             # another's).
             "thread_pool_churn.f",
+            # claude.md #210: thread-private helper functions -- every
+            # message is actually processed by a real, separately
+            # mangled per-thread function call (not an inline handler
+            # body), including one private func calling ANOTHER, in
+            # both a plain thread AND a pool (each pool instance's own
+            # private func closing over THAT instance's own state, not
+            # shared with its siblings).
+            "thread_private_func_churn.f",
         }

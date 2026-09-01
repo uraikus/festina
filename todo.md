@@ -34,12 +34,6 @@ and AddressSanitizer/LeakSanitizer coverage for the target.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately: each new
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
-- **A thread-private helper function** (an ordinary `func` callable
-  only from inside one thread's own body, closing over that thread's
-  own state) **isn't supported** — every top-level `func` is checked
-  for purity and either fully callable from any thread or not callable
-  from one at all; there's no way to declare one that's already scoped
-  to a single thread. See [api.md](api.md#threads).
 
 ## Memory model
 
