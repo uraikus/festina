@@ -6,12 +6,12 @@ Familiar, readable syntax — template strings, ternaries, arrow
 functions, ordinary control flow — checked at compile time and backed
 by real static types, not a runtime doing the work for you. Festina
 compiles through LLVM to a real, standalone executable — with SQLite,
-graphics, audio, timers, and an HTTP/WebSocket server built directly
-into the language, not bolted on as libraries.
+graphics, audio, timers, threads, and an HTTP/WebSocket server built
+directly into the language, not bolted on as libraries.
 
-Version 0.1 — see [CHANGELOG.md](CHANGELOG.md).
+Version 0.31 — see [CHANGELOG.md](CHANGELOG.md).
 
-[![Tests](https://img.shields.io/badge/tests-1843%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-2213%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -51,6 +51,12 @@ bin/festina compile examples/greet.f -o greet && ./greet
   (`aud music = 'music.mp3'` then `music.play()`) are just declarations
   and methods, backed by Cairo/X11 and
   ALSA under the hood.
+- **Real threads, without the footguns.** `thread worker { ... }` runs
+  on its own OS thread and can't touch a global or reach into another
+  thread at all — every message across the boundary is a deep copy, so
+  there is no shared mutable state to race on. Send with
+  `worker.postMessage(x)`, answer with `t.reply(y)`, get the answer back
+  with `.callback(fn)`, and scale out with `thread pool[N] { ... }`.
 - **Automatic memory, manual override.** Values are reclaimed for you —
   and `free spritesheet` / `delete map.key` exist for the moments you
   know the lifetime better than the compiler does.
@@ -166,6 +172,12 @@ setInterval(tick, 500)
 map[int] npcHealths = {'npc1': 10, 'npc2': 15}
 npcHealths['npc1'] = 30
 
+// Threads -- isolated, message-passing, no shared mutable state
+thread doubler {
+    on message(sender:thread, msg:int) { sender.reply(msg * 2) }
+}
+doubler.postMessage(21).callback(void (answer:int) => log(answer))
+
 // Config straight from the environment, no extra library
 text apiKey = environment.API_KEY
 ```
@@ -201,6 +213,7 @@ bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`files.f`](examples/files.f) | `blob` — a file's bytes, its methods, `save`/`saveCopy`, and what sharing one means |
 | [`tic_tac_toe.f`](examples/tic_tac_toe.f) | The game above — graphics, global game state, and win-checking logic together |
 | [`layers.f`](examples/layers.f) | `arr[img]` as a layer stack — each layer modified by its own drawing methods, one function compositing all of them every frame |
+| [`threaded_http_server.f`](examples/threaded_http_server.f) | `thread pool[N]` + `NAME.giveRequest(r)` — an HTTP server that computes real, CPU-bound per-request work across more than one OS thread at once |
 
 Every one of these is compiled and checked by the test suite on every
 change (`tests/test_examples.py` and, for the three needing a display,
@@ -221,7 +234,7 @@ frame about twice as fast as Chromium's.
 ## Project status
 
 The compiler frontend, LLVM codegen backend, and native C runtime are
-real and tested: **2093 tests, 0 failures** (9 more skip cleanly when
+real and tested: **2213 tests, 0 failures** (9 more skip cleanly when
 their optional tooling isn't installed — see
 [setup.md](setup.md#running-the-test-suite)). Every language construct
 in the [specification](claude.md) is implemented end to end, not just

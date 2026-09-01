@@ -1,5 +1,5 @@
 """claude.md #151: openPort/closePort, `on request`/`on upgrade`/
-`on message`/`on socketClose` -- HTTP + WebSocket server support.
+`on socketMessage`/`on socketClose` -- HTTP + WebSocket server support.
 
 Semantic-level checks (type/signature enforcement) need no toolchain at
 all and run unconditionally. Real compile-and-run coverage goes through
@@ -46,8 +46,8 @@ class TestSemanticSignatures:
         with pytest.raises(errors.CompileError, match="must declare exactly"):
             semantic.analyze(program)
 
-    def test_on_message_requires_socket_and_blob(self, parser, semantic, errors):
-        program = parser.parse("on message(s:socket, msg:text) { }")
+    def test_on_socket_message_requires_socket_and_blob(self, parser, semantic, errors):
+        program = parser.parse("on socketMessage(s:socket, msg:text) { }")
         with pytest.raises(errors.CompileError, match="must declare exactly"):
             semantic.analyze(program)
 
@@ -60,7 +60,7 @@ class TestSemanticSignatures:
         source = """
         on request(req:http) { }
         on upgrade(s:socket) { }
-        on message(s:socket, msg:blob) { }
+        on socketMessage(s:socket, msg:blob) { }
         on socketClose(s:socket) { }
         """
         program = parser.parse(source)
@@ -188,7 +188,7 @@ class TestSocketFieldsAndMethods:
 
     def test_send_and_close_are_recognized(self, parser, semantic):
         source = """
-        on message(s:socket, msg:blob) {
+        on socketMessage(s:socket, msg:blob) {
             s.send('hi')
             s.send(msg)
             s.close()
@@ -197,7 +197,7 @@ class TestSocketFieldsAndMethods:
         semantic.analyze(parser.parse(source))
 
     def test_close_takes_no_arguments(self, parser, semantic, errors):
-        program = parser.parse("on message(s:socket, msg:blob) { s.close(1) }")
+        program = parser.parse("on socketMessage(s:socket, msg:blob) { s.close(1) }")
         with pytest.raises(errors.CompileError, match="expects 0 argument"):
             semantic.analyze(program)
 
@@ -1097,7 +1097,7 @@ class TestWebSocketServer:
         on request(req:http) {
             req.upgrade()
         }
-        on message(s:socket, msg:blob) {
+        on socketMessage(s:socket, msg:blob) {
             text t = msg.toText()
             s.send(`echo:${t}`)
         }
@@ -1120,7 +1120,7 @@ class TestWebSocketServer:
         on upgrade(s:socket) {
             s.state['greeted'] = 'yes'
         }
-        on message(s:socket, msg:blob) {
+        on socketMessage(s:socket, msg:blob) {
             text v = s.state['greeted']
             s.send(v)
         }
@@ -1137,7 +1137,7 @@ class TestWebSocketServer:
         on request(req:http) {
             req.upgrade()
         }
-        on message(s:socket, msg:blob) {
+        on socketMessage(s:socket, msg:blob) {
             s.send(msg)
         }
         """)
@@ -1155,7 +1155,7 @@ class TestWebSocketServer:
         on request(req:http) {
             req.upgrade()
         }
-        on message(s:socket, msg:blob) {
+        on socketMessage(s:socket, msg:blob) {
         }
         on socketClose(s:socket) {
             log('socket-closed')
@@ -1177,7 +1177,7 @@ class TestWebSocketServer:
         on request(req:http) {
             req.upgrade()
         }
-        on message(s:socket, msg:blob) {
+        on socketMessage(s:socket, msg:blob) {
             s.close()
         }
         """)
@@ -1196,7 +1196,7 @@ class TestWebSocketServer:
         on upgrade(s:socket) {
             s.state['id'] = 'unset'
         }
-        on message(s:socket, msg:blob) {
+        on socketMessage(s:socket, msg:blob) {
             text t = msg.toText()
             if t == 'set' {
                 s.state['id'] = 'A'
@@ -1286,7 +1286,7 @@ class TestWebSocketFragmentation:
         server = compile_and_run_server("""
         openPort(__PORT__)
         on request(req:http) { req.upgrade() }
-        on message(s:socket, msg:blob) { s.send(`echo:${msg.toText()}`) }
+        on socketMessage(s:socket, msg:blob) { s.send(`echo:${msg.toText()}`) }
         """)
         ws, status_line, _, _ = server.ws_connect("/ws")
         assert b"101" in status_line
@@ -1301,7 +1301,7 @@ class TestWebSocketFragmentation:
         server = compile_and_run_server("""
         openPort(__PORT__)
         on request(req:http) { req.upgrade() }
-        on message(s:socket, msg:blob) { s.send(msg) }
+        on socketMessage(s:socket, msg:blob) { s.send(msg) }
         """)
         ws, _, _, _ = server.ws_connect("/ws")
         ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x2, payload=b"\x00\x01"))
@@ -1322,7 +1322,7 @@ class TestWebSocketFragmentation:
         server = compile_and_run_server("""
         openPort(__PORT__)
         on request(req:http) { req.upgrade() }
-        on message(s:socket, msg:blob) { s.send(`echo:${msg.toText()}`) }
+        on socketMessage(s:socket, msg:blob) { s.send(`echo:${msg.toText()}`) }
         """)
         ws, _, _, _ = server.ws_connect("/ws")
         ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x1, payload=b"part1-"))
@@ -1338,7 +1338,7 @@ class TestWebSocketFragmentation:
         server = compile_and_run_server("""
         openPort(__PORT__)
         on request(req:http) { req.upgrade() }
-        on message(s:socket, msg:blob) { s.send(msg) }
+        on socketMessage(s:socket, msg:blob) { s.send(msg) }
         """)
         ws, _, _, _ = server.ws_connect("/ws")
         ws.sock.sendall(_ws_mask_frame(fin=True, opcode=0x0, payload=b"orphan"))
@@ -1353,7 +1353,7 @@ class TestWebSocketFragmentation:
         server = compile_and_run_server("""
         openPort(__PORT__)
         on request(req:http) { req.upgrade() }
-        on message(s:socket, msg:blob) { s.send(msg) }
+        on socketMessage(s:socket, msg:blob) { s.send(msg) }
         """)
         ws, _, _, _ = server.ws_connect("/ws")
         ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x9, payload=b"bad"))
@@ -1367,7 +1367,7 @@ class TestWebSocketFragmentation:
         server = compile_and_run_server("""
         openPort(__PORT__)
         on request(req:http) { req.upgrade() }
-        on message(s:socket, msg:blob) { s.send(msg) }
+        on socketMessage(s:socket, msg:blob) { s.send(msg) }
         """)
         ws, _, _, _ = server.ws_connect("/ws")
         ws.sock.sendall(_ws_mask_frame(fin=False, opcode=0x1, payload=b"first-"))
@@ -1388,7 +1388,7 @@ class TestWebSocketFragmentation:
         server = compile_and_run_server("""
         openPort(__PORT__)
         on request(req:http) { req.upgrade() }
-        on message(s:socket, msg:blob) { s.send(msg) }
+        on socketMessage(s:socket, msg:blob) { s.send(msg) }
         """)
         ws, _, _, _ = server.ws_connect("/ws")
         chunk = b"x" * (1024 * 1024)  # 1MB
@@ -1449,7 +1449,7 @@ class TestPlatformAndWasmGating:
         # (triggered specifically to check this -- windows.md Phase 4
         # had only ever been MinGW cross-compiled before) exercised the
         # winsock2 backend end to end -- openPort()/on request/on
-        # upgrade/on message/on socketClose all tested clean -- so http
+        # upgrade/on socketMessage/on socketClose all tested clean -- so http
         # no longer waits behind FESTINA_ENABLE_WINDOWS_HTTP the way
         # claude.md #151 originally set it up. One real gap that same
         # run found, graceful shutdown, is documented in api.md rather

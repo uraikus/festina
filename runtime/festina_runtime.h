@@ -299,6 +299,22 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
  * @__festina_db's own default in codegen.py) is a safe no-op. */
 void festina_db_close(sqlite3 *db);
 
+/* claude.md #207: closes ONE thread's own private sqlite handle (a
+ * `thread` block's own `DatabaseURL`) at the point that thread's own
+ * worker actually stops, whether via an explicit `NAME.kill()` or via
+ * process teardown's own festina_thread_kill_all -- registered per
+ * thread through festina_thread_set_db_close (festina_runtime_thread.c),
+ * never called directly from codegen. Deliberately NOT festina_db_close
+ * reused as-is: see this function's own comment in festina_runtime.c
+ * for why finalizing the ENTIRE process-wide statement-cache registry
+ * (what festina_db_close does, correctly, for the one-time real
+ * process-shutdown case) would corrupt every OTHER still-running
+ * thread's -- or main's own -- cached prepared statements if run here
+ * instead. A NULL db is a safe no-op (a thread with no DatabaseURL of
+ * its own never gets this registered in the first place, but the check
+ * costs nothing). */
+void festina_thread_db_close(sqlite3 *db);
+
 /*
  * claude.md #32-34: sqlite() queries.
  *
@@ -1033,6 +1049,41 @@ void festina_http_service_ready(void);
  * only thing that ever calls through these hooks, and it's simply never
  * linked into a program that doesn't open a window. */
 void festina_register_http_service_hooks(void);
+/* claude.md #212 (Phase 4 -- private per-thread HTTP context): defined
+ * in festina_runtime_http.c; see festina_thread_set_http_context's own
+ * doc comment (festina_runtime_thread.c's declaration further down)
+ * for what these two do and when codegen wires them onto a specific
+ * thread's own FestinaThreadHandle. Declared here, not called
+ * directly anywhere in this header's own translation unit -- codegen
+ * passes their addresses (`ptr @festina_thread_http_service_pass`/
+ * `ptr @festina_thread_http_teardown`) straight into
+ * festina_thread_set_http_context, so festina_runtime_thread.c itself
+ * never needs to name them (and so never forces a program with
+ * threads but no http at all to link this translation unit) -- these
+ * prototypes exist purely so festina_runtime_http.c's own definitions
+ * are checked against a declared signature, the same as every other
+ * public function in this header. */
+void festina_thread_http_service_pass(int timeout_ms);
+void festina_thread_http_teardown(void);
+/* claude.md #213 (Phase 5 -- giveRequest): also defined in
+ * festina_runtime_http.c, also declared here purely so the
+ * definitions there are checked against a declared signature.
+ * festina_conn_detach resolves an http payload's own conn_id,
+ * verifies it's still a live, plain (non-TLS), not-yet-responded-to,
+ * non-upgraded connection, detaches it from THIS calling thread's own
+ * (`__thread`) connection table, and returns a heap-owned copy of it
+ * (or NULL, a silent no-op, if any of that isn't true) -- called from
+ * codegen-generated IR, on whichever thread calls `NAME.giveRequest`
+ * (today, always main -- semantic.py's own gate). Codegen then passes
+ * that opaque `ptr` straight to festina_thread_give_request above,
+ * never touching it itself. festina_thread_deliver_given_request is
+ * the OTHER end -- the hook festina_thread_set_http_context wires as
+ * `give_request_deliver`, called on the RECEIVING thread's own OS
+ * thread once dequeued, which re-attaches the connection (via the
+ * static festina_conn_attach) and dispatches this thread's own
+ * `on request`. */
+void *festina_conn_detach(void *http_payload);
+void festina_thread_deliver_given_request(void *payload);
 
 /* claude.md #195 Phase 2: `thread NAME { ... }` -- one pthread per
  * declared thread, two mutex+condvar-guarded FIFO queues (inbound,
@@ -1064,6 +1115,24 @@ void festina_register_http_service_hooks(void);
  * parameters below, and codegen.py's _thread_payload_release_fn. */
 typedef struct FestinaThreadHandle FestinaThreadHandle;
 
+/* claude.md #213 (Phase 5 -- giveRequest): the payload for one
+ * GIVE_REQUEST-kind FestinaThreadMsg (festina_runtime_thread.c's own
+ * internal struct, not itself in this header) -- deliberately just
+ * two opaque pointers, defined HERE (not privately in either .c file)
+ * since festina_thread_give_request (thread.c) builds it and
+ * festina_thread_deliver_given_request (http.c) unpacks it; neither
+ * TU needs to know what the other's own pointer actually points to
+ * (thread.c never dereferences `conn`/`http_value`, http.c never
+ * dereferences anything ABOUT this struct beyond its own two fields).
+ * `conn` is the festina_conn_detach'd connection (an opaque `FestinaConn*`
+ * as far as this header/thread.c are concerned); `http_value` is the
+ * SAME (never cloned) FestinaHttpValue payload the sending program's
+ * own `req` referred to. */
+typedef struct {
+    void *conn;
+    void *http_value;
+} FestinaGiveRequestPayload;
+
 /* Registers a new thread (its registry slot, queues, and the three
  * handler function pointers this thread's own `on load`/`on message`/
  * `on exit` bodies compiled to -- NULL for any of the three that
@@ -1085,7 +1154,7 @@ typedef struct FestinaThreadHandle FestinaThreadHandle;
  * invoked on that side, so the runtime never needs a NULL check
  * before calling either one). */
 FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
-                                             void (*on_message)(void *payload),
+                                             void (*on_message)(void *sender, void *payload),
                                              void (*on_exit)(int64_t code),
                                              void (*in_release)(void *payload),
                                              void (*out_release)(void *payload));
@@ -1095,25 +1164,138 @@ FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
  * coming back) can respawn without re-registering a whole new handle
  * (and therefore a whole new, empty pair of queues) each time. */
 void festina_thread_spawn(FestinaThreadHandle *h);
-/* `NAME.postMessage(x)` from the MAIN thread's own call sites: clones
- * x into `payload` (codegen's own job, see above) and enqueues it on
- * h's INBOUND queue, waking the worker if it's blocked waiting. */
-void festina_thread_post(FestinaThreadHandle *h, void *payload);
+/* claude.md #216: the singleton standing in for "main" as a real,
+ * non-null `thread` value -- see festina_runtime_thread.c's own
+ * g_main_handle doc comment. Passed as festina_thread_post's own
+ * `sender` whenever a send genuinely originates from main. */
+FestinaThreadHandle *festina_thread_get_main_handle(void);
+/* claude.md #216: `worker.main` -- true only for the singleton
+ * festina_thread_get_main_handle returns, false for every ordinary,
+ * festina_thread_register'd handle. `handle` is `void*` (not
+ * `FestinaThreadHandle*`) purely so codegen never needs this opaque
+ * struct's own layout, matching every other thread-handle-consuming
+ * declaration in this header. */
+int8_t festina_thread_is_main(void *handle);
+/* claude.md #208: `NAME.postMessage(x)` from main OR from inside
+ * ANOTHER thread's own body (threads may message each other directly
+ * now, not just main) -- clones x into `payload` (codegen's own job,
+ * see above) and enqueues it on h's INBOUND queue, waking the worker
+ * if it's blocked waiting. claude.md #216: `sender` is
+ * festina_thread_get_main_handle() when called from main (never NULL
+ * any more -- `worker:thread` has no null case left), or the CALLING
+ * thread's own handle when this is a thread-to-thread send --
+ * delivered straight through to h's own `on_message` as its first
+ * argument (the `worker:thread` parameter every `on message` handler
+ * now declares). */
+void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload, int64_t txn_id);
 /* `postMessage(x)` called from INSIDE this thread's own body: enqueues
  * on h's own OUTBOUND queue instead -- drained on the MAIN thread only
  * (see festina_thread_drain below), never processed by the worker
  * itself. */
-void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload);
-/* `NAME.onMessage(callback)`: registers the trampoline codegen built
- * for h's own inferred outbound type (unboxes `payload` and makes the
- * real indirect call through whatever Festina callback value the
- * call site's own global currently holds -- see
- * _emit_exec_callback_trampoline's own doc comment in codegen.py for
- * the shape this mirrors). Only ever called from the main thread,
- * before festina_thread_drain can ever actually invoke it for a given
- * message -- see festina_thread_drain's own doc comment on what
- * happens to anything posted before this call runs. */
-void festina_thread_set_out_callback(FestinaThreadHandle *h, void (*out_callback)(void *payload));
+void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload, int64_t txn_id);
+/* claude.md #217: `.reply(T)` / `NAME.postMessage(x).callback(fn)`.
+ * alloc_txn_id mints a fresh, process-wide, monotonic id (0 reserved
+ * for "no callback expected", the default on an ordinary send).
+ * register_callback records ONE pending `.callback(fn)` on `self`'s
+ * own list (self = the SENDING handle -- main's singleton, or the
+ * calling thread's own handle), called ahead of the actual send;
+ * `trampoline` is codegen-generated, unboxes a reply payload as the
+ * target's own concrete reply type and calls `user_fn` with it (one
+ * trampoline per distinct reply type, shared by every send site
+ * targeting that same thread/main). festina_thread_reply delivers a
+ * boxed reply value from `self` (the calling thread's own handle,
+ * used only to route a reply-to-main through THAT handle's own
+ * outbound queue) to `dest` (the original sender), tagged with the
+ * calling thread's own ambient "which message am I currently
+ * handling" state -- never triggers on_message on the receiving end. */
+int64_t festina_thread_alloc_txn_id(void);
+void festina_thread_register_callback(FestinaThreadHandle *self, int64_t txn_id,
+                                      void (*trampoline)(void *payload, void *user_fn),
+                                      void *user_fn);
+/* claude.md #218: `release` is how to free `payload` if this reply
+ * turns out to have nothing to dispatch to -- the receiving side knows
+ * only its OWN inbound type, never the sender's reply type, so the
+ * sender records the right function here. Also used when a reply is
+ * still queued at kill() time. `festina_thread_reply` releases the
+ * payload and delivers nothing at all if no message is currently being
+ * dispatched on the calling thread (nothing could ever answer it). */
+void festina_thread_reply(FestinaThreadHandle *self, FestinaThreadHandle *dest, void *payload,
+                          void (*release)(void *payload));
+/* claude.md #208: registers the ONE handler for everything sent to
+ * main, from any thread -- replaces the old per-thread
+ * festina_thread_set_out_callback (one dynamic `NAME.onMessage(...)`
+ * registration per thread, each installing its own codegen-built
+ * trampoline). Called at most once, from main()'s own prologue,
+ * before any thread's own worker starts -- see festina_thread_drain's
+ * own doc comment on what happens to anything posted before this call
+ * runs (nothing: no thread can post anything until it's spawned,
+ * which always happens strictly after this registration in the same
+ * prologue). */
+void festina_set_global_message_handler(void (*handler)(void *sender, void *payload));
+/* claude.md #207: registers the (zero-argument) closure that closes
+ * THIS thread's own private sqlite handle -- codegen emits a tiny
+ * per-thread trampoline (loads `@__festina_thread_NAME_db`, calls
+ * festina_thread_db_close on it, stores null back) and passes it here
+ * once, right after festina_thread_register, but ONLY for a thread
+ * that actually declared its own DatabaseURL (db_global is not None);
+ * a thread with no DatabaseURL never gets this call at all, so
+ * db_close stays NULL and festina_thread_main's own check below is a
+ * plain no-op for it, same as on_load/on_message/on_exit already are
+ * when a thread doesn't declare one. Called from festina_thread_main
+ * itself, once, right after on_exit(0) -- i.e. exactly when this
+ * thread's own worker is about to stop, whether that's an explicit
+ * `NAME.kill()` or festina_thread_kill_all() at process teardown --
+ * so a subsequent `NAME.live()`'s own on_load reopens a genuinely
+ * fresh handle instead of leaking the old one, which is the actual
+ * bug this closes. */
+void festina_thread_set_db_close(FestinaThreadHandle *h, void (*db_close)(void));
+/* claude.md #212 (Phase 4 -- private per-thread HTTP context): the
+ * db_close hook's own shape, reused for a thread that declared at
+ * least one HTTP-shaped handler (on request/on upgrade/on
+ * socketMessage/on socketClose) -- called at most once, right after
+ * festina_thread_register, ONLY for such a thread. `service_pass` is
+ * festina_thread_http_service_pass (festina_runtime_http.c), called
+ * repeatedly from festina_thread_main's own combined loop instead of
+ * blocking on this thread's inbound condvar forever, whenever nothing
+ * is currently queued to dispatch -- see that function's own doc
+ * comment for why this is a bounded POLL rather than the plain
+ * condvar-wait every other thread uses. `teardown` is
+ * festina_thread_http_teardown, called once, right before this
+ * thread's worker stops for good (mirroring db_close's own
+ * placement/reasoning exactly -- the identical "close it before
+ * nothing can ever reach it again" fix claude.md #207 already made
+ * for a thread's own sqlite handle, applied here to its own listeners/
+ * connections). A thread with no HTTP-shaped handler at all never
+ * gets this call, so both stay NULL and festina_thread_main's own
+ * checks below are plain no-ops for it, same as on_load/on_message/
+ * on_exit/db_close already are when undeclared. */
+/* claude.md #213 (Phase 5 -- giveRequest): `give_request_deliver`,
+ * widened onto this same call/struct -- festina_thread_deliver_given_
+ * request (festina_runtime_http.c), invoked from festina_thread_main's
+ * own dispatch loop (via a NEW FestinaThreadMsg kind, see that file's
+ * own doc comment) for a connection handed to THIS thread via
+ * `NAME.giveRequest(r)`. Wired unconditionally for every http-context
+ * thread, the same as service_pass/teardown -- a thread that never
+ * declared `on request` specifically just never has this hook
+ * actually invoked (semantic.py's own giveRequest gate guarantees the
+ * SENDING side only ever targets one that did), so there's no reason
+ * to track a fourth, narrower condition here. */
+void festina_thread_set_http_context(FestinaThreadHandle *h,
+                                     void (*service_pass)(int timeout_ms),
+                                     void (*teardown)(void),
+                                     void (*give_request_deliver)(void *payload));
+/* claude.md #213: enqueues a connection handed off via
+ * `NAME.giveRequest(r)` onto h's own inbound queue, tagged as a
+ * DIFFERENT kind from an ordinary postMessage (see FestinaThreadMsg's
+ * own doc comment) -- dispatched, once dequeued, by calling h's own
+ * give_request_deliver(http_value) after first re-attaching `conn`
+ * (opaque here -- this file never looks inside it; only
+ * festina_runtime_http.c's own festina_conn_attach does) into THIS
+ * thread's own (now correctly `__thread`-local, once this runs on its
+ * own OS thread) connection table. Always sent with no `sender` (this
+ * is legal only from main -- see semantic.py's own gate), unlike
+ * festina_thread_post's own sender parameter. */
+void festina_thread_give_request(FestinaThreadHandle *h, void *conn, void *http_value);
 /* `NAME.kill()`: blocking -- signals the worker to stop, pthread_joins
  * it, then discards anything still sitting in its inbound queue
  * (a real, deliberate choice: "kill" means stop now, not "finish
@@ -1149,13 +1331,14 @@ int8_t festina_thread_is_alive(FestinaThreadHandle *h);
  * ANY declared thread is still alive, which is what makes "a thread
  * should idle" actually keep the process running -- and
  * festina_thread_drain() -- delivers every declared thread's own
- * outbound queue to its registered onMessage() callback, one thread's
- * worth at a time, IF that thread has one registered yet (a message
- * posted before the corresponding `.onMessage()` call has run -- a
- * real possibility, since every thread spawns in main()'s prologue,
- * before __festina_main()'s own top-level statements, one of which is
- * what registers it -- simply stays queued rather than being silently
- * dropped; the next drain after registration flushes it) -- are polled
+ * outbound queue to the ONE registered top-level `on message` handler
+ * (claude.md #208; see festina_set_global_message_handler above), one
+ * thread's worth at a time, a no-op entirely if nothing is registered
+ * at all (a program with threads but no top-level `on message`
+ * handler -- semantic.py already rejects the OTHER gap, a bare
+ * postMessage(x) with nothing declared to receive it, at its own call
+ * site, so this can only ever be "no sender ever posts anything
+ * outbound," never "something's queued with nowhere to go"). Are polled
  * once per iteration by all three of this runtime's blocking loops
  * (festina_run_timer_loop here, festina_run_http_loop, and
  * festina_run_event_loop), the same "all three poll the same two

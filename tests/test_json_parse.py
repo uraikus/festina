@@ -375,3 +375,94 @@ class TestRuntimeBehavior:
         """
         result = compile_and_run(source)
         assert result.stdout.strip() == "done"
+
+    def test_u_escape_decodes_a_bmp_codepoint(self, compile_and_run):
+        # claude.md #206: \uXXXX used to throw "not yet supported" --
+        # now decoded into its UTF-8 encoding, same as every other
+        # escape. Festina source writes `\\u00e9` (two literal
+        # backslashes) because the lexer's own `\\` unescaping collapses
+        # that down to ONE literal backslash + `u00e9` before the JSON
+        # parser ever sees it -- which is the actual é escape.
+        source = r"""
+        struct Person { name:text }
+        Person p = '{"name":"caf\\u00e9"}'.toStruct(Person)
+        log(p.name)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "café"
+
+    def test_u_escape_decodes_a_surrogate_pair(self, compile_and_run):
+        # A high + low surrogate pair combining into one astral-plane
+        # codepoint (U+1F600 GRINNING FACE), the four-byte UTF-8 case.
+        source = r"""
+        struct Person { name:text }
+        Person p = '{"name":"\\ud83d\\ude00"}'.toStruct(Person)
+        log(p.name)
+        """
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "\U0001F600"
+
+    def test_unpaired_high_surrogate_throws(self, compile_and_run):
+        source = r"""
+        struct Person { name:text }
+        try {
+            Person p = '{"name":"\\ud83d"}'.toStruct(Person)
+            log('unreachable')
+        } catch (e:text) {
+            log(`caught: ${e}`)
+        }
+        """
+        result = compile_and_run(source)
+        assert "unpaired UTF-16 surrogate" in result.stdout
+
+    def test_lone_low_surrogate_throws(self, compile_and_run):
+        source = r"""
+        struct Person { name:text }
+        try {
+            Person p = '{"name":"\\ude00"}'.toStruct(Person)
+            log('unreachable')
+        } catch (e:text) {
+            log(`caught: ${e}`)
+        }
+        """
+        result = compile_and_run(source)
+        assert "unpaired UTF-16 surrogate" in result.stdout
+
+    def test_high_surrogate_followed_by_non_surrogate_throws(self, compile_and_run):
+        source = r"""
+        struct Person { name:text }
+        try {
+            Person p = '{"name":"\\ud83d\\u0041"}'.toStruct(Person)
+            log('unreachable')
+        } catch (e:text) {
+            log(`caught: ${e}`)
+        }
+        """
+        result = compile_and_run(source)
+        assert "low surrogate" in result.stdout
+
+    def test_truncated_u_escape_throws(self, compile_and_run):
+        source = r"""
+        struct Person { name:text }
+        try {
+            Person p = '{"name":"\\u12"}'.toStruct(Person)
+            log('unreachable')
+        } catch (e:text) {
+            log(`caught: ${e}`)
+        }
+        """
+        result = compile_and_run(source)
+        assert "caught:" in result.stdout
+
+    def test_invalid_hex_digit_in_u_escape_throws(self, compile_and_run):
+        source = r"""
+        struct Person { name:text }
+        try {
+            Person p = '{"name":"\\u12zz"}'.toStruct(Person)
+            log('unreachable')
+        } catch (e:text) {
+            log(`caught: ${e}`)
+        }
+        """
+        result = compile_and_run(source)
+        assert "invalid \\u escape" in result.stdout

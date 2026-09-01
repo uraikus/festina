@@ -1,4 +1,4 @@
-// claude.md #195/#197/#198: `thread NAME { ... }` -- real message-
+// claude.md #195/#197/#198/#208: `thread NAME { ... }` -- real message-
 // passing concurrency, at real volume, under ASan/LeakSanitizer (see
 // scripts/leak_stress.sh's own new "thread" runtime object). Every
 // message crossing either queue is a fresh malloc'd box, a fresh
@@ -13,6 +13,20 @@
 // delivered) and the two lifecycle operations that themselves
 // allocate/tear down real OS resources (kill()/live(), each
 // pthread_join()ing a real thread).
+//
+// claude.md #208: ONE global top-level `on message(worker:thread,
+// msg:T)` handler now receives EVERYTHING sent to main, from every
+// worker below -- there is no more per-thread `.onMessage(callback)`
+// to keep each worker's own reply shape separate by callback identity.
+// Ten different reply SHAPES still need to reach main through that one
+// declared T, so each is wrapped in its own single-field struct
+// (IntMsg/TextMsg/...) just before its own bare postMessage(x) call,
+// and all ten wrapper structs are members of one enum (ChurnMsg) --
+// the same "more than one type -> a real, pre-declared enum" shape
+// claude.md #208's own postMessage_of_multiple_enum_member_types test
+// already covers, just with more members. The one handler dispatches
+// on `typeof msg` and routes to the same ten onXReply functions the
+// old per-thread callbacks used to call directly.
 //
 // All N messages for a given worker are posted up front, in one tight
 // loop, rather than one-reply-triggers-the-next-send -- a ping-pong
@@ -37,85 +51,23 @@
 struct Item { n:int label:text }
 enum DataPacket = int, text
 
-thread pinger {
-  on message(p:int) {
-    postMessage(p + 1)
-  }
-}
+// claude.md #208: one single-field wrapper struct per reply shape --
+// field names are all distinct (v_int/v_text/...) so this stays a
+// legal pure-struct enum (analyze_enum's own "declared by both X and
+// Y" ambiguity check would reject two members sharing a field name).
+struct IntMsg { v_int:int }
+struct TextMsg { v_text:text }
+struct StructMsg { v_item:Item }
+struct ArrayMsg { v_arr:arr[int] }
+struct MapMsg { v_map:map[int] }
+struct EnumMsg { v_enum:DataPacket }
+struct BlobMsg { v_blob:blob }
+struct ImgMsg { v_img:img }
+struct AudMsg { v_aud:aud }
+struct UrlMsg { v_url:url }
 
-thread echoer {
-  on message(p:text) {
-    postMessage(`echo:${p}`)
-  }
-}
-
-thread structWorker {
-  on message(p:Item) {
-    Item out = p
-    out.n = p.n + 1
-    postMessage(out)
-  }
-}
-
-thread arrayWorker {
-  on message(p:arr[int]) {
-    arr[int] out = []
-    int i = 0
-    while i < p.length {
-        out.push(p[i] * 2)
-        i = i + 1
-    }
-    postMessage(out)
-  }
-}
-
-thread mapWorker {
-  on message(p:map[int]) {
-    map[int] out = {}
-    out['a'] = p['a'] + 1
-    out['b'] = p['b'] + 1
-    postMessage(out)
-  }
-}
-
-thread enumWorker {
-  on message(p:DataPacket) {
-    postMessage(p)
-  }
-}
-
-// claude.md #198 Phase 4: blob/img/aud/url clone -- festina_blob_clone/
-// _image_clone/_audio_clone/_url_clone, exercised at real volume the
-// identical way struct/arr[T]/map[T]/enum already are above. imgWorker
-// also draws on its own received clone before posting it back, the
-// same shape as TestThreads' own image-round-trip test -- proving the
-// img-method allow-list survives real concurrent churn, not just one
-// message.
-thread blobWorker {
-  on message(p:blob) {
-    postMessage(p)
-  }
-}
-
-thread imgWorker {
-  on message(p:img) {
-    color red = 'red'
-    p.drawPixel(0, 0, red)
-    postMessage(p)
-  }
-}
-
-thread audWorker {
-  on message(p:aud) {
-    postMessage(p)
-  }
-}
-
-thread urlWorker {
-  on message(p:url) {
-    postMessage(p)
-  }
-}
+enum ChurnMsg = IntMsg, TextMsg, StructMsg, ArrayMsg, MapMsg, EnumMsg,
+                BlobMsg, ImgMsg, AudMsg, UrlMsg
 
 int TOTAL = 20000
 int intRepliesSeen = 0
@@ -248,16 +200,129 @@ void func onUrlReply(x:url) {
     maybeDone()
 }
 
-pinger.onMessage(void (x:int) => onIntReply(x))
-echoer.onMessage(void (x:text) => onTextReply(x))
-structWorker.onMessage(void (x:Item) => onStructReply(x))
-arrayWorker.onMessage(void (x:arr[int]) => onArrayReply(x))
-mapWorker.onMessage(void (x:map[int]) => onMapReply(x))
-enumWorker.onMessage(void (x:DataPacket) => onEnumReply(x))
-blobWorker.onMessage(void (x:blob) => onBlobReply(x))
-imgWorker.onMessage(void (x:img) => onImgReply(x))
-audWorker.onMessage(void (x:aud) => onAudReply(x))
-urlWorker.onMessage(void (x:url) => onUrlReply(x))
+on message(worker:thread, msg:ChurnMsg) {
+    if typeof msg == 'IntMsg' {
+        onIntReply(msg.v_int)
+    } else if typeof msg == 'TextMsg' {
+        onTextReply(msg.v_text)
+    } else if typeof msg == 'StructMsg' {
+        onStructReply(msg.v_item)
+    } else if typeof msg == 'ArrayMsg' {
+        onArrayReply(msg.v_arr)
+    } else if typeof msg == 'MapMsg' {
+        onMapReply(msg.v_map)
+    } else if typeof msg == 'EnumMsg' {
+        onEnumReply(msg.v_enum)
+    } else if typeof msg == 'BlobMsg' {
+        onBlobReply(msg.v_blob)
+    } else if typeof msg == 'ImgMsg' {
+        onImgReply(msg.v_img)
+    } else if typeof msg == 'AudMsg' {
+        onAudReply(msg.v_aud)
+    } else if typeof msg == 'UrlMsg' {
+        onUrlReply(msg.v_url)
+    }
+}
+
+thread pinger {
+  on message(worker:thread, msg:int) {
+    IntMsg out
+    out.v_int = msg + 1
+    postMessage(out)
+  }
+}
+
+thread echoer {
+  on message(worker:thread, msg:text) {
+    TextMsg out
+    out.v_text = `echo:${msg}`
+    postMessage(out)
+  }
+}
+
+thread structWorker {
+  on message(worker:thread, msg:Item) {
+    Item item = msg
+    item.n = msg.n + 1
+    StructMsg out
+    out.v_item = item
+    postMessage(out)
+  }
+}
+
+thread arrayWorker {
+  on message(worker:thread, msg:arr[int]) {
+    arr[int] nums = []
+    int i = 0
+    while i < msg.length {
+        nums.push(msg[i] * 2)
+        i = i + 1
+    }
+    ArrayMsg out
+    out.v_arr = nums
+    postMessage(out)
+  }
+}
+
+thread mapWorker {
+  on message(worker:thread, msg:map[int]) {
+    map[int] entry = {}
+    entry['a'] = msg['a'] + 1
+    entry['b'] = msg['b'] + 1
+    MapMsg out
+    out.v_map = entry
+    postMessage(out)
+  }
+}
+
+thread enumWorker {
+  on message(worker:thread, msg:DataPacket) {
+    EnumMsg out
+    out.v_enum = msg
+    postMessage(out)
+  }
+}
+
+// claude.md #198 Phase 4: blob/img/aud/url clone -- festina_blob_clone/
+// _image_clone/_audio_clone/_url_clone, exercised at real volume the
+// identical way struct/arr[T]/map[T]/enum already are above. imgWorker
+// also draws on its own received clone before posting it back, the
+// same shape as TestThreads' own image-round-trip test -- proving the
+// img-method allow-list survives real concurrent churn, not just one
+// message.
+thread blobWorker {
+  on message(worker:thread, msg:blob) {
+    BlobMsg out
+    out.v_blob = msg
+    postMessage(out)
+  }
+}
+
+thread imgWorker {
+  on message(worker:thread, msg:img) {
+    color red = 'red'
+    msg.drawPixel(0, 0, red)
+    ImgMsg out
+    out.v_img = msg
+    postMessage(out)
+  }
+}
+
+thread audWorker {
+  on message(worker:thread, msg:aud) {
+    AudMsg out
+    out.v_aud = msg
+    postMessage(out)
+  }
+}
+
+thread urlWorker {
+  on message(worker:thread, msg:url) {
+    UrlMsg out
+    out.v_url = msg
+    postMessage(out)
+  }
+}
 
 // claude.md #195 Phase 2: a handful of real kill()/live() cycles up
 // front too -- each one spawns/joins a genuine OS thread, so this is

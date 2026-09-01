@@ -212,3 +212,73 @@ class TestIndividualExamples:
         assert result.returncode == 0
         assert (tmp_path / "custom_config.sqlite").exists()
         assert not (tmp_path / "festina.sqlite").exists()
+
+
+class TestThreadedHttpServerExample:
+    """claude.md #212/#213: threaded_http_server.f is a real, long-
+    running server (openPort(), never exits on its own), unlike every
+    other example above -- run as a background subprocess and torn
+    down by a finalizer, the same shape tests/conftest.py's own
+    compile_and_run_server fixture already uses for a server built
+    from an inline source string; this compiles the actual shipped
+    example FILE instead, so a change to the file itself is what this
+    test exercises, not a copy of its source."""
+
+    def test_both_routes_answer_and_the_pool_handles_them_concurrently(
+            self, cli_mod, tmp_path):
+        import socket
+        import time
+        import urllib.request
+
+        from tests.conftest import _free_tcp_port, _require_c_compiler, compile_file_or_skip
+
+        cc = _require_c_compiler()
+        src = os.path.join(EXAMPLES_DIR, "threaded_http_server.f")
+        out = tmp_path / "threaded_http_server"
+        compile_file_or_skip(cli_mod, str(src), str(out), cc=cc)
+
+        port = _free_tcp_port()
+        proc = subprocess.Popen([str(out), str(port)], cwd=REPO_ROOT,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            deadline = time.monotonic() + 10
+            connected = False
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    pytest.fail(f"server exited early (code {proc.returncode}):\n{proc.stdout.read()}")
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                        connected = True
+                        break
+                except OSError:
+                    time.sleep(0.05)
+            assert connected, "server never started listening"
+
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as resp:
+                assert resp.status == 200
+                assert resp.read() == b"instant -- try /slow\n"
+
+            # claude.md #213: fire four /slow requests (matching the
+            # example's own WORKER_COUNT) concurrently and confirm
+            # they all come back correctly -- doesn't measure timing
+            # (that's benchmarks/http_threaded/'s own job), just that
+            # the pool genuinely answers every one of them right,
+            # under real concurrent load, not just one at a time.
+            import concurrent.futures
+
+            def fetch_slow():
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/slow", timeout=10) as r:
+                    return r.status, r.read()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda _: fetch_slow(), range(4)))
+            for status, body in results:
+                assert status == 200
+                assert body.startswith(b"computed ") and body.endswith(b" on a worker thread\n")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)

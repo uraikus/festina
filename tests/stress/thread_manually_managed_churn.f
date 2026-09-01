@@ -23,20 +23,12 @@
 
 struct Item { n:int label:text }
 
-thread reader {
-    on message(p:Item?) {
-        int n = p.n
-        free p
-        postMessage(n)
-    }
-}
-
 int TOTAL = 5000
 int repliesSeen = 0
 int sum = 0
 
-void func onReply(n:int) {
-    sum = sum + n
+on message(worker:thread, msg:int) {
+    sum = sum + msg
     repliesSeen = repliesSeen + 1
     if repliesSeen == TOTAL {
         log(sum)
@@ -44,7 +36,13 @@ void func onReply(n:int) {
     }
 }
 
-reader.onMessage(void (n:int) => onReply(n))
+thread reader {
+    on message(worker:thread, msg:Item?) {
+        int n = msg.n
+        free msg
+        postMessage(n)
+    }
+}
 
 int i = 0
 while i < TOTAL {

@@ -2113,7 +2113,7 @@ Every connection is serviced from a **single thread**, the same "one
 thread total" model `setTimeout`/`setInterval` and graphics event
 handlers already use — connections are multiplexed, not run in
 parallel, so ordinary globals need no locking to read/write safely
-across requests. The tradeoff: a slow `on request`/`on message` handler
+across requests. The tradeoff: a slow `on request`/`on socketMessage` handler
 delays every *other* connection's own turn. This is built for the kind
 of small, script-shaped server this language already targets, not as a
 general-purpose production server replacement.
@@ -2235,7 +2235,7 @@ on upgrade(s:socket) {
     log('client connected')
 }
 
-on message(s:socket, msg:blob) {
+on socketMessage(s:socket, msg:blob) {
     s.send(`you said: ${msg.toText()}`)
 }
 
@@ -2253,16 +2253,16 @@ actually a valid WebSocket handshake (missing/mismatched headers),
 normal "no response sent" default (`200`, empty body) — never a crash.
 
 Once upgraded, `on upgrade(s:socket)` fires once for that connection,
-then `on message(s:socket, msg:blob)` fires once per message received
+then `on socketMessage(s:socket, msg:blob)` fires once per message received
 — **always as a `blob`**, whether the peer sent a text or binary frame
 (call `.toText()` if you know it's always text). `on socketClose(s)`
 fires exactly once when the connection ends, however it ends (the peer
 closed it, sent a close frame, or the read failed) — never for a plain
 HTTP connection that never upgraded.
 
-**Fragmentation is invisible to `on message`.** A peer
+**Fragmentation is invisible to `on socketMessage`.** A peer
 may split one logical message across several WebSocket frames (RFC 6455
-§5.4) — this runtime reassembles them itself, so `on message` fires
+§5.4) — this runtime reassembles them itself, so `on socketMessage` fires
 exactly once per MESSAGE either way, with the full, already-concatenated
 `blob`; there's no way to observe the individual fragments, and no
 reason to want to. A ping/pong or close frame arriving in the middle of
@@ -2532,7 +2532,7 @@ openSecurePort(8443, key)
 
 The TLS counterpart to `openPort()` — same listener/connection table,
 same single-threaded event loop, and the exact same `on request`/
-`on upgrade`/`on message`/`on socketClose` handler surface (a program
+`on upgrade`/`on socketMessage`/`on socketClose` handler surface (a program
 can mix plain `openPort()` and TLS `openSecurePort()` listeners
 freely; a connection's own `req`/`s` behaves identically either way —
 nothing about *reading* a request or *sending* a response differs
@@ -2690,19 +2690,19 @@ alias within one thread does. Both directions work the same way:
 ```festina
 struct Circle { x:int y:int }
 
+Circle? c
+on message(worker:thread, msg:Circle?) {
+    log(msg.x)                     // 99
+    log(c.x)                       // 99 -- c itself changed, proving no clone happened
+}
+
 thread Worker {
-    on message(p:Circle?) {
-        p.x = 99                   // mutates the SAME value the sender holds
-        postMessage(p)              // echoes the same reference back, no clone
+    on message(worker:thread, msg:Circle?) {
+        msg.x = 99                 // mutates the SAME value the sender holds
+        postMessage(msg)           // echoes the same reference back, no clone
     }
 }
 
-Circle? c
-void func onReply(x:Circle?) {
-    log(x.x)                       // 99
-    log(c.x)                       // 99 -- c itself changed, proving no clone happened
-}
-Worker.onMessage(void (x:Circle?) => onReply(x))
 c.x = 1
 Worker.postMessage(c)
 ```
@@ -3000,20 +3000,19 @@ deadlines together so neither blocks the other.
 ## Threads
 
 ```festina
+on message(worker:thread, msg:int) {
+    log(`main got: ${msg}`)
+}
+
 thread worker {
     on load() {
         log('worker: ready')
     }
-    on message(p:int) {
-        postMessage(p * 2)
+    on message(worker:thread, msg:int) {
+        postMessage(msg * 2)
     }
 }
 
-void func onReply(x:int) {
-    log(`main got: ${x}`)
-}
-
-worker.onMessage(void (x:int) => onReply(x))
 worker.postMessage(21)
 ```
 
@@ -3023,23 +3022,46 @@ main program. It starts (and runs `on load()`, if declared) as soon as
 the program starts, and idles until it either receives a message or is
 killed. **A thread's own body can see only its own state/locals,
 function names, and type names — never a global variable or constant,
-and it cannot call an ordinary top-level function** (see "Isolation"
-below).
+and it cannot call an ordinary top-level function** (see
+[Isolation](#isolation-what-a-thread-body-may-and-may-not-do) below).
 
-**Sending and receiving.** `on message(p:T)` declares the type a
-thread accepts (a thread with no `on message` accepts no messages at
-all, and `NAME.postMessage(x)` anywhere is a compile error). From the
-main program, `NAME.postMessage(x)` sends `x` to the thread; from
-inside the thread's own body, the bare `postMessage(x)` sends `x` back
-out to the main program. The main program registers
-`NAME.onMessage(callback)` to receive those: `callback` is checked
-against whatever type the thread's own `postMessage(x)` call sites
-actually send, which must be a single, consistent type — sending more
-than one shape from the same thread is a compile error that says to
-pre-declare a named `enum` covering both (the same convention `on
-message` itself already uses for multiple inbound types). A thread
-that never calls `postMessage` needs no `NAME.onMessage(...)`
-registration at all.
+A declaration is referred to two different ways, and the difference
+matters throughout this section:
+
+- **the thread's own name** (`worker`) — what you send *to*, and what
+  the main program controls: `worker.postMessage(x)`, `worker.kill()`,
+  `worker.live(cb)`, `worker.isAlive()`, `worker.giveRequest(r)`.
+- **a `thread` *value*** — what an `on message` handler receives as its
+  first parameter, identifying whoever sent that message. It has
+  exactly two operations: the field `.main` (was this sent by the main
+  program?) and the method `.reply(x)`. It is deliberately minimal:
+  it can't be compared (to `null` or to another `thread`), can't be
+  sent through `postMessage`, and has no text form, so `log(w)` and
+  `` `${w}` `` are compile errors rather than a printed pointer.
+
+### Sending and receiving
+
+Every message receiver — the main program, or a specific `thread` —
+declares its own inbound type directly with one
+`on message(worker:thread, msg:T)` handler, the *same* shape in both
+places. `worker` identifies who sent the message and is never `null`:
+check `worker.main` to tell whether it came from the main program,
+since main itself is a real `thread` value here too. `msg:T` is the
+receiver's own choice of type.
+
+There is exactly **one** `on message` at the top level for the whole
+program — it's what a bare `postMessage(x)` (inside any thread's own
+body) sends to. `NAME.postMessage(x)` sends `x` to a specific thread
+`NAME`, checked against *that thread's own* declared `on message`; this
+works both from the main program and from inside another thread's own
+body — **threads may message each other directly**, not just the main
+program. Sending anywhere with no matching `on message` declared is a
+compile error naming what's missing.
+
+Since each side's `msg` type is declared, not inferred, sending more
+than one shape to the same receiver needs a pre-declared `enum`
+covering all of them, exactly like an ordinary function parameter
+would.
 
 **Every message is a deep, independent copy** — two threads (or a
 thread and the main program) never share a mutable value, which is
@@ -3049,10 +3071,136 @@ Sendable types today: `int`, `float`, `bool`, `text`, `color`,
 `enum` built recursively from any of those (a self-referencing
 `struct`/`arr[T]`/`map[T]` type is rejected at compile time — cloning
 it could loop forever on a genuinely cyclic value). `func`,
-`http`/`socket`, `regex`, and `table` never will be (see
-"Limitations" below).
+`http`/`socket`, `regex`, `table` and `thread` itself never will be, as
+an ordinary `postMessage` argument (see
+[Limitations](#thread-limitations) below) — a **live** `http` request
+is a separate matter, handed off (not cloned, not sent through
+`postMessage` at all) via `NAME.giveRequest(r)`, see
+[Live connection hand-off](#live-connection-hand-off-namegiverequestr)
+below.
 
-**Lifecycle.**
+### Request/response: `.reply()` and `.callback()`
+
+`t.reply(x)` sends `x` straight back to whoever sent the message
+currently being handled. It bypasses `on message` on the receiving end
+entirely (that never fires for a reply) and instead runs whichever
+`.callback(fn)` the original sender attached:
+
+```festina
+thread worker {
+    on message(worker:thread, msg:int) {
+        worker.reply(msg * 2)      // answers THIS message's own sender
+    }
+}
+void func onDoubled(result:int) { log(result) }
+worker.postMessage(21).callback(onDoubled)   // logs 42
+```
+
+A receiver's **reply type** isn't declared separately — it's fixed by
+the first `t.reply(...)` call found anywhere in that receiver's own
+body, and every later one is checked against it the same way an
+ordinary parameter type is (an `enum` works here too, for more than one
+reply shape). Once a receiver has a reply type, **every**
+`.postMessage(x)` call site targeting it — the bare form included, for
+a worker sending to main — must chain `.callback(fn)` (with
+`fn:func[ReplyType]:void`), or it's a compile error: nothing would ever
+be able to receive a reply that receiver might send. Chaining
+`.callback(fn)` onto a target that never calls `.reply()` at all is
+equally a compile error, for the same reason in reverse.
+
+This works in either direction — main replying to a worker, or a worker
+replying to main or to another worker. `fn` always runs back on
+whichever side originally sent the message, on that side's own OS
+thread.
+
+Three details worth knowing:
+
+- **Reply at most once per message.** The first `.reply()` consumes the
+  one pending callback the sender registered; a second reply for the
+  same message has nothing left to answer and is discarded.
+- **A `thread` value outliving its own dispatch replies to nothing.**
+  Stashing `worker` in a struct field, an `arr[thread]` or a
+  `map[thread]` and calling `.reply()` on it later — from a timer, say,
+  or a different handler — is legal but does nothing: the message it
+  would have answered is long finished.
+- **`kill()` drops pending callbacks.** Killing a thread discards any
+  `.callback(fn)` still waiting on a reply from it, and any the thread
+  itself was waiting on; those `fn`s simply never run.
+
+**`fn`'s own body is ordinary code, not thread-isolated — running it
+off main is a real responsibility, not just a detail.** `fn` is a plain
+top-level `func`, so it's free to read/write top-level variables;
+unlike a thread's own `on message` (which the compiler blocks from
+touching top-level state at all), nothing stops `fn` from doing so
+here, and when `fn` was registered by a worker's own send (the bare
+form, or one worker messaging another directly), it runs back on *that
+worker's* OS thread — genuinely concurrently with main and every other
+thread, not marshaled onto main the way `blob`/`img`/`aud`'s own
+[`.callback()`](#loading-in-the-background-callback) is. Two different
+callbacks touching the same top-level variable from two different
+threads is a real data race, caught directly during this feature's own
+development (a first draft of its own stress test raced on exactly this
+and was rewritten once ThreadSanitizer flagged it). Keep an `fn`
+registered by a worker's own send limited to state only that one
+worker's own replies ever touch, or relay the result onward through
+another `postMessage` (itself always safe — every queue this runtime
+uses is its own plain mutex-protected structure) rather than writing to
+shared state directly.
+
+### Thread-private state
+
+```festina
+thread counter {
+    int total = 0
+    on message(worker:thread, msg:int) {
+        total = total + msg
+        postMessage(total)
+    }
+}
+```
+
+A variable declared directly in a thread's own body (`int total = 0`
+above) is visible to every handler in that one thread and invisible
+everywhere else, including other threads and the main program — it
+persists across messages the same way a global would, just scoped to
+this one thread.
+
+### Thread-private functions
+
+A `func` declared directly in a thread's own body (a sibling of its
+state vars/`on load`/`on message`/`on exit`) is callable only from that
+one thread's own handlers and other private funcs, with direct
+read/write access to that thread's own state:
+
+```festina
+thread counter {
+    int total = 0
+    void func addToTotal(x:int) {
+        total = total + x
+    }
+    on message(worker:thread, msg:int) {
+        addToTotal(msg)
+        postMessage(total)
+    }
+}
+```
+
+Two private funcs may call each other regardless of which one is
+declared first (their names are all known before any body is checked,
+same as top-level functions). A private func may also `postMessage`
+like a handler can — both the bare form (to main) and
+`NAME.postMessage(x)` (to another thread). **An ordinary top-level
+`func` remains completely uncallable from inside a thread body** —
+declare the helper directly inside the thread instead if it only needs
+to be called from there. A private func has no first-class value form
+(no `func[...]:...` reference to it by bare name) — it may only ever be
+called, which also means it can't be handed to `.callback(fn)`; use a
+top-level `func` there. Each pool instance
+([below](#thread-pools-thread-namen)) gets its own independent copy of
+every private func, closing over that ONE instance's own state, exactly
+like its handlers already do.
+
+### Lifecycle: `kill()`, `live()`, `isAlive()`
 
 ```festina
 log(worker.isAlive())        // true
@@ -3067,9 +3215,14 @@ log(worker.isAlive())        // true
   always `0` here — a thread's own `kill()` carries no exit code of
   its own to pass through (unlike the main program's own
   `on exit(code:int)`, which does — see [Graceful shutdown](#graceful-shutdown)).
+  Anything still queued for the thread is discarded rather than drained
+  first, and any pending `.callback(fn)` waiting on it is dropped.
 - `NAME.live(callback)` respawns a killed thread and calls
   `callback(true)` once it's running again.
 - `NAME.isAlive()` reads whether the thread is currently running.
+
+These three are callable **only** from the main program — a thread may
+message another thread, but may not control its lifecycle.
 
 If the main program exits (including via `close(code)` or a
 SIGINT/SIGTERM-driven [graceful shutdown](#graceful-shutdown)), every
@@ -3079,45 +3232,52 @@ still-alive thread is killed first (each thread's own
 threaded through), so a declared thread never survives as an orphaned
 process.
 
-**Thread-private state:**
+### Isolation: what a thread body may and may not do
 
-```festina
-thread counter {
-    int total = 0
-    on message(p:int) {
-        total = total + p
-        postMessage(total)
-    }
-}
-```
+A thread's body **may** call `log`/`fail`, string/array/map/struct/enum
+operations, `Math`, time functions, `blankImage()` plus `img`-method
+drawing/clip/resize/pixel calls (each touches only that one private
+image, never shared state), `regex()`/`mkdir()`/`ls()`, and
+`exec(args)` (the blocking, single-argument form).
 
-A variable declared directly in a thread's own body (`int total = 0`
-above) is visible to every handler in that one thread and invisible
-everywhere else, including other threads and the main program — it
-persists across messages the same way a global would, just scoped to
-this one thread.
+It may **not** call any canvas/window builtin (`drawRect`, `render`,
+`saveCanvas`, ...) or `setTimeout`/`setInterval`, and it may not call
+any ordinary top-level `func` declared outside the thread — declare a
+`func` directly inside the thread instead (see
+[Thread-private functions](#thread-private-functions) above).
 
-**Isolation.** A thread's body may call `log`/`fail`,
-string/array/map/struct/enum operations, `Math`, time functions, and
-`blankImage()` plus `img`-method drawing/clip/resize/pixel calls (each
-touches only that one private image, never shared state). It may
-**not** call any canvas/window builtin (`drawRect`, `render`,
-`saveCanvas`, ...), `setTimeout`/`setInterval`, `exec()`,
-`mkdir()`/`ls()`, `openPort()`/`openSecurePort()`, or any ordinary
-top-level `func` declared outside the thread. `sqlite()`/`sqliteInt()`/
-`sqliteFloat()`/`sqliteText()` are allowed **only** for a thread that
-declared its own `DatabaseURL` — see below.
+Two builtins are allowed conditionally:
 
-**Per-thread SQLite.** A thread's own first statement may be
-`DatabaseURL = '<literal>'` — a plain string literal only, unlike the
-main program's own `DatabaseURL` (which may be any `text` expression):
+- `sqlite()`/`sqliteInt()`/`sqliteFloat()`/`sqliteText()` — only for a
+  thread that declared its own `DatabaseURL`, see
+  [A thread's own database](#a-threads-own-database-databaseurl) below.
+- `openPort()`/`closePort()`/`openSecurePort()` — only for a thread
+  that has already declared its own `on request`/`on upgrade`/
+  `on socketMessage`/`on socketClose`, see
+  [A thread's own HTTP context](#a-threads-own-http-context) below.
+
+<a name="thread-limitations"></a>
+**`exec(args, callback)` (the non-blocking form) is rejected inside a
+thread body** — unlike the blocking `exec(args)` form, its callback
+always runs on the *main* program's own OS thread, regardless of which
+thread dispatched it, so a thread handing it a closure over its own
+private state would be a real cross-thread violation. Use the blocking
+form instead. The non-blocking HTTP client form (`req.send()` with a
+`callback` field) is unavailable inside a thread body for the identical
+reason.
+
+### A thread's own database: `DatabaseURL`
+
+A thread's own first statement may be `DatabaseURL = '<literal>'` — a
+plain string literal only, unlike the main program's own `DatabaseURL`
+(which may be any `text` expression):
 
 ```festina
 thread logger {
     DatabaseURL = './logs.sqlite'
     table LogEntry { message:text }
-    on message(p:text) {
-        sqlite('INSERT INTO LogEntry (message) VALUES (?)', [p])
+    on message(worker:thread, msg:text) {
+        sqlite('INSERT INTO LogEntry (message) VALUES (?)', [msg])
     }
 }
 logger.postMessage('started up')
@@ -3137,13 +3297,192 @@ declares no `DatabaseURL` of its own); a non-literal main `DatabaseURL`
 (an expression the compiler can't prove anything about) skips this
 check rather than guessing.
 
-**Limitations.** Threads are singletons, declared once by name — there
-is no way to spawn more than one instance of the same `thread` block
-(a worker pool, say). There is also no way to declare a thread-private
-*helper function* — every top-level `func` is either callable from
-every thread (if it never touches a global or an impure builtin) or
-from none at all; a `func` scoped to one particular thread's own body,
-closing over that thread's own state, isn't supported.
+### Thread pools: `thread NAME[N]`
+
+`thread NAME[N] { ... }` declares `N` fully independent instances of
+the same body — each its own OS thread, its own private state, its own
+inbound queue:
+
+```festina
+thread pool[4] {
+    on message(worker:thread, msg:int) {
+        postMessage(msg * 2)
+    }
+}
+pool[0].postMessage(1)
+pool[3].postMessage(2)
+```
+
+A pool instance is addressed with `NAME[i]` (`i` any `int`
+expression, not just a literal) everywhere a singleton thread's own
+bare `NAME` would be used — `pool[i].postMessage(x)`/`.kill()`/
+`.live(callback)`/`.isAlive()`/`.giveRequest(r)` all work identically
+to the singleton form, just per-instance. **An out-of-range index is a
+silent no-op** (this language's own established "test, don't fail"
+convention, the same one `NAME.isAlive()` itself already follows) —
+`pool[99].kill()` neither crashes nor raises, it simply does nothing,
+`pool[99].isAlive()` reads `false`, and `pool[99].postMessage(x)` sends
+nothing (its argument isn't even evaluated, and a chained
+`.callback(fn)` is never registered, so nothing is left dangling). The
+bare pool name on its own (`pool.kill()`, with no index) is a compile
+error naming the fix — a pool must always be indexed. There is no
+`pool.length` — the size is whatever `N` the declaration itself used,
+known at every call site already.
+
+`N` is a compile-time literal because the body is **compiled once per
+instance** — each of the `N` instances gets its own independently named
+copy of every handler, private func and state variable. That's what
+makes the instances genuinely independent with no runtime indirection,
+but it does mean a pool costs `N` copies of its body's generated code
+(a ~12-line body measures around 136 lines of LLVM IR per instance), so
+a large `N` over a large body is a real compiled-size decision rather
+than a free one.
+
+**A pool may not declare its own `DatabaseURL`.** Every instance in a
+pool runs the identical body, so a `DatabaseURL = '<literal>'` there
+would be the SAME literal path for all `N` of them — unlike an
+ordinary singleton thread's own `DatabaseURL` (always private to that
+one thread), `N` pool instances would each open their own independent
+sqlite connection into the identical file, concurrently, with no
+coordination between them. This is a compile error naming the fix; give
+each instance a genuinely distinct database with an ordinary
+(non-pool) thread declared per instance instead, or have pool workers
+message a single dedicated database thread rather than querying
+`sqlite()` directly from inside the pool.
+
+### A thread's own HTTP context
+
+A thread may declare `on request(req:http)`/`on upgrade(s:socket)`/
+`on socketMessage(s:socket, msg:blob)`/`on socketClose(s:socket)` — the
+identical four handlers/signatures the main program's own top-level
+HTTP/WebSocket support already uses (see
+[HTTP and WebSocket servers](#http-and-websocket-servers) above) — and, once
+it has declared at least one of them, call `openPort()`/`closePort()`/
+`openSecurePort()` too:
+
+```festina
+thread server {
+    on load() {
+        openPort(8080)
+    }
+    on request(req:http) {
+        req.send({'code': 200, 'body': 'hello from a thread'})
+    }
+}
+```
+
+This gives the thread its own **fully private** connection table and
+listener set — never shared with the main program's own HTTP context,
+or with any other thread's — so a program can serve traffic on more
+than one port, from more than one OS thread, with no coordination
+needed between them. A request accepted on the main program's own port
+is never routed to a thread's `on request` and vice versa; two
+listeners on different ports (one on main, one on a thread, or two
+different threads) accept and respond to real, concurrent traffic
+completely independently. The gate on `openPort()`/`openSecurePort()`
+— declaring a handler first — exists because that declaration is what
+gives this thread's own message loop the ability to actually service a
+listener at all: a thread that only ever declares state/`on load`/
+`on message`/`on exit` blocks on its own inbound queue exactly as
+before, never polling for a connection even if one were somehow
+already open.
+
+A thread that declares an HTTP-shaped handler but never calls
+`openPort()` of its own still gets this private, receive-only context
+— it simply never accepts a connection on its own; a live connection
+still reaches it whenever the main program hands one off directly (see
+[Live connection hand-off](#live-connection-hand-off-namegiverequestr)
+below), or via `on message`'s own inter-thread messaging.
+`postMessage` (bare or named) works from inside any of these four
+handlers exactly like it does from `on load`/`on message`/`on exit` or
+a private func.
+
+The http client form — `req.send()` with zero arguments — also works
+from inside a thread body (it touches no shared connection-table state
+at all, just a fresh outbound socket), including targeting the main
+program's own port or another thread's; it must never target its
+*own* listener from inside that same thread's own handler/on_load,
+though — a thread has only one OS thread servicing both its accept
+loop and any blocking call it makes, so a self-directed request would
+simply wait forever for a response nothing is left running to send.
+
+`openPort()`/`openSecurePort()` don't check whether some other context
+already listens on the same port — two contexts (main and a thread, or
+two threads, including two instances of the same pool) racing to bind
+the identical port number fails exactly the way it would outside this
+language entirely (the OS refuses the second bind); give each its own
+port.
+
+### Live connection hand-off: `NAME.giveRequest(r)`
+
+The main program, having accepted a live request on its own port, may
+hand it directly to a thread — that thread's own `on request` fires for
+it, on the connection's own live socket, exactly as if THAT thread had
+accepted it itself:
+
+```festina
+thread worker {
+    on request(req:http) {
+        req.send({'code': 200, 'body': 'handled by worker'})
+    }
+}
+
+on request(req:http?) {
+    worker.giveRequest(req)
+}
+
+openPort(8080)
+```
+
+`giveRequest` is legal only from the main program (like `kill()`/
+`live()`/`isAlive()`, a thread may not call it — including on itself or
+another thread), and only onto a thread that has already declared its
+own `on request`. The argument must be a **manually-managed `http?`**
+value — main's own top-level `on request` handler must declare its
+`req` parameter with the `?` suffix (see [`T?` — manually-managed
+values](#t-manually-managed-values) above) for this to be legal at
+all; an ordinary, auto-managed `req:http` is rejected outright, since
+main's own end-of-handler cleanup would still release it out from
+under the thread it was just handed to. **There is no compile-time
+check that main's own code never touches `r` again after handing it
+off** — the same accepted-risk contract `T?` itself already carries
+(claude.md #202): once handed off, the connection belongs entirely to
+the receiving thread, and reading or writing `r` afterward is
+undefined. In exchange, this costs nothing to make safe at the
+value level: a manually-managed value was never auto-retained or
+auto-released to begin with, so there's no automatic cleanup left to
+race against the receiving thread's own use.
+
+A request that arrives with nothing in its own body ever calling
+`ok()`/`redirect()`/`send()`/`upgrade()` still gets the same forgiving
+default (`200`, empty body) whether it was answered directly or handed
+off — a hand-off doesn't change that behavior. A thread receiving a
+handed-off request needs no `openPort()` of its own at all — the
+receive-only context
+[above](#a-threads-own-http-context) is exactly what makes this
+useful even for a thread that never listens on any port itself, e.g. a
+dedicated worker that only ever handles requests main routes to it.
+
+**First-cut scope, documented, not silently absent:**
+- **Plain (non-TLS) connections only.** A request accepted on an
+  `openSecurePort()` listener cannot be handed off yet — `giveRequest`
+  is a silent no-op for one (nothing crashes; the connection simply
+  stays with main, unresponded, until its own `on request` returns and
+  gets the same default-200 fallback above).
+- **A connection already answered, or already upgraded to a
+  WebSocket, cannot be handed off either** — both are silent no-ops
+  for the identical "test, don't fail" reason.
+- **Never hand a thread a request whose eventual answer depends on
+  that same thread's own blocking client call to the connection that
+  triggered it.** A thread has only one OS thread servicing both its
+  own accept loop and any blocking `req.send()` it makes (see
+  [A thread's own HTTP context](#a-threads-own-http-context) above) —
+  if a thread's own client request happens to be routed BACK to itself
+  (directly, or indirectly through main handing off every request main
+  receives to that one thread, including ones that thread's own code
+  triggered), nothing is left running to ever answer it, and the call
+  waits forever. Route a driving/verifying client call through a
+  different thread than the one receiving the hand-off.
 
 ## Audio
 

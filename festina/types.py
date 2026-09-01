@@ -85,16 +85,35 @@ class EnumType:
 
 @dataclass(frozen=True)
 class ThreadType:
-    """claude.md #195: `thread NAME { ... }` -- name-only, exactly like
-    StructType/TableType/EnumType above. `NAME` itself becomes a global
-    value of this type, supporting exactly five methods: `.postMessage(x)`,
-    `.onMessage(callback)`, `.kill()`, `.live(callback)`, `.isAlive()`.
-    The real inbound/outbound message types (both INFERRED, never
-    declared -- see semantic.py's own thread-analysis comments) live in
+    """claude.md #195/#208: `thread NAME { ... }` -- name-only, exactly
+    like StructType/TableType/EnumType above. `NAME` itself becomes a
+    global value of this type, supporting `.postMessage(x)`, `.kill()`,
+    `.live(callback)`, `.isAlive()`. The real inbound message type
+    (DECLARED, on this thread's own `on message(worker:thread, msg:T)`
+    handler -- see semantic.py's own thread-analysis comments) lives in
     a separate `threads` dict (semantic.py's AnalyzedProgram, mirrored
     in codegen.py's self.threads), the same split every other name-only
-    type here already uses."""
-    name: str
+    type here already uses.
+
+    claude.md #208: `name` is `None` for the GENERIC variant -- the
+    type spelled by the bare `thread` keyword in a parameter position
+    (`on message(worker:thread, msg:T)`), resolved once, in
+    resolve_type_name, alongside every other builtin type keyword.
+    This is deliberately a DIFFERENT value from any specific declared
+    thread's own `ThreadType("someName")` (dataclass equality means the
+    two never compare equal) -- there is no way for ordinary Festina
+    code to construct a `thread`-typed value itself; `worker`'s own
+    value only ever arrives via message delivery (the sender's own
+    handle, boxed by the runtime at every postMessage/bare-postMessage
+    send site), so no widening/narrowing conversion between the named
+    and generic forms is needed anywhere in this compiler.
+
+    claude.md #216: `worker` is never `null` any more -- when main is
+    the sender, it's a real singleton handle (`is_main` set at the
+    runtime level), exposed to Festina code as the one field on
+    `thread`, `.main:bool` (see semantic.py's ThreadType field-access
+    branch)."""
+    name: str | None
 
     def __repr__(self):
         return f"ThreadType({self.name})"
@@ -379,4 +398,14 @@ def type_name(t):
         params = ",".join(type_name(p) for p in t.param_types)
         ret = "void" if t.return_type is None else type_name(t.return_type)
         return f"func[{params}]:{ret}"
+    if isinstance(t, ThreadType):
+        # claude.md #218: without this, every user-facing message about
+        # a thread value (`cannot assign value of type X to int`, an
+        # argument-type mismatch, ...) fell through to `str(t)` below
+        # and printed this class's own Python repr -- `ThreadType(None)`
+        # -- rather than the type as the language actually spells it.
+        # The generic variant IS spelled `thread`; a specific declared
+        # thread's own type is only ever reachable through its name, so
+        # naming it that way is what a reader can act on.
+        return "thread" if t.name is None else f"thread '{t.name}'"
     return str(t)

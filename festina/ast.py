@@ -152,25 +152,33 @@ class EventHandler(Node):
 
 
 class ThreadDecl(Node):
-    """claude.md #195: `thread NAME { ... }` -- an isolated background
-    worker: its own OS thread, its own private state, and message
-    queues to/from the main program. No signature of its own (no
+    """claude.md #195/#208: `thread NAME { ... }` -- an isolated
+    background worker: its own OS thread, its own private state, and
+    message queues to/from the main program (and, per claude.md #208,
+    to/from any other thread directly). No signature of its own (no
     parens) -- `body` is an ordinary block that may contain nested
-    `on load()`/`on message(p:T)`/`on exit(code:int)` handlers (parsed
-    as ordinary EventHandler nodes, same as anywhere else) and
-    thread-private state VarDecls. `NAME` itself becomes a global
-    value semantic.py registers with a `ThreadType`, supporting
-    `.postMessage(x)`/`.onMessage(callback)`/`.kill()`/`.live(callback)`/
-    `.isAlive()`. The thread's inbound message type is whatever its own
-    `on message(p:T)` (if any) declares -- found by semantic analysis,
-    not stored here; there is deliberately no place in this node for a
-    message type, since one would only ever be checked against that
-    handler's own parameter and never used for anything else."""
-    def __init__(self, name, body, line=0, column=0):
+    `on load()`/`on message(worker:thread, msg:T)`/`on exit(code:int)`
+    handlers (parsed as ordinary EventHandler nodes, same as anywhere
+    else) and thread-private state VarDecls. `NAME` itself becomes a
+    global value semantic.py registers with a `ThreadType`, supporting
+    `.postMessage(x)`/`.kill()`/`.live(callback)`/`.isAlive()`. The
+    thread's inbound message type is whatever its own `on message`
+    (if any) declares -- found by semantic analysis, not stored here;
+    there is deliberately no place in this node for a message type,
+    since one would only ever be checked against that handler's own
+    parameter and never used for anything else.
+
+    claude.md #209: `pool_size` is `None` for an ordinary singleton
+    thread, or a positive `int` for `thread NAME[N] { ... }` -- a pool
+    of `N` independent instances of the same body, addressed at a use
+    site via `NAME[i]` (an ordinary computed `Member`, needing no
+    grammar of its own -- see parse_thread_decl's own comment)."""
+    def __init__(self, name, body, line=0, column=0, pool_size=None):
         self.name = name
         self.body = body
         self.line = line
         self.column = column
+        self.pool_size = pool_size
 
 
 class Block(Node):
