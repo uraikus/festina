@@ -58,6 +58,18 @@ available (statically linked when possible — see
 [setup.md](setup.md#static-linking-sqlite3)), since automatic database
 support (`table`, `sqlite()`) is always on.
 
+## Imports
+
+```festina
+import database.f
+import graphics.f
+```
+
+Resolved recursively before compilation into one merged compilation
+unit; a file is never imported more than once even if multiple files
+depend on it; errors still point at the file a statement actually came
+from.
+
 ## Types
 
 ```text
@@ -764,6 +776,98 @@ only unchecked operation in the language.
 Arrays grow, and are searched, through the methods in
 [Growing arrays](#growing-arrays) below.
 
+### Growing arrays
+
+```festina
+arr[int] xs = [1, 2, 3]
+
+xs.push(4)          // -> new length
+xs.pop()            // -> last element, removed
+xs.shift()          // -> first element, removed
+xs.unshift(0)       // -> new length
+arr[int] cut = xs.splice(1, 2)   // remove 2 from index 1, return them
+xs.splice(1, 0, [8, 9])           // insert [8, 9] at index 1, remove nothing
+xs.indexOf(3)       // -> first index holding 3, or -1
+```
+
+`splice` clamps rather than failing — a negative start counts back from
+the end, and an oversized range clamps to what's actually there, so
+`splice(i, 1)` at a boundary is a no-op. It takes an optional third
+argument — `splice(start, count, insertArr)` — to insert as well as
+remove (Festina has no variadic calls, so the items to insert are one
+explicit `arr[T]` rather than a spread list); either way only the
+REMOVED elements are returned, never the inserted ones.
+
+`push()`/`unshift()`/`pop()`/`shift()`/`splice()` each resize the
+backing buffer to exactly the new length internally, not amortized —
+see [`amor` — amortized-growth arrays](#amor--amortized-growth-arrays)
+below if that matters for a specific array (a long run of pushes in
+particular).
+
+`pop()`/`shift()` on an empty array return `null` — not zero, so an
+empty pop is distinguishable from popping a real `0`:
+
+```festina
+arr[int] empty = []
+log(empty.pop() == null)     // true
+```
+
+`indexOf()` answers `-1` when the value isn't present, rather than
+`null` — an index is the kind of thing you compare or feed straight to
+`splice`, and both read naturally against `-1`:
+
+```festina
+if queue.indexOf(target) >= 0 { ... }
+queue.splice(queue.indexOf(target), 1)   // remove by value
+```
+
+What "the same value" means depends on the element type:
+
+- `int`, `float`, `bool` — **by value**.
+- `text` — **by content**, so a needle built at runtime finds a match:
+  `names.indexOf('gr' + 'ace')` is `1` for `['ada', 'grace']`. (Identity
+  would be useless here: text is copied on binding, so two equal strings
+  are almost always two different buffers.)
+- `struct`, `arr`, `map` — **by identity**. Two separately-declared
+  structs with identical fields are two different values; only the one
+  actually in the array is found.
+
+Elements are owned the same way any other binding owns them: pushing a
+`text` copies it, so the array and the variable don't share a buffer.
+Removing transfers ownership to whoever receives it. `indexOf()` takes
+no ownership at all — an index isn't a reference.
+
+### Sorting: `sort(cmpFn)`
+
+```festina
+int func byAsc(a:int, b:int) { return a - b }
+
+arr[int] xs = [5, 3, 8, 1]
+xs.sort(byAsc)         // in place -- xs is now [1,3,5,8]
+```
+
+`sort()` takes a comparator, `cmpFn:func[T,T]:int`, and sorts in place —
+JavaScript's/C `qsort()`'s convention: return negative if the first
+argument belongs before the second, positive if after, `0` if they're
+equal. Sorting is **stable** — two elements the comparator calls equal
+keep their original relative order, so sorting a list twice by two
+different keys ("sort by name, then re-sort by score" to get "score
+descending, ties broken by name") behaves the way it reads.
+
+The comparator can be any `func[T,T]:int`-typed expression, not just the
+bare name of a declared function — a variable holding a function value
+works too, the same first-class-function rule every other callback
+(`.callback()`) already follows.
+
+```festina
+struct Enemy { name:text y:int }
+
+int func byDepth(a:Enemy, b:Enemy) { return a.y - b.y }
+
+arr[Enemy] enemies = [...]
+enemies.sort(byDepth)   // back-to-front draw order by Y position
+```
+
 ## Maps
 
 ```festina
@@ -1025,6 +1129,50 @@ DatabaseURL = environment.DATABASE_URL
 statement is a compile-time error; it has no effect at all in an
 imported file (only the file actually passed to the compiler is
 checked).
+
+### Single-value queries
+
+A `struct` — unlike a `table` — declares only a shape, not a real
+table, so it costs nothing to use as a one-off landing spot for a
+value that would otherwise need a throwaway `table` sitting in your
+database forever just to receive a `count(*)`:
+
+```festina
+struct Total { total:int }
+struct Name  { name:text }
+struct Mean  { mean:float }
+
+arr[Total] t = sqlite(`SELECT count(*) AS total FROM Post`)
+int total = t[0].total
+
+arr[Name] n = sqlite(`SELECT title AS name FROM Post WHERE id = ?`, [2])
+text name = n[0].name
+
+arr[Mean] m = sqlite(`SELECT avg(score) AS mean FROM Post`)
+float mean = m[0].mean
+```
+
+Alias the column to match the struct's field name (`AS total`, `AS
+name`, ...) the same way any `sqlite()` query does. A query matching no
+rows comes back as an empty array (`arr.length == 0`) rather than a
+value — check that before indexing `[0]`.
+
+### JSON and full-text search
+
+Both are ordinary SQL, and `sqlite()` passes SQL through untouched — so
+SQLite's JSON1 and FTS5 work today with no extra language feature:
+
+```festina
+struct Name { name:text }
+arr[Name] n = sqlite(`SELECT json_extract(data, '$.name') AS name FROM Doc WHERE id = ?`, [1])
+log(n[0].name)
+
+sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
+sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
+struct Total { total:int }
+arr[Total] t = sqlite(`SELECT count(*) AS total FROM PostSearch WHERE PostSearch MATCH ?`, ['machine'])
+log(t[0].total)
+```
 
 ## Environment variables
 
@@ -2833,142 +2981,6 @@ doTheWork()
 log(`took ${now() - started}ms`)
 ```
 
-### Single-value queries
-
-A `struct` — unlike a `table` — declares only a shape, not a real
-table, so it costs nothing to use as a one-off landing spot for a
-value that would otherwise need a throwaway `table` sitting in your
-database forever just to receive a `count(*)`:
-
-```festina
-struct Total { total:int }
-struct Name  { name:text }
-struct Mean  { mean:float }
-
-arr[Total] t = sqlite(`SELECT count(*) AS total FROM Post`)
-int total = t[0].total
-
-arr[Name] n = sqlite(`SELECT title AS name FROM Post WHERE id = ?`, [2])
-text name = n[0].name
-
-arr[Mean] m = sqlite(`SELECT avg(score) AS mean FROM Post`)
-float mean = m[0].mean
-```
-
-Alias the column to match the struct's field name (`AS total`, `AS
-name`, ...) the same way any `sqlite()` query does. A query matching no
-rows comes back as an empty array (`arr.length == 0`) rather than a
-value — check that before indexing `[0]`.
-
-### JSON and full-text search
-
-Both are ordinary SQL, and `sqlite()` passes SQL through untouched — so
-SQLite's JSON1 and FTS5 work today with no extra language feature:
-
-```festina
-struct Name { name:text }
-arr[Name] n = sqlite(`SELECT json_extract(data, '$.name') AS name FROM Doc WHERE id = ?`, [1])
-log(n[0].name)
-
-sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
-sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
-struct Total { total:int }
-arr[Total] t = sqlite(`SELECT count(*) AS total FROM PostSearch WHERE PostSearch MATCH ?`, ['machine'])
-log(t[0].total)
-```
-
-## Growing arrays
-
-```festina
-arr[int] xs = [1, 2, 3]
-
-xs.push(4)          // -> new length
-xs.pop()            // -> last element, removed
-xs.shift()          // -> first element, removed
-xs.unshift(0)       // -> new length
-arr[int] cut = xs.splice(1, 2)   // remove 2 from index 1, return them
-xs.splice(1, 0, [8, 9])           // insert [8, 9] at index 1, remove nothing
-xs.indexOf(3)       // -> first index holding 3, or -1
-```
-
-`splice` clamps rather than failing — a negative start counts back from
-the end, and an oversized range clamps to what's actually there, so
-`splice(i, 1)` at a boundary is a no-op. It takes an optional third
-argument — `splice(start, count, insertArr)` — to insert as well as
-remove (Festina has no variadic calls, so the items to insert are one
-explicit `arr[T]` rather than a spread list); either way only the
-REMOVED elements are returned, never the inserted ones.
-
-`push()`/`unshift()`/`pop()`/`shift()`/`splice()` each resize the
-backing buffer to exactly the new length internally, not amortized —
-see [`amor` — amortized-growth arrays](#amor--amortized-growth-arrays)
-below if that matters for a specific array (a long run of pushes in
-particular).
-
-`pop()`/`shift()` on an empty array return `null` — not zero, so an
-empty pop is distinguishable from popping a real `0`:
-
-```festina
-arr[int] empty = []
-log(empty.pop() == null)     // true
-```
-
-`indexOf()` answers `-1` when the value isn't present, rather than
-`null` — an index is the kind of thing you compare or feed straight to
-`splice`, and both read naturally against `-1`:
-
-```festina
-if queue.indexOf(target) >= 0 { ... }
-queue.splice(queue.indexOf(target), 1)   // remove by value
-```
-
-What "the same value" means depends on the element type:
-
-- `int`, `float`, `bool` — **by value**.
-- `text` — **by content**, so a needle built at runtime finds a match:
-  `names.indexOf('gr' + 'ace')` is `1` for `['ada', 'grace']`. (Identity
-  would be useless here: text is copied on binding, so two equal strings
-  are almost always two different buffers.)
-- `struct`, `arr`, `map` — **by identity**. Two separately-declared
-  structs with identical fields are two different values; only the one
-  actually in the array is found.
-
-Elements are owned the same way any other binding owns them: pushing a
-`text` copies it, so the array and the variable don't share a buffer.
-Removing transfers ownership to whoever receives it. `indexOf()` takes
-no ownership at all — an index isn't a reference.
-
-### Sorting: `sort(cmpFn)`
-
-```festina
-int func byAsc(a:int, b:int) { return a - b }
-
-arr[int] xs = [5, 3, 8, 1]
-xs.sort(byAsc)         // in place -- xs is now [1,3,5,8]
-```
-
-`sort()` takes a comparator, `cmpFn:func[T,T]:int`, and sorts in place —
-JavaScript's/C `qsort()`'s convention: return negative if the first
-argument belongs before the second, positive if after, `0` if they're
-equal. Sorting is **stable** — two elements the comparator calls equal
-keep their original relative order, so sorting a list twice by two
-different keys ("sort by name, then re-sort by score" to get "score
-descending, ties broken by name") behaves the way it reads.
-
-The comparator can be any `func[T,T]:int`-typed expression, not just the
-bare name of a declared function — a variable holding a function value
-works too, the same first-class-function rule every other callback
-(`.callback()`) already follows.
-
-```festina
-struct Enemy { name:text y:int }
-
-int func byDepth(a:Enemy, b:Enemy) { return a.y - b.y }
-
-arr[Enemy] enemies = [...]
-enemies.sort(byDepth)   // back-to-front draw order by Y position
-```
-
 ## Timers
 
 ```festina
@@ -3666,18 +3678,6 @@ alternative would be breaking a reservation you asked for.
 `isPlaying()` is about the **clip**, not one playback of it: it is true
 while any channel is playing that clip. To ask about a single
 playback, name its channel with `isAudioPlayerPlaying(n)` instead.
-
-## Imports
-
-```festina
-import database.f
-import graphics.f
-```
-
-Resolved recursively before compilation into one merged compilation
-unit; a file is never imported more than once even if multiple files
-depend on it; errors still point at the file a statement actually came
-from.
 
 ## `log()` / `fail()` / `close()`
 

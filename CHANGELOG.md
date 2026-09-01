@@ -9,6 +9,23 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.37] - 2026-09-01
+
+### Documentation
+
+- **api.md reorganized.** Three sections that had drifted far from
+  their own topic (an artifact of being documented in whatever order
+  they were built rather than the order a reader looks for them) moved
+  to where they belong: "Single-value queries"/"JSON and full-text
+  search" into `Built-in SQLite`, "Growing arrays"/"Sorting" into
+  `Arrays`, and `Imports` up near the top, right after the compilation
+  pipeline. No headings renamed, so every existing anchor (including
+  external links from this changelog) still resolves. Checked the
+  whole file for stale language left over from this session's earlier
+  removals/fixes -- none found.
+
+See claude.md #229.
+
 ## [0.36] - 2026-09-01
 
 ### Fixed
