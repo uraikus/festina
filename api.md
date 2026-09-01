@@ -3057,8 +3057,11 @@ Sendable types today: `int`, `float`, `bool`, `text`, `color`,
 `enum` built recursively from any of those (a self-referencing
 `struct`/`arr[T]`/`map[T]` type is rejected at compile time — cloning
 it could loop forever on a genuinely cyclic value). `func`,
-`http`/`socket`, `regex`, and `table` never will be (see
-"Limitations" below).
+`http`/`socket`, `regex`, and `table` never will be, as an ordinary
+`postMessage` argument (see "Limitations" below) — a **live**
+`http` request is a separate matter, handed off (not cloned, not sent
+through `postMessage` at all) via `NAME.giveRequest(r)`, see
+[Live connection hand-off](#threads) below.
 
 **Lifecycle.**
 

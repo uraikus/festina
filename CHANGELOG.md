@@ -9,6 +9,23 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.27] - 2026-09-01
+
+### Changed
+
+- **Docs/tests/release consolidation for the `thread` extensions
+  plan** (thread pools, thread-private functions, wider builtin
+  access, private per-thread HTTP contexts, live connection
+  hand-off -- 0.22 through 0.26). Audited api.md's Threads/HTTP
+  sections end to end; clarified the "Sendable types" paragraph's own
+  wording now that a live `http` request can be handed off (not
+  cloned, not sent through `postMessage`) via `giveRequest`. Full,
+  unfiltered `scripts/leak_stress.sh` and `scripts/thread_tsan_
+  stress.sh` runs (every stress program, not just this plan's own
+  additions) both clean.
+
+See claude.md #214.
+
 ## [0.26] - 2026-09-01
 
 ### Added
