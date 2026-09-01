@@ -495,6 +495,31 @@ def _is_refcounted(t):
                            types_mod.UrlType, types_mod.EnumType))
             or t == BLOB)
 
+
+def _is_manually_managed(t):
+    """claude.md #202: `T?` -- true exactly for a resolved type whose
+    own `manually_managed` field (set by semantic.py's
+    apply_manually_managed, from a trailing `?` after the type at a
+    declaration/parameter site) is True. Safe on any type, including
+    ones with no such field at all (getattr's own default), since
+    `?` is accepted-but-inert on scalars/text/color/font/table (see
+    apply_manually_managed's own comment) -- those never get the flag
+    set in the first place, so this is simply always False for them,
+    with no special-casing needed here either.
+
+    The representation (heap allocation, refcount header,
+    _release_fn_for dispatch) is IDENTICAL whether or not this is
+    True -- `free`/`delete` (_emit_free/_emit_delete) dispatch through
+    that same pair completely unconditionally of this flag, and need
+    no changes at all. This predicate exists only to gate the
+    AUTOMATIC bookkeeping call sites (declaration-time retain,
+    scope-exit release tracking, reassignment retain/release,
+    escaping-parameter retain) that every other refcounted value gets
+    for free and a manually-managed one must never get -- the whole
+    point of `T?` is that the program, not the compiler, decides when
+    (if ever) it's released."""
+    return getattr(t, "manually_managed", False)
+
 FESTINA_ARRAY_LLVM_TYPE = "%struct._FestinaArray"
 # claude.md #174: amor arr[T] -- an "amortized array". Byte-compatible
 # with FESTINA_ARRAY_LLVM_TYPE's own {i64 length, ptr data} prefix
@@ -1115,6 +1140,24 @@ class CodeGen:
                                                 # escape_analysis.find_escaping_names call this session
                                                 # makes (see _emit_analyzed_func_body) -- see that
                                                 # module's own docstring for the full contract.
+        self._manually_managed_refs = set()    # claude.md #202: `T?` -- storage refs (e.g. "@name" for
+                                                # a global, "%name.123" for a local/parameter slot) bound
+                                                # by a declaration/parameter whose own AST node carried
+                                                # manually_managed=True. `env` itself keeps storing the
+                                                # ordinary, unflagged resolved Type for every binding
+                                                # (T? has byte-identical runtime representation to T, and
+                                                # every existing type-shape dispatch in this file -- ==
+                                                # BLOB/REGEX, isinstance(..., StructType), ... -- must stay
+                                                # completely unaware `?` exists), so this is the ONE place
+                                                # that answers "was THIS binding declared manually-managed"
+                                                # for the handful of sites (reassignment retain/release,
+                                                # escaping-parameter retain) that need to know, without
+                                                # threading a second value through env.lookup's own return
+                                                # shape everywhere. A ref is unique per COMPILE-TIME
+                                                # declaration/parameter site (not per runtime execution --
+                                                # a loop body's own VarDecl is emitted, and _unique()'d,
+                                                # exactly once), so membership is stable for every
+                                                # assignment textually reachable from that same binding.
         self._active_free_locals = []          # claude.md #74: stack of "frames," one per currently-
                                                 # open block within the function/handler body being
                                                 # emitted -- not just its own top-level body anymore, but
@@ -2053,8 +2096,23 @@ class CodeGen:
             self._emit_thread_decl(stmt)
             return
         if isinstance(stmt, ast.VarDecl):
+            # claude.md #202: `type_` here is deliberately the BARE
+            # (never manually_managed-flagged) resolved type, unlike
+            # semantic.py's own resolution -- codegen's runtime
+            # representation for `T?` is byte-for-byte identical to
+            # `T` (that's the whole point), so every existing
+            # type-shape dispatch in this file (== BLOB/REGEX,
+            # isinstance(..., StructType), ...) must keep seeing the
+            # ordinary type, completely unaware `?` exists. Only the
+            # small set of AUTOMATIC-bookkeeping call sites (see
+            # _is_manually_managed's own doc comment) need to know
+            # about it at all, and they read it directly off the
+            # AST node's own `.manually_managed` flag instead, never
+            # off `type_`.
             type_ = self._resolve(stmt.type_expr, stmt)
             ref = f"@{stmt.name}"
+            if stmt.manually_managed:
+                self._manually_managed_refs.add(ref)
             self.global_env.define(stmt.name, ref, type_)
             self.entry_stmts.append(stmt)
             return
@@ -2381,15 +2439,37 @@ class CodeGen:
         tracking."""
         escaping = escape_analysis.find_escaping_names(decl.body, escaping_params=self.escaping_params)
         for t, p in zip(param_types, decl.params):
-            slot = f"%{p.name}"
+            # claude.md #202: `.{self._unique()}` -- a plain `%{p.name}`
+            # was unique enough while nothing outside _emit_local_
+            # retain_release's own `ref` parameter ever needed to
+            # recognize this exact string again from OUTSIDE the
+            # function currently being emitted -- LLVM's own local
+            # namespace is per-function, so two different functions
+            # both naming a parameter `c` never collided at the IR
+            # level. `self._manually_managed_refs` (below) does need
+            # that: it's a single set shared across the WHOLE compile,
+            # so two unrelated `c` parameters -- one manually-managed,
+            # one not -- would otherwise collide on the identical
+            # string and silently cross-contaminate each other's
+            # bookkeeping. Mirrors every VarDecl-local slot, which
+            # already carries this exact suffix for this exact reason.
+            slot = f"%{p.name}.{self._unique()}"
             body_lines.append(f"  {slot} = alloca {_llvm_type(t)}")
             arg_ref = f"%arg.{p.name}"
-            if p.name in escaping and _is_refcounted(t):
+            if p.manually_managed:
+                self._manually_managed_refs.add(slot)
+            if p.name in escaping and _is_refcounted(t) and not p.manually_managed:
                 # claude.md #118: _is_refcounted rather than the
                 # struct/arr/map tuple, so a blob/img/aud/regex
                 # parameter that escapes (is reassigned, say) carries
                 # its own +1 here too -- otherwise the reassignment's
                 # release would drop a reference the CALLER still owns.
+                #
+                # claude.md #202: `T?` -- never retained, never tracked
+                # for scope-exit release, no matter how the callee's
+                # own body uses it -- the whole point is that nothing
+                # here ever automatically decides this binding's
+                # lifetime.
                 body_lines.append(f"  call void @festina_retain(ptr {arg_ref})")
                 self._active_free_locals[-1].append((slot, t))
             elif p.name in escaping and t == TEXT:
@@ -3265,8 +3345,12 @@ class CodeGen:
         on_load_decl = on_message_decl = on_exit_decl = None
         for stmt in decl.body.body:
             if isinstance(stmt, ast.VarDecl):
+                # claude.md #202: bare (unflagged) type -- see the
+                # identical comment on _toplevel's own VarDecl branch.
                 type_ = self._resolve(stmt.type_expr, stmt)
                 ref = f"@__festina_thread_{decl.name}_state_{stmt.name}"
+                if stmt.manually_managed:
+                    self._manually_managed_refs.add(ref)
                 self.global_env.define(ref[1:], ref, type_)
                 state_env.define(stmt.name, ref, type_)
                 if stmt.init is not None:
@@ -3665,7 +3749,14 @@ class CodeGen:
         _current_escaping_names is None -- __festina_main's own top-
         level statements, which #74 doesn't analyze at all), this is
         unchanged from before #74 existed: no frame, no tracking,
-        nothing freed."""
+        nothing freed.
+
+        claude.md #202: a `T?` VarDecl (stmt.manually_managed) is
+        skipped from this tracking outright, regardless of its own
+        type or escape_analysis's escaping-ness verdict for it -- it
+        is never auto-released at scope exit, full stop, so there is
+        nothing about "does this scope own the release" left for this
+        method to decide for it."""
         env = Env(parent_env)
         ctx = {"lines": lines, "terminated": False}
         tracking = self._current_escaping_names is not None
@@ -3676,7 +3767,7 @@ class CodeGen:
                 if ctx["terminated"]:
                     break
                 self._emit_stmt(stmt, env, return_type, ctx)
-                if tracking and isinstance(stmt, ast.VarDecl):
+                if tracking and isinstance(stmt, ast.VarDecl) and not stmt.manually_managed:
                     found = env.lookup(stmt.name)
                     if found is not None:
                         ref, type_ = found
@@ -3839,6 +3930,8 @@ class CodeGen:
     def _emit_stmt(self, stmt, env, return_type, ctx):
         lines = ctx["lines"]
         if isinstance(stmt, ast.VarDecl):
+            # claude.md #202: bare (unflagged) type -- see the
+            # identical comment on _toplevel's own VarDecl branch.
             type_ = self._resolve(stmt.type_expr, stmt)
             # claude.md #197: EnumType/HttpType/SocketType/UrlType join
             # this branch too -- all four are `_is_refcounted`, all
@@ -3898,12 +3991,21 @@ class CodeGen:
                     val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                     fresh = self._refcounted_source_is_fresh(stmt.init, vtype, type_)
                     val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
-                    if not fresh:
+                    # claude.md #202: `T?` -- never auto-retain on
+                    # declaration, aliased initializer or not. The
+                    # binding shares whatever single reference its
+                    # initializer already held (or, if `fresh`, the
+                    # one it was just born with); either way this
+                    # scope neither owns nor tracks it, and only an
+                    # explicit free()/delete() will ever release it.
+                    if not fresh and not stmt.manually_managed:
                         lines.append(f"  call void @festina_retain(ptr {val})")
                     lines.append(f"  store ptr {val}, ptr {slot}")
                 # No tracking call here: _emit_block scans each VarDecl
                 # it emits and looks the name back up, so defining it is
                 # all this branch owes the release machinery.
+                if stmt.manually_managed:
+                    self._manually_managed_refs.add(slot)
                 env.define(stmt.name, slot, type_)
                 return
             if isinstance(type_, types_mod.StructType):
@@ -4001,14 +4103,27 @@ class CodeGen:
                     # correctly counted, whichever way it came to exist.
                     val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                     val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
-                    if not self._is_owning_refcounted_source(stmt.init):
+                    # claude.md #202: `T?` -- see the identical retain
+                    # skip on the blob/regex/img/aud/http/socket/url/
+                    # enum branch above.
+                    if not self._is_owning_refcounted_source(stmt.init) and not stmt.manually_managed:
                         lines.append(f"  call void @festina_retain(ptr {val})")
                     lines.append(f"  {slot} = alloca ptr")
                     lines.append(f"  store ptr {val}, ptr {slot}")
+                    if stmt.manually_managed:
+                        self._manually_managed_refs.add(slot)
                     env.define(stmt.name, slot, type_)
                     return
+                # claude.md #202: a manually-managed struct is never
+                # stack-allocated, regardless of escape_analysis's own
+                # verdict -- it needs a stable, independently freeable
+                # heap address for as long as the program might still
+                # hold a reference to it, which the compiler has no
+                # way to bound the way it can for an ordinary local
+                # (whose escaping-ness IS exactly that bound).
                 non_escaping = (self._current_escaping_names is not None
-                                and stmt.name not in self._current_escaping_names)
+                                and stmt.name not in self._current_escaping_names
+                                and not stmt.manually_managed)
                 if non_escaping:
                     lines.append(f"  {backing} = alloca {struct_ty}")
                     # calloc zero-initializes; alloca doesn't -- claude.md
@@ -4044,6 +4159,8 @@ class CodeGen:
                     backing = self._emit_fresh_heap_header(struct_ty, lines, type_tag=type_tag)
                 lines.append(f"  {slot} = alloca ptr")
                 lines.append(f"  store ptr {backing}, ptr {slot}")
+                if stmt.manually_managed:
+                    self._manually_managed_refs.add(slot)
                 env.define(stmt.name, slot, type_)
                 # stmt.init is None here -- handled by the early-return
                 # branch above.
@@ -4095,10 +4212,14 @@ class CodeGen:
                 if stmt.init is not None:
                     val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                     val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
-                    if not self._is_owning_refcounted_source(stmt.init):
+                    # claude.md #202: `T?` -- see the identical retain
+                    # skip on the StructType branch above.
+                    if not self._is_owning_refcounted_source(stmt.init) and not stmt.manually_managed:
                         lines.append(f"  call void @festina_retain(ptr {val})")
                     lines.append(f"  {slot} = alloca ptr")
                     lines.append(f"  store ptr {val}, ptr {slot}")
+                    if stmt.manually_managed:
+                        self._manually_managed_refs.add(slot)
                     env.define(stmt.name, slot, type_)
                     return
                 if stack_allocatable:
@@ -4108,6 +4229,8 @@ class CodeGen:
                     backing = self._emit_fresh_heap_header(payload_ty, lines)
                 lines.append(f"  {slot} = alloca ptr")
                 lines.append(f"  store ptr {backing}, ptr {slot}")
+                if stmt.manually_managed:
+                    self._manually_managed_refs.add(slot)
                 env.define(stmt.name, slot, type_)
                 # stmt.init is None here -- handled by the early-return
                 # branches above.
@@ -7396,6 +7519,14 @@ class CodeGen:
         `null`, and `free(NULL)` is always a defined no-op."""
         if not ref.startswith("@"):
             return val
+        # claude.md #202: `T?` -- a manually-managed global's own slot
+        # is never touched here at all: no read-and-free of whatever
+        # it held, no retain of the new value. The caller still always
+        # stores whatever this returns (unchanged `val`), so the
+        # assignment itself proceeds exactly as normal -- only the
+        # bookkeeping around it is skipped.
+        if ref in self._manually_managed_refs:
+            return val
         if ttype == TEXT:
             old = self.tmp()
             lines.append(f"  {old} = load ptr, ptr {ref}")
@@ -7757,6 +7888,14 @@ class CodeGen:
         header's own out-pointers) works exactly the same whether the
         header itself lives on the stack or the heap, so nothing about
         #175's representation change disqualifies this optimization."""
+        # claude.md #202: `T?` -- a manually-managed arr[T]/map[T] is
+        # never stack-allocated, matching the identical StructType
+        # rule right above it in _emit_stmt -- it needs a stable,
+        # independently freeable heap address for as long as the
+        # program might still hold a reference to it, not just for as
+        # long as escape_analysis can prove THIS name still needs it.
+        if stmt.manually_managed:
+            return False
         if self._current_escaping_names is None or stmt.name in self._current_escaping_names:
             return False
         if isinstance(type_, types_mod.ArrayType) and type_.amortized:
@@ -7843,7 +7982,17 @@ class CodeGen:
         it if this reassignment was its last reference. Retain (when it
         happens) still happens before release, for the identical
         self-assignment-safety reason the global version's own comment
-        explains."""
+        explains.
+
+        claude.md #202: `T?` -- a manually-managed local's own slot is
+        skipped here entirely (no read-and-release of whatever it
+        held, no retain of the new value), the identical no-op
+        _emit_global_retain_release's own guard gives a manually-
+        managed global -- _emit_assign's own trailing `store` still
+        always runs regardless, so the reassignment itself proceeds
+        exactly as normal."""
+        if ref in self._manually_managed_refs:
+            return
         old = self.tmp()
         lines.append(f"  {old} = load ptr, ptr {ref}")
         if not self._refcounted_source_is_fresh(source_expr, source_type, ttype):

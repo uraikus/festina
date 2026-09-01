@@ -271,6 +271,40 @@ for int i = 0, i < 40, i++ {
 }
 log(total)
 """,
+    # claude.md #202: `T?` -- struct/arr/map, all through the SAME
+    # `_is_manually_managed` gate in codegen.py, in one program (the
+    # representation and the gating are identical across every eligible
+    # type, unlike img/aud's own type-specific quirks above, so one
+    # combined program is real coverage rather than three copies of the
+    # same assertion). Every allocation is freed EXPLICITLY -- this
+    # program is proof `free`/`delete` still fully reclaim a manually-
+    # managed value; see test_manually_managed_value_leaks_when_never_
+    # freed below for the opposite (and equally load-bearing) proof,
+    # that skipping free() on one is a REAL leak, not silently caught by
+    # the automatic system that every other type here relies on.
+    "manually_managed": """
+struct Point { x:int y:int }
+int total = 0
+for int i = 0, i < 200, i++ {
+    Point? p
+    p.x = i
+    p.y = i * 2
+    total = total + p.x + p.y
+    free p
+
+    arr[int]? xs
+    xs.push(i)
+    xs.push(i + 1)
+    total = total + xs.length
+    free xs
+
+    map[int]? m
+    m['k'] = i
+    total = total + m['k']
+    free m
+}
+log(total)
+""",
 }
 
 
@@ -337,6 +371,64 @@ class TestLeakStress:
         assert result.returncode != 0, (
             "the leak harness reported a known-leaking program as clean, which "
             "means it is not instrumenting anything:\n" + result.stdout)
+        assert "LeakSanitizer" in result.stdout
+
+    def test_manually_managed_value_leaks_when_never_freed(self, tmp_path):
+        """claude.md #202: the opposite-direction canary `T?` needs that
+        no other type in this suite does. Every other per-type program
+        above is proof the compiler reclaims a value it automatically
+        manages; this is proof it does NOT automatically manage a `T?`
+        one at all -- a manually-managed struct that's simply let go
+        out of scope, with no `free`/`delete` ever called on it, MUST
+        show up as a real, reported leak. If it didn't, the compiler
+        would be silently retaining/releasing it after all, defeating
+        the entire point of the `?` qualifier (claude.md #111's `free`
+        statement would then have nothing left to be the ONLY release
+        for)."""
+        canary = tmp_path / "canary.f"
+        canary.write_text(
+            "struct Point { x:int y:int }\n"
+            "Point? sink\n"
+            "int i = 0\n"
+            "while i < 200 {\n"
+            "    Point? p\n"
+            "    p.x = i\n"
+            "    // Assigned into a GLOBAL, deliberately -- not just to\n"
+            "    // exercise the reassignment-skip gate too (an ordinary\n"
+            "    // managed struct assigned here would retain the new\n"
+            "    // value and release whatever `sink` held before), but\n"
+            "    // because a value that's merely READ and discarded is\n"
+            "    // provably dead code once nothing auto-manages it (no\n"
+            "    // retain/release call remains for LLVM's own optimizer\n"
+            "    // to treat as opaque), and gets optimized away entirely\n"
+            "    // -- confirmed directly: an earlier draft of this\n"
+            "    // canary computed a running total and logged it instead\n"
+            "    // of assigning to a global, and reported clean not\n"
+            "    // because the compiler still auto-manages `T?` but\n"
+            "    // because LLVM correctly proved the whole allocation had\n"
+            "    // no observable effect and deleted it outright. Escaping\n"
+            "    // to a global's own storage -- externally visible, so\n"
+            "    // LLVM cannot prove a store to it is dead -- is what\n"
+            "    // keeps each iteration's allocation from being erased\n"
+            "    // before it ever gets a chance to leak. No `free p` (or\n"
+            "    // `free sink`) anywhere: if the automatic system left\n"
+            "    // this alone as designed, every one of the 199\n"
+            "    // iterations `sink` no longer points at leaks its own\n"
+            "    // allocation (the 200th is still reachable through\n"
+            "    // `sink` itself at exit, so 199 is the exact expected\n"
+            "    // count, not just 'more than zero').\n"
+            "    sink = p\n"
+            "    i = i + 1\n"
+            "}\n"
+            "log(sink.x)\n"
+        )
+        result = _run_harness(str(canary))
+        if result.returncode == _SKIP_EXIT:
+            pytest.skip(result.stderr.strip() or "sanitizers unavailable")
+        assert result.returncode != 0, (
+            "a manually-managed value that is never freed compiled clean under "
+            "LeakSanitizer -- the automatic system is retaining/releasing it "
+            "after all, which defeats `T?` entirely:\n" + result.stdout)
         assert "LeakSanitizer" in result.stdout
 
     def test_the_suite_covers_every_managed_resource(self):

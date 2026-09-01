@@ -2592,6 +2592,73 @@ says** (all of it applies here too):
 Memory is automatic — but `free` and `delete` exist for the moments you
 know better than the compiler does.
 
+### <a name="t-manually-managed-values"></a>`T?` — manually-managed values
+
+```festina
+struct Circle { x:int y:int }
+
+Circle? c
+c.x = 1
+c.y = 2
+useCircle(c)
+free c                     // the ONLY release this ever gets
+```
+
+A trailing `?` right after a type — at a variable declaration or a
+function/thread-handler parameter — opts that one binding **out of
+automatic memory management entirely**. An ordinary `Circle` local is
+retained on alias and released at scope exit without you writing
+anything; a `Circle?` local gets none of that — nothing ever calls
+`free` on it but you. Skip that call and it leaks, on purpose: that is
+what "manually managed" means.
+
+`?` applies to the same types `free`/`delete` already know how to
+release — struct, `arr[T]`, `map[T]`, `enum`, `blob`, `img`, `aud`,
+`http`, `socket`, `url`, `regex` — plus `int`/`float`/`bool`/`text`/
+`color`/`font`/`table`, where it's accepted but has no effect at all
+(none of those are automatically managed to begin with, so `int? count
+= 1` behaves exactly like `int count = 1`).
+
+**`T?` is a genuinely different type from `T`, not a looser version of
+it** — the same relationship `amor arr[T]` has to plain `arr[T]`.
+Assigning one where the other is expected, in either direction, is a
+compile error:
+
+```festina
+Circle? c
+Circle plain = c           // error: cannot assign value of type Circle? to Circle
+```
+
+There's no conversion between them — a `T?` binding only ever comes
+from another `T?` binding (a declaration with no initializer, an
+aliasing assignment, or a `T?`-declared parameter). A struct's own
+"no literal syntax, fields set individually" shape and `blob`/`img`/
+`aud`'s own text-to-value coercion both still work as the natural way
+to *populate* one; a value with no such escape hatch (`regex`, for
+instance, which only ever comes from a `/pattern/` literal or `regex()`,
+both always plain `regex`) currently has no way to become manually-
+managed other than through a parameter or another already-manually-
+managed binding — a known, narrow gap, not a bug.
+
+**`free`/`delete` work on a `T?` value exactly as documented above** —
+same reference-count decrement, same "an alias survives" behavior,
+same everything. They are simply the *only* release a manually-managed
+value ever gets: nothing else will ever call them for you. Because of
+that, `const T? x` isn't allowed (a `const` you could never mutate but
+also could never manually release would be a permanent, unavoidable
+leak) and `?` can't appear inside another type (`arr[T?]`, a struct
+field typed `T?`, a function's `T?` return type) — a manually-managed
+value only ever lives in a variable or parameter binding directly, so
+there's always exactly one place responsible for freeing it.
+
+**Passing a `Circle?` across a `thread` boundary isn't supported yet**
+— `on message(p:Circle?)` and `postMessage`ing a manually-managed value
+both raise a clear compile error naming this. That's planned future
+work, not a permanent restriction: crossing threads is the one place a
+manually-managed value's own "nothing auto-manages it" property
+actually matters beyond a single thread, and needs its own design pass
+before it opens up.
+
 ### `free`
 
 ```festina

@@ -9,6 +9,46 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.15] - 2026-09-01
+
+### Added
+
+- `T?` — a trailing `?` after a type at a variable/parameter
+  declaration opts that one binding out of automatic memory management
+  entirely (no retain on alias, no release at scope exit or
+  reassignment). `free`/`delete` work unchanged and become the *only*
+  release it ever gets. A genuinely distinct type from `T` (mirroring
+  `amor arr[T]`'s own relationship to plain `arr[T]`) — no implicit
+  decay either direction. Applies to struct/`arr[T]`/`map[T]`/`enum`/
+  `blob`/`img`/`aud`/`http`/`socket`/`url`/`regex`; accepted but inert
+  on `int`/`float`/`bool`/`text`/`color`/`font`/`table`. `arr[T?]`, a
+  `T?` struct field, a `T?` return type, and `const T? x` are all
+  compile errors this round. See [api.md](api.md#t-manually-managed-values).
+
+### Fixed
+
+- A user-defined function with a manually-managed parameter
+  (`func f(p:Circle?)`) was permanently uncallable — the call-site
+  argument check re-derived the parameter's type without its own `?`,
+  rejecting the one argument type that could ever match it.
+- `blob?`/`img?`/`aud?` failed to parse at all, misrouted into the
+  unrelated anonymous `.callback()` form.
+- `.test()`/`.play()`/`.playLoop()`/`.stop()`/`.isPlaying()`/`.send()`/
+  `.clip()`/`.resize()`/`.getPixelColor()`/`.save()`/`.saveCopy()` and
+  the `text -> blob` coercion stopped recognizing a manually-managed
+  receiver of the matching type, via several pre-existing exact-equality
+  type checks never meant to distinguish more than one shape of blob/
+  regex/img/aud/http/socket.
+- A grammar-ambiguity disambiguation helper (`Circle? c` vs. a bare
+  ternary statement) used an absolute token index where a relative
+  offset was passed in, silently misrouting a `T?` declaration found
+  anywhere but the very first statement of a file.
+
+See [claude.md #202](claude.md) for the full design and implementation
+record. Crossing a `thread` boundary with a manually-managed value
+(`on message`/`postMessage`) is not yet supported — planned follow-up
+work, not a permanent restriction.
+
 ## [0.14] - 2026-08-31
 
 ### Documentation

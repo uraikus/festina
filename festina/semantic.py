@@ -33,6 +33,7 @@ analyzing it, so errors still name the right file (see the loops at the
 bottom of analyze()).
 """
 from . import ast
+import dataclasses
 import math
 
 from . import types as types_mod
@@ -229,6 +230,59 @@ _NUMERIC_TYPES = (_INT, _FLOAT)
 _TEXT = types_mod.PrimitiveType("text")
 _BLOB = types_mod.PrimitiveType("blob")
 _BOOL = types_mod.PrimitiveType("bool")
+
+
+def _is_blob_type(t):
+    """claude.md #202: `t == _BLOB` breaks for a manually-managed
+    `blob?` -- a genuinely different, unequal dataclass instance from
+    the plain `_BLOB` singleton (manually_managed is a real, `__eq__`-
+    participating field) -- everywhere blob is checked by identity
+    rather than via an isinstance check the way img/aud/http/... all
+    already are (blob has no dedicated dataclass of its own for that).
+    Use this instead of `== _BLOB` at any site that must keep treating
+    a manually-managed blob exactly like an ordinary one -- every
+    site that dispatches by VALUE SHAPE (a method call, a coercion
+    rule, ...) needs to, since `T?`'s representation is identical to
+    `T`'s; only the handful of sites that gate AUTOMATIC bookkeeping
+    care about the flag at all."""
+    return isinstance(t, types_mod.PrimitiveType) and t.name == "blob"
+
+# claude.md #202: `T?` -- the exact set of resolved types
+# `manually_managed` means something real for, mirroring
+# codegen._is_refcounted's own family exactly (every type this runtime
+# already knows how to release via a refcount header). Not TableType
+# (a query row has no refcount header at all -- see FreeStmt's own
+# "nulled WITHOUT freeing" special case) and not FuncType.
+_MANUALLY_MANAGEABLE_TYPES = (
+    types_mod.StructType, types_mod.ArrayType, types_mod.MapType, types_mod.EnumType,
+    types_mod.ImageType, types_mod.AudioType, types_mod.HttpType, types_mod.SocketType,
+    types_mod.UrlType, types_mod.RegexType,
+)
+
+
+def apply_manually_managed(resolved_type, manually_managed):
+    """claude.md #202: called right after EVERY `resolve(...)` of a
+    declaration/parameter whose own AST node carries a `manually_managed`
+    flag (set by a trailing `?` after the type -- parser.py's
+    parse_var_decl/parse_typed_params) -- rebuilds the resolved type
+    with `manually_managed=True` when it's one of
+    `_MANUALLY_MANAGEABLE_TYPES` (via `dataclasses.replace`, the same
+    mechanism `resolve_type_name`'s own `amortized=type_expr.amortized`
+    already uses for ArrayType), or the one non-isinstance special case
+    (`blob`, a PrimitiveType value rather than its own dataclass).
+    Every OTHER type (int/float/bool/text/color/font/table/func) is
+    returned completely unchanged regardless of `manually_managed` --
+    `?` on one of those is accepted grammar with zero type-level
+    effect, matching claude.md #202's own `int? count = 1` example
+    exactly: it resolves to the identical, fully interchangeable
+    `PrimitiveType("int")` whether or not the source wrote `?`."""
+    if not manually_managed:
+        return resolved_type
+    if isinstance(resolved_type, _MANUALLY_MANAGEABLE_TYPES):
+        return dataclasses.replace(resolved_type, manually_managed=True)
+    if resolved_type == _BLOB:
+        return types_mod.PrimitiveType("blob", manually_managed=True)
+    return resolved_type
 
 # See the placeholder above for what this is and why. Defined here
 # rather than there because it needs _TEXT/_BOOL.
@@ -1181,7 +1235,10 @@ def analyze(program, filename="<string>"):
         # shows; codegen needs no special coercion for it either, since
         # blob and text already share the identical `ptr` runtime
         # representation (see _llvm_type).
-        if declared == _BLOB and actual == _TEXT:
+        # claude.md #202: _is_blob_type rather than `declared == _BLOB`
+        # -- see its own doc comment; otherwise this coercion silently
+        # stops working for `blob?` specifically.
+        if _is_blob_type(declared) and actual == _TEXT:
             return
         # claude.md #91: `color red = 'red'` / `font body = '13px arial'`
         # -- a colour and a font are written as text because that is what
@@ -1391,7 +1448,8 @@ def analyze(program, filename="<string>"):
             # invisible to Festina source), so the synthesized FuncDecl
             # only ever needs to exist by the time this expression
             # itself is reached, never any earlier.
-            param_types = tuple(resolve(p.type_expr, expr) for p in expr.params)
+            param_types = tuple(apply_manually_managed(resolve(p.type_expr, expr), p.manually_managed)
+                               for p in expr.params)
             return_type = None if expr.return_type == "void" else resolve(expr.return_type, expr)
             # claude.md #23's own void-vs-non-void rules already reject
             # `return <value>` inside a void function -- so a void arrow
@@ -1456,7 +1514,8 @@ def analyze(program, filename="<string>"):
                 # callee of an immediately-enclosing Call or not, not by
                 # anything stored on the Symbol).
                 decl = sym.node
-                param_types = tuple(resolve(p.type_expr, decl) for p in decl.params)
+                param_types = tuple(apply_manually_managed(resolve(p.type_expr, decl), p.manually_managed)
+                                   for p in decl.params)
                 ret_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
                 return types_mod.FuncType(param_types, ret_type)
             return sym.type
@@ -2428,7 +2487,14 @@ def analyze(program, filename="<string>"):
                 )
             for arg_expr, param in zip(expr.args, func_decl.params):
                 arg_type = infer(arg_expr, scope)
-                param_type = resolve(param.type_expr, callee)
+                # claude.md #202: `T?` -- missing this wrap here made
+                # every user-defined function with a manually-managed
+                # parameter permanently uncallable (its own declared
+                # `Circle?` parameter was checked here as plain
+                # `Circle`, rejecting the one argument type that could
+                # ever actually match it -- caught by a real end-to-end
+                # compile, not a unit test alone).
+                param_type = apply_manually_managed(resolve(param.type_expr, callee), param.manually_managed)
                 check_assignable(param_type, arg_type, callee,
                                   what=f"argument '{param.name}' of '{name}'")
             return sym.type
@@ -2745,7 +2811,7 @@ def analyze(program, filename="<string>"):
                         )
                     return _TEXT
             # claude.md #67: pattern.test(value:text) -> bool
-            if callee.prop == "test" and infer(callee.obj, scope) == _REGEX:
+            if callee.prop == "test" and isinstance(infer(callee.obj, scope), types_mod.RegexType):
                 if len(expr.args) != 1:
                     raise CompileError(
                         f"test() expects exactly 1 argument, got {len(expr.args)}",
@@ -2836,7 +2902,7 @@ def analyze(program, filename="<string>"):
             # caller could not otherwise learn, so the pool was
             # addressable only by naming a channel by hand -- which is
             # to say, by not using the pool. -1 if nothing was played.
-            if callee.prop in ("play", "playLoop") and infer(callee.obj, scope) == _AUDIO:
+            if callee.prop in ("play", "playLoop") and isinstance(infer(callee.obj, scope), types_mod.AudioType):
                 if len(expr.args) > 1:
                     raise CompileError(
                         f"{callee.prop}() expects 0 or 1 argument (an optional "
@@ -2892,7 +2958,7 @@ def analyze(program, filename="<string>"):
             # error rather than a silent overwrite of the original.
             if callee.prop in ("save", "saveCopy"):
                 obj_type = infer(callee.obj, scope)
-                if (obj_type == _BLOB
+                if (_is_blob_type(obj_type)
                         or isinstance(obj_type, (types_mod.ImageType,
                                                  types_mod.AudioType))):
                     lo = 0 if callee.prop == "save" else 1
@@ -2971,7 +3037,7 @@ def analyze(program, filename="<string>"):
             # by name here, like every other method on a non-struct
             # receiver, so arity and argument types are enforced rather
             # than left to the generic member fallback.
-            if callee.prop in _BLOB_METHODS and infer(callee.obj, scope) == _BLOB:
+            if callee.prop in _BLOB_METHODS and _is_blob_type(infer(callee.obj, scope)):
                 arg_types, return_type = _BLOB_METHODS[callee.prop]
                 if len(expr.args) != len(arg_types):
                     raise CompileError(
@@ -2994,7 +3060,7 @@ def analyze(program, filename="<string>"):
                 return return_type
             # claude.md #151: http's fixed-shape methods, checked the
             # identical dict-driven way blob's own just above are.
-            if callee.prop in _HTTP_METHODS and infer(callee.obj, scope) == _HTTP:
+            if callee.prop in _HTTP_METHODS and isinstance(infer(callee.obj, scope), types_mod.HttpType):
                 arg_types, return_type = _HTTP_METHODS[callee.prop]
                 if len(expr.args) != len(arg_types):
                     raise CompileError(
@@ -3016,7 +3082,7 @@ def analyze(program, filename="<string>"):
                         )
                 return return_type
             # claude.md #151: socket's own fixed-shape method (`close`).
-            if callee.prop in _SOCKET_METHODS and infer(callee.obj, scope) == _SOCKET:
+            if callee.prop in _SOCKET_METHODS and isinstance(infer(callee.obj, scope), types_mod.SocketType):
                 arg_types, return_type = _SOCKET_METHODS[callee.prop]
                 if len(expr.args) != len(arg_types):
                     raise CompileError(
@@ -3055,7 +3121,7 @@ def analyze(program, filename="<string>"):
             callee_obj_is_http_lit = callee.prop == "send" and isinstance(callee.obj, ast.MapLit)
             if callee_obj_is_http_lit:
                 _validate_http_lit(callee.obj, scope, filename, infer)
-            if callee.prop == "send" and (callee_obj_is_http_lit or infer(callee.obj, scope) == _HTTP):
+            if callee.prop == "send" and (callee_obj_is_http_lit or isinstance(infer(callee.obj, scope), types_mod.HttpType)):
                 # claude.md #162: send() is now overloaded by ARITY,
                 # not just optional trailing arguments the way it used
                 # to be -- `req.send(res:http)` (one argument) is the
@@ -3107,7 +3173,7 @@ def analyze(program, filename="<string>"):
             # code or headers to attach) -- blob sends as a binary
             # frame, everything else as a text frame (see codegen's
             # _emit_socket_send).
-            if callee.prop == "send" and infer(callee.obj, scope) == _SOCKET:
+            if callee.prop == "send" and isinstance(infer(callee.obj, scope), types_mod.SocketType):
                 if len(expr.args) != 1:
                     raise CompileError(
                         f"send() expects exactly 1 argument (the data to send), "
@@ -3136,7 +3202,7 @@ def analyze(program, filename="<string>"):
             # overlapping-effects case is covered by play() returning
             # its channel, so the two coexist instead of one standing
             # in for the other.
-            if callee.prop == "stop" and infer(callee.obj, scope) == _AUDIO:
+            if callee.prop == "stop" and isinstance(infer(callee.obj, scope), types_mod.AudioType):
                 if expr.args:
                     raise CompileError(
                         f"stop() expects no arguments, got {len(expr.args)} -- "
@@ -3254,7 +3320,7 @@ def analyze(program, filename="<string>"):
                         check_assignable(types_mod.ArrayType(elem), infer(expr.args[2], scope),
                                           callee, what="splice() insert argument")
                     return types_mod.ArrayType(elem)
-            if callee.prop in ("clip", "resize") and infer(callee.obj, scope) == _IMAGE:
+            if callee.prop in ("clip", "resize") and isinstance(infer(callee.obj, scope), types_mod.ImageType):
                 expected = 4 if callee.prop == "clip" else 2
                 if len(expr.args) != expected:
                     raise CompileError(
@@ -3279,7 +3345,7 @@ def analyze(program, filename="<string>"):
             # than folded into the drawRect/.../drawText block just
             # below) since every one of those returns nothing, and this
             # returns a color.
-            if callee.prop == "getPixelColor" and infer(callee.obj, scope) == _IMAGE:
+            if callee.prop == "getPixelColor" and isinstance(infer(callee.obj, scope), types_mod.ImageType):
                 if len(expr.args) != 2:
                     raise CompileError(
                         f"getPixelColor() expects 2 arguments, got {len(expr.args)}",
@@ -3305,7 +3371,7 @@ def analyze(program, filename="<string>"):
             # image's own pixel space, with no window/canvas needed at
             # all -- see codegen.py's _emit_image_draw_method.
             if (callee.prop in ("drawRect", "drawPixel", "drawCircle", "drawText")
-                    and infer(callee.obj, scope) == _IMAGE):
+                    and isinstance(infer(callee.obj, scope), types_mod.ImageType)):
                 # claude.md #188 (uraikus/festina#76 item 8): the same
                 # optional-trailing-fill-and-border-colour forms the
                 # free-function versions gained, in _BUILTIN_SIGNATURE_
@@ -3348,7 +3414,7 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 return None
-            if callee.prop == "isPlaying" and infer(callee.obj, scope) == _AUDIO:
+            if callee.prop == "isPlaying" and isinstance(infer(callee.obj, scope), types_mod.AudioType):
                 if expr.args:
                     raise CompileError(
                         f"isPlaying() takes no arguments, got {len(expr.args)}",
@@ -3600,6 +3666,17 @@ def analyze(program, filename="<string>"):
 
     def analyze_var_decl(decl, scope, is_global):
         declared_type = resolve(decl.type_expr, decl)
+        # claude.md #202: `T?` -- applied immediately after resolve(),
+        # before ANY of the checks below (the `amor` no-initializer
+        # check, the TableType check, check_assignable, ...) run, so
+        # every one of them already sees the real, possibly-manually-
+        # managed type -- in particular, check_assignable's own generic
+        # `declared != actual` fallback is what makes a `Circle?`
+        # source assigned into an ordinary `Circle`-typed position (or
+        # vice versa) a compile error, with zero new code of its own
+        # (the two are already unequal dataclass instances once this
+        # line runs).
+        declared_type = apply_manually_managed(declared_type, decl.manually_managed)
         # claude.md #174: `amor arr[T]` (local or global) requires an
         # initializer -- unlike plain arr[T]/map[T], which start
         # "empty" via a real, immortal, zero-entry static header (see
@@ -3810,7 +3887,14 @@ def analyze(program, filename="<string>"):
         return_type = resolve(decl.return_type, decl) if decl.return_type != "void" else None
         func_scope = Scope(global_scope)
         for p in decl.params:
-            func_scope.define(p.name, Symbol(p.name, resolve(p.type_expr, decl), "parameter"), decl, filename)
+            # claude.md #202: `T?` -- resolve() then, when the
+            # parameter's own `?` was written, rebuild with
+            # manually_managed=True (see apply_manually_managed's own
+            # doc comment). A manually-managed parameter is still just
+            # borrowed like any other (codegen's own escaping-parameter
+            # retain logic separately learns to skip retaining one).
+            ptype = apply_manually_managed(resolve(p.type_expr, decl), p.manually_managed)
+            func_scope.define(p.name, Symbol(p.name, ptype, "parameter"), decl, filename)
         analyze_block(decl.body, func_scope, return_type=return_type)
 
     def analyze_event_handler(decl):
@@ -3831,7 +3915,8 @@ def analyze(program, filename="<string>"):
                 )
         handler_scope = Scope(global_scope)
         for p in decl.params:
-            handler_scope.define(p.name, Symbol(p.name, resolve(p.type_expr, decl), "parameter"), decl, filename)
+            ptype = apply_manually_managed(resolve(p.type_expr, decl), p.manually_managed)
+            handler_scope.define(p.name, Symbol(p.name, ptype, "parameter"), decl, filename)
         analyze_block(decl.body, handler_scope, return_type=None)
 
     def _merge_thread_outbound_type(info, new_type, node):
@@ -3857,6 +3942,18 @@ def analyze(program, filename="<string>"):
         the type before it ever reaches postMessage, so this function
         sees a single, already-consistent EnumType and never needs to
         invent one itself."""
+        # claude.md #202: see the identical guard + comment on the
+        # inbound ('on message') side above -- Phase 2 work, not yet
+        # implemented.
+        if getattr(new_type, "manually_managed", False):
+            raise CompileError(
+                f"postMessage({types_mod.type_name(new_type)}) -- a manually-"
+                f"managed ('T?') type cannot yet cross a thread boundary -- "
+                f"postMessage/on message reference-sharing for manually-managed "
+                f"values is not implemented in this phase",
+                file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
+                category="invalid function argument type",
+            )
         if not _is_thread_sendable_type(new_type, structs, enums):
             raise CompileError(
                 f"postMessage({types_mod.type_name(new_type)}) -- "
@@ -4006,7 +4103,28 @@ def analyze(program, filename="<string>"):
                                 file=filename, line=stmt.line, column=stmt.column,
                                 category="invalid function argument type",
                             )
-                        msg_type = resolve(stmt.params[0].type_expr, stmt)
+                        msg_type = apply_manually_managed(
+                            resolve(stmt.params[0].type_expr, stmt),
+                            stmt.params[0].manually_managed)
+                        # claude.md #202: reference-sharing for a manually-
+                        # managed message type is Phase 2 work (not yet
+                        # implemented) -- reject it explicitly here rather
+                        # than silently letting _is_thread_sendable_type's
+                        # own isinstance-based checks treat it as an
+                        # ordinary sendable type and fall back to deep-
+                        # clone behavior, which would quietly defeat the
+                        # whole point of `T?` for anything crossing a
+                        # thread boundary.
+                        if getattr(msg_type, "manually_managed", False):
+                            raise CompileError(
+                                f"'on message(p:{types_mod.type_name(msg_type)})': "
+                                f"a manually-managed ('T?') type cannot yet cross a "
+                                f"thread boundary -- postMessage/on message "
+                                f"reference-sharing for manually-managed values is "
+                                f"not implemented in this phase",
+                                file=filename, line=stmt.line, column=stmt.column,
+                                category="invalid function argument type",
+                            )
                         if not _is_thread_sendable_type(msg_type, structs, enums):
                             raise CompileError(
                                 f"'on message(p:{types_mod.type_name(msg_type)})': "
@@ -4018,7 +4136,8 @@ def analyze(program, filename="<string>"):
                             )
                         info.inbound_type = msg_type
                     else:
-                        param_types = tuple(resolve(p.type_expr, stmt) for p in stmt.params)
+                        param_types = tuple(apply_manually_managed(resolve(p.type_expr, stmt), p.manually_managed)
+                                             for p in stmt.params)
                         if param_types != sig:
                             raise CompileError(
                                 f"on {stmt.name}(...) must declare exactly {help_text}",
@@ -4027,7 +4146,8 @@ def analyze(program, filename="<string>"):
                             )
                     handler_scope = Scope(thread_state_scope)
                     for p in stmt.params:
-                        handler_scope.define(p.name, Symbol(p.name, resolve(p.type_expr, stmt), "parameter"),
+                        ptype = apply_manually_managed(resolve(p.type_expr, stmt), p.manually_managed)
+                        handler_scope.define(p.name, Symbol(p.name, ptype, "parameter"),
                                               stmt, filename)
                     analyze_block(stmt.body, handler_scope, return_type=None)
                     continue

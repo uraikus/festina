@@ -189,7 +189,18 @@ class Parser:
                                 f"parameter '{name_tok.value}' requires a type, e.g. '{name_tok.value}:int'")
             self.eat_op(":")
             type_expr = self.parse_type()
-            params.append(ast.Param(name_tok.value, type_expr))
+            # claude.md #202: `T?` -- an optional trailing '?' right
+            # after parse_type() returns, exactly like parse_var_decl's
+            # own matching check below. Deliberately NOT inside
+            # parse_type() itself -- see Param's own doc comment
+            # (ast.py) for why that's what makes nesting (arr[T?], a
+            # T?-typed field, ...) a plain parse error everywhere else
+            # rather than needing its own rejection logic.
+            manually_managed = False
+            if self.at_op("?"):
+                self.eat()
+                manually_managed = True
+            params.append(ast.Param(name_tok.value, type_expr, manually_managed))
             if self.at_op(","):
                 self.eat()
         return params
@@ -309,7 +320,18 @@ class Parser:
         # OTHER expression here is simply evaluated and its result
         # discarded, same as any other bare expression-statement) is
         # parsed and wrapped as an ordinary ExprStmt.
-        if t.type in ("blob", "img", "aud") and self.peek(1).type != "IDENT":
+        # claude.md #202: `blob? name = ...` (or img?/aud?) is a
+        # manually-managed DECLARATION, not the anonymous callback
+        # form above -- peek(1) is OP("?"), not IDENT, so the plain
+        # "peek(1) != IDENT" check below would otherwise misroute it
+        # here too and then choke trying to parse a bare `?` as an
+        # expression. Mirrors _looks_like_declaration's own identical
+        # `IDENT OP(?) IDENT` shape check.
+        looks_like_manually_managed_decl = (
+            self.peek(1).type == "OP" and self.peek(1).value == "?"
+            and self.peek(2).type == "IDENT")
+        if (t.type in ("blob", "img", "aud") and self.peek(1).type != "IDENT"
+                and not looks_like_manually_managed_decl):
             self.eat()  # the (redundant, purely readability) type keyword
             expr = self.parse_expression()
             self._semi()
@@ -336,7 +358,78 @@ class Parser:
             return True
         if t0.type == "IDENT" and t1.type == "IDENT":
             return True
+        # claude.md #202: `T?` -- a bare struct/table/enum type name
+        # (an IDENT, unlike a TYPE_KEYWORD/arr/map/amor/func, which are
+        # all recognized by t0 alone above) followed by a manually-
+        # managed `?` inserts one extra OP("?") token between the type
+        # name and the variable name, which the plain "t0 IDENT, t1
+        # IDENT" check above would otherwise miss entirely (t1 is `?`,
+        # not the variable name) -- `Circle? c = ...` would silently
+        # fail to be recognized as a declaration at all without this.
+        # `IDENT ? IDENT` alone is genuinely ambiguous with a bare
+        # ternary expression STATEMENT whose condition happens to be an
+        # ordinary identifier (`flag ? doThing() : doOther()`) -- see
+        # _confirms_manually_managed_var_decl's own doc comment for how
+        # that's resolved.
+        if (t0.type == "IDENT" and t1.type == "OP" and t1.value == "?"
+                and self.peek(2).type == "IDENT"):
+            return self._confirms_manually_managed_var_decl(self.i + 3)
         return False
+
+    def _confirms_manually_managed_var_decl(self, start):
+        """claude.md #202: disambiguates `Circle? c ...` (a
+        manually-managed declaration) from `Circle ? c : ...` (an
+        ordinary ternary EXPRESSION used as a bare statement, its
+        result discarded) -- both start with the identical `IDENT OP(?)
+        IDENT` token shape, so `_looks_like_declaration` alone can't
+        tell them apart without looking further. `start` is the
+        ABSOLUTE index into `self.toks` (not an offset from the
+        current position) right after that shape -- i.e. the token
+        right after the presumed variable name; callers must add
+        `self.i` themselves, mirroring how `peek(k)` itself resolves
+        `k` against `self.i`.
+
+        Mirrors _arrow_params_end's own "scan ahead to confirm the
+        shape before committing" precedent for the identical class of
+        problem (a bare-IDENT return type ambiguous with an ordinary
+        function call there). The deciding fact: a ternary's own `:`
+        MUST appear, at the same bracket nesting depth, before the
+        ternary expression is complete (parse_ternary unconditionally
+        eats one) -- so scanning forward, tracking paren/bracket/brace
+        depth, the first depth-0 `=` found means this is a declaration
+        (`Circle? c = ...`), the first depth-0 `:` found means it's a
+        ternary, and running out of the enclosing scope (depth going
+        negative -- e.g. the block's own closing `}`) or reaching EOF
+        with neither means a no-initializer declaration
+        (`Circle? c` followed by whatever statement comes next, which
+        may itself contain unrelated `=`/`:` tokens at their OWN depth
+        0 that this scan would otherwise never reach, since it always
+        resolves at the very first depth-0 `=` or `:` it sees -- e.g.
+        `Circle? c` immediately followed by `x = 5` correctly resolves
+        as a declaration at `x`'s own `=`, without ever needing to
+        prove anything about what follows `x = 5` itself)."""
+        depth = 0
+        i = start
+        # A generous, not-expected-to-ever-bind-in-real-code bound --
+        # purely to guarantee termination rather than to reject
+        # anything a real program would write.
+        limit = min(len(self.toks), start + 2000)
+        while i < limit:
+            tok = self.toks[i]
+            if tok.type == "EOF":
+                return True
+            if depth == 0 and tok.type == "OP" and tok.value == "=":
+                return True
+            if depth == 0 and tok.type == "OP" and tok.value == ":":
+                return False
+            if tok.type in ("LPAREN", "LBRACK", "LBRACE"):
+                depth += 1
+            elif tok.type in ("RPAREN", "RBRACK", "RBRACE"):
+                depth -= 1
+                if depth < 0:
+                    return True
+            i += 1
+        return True
 
     def _starts_func_decl(self):
         """True if the statement at the current position is
@@ -520,13 +613,23 @@ class Parser:
     def parse_var_decl(self):
         t = self.peek()
         type_expr = self.parse_type()
+        # claude.md #202: `T?` -- an optional trailing '?' right after
+        # parse_type() returns. `const` declarations (parse_const_decl,
+        # just below) deliberately do NOT get this same check -- `const
+        # T? x` stays a plain parse error this round (see VarDecl's own
+        # doc comment in ast.py for why).
+        manually_managed = False
+        if self.at_op("?"):
+            self.eat()
+            manually_managed = True
         name_tok = self.eat("IDENT")
         init = None
         if self.at_op("="):
             self.eat()
             init = self.parse_assign_expr()
         self._semi()
-        return ast.VarDecl(type_expr, name_tok.value, init, is_const=False, line=t.line, column=t.column)
+        return ast.VarDecl(type_expr, name_tok.value, init, is_const=False,
+                           manually_managed=manually_managed, line=t.line, column=t.column)
 
     def parse_const_decl(self):
         t = self.eat("const")
