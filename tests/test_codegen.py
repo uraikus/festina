@@ -15326,123 +15326,18 @@ class TestExec:
         assert exc_info.value.category == "unsupported platform feature"
         assert "exec" in str(exc_info.value)
 
-
-class TestExecCallback:
-    """claude.md #177: exec(args, callback) -- the non-blocking
-    counterpart to exec(args) above, dispatched onto the same
-    background worker pool blob/img/aud's own `.callback()` runs on.
-    Real compile-and-run coverage, matching TestAsyncIoRuntime's own
-    discipline in tests/test_async_io.py."""
-
-    def test_does_not_block(self, compile_and_run):
-        result = compile_and_run("""
-        void func onDone(code:int) {
-            log(`done: ${code}`)
-            close(0)
-        }
-        arr[text] cmd = ['/bin/sh', '-c', 'sleep 1 && exit 0']
-        exec(cmd, onDone)
-        log('dispatched')
-        """)
-        assert result.returncode == 0, result.stdout
-        assert result.stdout.index("dispatched") < result.stdout.index("done:")
-        assert "done: 0" in result.stdout
-
-    def test_program_exits_cleanly_with_no_explicit_close(self, compile_and_run):
-        # No openPort()/graphics/setTimeout/other async_io call anywhere
-        # -- festina_run_timer_loop is entered ONLY because of
-        # uses_async_io (see codegen.py's own widened loop-selection
-        # condition), and must correctly wait for the outstanding exec,
-        # run the callback, THEN exit on its own.
-        result = compile_and_run("""
-        void func onDone(code:int) {
-            log(`done: ${code}`)
-        }
-        arr[text] cmd = ['/bin/echo', 'child ran']
-        exec(cmd, onDone)
-        log('dispatched')
-        """)
-        assert result.returncode == 0, result.stdout
-        assert "child ran" in result.stdout
-        assert "done: 0" in result.stdout
-
-    def test_real_exit_code_is_delivered(self, compile_and_run):
-        result = compile_and_run("""
-        void func onDone(code:int) {
-            log(code)
-            close(0)
-        }
-        arr[text] cmd = ['/bin/sh', '-c', 'exit 42']
-        exec(cmd, onDone)
-        """)
-        assert result.returncode == 0, result.stdout
-        assert result.stdout == "42\n"
-
-    def test_a_missing_executable_delivers_negative_one(self, compile_and_run):
-        result = compile_and_run("""
-        void func onDone(code:int) {
-            log(code)
-            close(0)
-        }
-        arr[text] cmd = ['/no/such/binary/at/all/xyz']
-        exec(cmd, onDone)
-        """)
-        assert result.returncode == 0, result.stdout
-        assert result.stdout == "-1\n"
-
-    def test_multiple_concurrent_execs_all_complete(self, compile_and_run):
-        result = compile_and_run("""
-        int done = 0
-        int total = 0
-        void func onDone(code:int) {
-            done = done + 1
-            total = total + code
-            if done == 5 { close(0) }
-        }
-        arr[text] c1 = ['/bin/sh', '-c', 'exit 1']
-        arr[text] c2 = ['/bin/sh', '-c', 'exit 2']
-        arr[text] c3 = ['/bin/sh', '-c', 'exit 3']
-        arr[text] c4 = ['/bin/sh', '-c', 'exit 4']
-        arr[text] c5 = ['/bin/sh', '-c', 'exit 5']
-        exec(c1, onDone)
-        exec(c2, onDone)
-        exec(c3, onDone)
-        exec(c4, onDone)
-        exec(c5, onDone)
-        log('all 5 dispatched')
-        """)
-        assert result.returncode == 0, result.stdout
-        assert "all 5 dispatched" in result.stdout
-
-    def test_callback_may_be_a_stored_function_value(self, compile_and_run):
-        # Not a bare declared-function name at the call site -- exercises
-        # the runtime, data-carried side of _emit_exec_callback_trampoline
-        # (the callback pointer travels through the payload precisely
-        # because it need not be a compile-time-constant symbol).
-        result = compile_and_run("""
-        void func onDone(code:int) {
-            log(code)
-            close(0)
-        }
-        func[int]:void cb = onDone
-        arr[text] cmd = ['/bin/sh', '-c', 'exit 9']
-        exec(cmd, cb)
-        """)
-        assert result.returncode == 0, result.stdout
-        assert result.stdout == "9\n"
-
-    def test_exec_callback_form_is_rejected_for_wasm(self, cli_mod, tmp_path):
-        src = tmp_path / "main.f"
-        src.write_text("""
+    def test_the_removed_two_argument_callback_form_is_a_clear_error(
+            self, parser, semantic, errors):
+        # claude.md #221: exec(args, callback) -- the non-blocking form
+        # claude.md #177 added -- was removed; exec() now only ever
+        # takes 1 argument.
+        source = """
         void func onDone(code:int) { log(code) }
         arr[text] cmd = ['ls']
         exec(cmd, onDone)
-        """, encoding="utf-8")
-        with pytest.raises(cli_mod.CompileError) as exc_info:
-            cli_mod.compile_file(str(src), str(tmp_path / "out.wasm"),
-                                  cc="clang", target="wasm32-wasi")
-        assert exc_info.value.category == "unsupported platform feature"
-        assert "exec" in str(exc_info.value)
+        """
+        with pytest.raises(errors.CompileError, match="expects 1 argument"):
+            semantic.analyze(parser.parse(source))
 
 
 class TestToInt:

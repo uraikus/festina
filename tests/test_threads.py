@@ -1195,14 +1195,17 @@ class TestThreadWiderBuiltinAccess:
         source = "thread w { on load() { int code = exec(['true']) } }"
         semantic.analyze(parser.parse(source))
 
-    def test_exec_with_a_callback_is_still_rejected_inside_a_thread(
+    def test_exec_with_a_callback_is_rejected_inside_a_thread_too(
             self, parser, semantic, errors):
+        # claude.md #221: exec(args, callback) no longer exists at all
+        # (not just inside a thread) -- this now hits the ordinary
+        # "exec() expects 1 argument" arity error, the same one any
+        # other call site gets.
         source = """
         void func onDone(code:int) { }
         thread w { on load() { exec(['true'], onDone) } }
         """
-        with pytest.raises(errors.CompileError,
-                            match="its callback always runs on the main program's own OS thread"):
+        with pytest.raises(errors.CompileError, match="exec\\(\\) expects 1 argument"):
             semantic.analyze(parser.parse(source))
 
     def test_canvas_and_timer_builtins_are_still_rejected_inside_a_thread(

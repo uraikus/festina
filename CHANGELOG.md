@@ -9,6 +9,19 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.34] - 2026-09-01
+
+### Removed
+
+- **`exec(args, callback)`** -- the non-blocking form. `exec(args)`
+  (blocking) is unaffected. The callback always ran on main's own OS
+  thread regardless of which thread dispatched it -- a real cross-
+  thread-isolation hazard for a language whose whole thread story is
+  "no shared mutable state to race on" -- so it's gone rather than
+  documented around.
+
+See claude.md #221.
+
 ## [0.33] - 2026-09-01
 
 ### Added

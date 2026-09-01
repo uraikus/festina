@@ -868,18 +868,12 @@ def _check_message_handler_params(params, node, filename, structs, tables, enums
 # `database_url` (a thread that declared its own `DatabaseURL` may call
 # it; one that didn't may not), a per-thread question this flat, unconditional set
 # has no way to represent. `exec` is ALSO deliberately not here
-# (claude.md #211) -- the 1-argument (blocking) form's own fork/
-# execvp/waitpid touches no shared state at all (confirmed directly
-# by reading festina_run_argv), but the 2-argument
-# (`exec(args, callback)`, non-blocking) form's own callback is
-# documented to run on MAIN's OS thread regardless of which thread
-# dispatched it (confirmed directly: festina_process_exec_dispatch's
-# own worker only ever computes the exit code; the trampoline that
-# actually invokes the callback runs from festina_async_io_dispatch's
-# own main-thread drain step) -- a real cross-thread-isolation
-# violation the arity alone can't express as a flat name-only set, so
-# `exec` gets its own dedicated arity-aware check instead, mirroring
-# the sqlite one's own shape. `regex`/`mkdir`/`ls` are NOT here either
+# (claude.md #211) -- its only remaining form (claude.md #221 removed
+# the non-blocking `exec(args, callback)` form, whose callback ran on
+# MAIN's OS thread regardless of which thread dispatched it -- a real
+# cross-thread-isolation violation) is the blocking, 1-argument one,
+# whose own fork/execvp/waitpid touches no shared state at all
+# (confirmed directly by reading festina_run_argv). `regex`/`mkdir`/`ls` are NOT here either
 # (claude.md #211) -- confirmed safe by reading each: `regex()`'s own
 # memoization slot is a per-CALL-SITE codegen-generated global
 # (`_regex_memo_slots`, keyed by `id(Call node)`), lexically private
@@ -2564,29 +2558,6 @@ def analyze(program, filename="<string>"):
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
-                if name == "exec" and len(expr.args) == 2:
-                    # claude.md #211: unlike the flat _THREAD_DISALLOWED_
-                    # BUILTINS set just below, `exec`'s own safety
-                    # depends on ARITY, not just its name -- the
-                    # blocking 1-argument form is fine (see this
-                    # module's own comment above _THREAD_DISALLOWED_
-                    # BUILTINS for the confirmed-by-reading reasoning);
-                    # the non-blocking 2-argument form's own callback
-                    # always runs on MAIN's OS thread regardless of
-                    # which thread dispatched it, a real cross-thread-
-                    # isolation violation. Checked here, ahead of the
-                    # flat set (which no longer even lists `exec`), so
-                    # this gets its own specific reason instead of the
-                    # generic "touches shared state" one.
-                    raise CompileError(
-                        f"'exec(args, callback)' cannot be called from inside a "
-                        f"thread body -- its callback always runs on the main "
-                        f"program's own OS thread, regardless of which thread "
-                        f"dispatched it; 'exec(args)' (the blocking, 1-argument "
-                        f"form) is fine",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
                 if (name in ("openPort", "closePort", "openSecurePort")
                         and not _current_thread[0].has_http_handler):
                     # claude.md #212: mirrors the sqlite gate just
@@ -2725,20 +2696,19 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return _BOOL
-            # claude.md #150/#177: exec(args) -> int (unchanged,
-            # blocking) or exec(args, callback) -> void (new,
-            # non-blocking -- callback receives the real exit code once
-            # the spawned process exits). Return type depends on arity
-            # the same way saveCanvas's own does, so this owns both
-            # shapes in one place rather than splitting exec() across
-            # the generic _BUILTIN_SIGNATURES dict (which can express
-            # neither the arity-dependent return type nor a structurally
-            # -checked callback argument) and a second dedicated branch.
+            # claude.md #150: exec(args) -> int -- spawns args[0] with
+            # args[1:] as its own argv, blocking until it exits, and
+            # answers its real exit code. claude.md #177's own
+            # non-blocking exec(args, callback) form was removed in
+            # claude.md #221 (its callback always ran on main's own OS
+            # thread regardless of which thread dispatched it -- a real
+            # cross-thread-isolation hazard for a language whose whole
+            # thread story is "no shared mutable state to race on" --
+            # so only the always-safe blocking form remains).
             if name == "exec":
-                if len(expr.args) not in (1, 2):
+                if len(expr.args) != 1:
                     raise CompileError(
-                        f"exec() expects 1 argument (args) or 2 (args, and a "
-                        f"callback), got {len(expr.args)}",
+                        f"exec() expects 1 argument (args), got {len(expr.args)}",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
@@ -2751,28 +2721,7 @@ def analyze(program, filename="<string>"):
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
-                if len(expr.args) == 1:
-                    return _INT
-                # claude.md #177: checked structurally, the same
-                # permissive way blob/img/aud's own `.callback()`
-                # already is -- any func[int]:void-typed EXPRESSION,
-                # not restricted to a bare declared-function name the
-                # way setTimeout's own older callback rule is. First-
-                # class function values (claude.md #141) postdate that
-                # restriction; blob/img/aud's `.callback()` already
-                # established the newer, correct precedent this follows.
-                fn_type = infer(expr.args[1], scope)
-                if (not isinstance(fn_type, types_mod.FuncType)
-                        or len(fn_type.param_types) != 1
-                        or fn_type.return_type is not None
-                        or fn_type.param_types[0] != _INT):
-                    raise CompileError(
-                        f"exec()'s second argument expects func[int]:void, "
-                        f"found {types_mod.type_name(fn_type)}",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
-                return None
+                return _INT
             if name in ("fail", "troubleshoot"):
                 # claude.md #158: fail(message) is unchanged (1 argument,
                 # any type -- coerced to text at codegen, same as

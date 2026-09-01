@@ -2062,32 +2062,6 @@ unambiguous. Not available under `--target=wasm32-wasi` — WASI has no
 process model to spawn into — rejected at compile time rather than
 failing at runtime; see [wasm.md](wasm.md).
 
-### Running without blocking: `exec(args, callback)`
-
-`exec(cmd)` blocks the whole program until the child exits. Passing a
-second, `func[int]:void` argument instead dispatches the same spawn to
-a background thread and returns immediately — the real exit code
-arrives later, through `callback`, the same non-blocking shape
-`.callback()` gives `blob`/`img`/`aud` loads above:
-
-```festina
-void func onDone(code:int) {
-    log(`child exited with ${code}`)
-}
-
-arr[text] cmd = ['/bin/sh', '-c', 'sleep 1 && echo done']
-exec(cmd, onDone)
-log('dispatched')                     // logs BEFORE onDone ever runs
-```
-
-`callback` receives the exact same value the blocking form would have
-returned — the real exit code, or `-1` if the process never started at
-all. The 2-argument form itself returns nothing: there's no handle to
-hand back (an `int` can't be mutated in place the way a `blob` is) and
-no cancel/kill mechanism to justify one either. Not available under
-`--target=wasm32-wasi`, for the identical reason the blocking form
-isn't.
-
 ## HTTP and WebSocket servers
 
 ```festina
@@ -2984,7 +2958,7 @@ descending, ties broken by name") behaves the way it reads.
 The comparator can be any `func[T,T]:int`-typed expression, not just the
 bare name of a declared function — a variable holding a function value
 works too, the same first-class-function rule every other callback
-(`.callback()`, `exec(args, callback)`) already follows.
+(`.callback()`) already follows.
 
 ```festina
 struct Enemy { name:text y:int }
@@ -3252,8 +3226,7 @@ process.
 A thread's body **may** call `log`/`fail`, string/array/map/struct/enum
 operations, `Math`, time functions, `blankImage()` plus `img`-method
 drawing/clip/resize/pixel calls (each touches only that one private
-image, never shared state), `regex()`/`mkdir()`/`ls()`, and
-`exec(args)` (the blocking, single-argument form).
+image, never shared state), `regex()`/`mkdir()`/`ls()`, and `exec()`.
 
 It may **not** call any canvas/window builtin (`drawRect`, `render`,
 `saveCanvas`, ...) or `setTimeout`/`setInterval`, and it may not call
@@ -3272,14 +3245,15 @@ Two builtins are allowed conditionally:
   [A thread's own HTTP context](#a-threads-own-http-context) below.
 
 <a name="thread-limitations"></a>
-**`exec(args, callback)` (the non-blocking form) is rejected inside a
-thread body** — unlike the blocking `exec(args)` form, its callback
-always runs on the *main* program's own OS thread, regardless of which
-thread dispatched it, so a thread handing it a closure over its own
-private state would be a real cross-thread violation. Use the blocking
-form instead. The non-blocking HTTP client form (`req.send()` with a
-`callback` field) is unavailable inside a thread body for the identical
-reason.
+**The non-blocking HTTP client form (`req.send()` with a `callback`
+field) is unavailable inside a thread body** — its callback always
+runs on the *main* program's own OS thread, regardless of which thread
+dispatched the request, so a thread handing it a closure over its own
+private state would be a real cross-thread violation. (`exec()` has no
+such hazard any more — claude.md #221 removed its own non-blocking
+`exec(args, callback)` form for exactly this reason, so only the
+always-safe blocking `exec(args)` remains, usable freely from any
+thread body.)
 
 ### A thread's own database: `DatabaseURL`
 

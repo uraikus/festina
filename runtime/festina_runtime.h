@@ -222,25 +222,6 @@ void *festina_argv_array(int argc, char **argv);
  * calls. */
 int64_t festina_process_exec(void *args);
 
-/* claude.md #177 (new entry): the non-blocking counterpart --
- * exec(args, callback) -- dispatched onto the exact same background
- * worker pool blob/img/aud's own `.callback()` runs on
- * (festina_async_io_dispatch, below). `user_callback` is the program's
- * real func[int]:void value, carried through as opaque data (it may be
- * an arbitrary runtime value, not just a bare function symbol -- see
- * FestinaExecPayload's own comment); `trampoline` is codegen's own
- * single generated void(ptr) wrapper that reads the exit code and
- * user_callback back out of the payload and calls the latter -- see
- * festina_runtime.c's own FestinaExecPayload/
- * _emit_exec_callback_trampoline doc comments for why a trampoline is
- * needed here at all (an int result, unlike blob/img/aud's own
- * already-ptr-shaped one). Never called with a NULL user_callback/
- * trampoline -- codegen only ever reaches this from the 2-argument
- * exec() form, which always has a real callback; the 1-argument, fully
- * synchronous form still calls festina_process_exec above directly. */
-void festina_process_exec_dispatch(void *args, void *user_callback,
-                                    void (*trampoline)(void *));
-
 /* claude.md #93: math, files and time -- all libc/libm, both already on
  * every link line, so none of this costs a new dependency.
  *

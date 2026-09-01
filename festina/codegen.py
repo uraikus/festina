@@ -1067,21 +1067,12 @@ class CodeGen:
                                                 # wasm32-wasi build outright (there is no SjLj
                                                 # support for that target at all), the same way
                                                 # uses_exec below already does.
-        self._exec_callback_trampoline = None  # claude.md #177: lazily-generated, cached LLVM
-                                                # symbol name for the ONE generic trampoline every
-                                                # exec(args, callback) call site shares -- see
-                                                # _emit_exec_callback_trampoline's own comment on
-                                                # why a single generic trampoline (data-driven via
-                                                # the payload) is right here, unlike
-                                                # _emit_map_value_release_trampoline's own fresh-
-                                                # per-call-site shape.
         self._sort_trampolines = {}            # claude.md #184: types_mod.type_name(element) ->
                                                 # LLVM symbol name for that element type's qsort()
                                                 # comparator trampoline -- one per DISTINCT element
                                                 # type a program calls .sort() on (the trampoline has
-                                                # to decode that type's own raw slot, so unlike
-                                                # _exec_callback_trampoline above it can't be a single
-                                                # shared symbol), cached the same way
+                                                # to decode that type's own raw slot, so it can't be
+                                                # a single shared symbol), cached the same way
                                                 # _array_release_fns below already keys per-type
                                                 # helpers.
         self.uses_exec = False                 # claude.md #150: any exec() call anywhere -- unlike
@@ -1689,9 +1680,6 @@ class CodeGen:
             "declare ptr @festina_text_char_at(ptr, i64)",
             "declare ptr @festina_argv_array(i32, ptr)",
             "declare i64 @festina_process_exec(ptr)",
-            # claude.md #177: exec(args, callback) -- the non-blocking
-            # counterpart just above.
-            "declare void @festina_process_exec_dispatch(ptr, ptr, ptr)",
             "declare i64 @strlen(ptr)",
             # claude.md #151: openPort/on request/on upgrade/on message/
             # on socketClose -- see festina_runtime.h's own extensive
@@ -9413,55 +9401,6 @@ class CodeGen:
         self.func_defs.append("")
         return trampoline_name
 
-    def _emit_exec_callback_trampoline(self):
-        """claude.md #177: bridges festina_async_io_dispatch's fixed
-        `void(*)(void*)` callback ABI to exec(args, callback)'s real
-        `func[int]:void` value -- the one wrinkle blob/img/aud's own
-        `.callback()` never had, since THEIR callback value is already
-        `func[T]:void` for a pointer-shaped T (an img/aud/blob handle),
-        which already IS `void(ptr)`-shaped and needs no adapter at
-        all. exec()'s result is a plain `int` (i64), so calling the
-        real callback needs an actual bridge, not just a cast.
-
-        Unlike _emit_map_value_release_trampoline just above (fresh
-        per call site, hardcoding a fixed release-function SYMBOL known
-        at codegen time), this trampoline cannot hardcode which
-        function to call: exec(args, callback)'s own callback is
-        checked the same permissive, structural way blob/img/aud's
-        `.callback()` already is (semantic.py) -- any func[int]:void-
-        typed EXPRESSION, which may be an ordinary runtime SSA value
-        (a variable, a struct field, ...) that a separately-emitted
-        top-level LLVM function could never reference directly. So
-        instead this trampoline is entirely generic and DATA-driven:
-        it reads both the exit code and the real callback pointer back
-        out of the payload (FestinaExecPayload in runtime/
-        festina_runtime.c -- `{ i64 exit_code; void(*user_callback)
-        (i64); ... }`, a fixed two-field prefix both sides agree on)
-        and makes an indirect call through the pointer it just loaded.
-        That means ONE trampoline correctly serves every exec(args,
-        callback) call site in the whole program, compile-time-
-        constant callback or not -- generated once, lazily, and
-        cached in self._exec_callback_trampoline."""
-        if self._exec_callback_trampoline is not None:
-            return self._exec_callback_trampoline
-        uid = self._unique()
-        trampoline_name = f"@__festina_exec_callback_{uid}"
-        body = [f"define void {trampoline_name}(ptr %payload) {{", "entry:"]
-        exit_code = self.tmp()
-        body.append(f"  {exit_code} = load i64, ptr %payload")
-        cb_slot = self.tmp()
-        body.append(
-            f"  {cb_slot} = getelementptr {{i64, ptr}}, ptr %payload, i32 0, i32 1")
-        cb_val = self.tmp()
-        body.append(f"  {cb_val} = load ptr, ptr {cb_slot}")
-        body.append(f"  call void {cb_val}(i64 {exit_code})")
-        body.append("  ret void")
-        body.append("}")
-        self.func_defs.extend(body)
-        self.func_defs.append("")
-        self._exec_callback_trampoline = trampoline_name
-        return trampoline_name
-
     def _emit_sort_comparator_trampoline(self, elem_type):
         """claude.md #184 (uraikus/festina#76 item 2): bridges
         festina_array_sort's own `int(*)(const void*, const void*,
@@ -9471,22 +9410,20 @@ class CodeGen:
         userdata-less comparator would otherwise force -- to a real
         `func[T,T]:int` Festina value.
 
-        Unlike _emit_exec_callback_trampoline just above, `userdata`
-        IS the callback pointer itself, not a payload struct to read
-        one back out of: .sort()'s comparator argument is evaluated
-        once, at the call site, into an ordinary `ptr` value (first-
-        class function values already ARE bare pointers, claude.md
-        #141), and festina_array_sort hands that same pointer back on
-        every single comparison unchanged, so there's nothing else to
-        carry alongside it.
+        `userdata` IS the callback pointer itself, not a payload struct
+        to read one back out of: .sort()'s comparator argument is
+        evaluated once, at the call site, into an ordinary `ptr` value
+        (first-class function values already ARE bare pointers,
+        claude.md #141), and festina_array_sort hands that same
+        pointer back on every single comparison unchanged, so there's
+        nothing else to carry alongside it.
 
         Cached per element type (types_mod.type_name(elem_type), the
-        same keying _array_release_fns already uses) rather than
-        shared like _exec_callback_trampoline's one symbol, because
-        decoding the two raw comparison slots needs THIS type's own
-        LLVM type -- an i64 slot decodes differently than an i8 or
-        double or ptr one, and the indirect call's own argument types
-        have to match the real comparator's signature exactly."""
+        same keying _array_release_fns already uses), because decoding
+        the two raw comparison slots needs THIS type's own LLVM type --
+        an i64 slot decodes differently than an i8 or double or ptr
+        one, and the indirect call's own argument types have to match
+        the real comparator's signature exactly."""
         key = types_mod.type_name(elem_type)
         if key in self._sort_trampolines:
             return self._sort_trampolines[key]
@@ -10689,40 +10626,21 @@ class CodeGen:
                 # own single arr[text] argument is exactly that same
                 # case (a refcounted type, not text), not a new one.
                 #
-                # claude.md #177: exec(args, callback) -- the non-
-                # blocking form. Same args handling, dispatched instead
-                # through festina_process_exec_dispatch (releasing args
-                # right after, exactly like the 1-arg form releases it
-                # right after ITS own synchronous call returns -- same
-                # timing, matches festina_process_exec_dispatch's own
-                # doc comment on why it must deep-copy rather than
-                # borrow). The callback value itself needs no cleanup
-                # of its own -- func[T]:void values are never allocated/
-                # freed (see _llvm_type's own FuncType comment), so
-                # there's nothing here to release, same as the ordinary
-                # indirect-call-through-a-func-value site below.
+                # claude.md #177 added a non-blocking exec(args,
+                # callback) form; claude.md #221 removed it (its
+                # callback always ran on main's own OS thread regardless
+                # of which thread dispatched it -- a real cross-thread-
+                # isolation hazard). Only the blocking form remains.
                 self.uses_exec = True
                 arg_expr = expr.args[0]
                 val, vtype = self._emit_expr(arg_expr, env, lines)
-                if len(expr.args) == 1:
-                    out = self.tmp()
-                    lines.append(f"  {out} = call i64 @festina_process_exec(ptr {val})")
-                    if _is_refcounted(vtype) and self._is_owning_refcounted_source(arg_expr):
-                        lines.append(f"  call void {self._release_fn_for(vtype)}(ptr {val})")
-                    else:
-                        self._free_text_temp(arg_expr, val, vtype, lines)
-                    return out, INT
-                self.uses_async_io = True
-                cb_val, _ = self._emit_expr(expr.args[1], env, lines)
-                trampoline_name = self._emit_exec_callback_trampoline()
-                lines.append(
-                    f"  call void @festina_process_exec_dispatch(ptr {val}, "
-                    f"ptr {cb_val}, ptr {trampoline_name})")
+                out = self.tmp()
+                lines.append(f"  {out} = call i64 @festina_process_exec(ptr {val})")
                 if _is_refcounted(vtype) and self._is_owning_refcounted_source(arg_expr):
                     lines.append(f"  call void {self._release_fn_for(vtype)}(ptr {val})")
                 else:
                     self._free_text_temp(arg_expr, val, vtype, lines)
-                return "0", None
+                return out, INT
             if name in ("openPort", "closePort"):
                 # claude.md #151: both take a single plain int -- no
                 # refcounted/text argument-cleanup story at all, unlike
