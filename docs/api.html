@@ -103,6 +103,7 @@
         <a class="sub" href="#http-limitations">Limitations</a>
         <a class="sub" href="#opensecureport">openSecurePort() -- TLS</a>
         <a href="#freeing-and-deleting">Freeing and deleting</a>
+        <a class="sub" href="#t-manually-managed-values">T? -- manually-managed values</a>
         <a class="sub" href="#free">free</a>
         <a class="sub" href="#delete">delete</a>
         <a href="#saving-bytes-to-a-path">Saving bytes to a path</a>
@@ -112,6 +113,12 @@
         <a href="#growing-arrays">Growing arrays</a>
         <a class="sub" href="#sorting-sortcmpfn">Sorting: sort(cmpFn)</a>
         <a href="#timers">Timers</a>
+        <a href="#threads">Threads</a>
+        <a class="sub" href="#thread-lifecycle">Lifecycle</a>
+        <a class="sub" href="#thread-private-state">Thread-private state</a>
+        <a class="sub" href="#thread-isolation">Isolation</a>
+        <a class="sub" href="#thread-sqlite">Per-thread SQLite</a>
+        <a class="sub" href="#thread-limitations">Limitations</a>
         <a href="#audio">Audio</a>
         <a class="sub" href="#stopping-a-sound">Stopping a sound</a>
         <a class="sub" href="#overlapping-sounds">Overlapping sounds</a>
@@ -2830,6 +2837,159 @@ openSecurePort(8443, key)</pre>
           the compiler does.
         </p>
 
+        <h3 id="t-manually-managed-values">T? — manually-managed values <a class="anchor" href="#t-manually-managed-values">#</a></h3>
+        <pre class="code"><span class="kw">struct</span> Circle { x:<span class="kw">int</span> y:<span class="kw">int</span> }
+
+Circle? c
+c.x = 1
+c.y = 2
+useCircle(c)
+<span class="kw">free</span> c                     <span class="cm">// the ONLY release this ever gets</span></pre>
+        <p>
+          A trailing <code>?</code> right after a type — at a variable
+          declaration or a function/thread-handler parameter — opts
+          that one binding <strong>out of automatic memory management
+          entirely</strong>. An ordinary <code>Circle</code> local is
+          retained on alias and released at scope exit without you
+          writing anything; a <code>Circle?</code> local gets none of
+          that — nothing ever calls <code>free</code> on it but you.
+          Skip that call and it leaks, on purpose: that is what
+          "manually managed" means.
+        </p>
+        <p class="muted">
+          <code>?</code> applies to the same types <code>free</code>/<code>delete</code>
+          already know how to release — struct, <code>arr[T]</code>,
+          <code>map[T]</code>, <code>enum</code>, <code>blob</code>,
+          <code>img</code>, <code>aud</code>, <code>http</code>,
+          <code>socket</code>, <code>url</code>, <code>regex</code> —
+          plus <code>int</code>/<code>float</code>/<code>bool</code>/<code>text</code>/<code>color</code>/<code>font</code>/<code>table</code>,
+          where it's accepted but has no effect at all (none of those
+          are automatically managed to begin with, so
+          <code>int? count = 1</code> behaves exactly like
+          <code>int count = 1</code>).
+        </p>
+        <p>
+          <strong><code>T?</code> is a genuinely different type from
+          <code>T</code>, not a looser version of it</strong> — the
+          same relationship <code>amor arr[T]</code> has to plain
+          <code>arr[T]</code>. Assigning one where the other is
+          expected, in either direction, is a compile error:
+        </p>
+        <pre class="code">Circle? c
+Circle plain = c           <span class="cm">// error: cannot assign value of type Circle? to Circle</span></pre>
+        <p>
+          There's no conversion between them — but a <code>T?</code>
+          declaration's own initializer may be a <strong>fresh
+          construction</strong> of the matching plain type: a literal
+          (<code>regex</code>/<code>arr[T]</code>/<code>map[T]</code>),
+          a <code>regex()</code> call, or any function call at all
+          (including one returning a plain struct):
+        </p>
+        <pre class="code">regex? pattern = /^[a-z]+$/       <span class="cm">// a fresh literal -- fine</span>
+<span class="kw">arr[int]?</span> xs = [1, 2, 3]          <span class="cm">// a fresh array literal -- fine</span>
+
+Circle <span class="kw">func</span> makeCircle() { Circle c
+c.x = 1
+<span class="kw">return</span> c }
+Circle? c = makeCircle()          <span class="cm">// a fresh call result -- fine</span>
+
+Circle plain
+Circle? alias = plain             <span class="cm">// error: cannot assign value of type Circle to Circle?</span></pre>
+        <p class="muted">
+          This is safe specifically <em>because</em> the value is fresh
+          — nothing else could already hold a reference to something
+          just constructed right here, so there's no aliasing hazard
+          for "no implicit decay" to guard against. Reading an
+          <strong>existing</strong> binding of the plain type
+          (<code>alias</code> above) is still rejected: that value's
+          own lifecycle is already someone else's automatic
+          responsibility. Once a value is bound as <code>T?</code>, it
+          only ever spreads to further <code>T?</code> bindings the
+          ordinary way (another declaration with no initializer, an
+          aliasing assignment from an existing <code>T?</code>, or a
+          <code>T?</code>-declared parameter) — the fresh-construction
+          allowance only ever applies at the birth point.
+        </p>
+        <div class="callout">
+          <strong><code>free</code>/<code>delete</code> work on a
+          <code>T?</code> value exactly as documented above</strong> —
+          same reference-count decrement, same "an alias survives"
+          behavior, same everything. They are simply the <em>only</em>
+          release a manually-managed value ever gets: nothing else
+          will ever call them for you. Because of that,
+          <code>const T? x</code> isn't allowed (a <code>const</code>
+          you could never mutate but also could never manually release
+          would be a permanent, unavoidable leak) and <code>?</code>
+          can't appear inside another type (<code>arr[T?]</code>, a
+          struct field typed <code>T?</code>, a function's
+          <code>T?</code> return type) — a manually-managed value only
+          ever lives in a variable or parameter binding directly, so
+          there's always exactly one place responsible for freeing it.
+        </div>
+        <p>
+          <strong>A manually-managed parameter can be
+          <code>free</code>d, unlike an ordinary one.</strong> Freeing
+          an ordinary parameter is a compile error — it borrows its
+          caller's value, and the caller is the one that releases it.
+          A <code>T?</code> parameter has no such caller-side release
+          waiting to happen (nothing ever auto-manages it, on either
+          side of a call), so <code>free</code>ing it is exactly as
+          legitimate as freeing any other <code>T?</code> binding:
+        </p>
+        <pre class="code"><span class="kw">void func</span> consume(c:Circle?) {
+    log(c.x)
+    <span class="kw">free</span> c                     <span class="cm">// fine -- c was never "borrowed"</span>
+}</pre>
+        <p>
+          <strong>Crossing a <code>thread</code> boundary shares the
+          reference, never clones it</strong> — <code>postMessage</code>/<code>on message</code>
+          deep-clone every other value type (see <a href="#threads">Threads</a>
+          below), but a manually-managed one crosses by handing the
+          raw reference straight to the other side, exactly like an
+          ordinary alias within one thread does. Both directions work
+          the same way:
+        </p>
+        <pre class="code"><span class="kw">struct</span> Circle { x:<span class="kw">int</span> y:<span class="kw">int</span> }
+
+<span class="kw">thread</span> Worker {
+    <span class="kw">on</span> message(p:Circle?) {
+        p.x = 99                   <span class="cm">// mutates the SAME value the sender holds</span>
+        postMessage(p)              <span class="cm">// echoes the same reference back, no clone</span>
+    }
+}
+
+Circle? c
+<span class="kw">void func</span> onReply(x:Circle?) {
+    log(x.x)                       <span class="cm">// 99</span>
+    log(c.x)                       <span class="cm">// 99 -- c itself changed, proving no clone happened</span>
+}
+Worker.onMessage(<span class="kw">void</span> (x:Circle?) =&gt; onReply(x))
+c.x = 1
+Worker.postMessage(c)</pre>
+        <p class="muted">
+          This is sound for the identical reason <code>T?</code>'s own
+          automatic-management opt-out is sound in the first place: the
+          whole safety argument behind deep-cloning everything else
+          (see <a href="#threads">Threads</a> below) is that this
+          runtime's retain/release counters are non-atomic, correct
+          only because exactly one thread ever touches a given value's
+          refcount. A manually-managed value's refcount is
+          <strong>never</strong> touched by either side's automatic
+          bookkeeping — nothing here can race on the mechanism a
+          shared, ordinary value's clone exists specifically to avoid
+          racing on. What's left is exactly what "manually managed"
+          already means, now spanning two threads instead of one:
+          don't read and write the same value from both sides at the
+          same instant without your own synchronization, and call
+          <code>free</code>/<code>delete</code> exactly once, from
+          whichever side is provably done with it. Aliasing a
+          manually-managed value never bumps its refcount, on either
+          side of a <code>postMessage</code> — two bindings (a sender's
+          and a receiver's) referencing the same value share exactly
+          one reference, and <code>free</code>ing it through either one
+          frees it for both.
+        </p>
+
         <h3 id="free">free <a class="anchor" href="#free">#</a></h3>
         <pre class="code"><span class="kw">img</span> spritesheet = <span class="str">'spritesheet.png'</span>
 <span class="kw">img</span> grass = spritesheet.clip(0, 0, 31, 31)
@@ -3102,6 +3262,185 @@ clearInterval(id)          <span class="cm">// clearTimeout()/clearInterval() ar
           a program uses both,
           one event loop multiplexes X11 events and timer deadlines
           together so neither blocks the other.
+        </p>
+      </section>
+
+      <section class="doc-section" id="threads">
+        <h2>Threads <a class="anchor" href="#threads">#</a></h2>
+        <pre class="code"><span class="kw">thread</span> worker {
+    <span class="kw">on</span> load() {
+        log(<span class="str">'worker: ready'</span>)
+    }
+    <span class="kw">on</span> message(p:<span class="kw">int</span>) {
+        postMessage(p * 2)
+    }
+}
+
+<span class="kw">void func</span> onReply(x:<span class="kw">int</span>) {
+    log(<span class="str">`main got: ${x}`</span>)
+}
+
+worker.onMessage(<span class="kw">void</span> (x:<span class="kw">int</span>) =&gt; onReply(x))
+worker.postMessage(21)</pre>
+        <p>
+          <code>thread NAME { ... }</code> declares an isolated
+          background worker: its own OS thread, its own private state,
+          and message queues to and from the main program. It starts
+          (and runs <code>on load()</code>, if declared) as soon as the
+          program starts, and idles until it either receives a message
+          or is killed. <strong>A thread's own body can see only its
+          own state/locals, function names, and type names — never a
+          global variable or constant, and it cannot call an ordinary
+          top-level function</strong> (see "Isolation" below).
+        </p>
+        <p>
+          <strong>Sending and receiving.</strong>
+          <code>on message(p:T)</code> declares the type a thread
+          accepts (a thread with no <code>on message</code> accepts no
+          messages at all, and <code>NAME.postMessage(x)</code>
+          anywhere is a compile error). From the main program,
+          <code>NAME.postMessage(x)</code> sends <code>x</code> to the
+          thread; from inside the thread's own body, the bare
+          <code>postMessage(x)</code> sends <code>x</code> back out to
+          the main program. The main program registers
+          <code>NAME.onMessage(callback)</code> to receive those:
+          <code>callback</code> is checked against whatever type the
+          thread's own <code>postMessage(x)</code> call sites actually
+          send, which must be a single, consistent type — sending more
+          than one shape from the same thread is a compile error that
+          says to pre-declare a named <code>enum</code> covering both
+          (the same convention <code>on message</code> itself already
+          uses for multiple inbound types). A thread that never calls
+          <code>postMessage</code> needs no
+          <code>NAME.onMessage(...)</code> registration at all.
+        </p>
+        <div class="callout">
+          <strong>Every message is a deep, independent copy</strong> —
+          two threads (or a thread and the main program) never share a
+          mutable value, which is what makes running Festina code on
+          more than one thread safe at all. Sendable types today:
+          <code>int</code>, <code>float</code>, <code>bool</code>,
+          <code>text</code>, <code>color</code>, <code>font</code>,
+          <code>blob</code>, <code>img</code>, <code>aud</code>,
+          <code>url</code>, and
+          <code>struct</code>/<code>arr[T]</code>/<code>map[T]</code>/<code>enum</code>
+          built recursively from any of those (a self-referencing
+          <code>struct</code>/<code>arr[T]</code>/<code>map[T]</code>
+          type is rejected at compile time — cloning it could loop
+          forever on a genuinely cyclic value). <code>func</code>,
+          <code>http</code>/<code>socket</code>, <code>regex</code>,
+          and <code>table</code> never will be (see "Limitations"
+          below). A manually-managed (<code>T?</code>) value is the one
+          exception — see <a href="#t-manually-managed-values">T? —
+          manually-managed values</a> above, which shares the
+          reference across the boundary instead of cloning it.
+        </div>
+
+        <h3 id="thread-lifecycle">Lifecycle <a class="anchor" href="#thread-lifecycle">#</a></h3>
+        <pre class="code">log(worker.isAlive())        <span class="cm">// true</span>
+worker.kill()                 <span class="cm">// blocks until the thread has stopped</span>
+log(worker.isAlive())        <span class="cm">// false</span>
+worker.live(<span class="kw">void</span> (ok:<span class="kw">bool</span>) =&gt; log(ok))   <span class="cm">// respawns it; runs on load() again</span>
+log(worker.isAlive())        <span class="cm">// true</span></pre>
+        <ul>
+          <li><code>NAME.kill()</code> stops the thread (running <code>on exit(code:int)</code> first, if declared) and blocks until it has actually stopped. <code>code</code> is always <code>0</code> here — a thread's own <code>kill()</code> carries no exit code of its own to pass through (unlike the main program's own <code>on exit(code:int)</code>, which does — see <a href="#graceful-shutdown">Graceful shutdown</a>).</li>
+          <li><code>NAME.live(callback)</code> respawns a killed thread and calls <code>callback(true)</code> once it's running again.</li>
+          <li><code>NAME.isAlive()</code> reads whether the thread is currently running.</li>
+        </ul>
+        <p class="muted">
+          If the main program exits (including via <code>close(code)</code>
+          or a SIGINT/SIGTERM-driven <a href="#graceful-shutdown">graceful
+          shutdown</a>), every still-alive thread is killed first (each
+          thread's own <code>on exit(code:int)</code>, if declared,
+          runs with <code>code</code> <code>0</code>, the identical
+          <code>kill()</code> behavior above — the main program's own
+          real exit code isn't threaded through), so a declared thread
+          never survives as an orphaned process.
+        </p>
+
+        <h3 id="thread-private-state">Thread-private state <a class="anchor" href="#thread-private-state">#</a></h3>
+        <pre class="code"><span class="kw">thread</span> counter {
+    <span class="kw">int</span> total = 0
+    <span class="kw">on</span> message(p:<span class="kw">int</span>) {
+        total = total + p
+        postMessage(total)
+    }
+}</pre>
+        <p>
+          A variable declared directly in a thread's own body
+          (<code>int total = 0</code> above) is visible to every
+          handler in that one thread and invisible everywhere else,
+          including other threads and the main program — it persists
+          across messages the same way a global would, just scoped to
+          this one thread.
+        </p>
+
+        <h3 id="thread-isolation">Isolation <a class="anchor" href="#thread-isolation">#</a></h3>
+        <p>
+          A thread's body may call <code>log</code>/<code>fail</code>,
+          string/array/map/struct/enum operations, <code>Math</code>,
+          time functions, and <code>blankImage()</code> plus
+          <code>img</code>-method drawing/clip/resize/pixel calls (each
+          touches only that one private image, never shared state). It
+          may <strong>not</strong> call any canvas/window builtin
+          (<code>drawRect</code>, <code>render</code>,
+          <code>saveCanvas</code>, ...),
+          <code>setTimeout</code>/<code>setInterval</code>,
+          <code>exec()</code>, <code>mkdir()</code>/<code>ls()</code>,
+          <code>openPort()</code>/<code>openSecurePort()</code>, or any
+          ordinary top-level <code>func</code> declared outside the
+          thread. <code>sqlite()</code><wbr>/<code>sqliteInt()</code><wbr>/<code>sqliteFloat()</code><wbr>/<code>sqliteText()</code>
+          are allowed <strong>only</strong> for a thread that declared
+          its own <code>DatabaseURL</code> — see below.
+        </p>
+
+        <h3 id="thread-sqlite">Per-thread SQLite <a class="anchor" href="#thread-sqlite">#</a></h3>
+        <p>
+          A thread's own first statement may be
+          <code>DatabaseURL = '&lt;literal&gt;'</code> — a plain
+          string literal only, unlike the main program's own
+          <code>DatabaseURL</code> (which may be any <code>text</code>
+          expression):
+        </p>
+        <pre class="code"><span class="kw">thread</span> logger {
+    DatabaseURL = <span class="str">'./logs.sqlite'</span>
+    <span class="kw">table</span> LogEntry { message:<span class="kw">text</span> }
+    <span class="kw">on</span> message(p:<span class="kw">text</span>) {
+        sqlite(<span class="str">'INSERT INTO LogEntry (message) VALUES (?)'</span>, [p])
+    }
+}
+logger.postMessage(<span class="str">'started up'</span>)</pre>
+        <p class="muted">
+          A thread with its own <code>DatabaseURL</code> gets its own
+          private sqlite handle — never shared with the main program
+          or any other thread — and may call
+          <code>sqlite()</code><wbr>/<code>sqliteInt()</code><wbr>/<code>sqliteFloat()</code><wbr>/<code>sqliteText()</code>;
+          every <code>table</code> declared anywhere in the program is
+          synced against it, the same as the main program's own
+          database. A thread that did <strong>not</strong> declare its
+          own <code>DatabaseURL</code> may not call any of the four at
+          all — a clear compile error naming the fix.
+          <strong>Two contexts (a thread and the main program, or two
+          threads) may never resolve to the same literal database
+          file</strong> — checked at compile time across the whole
+          program, including the main program's own default
+          (<code>'festina.sqlite'</code>, when it declares no
+          <code>DatabaseURL</code> of its own); a non-literal main
+          <code>DatabaseURL</code> (an expression the compiler can't
+          prove anything about) skips this check rather than guessing.
+        </p>
+
+        <h3 id="thread-limitations">Limitations <a class="anchor" href="#thread-limitations">#</a></h3>
+        <p class="muted">
+          Threads are singletons, declared once by name — there is no
+          way to spawn more than one instance of the same
+          <code>thread</code> block (a worker pool, say). There is also
+          no way to declare a thread-private <em>helper function</em> —
+          every top-level <code>func</code> is either callable from
+          every thread (if it never touches a global or an impure
+          builtin) or from none at all; a <code>func</code> scoped to
+          one particular thread's own body, closing over that thread's
+          own state, isn't supported.
         </p>
       </section>
 
