@@ -562,4 +562,15 @@ class TestLeakStress:
             # manages it on either side) -- miss that free and every
             # one of these leaks, unmissable at this volume.
             "thread_manually_managed_churn.f",
+            # claude.md #209: `thread NAME[N] { ... }` -- an ownership
+            # shape none of the files above exercise: N genuinely
+            # independent OS threads all running the IDENTICAL
+            # generated body concurrently, each its own private state/
+            # handle/queue. thread_churn.f's own workers are each a
+            # DIFFERENT body, one instance apiece -- this is the shape
+            # most likely to expose a bug where per-instance codegen
+            # accidentally shared something (a global instead of a
+            # namespaced one, one instance's handle read/written by
+            # another's).
+            "thread_pool_churn.f",
         }
