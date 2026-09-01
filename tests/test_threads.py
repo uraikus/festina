@@ -875,6 +875,71 @@ class TestThreadPools:
         with pytest.raises(errors.CompileError, match="is an ordinary thread, not a pool"):
             semantic.analyze(parser.parse(source))
 
+    def test_an_auto_pool_resolves_to_cpu_count_with_no_other_threads(
+            self, parser, semantic, monkeypatch):
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 8)
+        program = parser.parse("thread pool[] { }")
+        semantic.analyze(program)
+        assert program.body[0].pool_size == 8
+
+    def test_an_auto_pool_subtracts_a_singleton_threads_own_one(
+            self, parser, semantic, monkeypatch):
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 8)
+        source = """
+        thread worker { on load() { } }
+        thread pool[] { }
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+        assert program.body[1].pool_size == 7
+
+    def test_an_auto_pool_subtracts_an_explicit_pools_own_n(
+            self, parser, semantic, monkeypatch):
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 8)
+        source = """
+        thread fixed[3] { }
+        thread pool[] { }
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+        assert program.body[1].pool_size == 5
+
+    def test_an_auto_pool_is_floored_at_one(self, parser, semantic, monkeypatch):
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 2)
+        source = """
+        thread a[3] { }
+        thread b[3] { }
+        thread pool[] { }
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+        assert program.body[2].pool_size == 1
+
+    def test_two_auto_pools_each_get_the_full_remaining_budget(
+            self, parser, semantic, monkeypatch):
+        # claude.md #220: auto pools don't divide the remaining budget
+        # between themselves -- each sizes independently against the
+        # same fixed total, so both land on the same number here.
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 8)
+        source = """
+        thread worker { on load() { } }
+        thread poolA[] { }
+        thread poolB[] { }
+        """
+        program = parser.parse(source)
+        semantic.analyze(program)
+        assert program.body[1].pool_size == 7
+        assert program.body[2].pool_size == 7
+
+    def test_an_auto_pool_declaration_indexes_like_an_ordinary_pool(
+            self, parser, semantic, monkeypatch):
+        monkeypatch.setattr(semantic.os, "cpu_count", lambda: 4)
+        source = """
+        thread pool[] { on message(worker:thread, msg:int) { } }
+        pool[0].postMessage(1)
+        """
+        semantic.analyze(parser.parse(source))
+
     def test_pool_isalive_kill_live_are_accepted_when_indexed(self, parser, semantic):
         source = """
         thread pool[2] { on load() { } }

@@ -35,6 +35,7 @@ bottom of analyze()).
 from . import ast
 import dataclasses
 import math
+import os
 
 from . import types as types_mod
 from .errors import CompileError
@@ -5090,6 +5091,35 @@ def analyze(program, filename="<string>"):
         scope = Scope(parent_scope)
         for stmt in block.body:
             analyze_statement(stmt, scope, return_type, loop_depth)
+
+    # claude.md #220: `thread NAME[] { ... }` -- empty brackets, no
+    # literal N -- resolves its own pool size HERE, before anything
+    # else in this function ever reads a ThreadDecl's `pool_size`. The
+    # parser leaves the sentinel string `"auto"` in place (see
+    # parse_thread_decl's own comment); this pass mutates it in place
+    # into a real positive int, so every later reader -- the rest of
+    # this file, all of codegen.py -- never has to know "auto" existed.
+    #
+    # The rule: os.cpu_count() (the machine COMPILING the program, not
+    # necessarily the one that later runs it -- see claude.md #220's
+    # own entry for why compile time was chosen over run time) minus
+    # every OTHER thread the program declares, floored at 1. "Every
+    # other thread" counts an ordinary singleton as 1 and an explicit
+    # `NAME[N]` pool as N; another `NAME[]` auto pool is deliberately
+    # NOT counted here (each auto pool sizes itself independently
+    # against the same fixed total, rather than trying to solve a
+    # system of equations between them -- simple and order-independent,
+    # at the cost of two auto pools on the same machine each getting
+    # the full remaining budget rather than splitting it).
+    _fixed_thread_total = sum(
+        1 if stmt.pool_size is None else stmt.pool_size
+        for stmt in program.body
+        if isinstance(stmt, ast.ThreadDecl) and stmt.pool_size != "auto"
+    )
+    _cpu_count = os.cpu_count() or 1
+    for stmt in program.body:
+        if isinstance(stmt, ast.ThreadDecl) and stmt.pool_size == "auto":
+            stmt.pool_size = max(1, _cpu_count - _fixed_thread_total)
 
     # claude.md #106: every struct and table NAME is registered before
     # any of their fields resolve, so declaration order stops mattering.

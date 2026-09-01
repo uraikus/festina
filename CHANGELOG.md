@@ -9,6 +9,20 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.33] - 2026-09-01
+
+### Added
+
+- **`thread NAME[] { ... }`** -- empty brackets, no literal size --
+  sizes the pool itself: `os.cpu_count()` (read on the machine
+  compiling the program) minus every other thread the program
+  declares, floored at 1. `thread NAME { ... }` (no brackets at all)
+  is unchanged, still a singleton. Two auto-sized pools in the same
+  program each get the full remaining budget rather than splitting it.
+  See [api.md](api.md#thread-pools-thread-namen).
+
+See claude.md #220.
+
 ## [0.32] - 2026-09-01
 
 ### Removed

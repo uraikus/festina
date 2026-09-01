@@ -16838,6 +16838,27 @@ class TestThreadPools:
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["false", "true"]
 
+    def test_an_auto_sized_pool_really_has_the_resolved_number_of_instances(
+            self, compile_and_run, codegen, monkeypatch):
+        # claude.md #220: `thread pool[] { }` resolves its own size at
+        # semantic-analysis time (cpu_count minus every other declared
+        # thread, floored at 1) -- codegen.py never sees the "auto"
+        # sentinel at all, so this proves the RESOLVED pool really has
+        # that many live instances, not just that it compiles.
+        monkeypatch.setattr(codegen.semantic_mod.os, "cpu_count", lambda: 3)
+        source = """
+        thread solo { on load() { } }
+        thread pool[] { }
+        log(pool[0].isAlive())
+        log(pool[1].isAlive())
+        log(pool[2].isAlive())
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # 3 cpus - 1 (solo) = 2 instances: pool[0]/pool[1] alive, pool[2] out of range.
+        assert result.stdout.strip().splitlines() == ["true", "true", "false"]
+
 
 class TestThreadPrivateFunctions:
     """claude.md #210: real, compiled-and-run proof that a thread-

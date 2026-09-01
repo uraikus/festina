@@ -3353,6 +3353,26 @@ but it does mean a pool costs `N` copies of its body's generated code
 a large `N` over a large body is a real compiled-size decision rather
 than a free one.
 
+**`thread NAME[] { ... }` — empty brackets — sizes the pool for you.**
+`N` becomes `os.cpu_count()` (read on the machine *compiling* the
+program — the resulting count is an ordinary literal baked into the
+binary, not re-measured wherever it later runs) minus every other
+thread the program declares, floored at 1:
+
+```festina
+thread logger { on load() { } }   // 1 thread
+thread pool[] { ... }             // gets cpu_count() - 1 instances
+```
+
+An ordinary singleton (`thread NAME { ... }`, no brackets at all)
+always counts as 1; an explicit `thread NAME[N] { ... }` counts as `N`.
+Two auto-sized pools in the same program don't split the remaining
+budget between them — each is sized independently against the same
+fixed total, so both get the same count. Once resolved, an auto-sized
+pool is in every other respect an ordinary `thread NAME[N] { ... }` —
+same indexing, same out-of-range-is-a-no-op behavior, same per-instance
+compiled-size cost above.
+
 **A pool may not declare its own `DatabaseURL`.** Every instance in a
 pool runs the identical body, so a `DatabaseURL = '<literal>'` there
 would be the SAME literal path for all `N` of them — unlike an

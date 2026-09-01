@@ -172,7 +172,15 @@ class ThreadDecl(Node):
     thread, or a positive `int` for `thread NAME[N] { ... }` -- a pool
     of `N` independent instances of the same body, addressed at a use
     site via `NAME[i]` (an ordinary computed `Member`, needing no
-    grammar of its own -- see parse_thread_decl's own comment)."""
+    grammar of its own -- see parse_thread_decl's own comment).
+
+    claude.md #220: `pool_size` is briefly the string `"auto"` for
+    `thread NAME[] { ... }` (empty brackets) between parsing and
+    semantic.py's own pre-pass at the top of `analyze()`, which
+    resolves it into a real positive int (os.cpu_count() minus every
+    other thread the program declares, floored at 1) before any real
+    analysis begins -- nothing downstream of that pre-pass, including
+    every codegen.py read of `decl.pool_size`, ever sees `"auto"`."""
     def __init__(self, name, body, line=0, column=0, pool_size=None):
         self.name = name
         self.body = body
