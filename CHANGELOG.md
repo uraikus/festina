@@ -9,6 +9,22 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.22] - 2026-09-01
+
+### Added
+
+- **`thread NAME[N] { ... }` -- thread pools.** Declares `N` fully
+  independent instances of the same thread body, each its own OS
+  thread, private state, and inbound queue. Addressed with `NAME[i]`
+  (any `int` expression) everywhere a singleton thread's own bare
+  `NAME` would be used — `pool[i].postMessage(x)`/`.kill()`/
+  `.live(callback)`/`.isAlive()` all work identically to the singleton
+  form, just per-instance. An out-of-range index is a silent no-op,
+  matching `NAME.isAlive()`'s own established "test, don't fail"
+  convention rather than crashing or raising.
+
+See claude.md #209 for the full design.
+
 ## [0.21] - 2026-09-01
 
 ### Changed
