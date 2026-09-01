@@ -9,6 +9,36 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.40] - 2026-09-01
+
+### Changed
+
+- **`NAME.drain()`'s bookkeeping no longer costs the worker an extra
+  mutex round trip per message.** The "finished dispatching" flag is
+  now cleared inside the lock acquisition the worker already makes
+  when it looks for its next message, and the wake-up broadcast is
+  skipped entirely unless a `drain()` is actually waiting -- a
+  program that never calls `drain()` pays one predictable branch per
+  message and nothing else. Measured on a 400,000-message
+  fire-and-forget program: min 208 -> 171 ms, median 300 -> 225 ms.
+
+### Fixed
+
+- `drain()` on a thread that stops while the call is blocked can no
+  longer sleep forever -- `alive` is part of the wait predicate and a
+  stopping thread wakes any waiter on its way out. (Not reachable
+  from Festina code today, where only the main program can call
+  either `drain()` or `kill()` and never concurrently; kept correct
+  rather than relied on.)
+
+### Documentation
+
+- `drain()` waits for the thread's own side effects, not for a
+  reply's `.callback(fn)` to run on main -- spelled out in api.md,
+  with a test pinning the order.
+
+See claude.md #232.
+
 ## [0.39] - 2026-09-01
 
 ### Added

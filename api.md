@@ -3265,6 +3265,17 @@ both already run to completion before any teardown begins, so a
 `postMessage(x)` immediately followed by `drain()` there is a reliable
 "fire this off and be sure it landed before we exit" pattern.
 
+`drain()` is about the thread's own side effects, not round-trip
+completion. It returns once the thread has *processed* everything —
+including any `.reply()` it made along the way — but a reply is
+delivered to your `.callback(fn)` by the main program's own event
+loop, which only runs once top-level code returns. So after
+`worker.postMessage(x).callback(fn); worker.drain()`, the next line
+always runs *before* `fn` does, never after. It also works on a thread
+with its own [HTTP context](#a-threads-own-http-context), whose worker
+loop polls rather than blocks — a drain there can take up to one poll
+interval (~20ms) longer to notice an idle queue.
+
 All four of these are callable **only** from the main program — a
 thread may message another thread, but may not control its lifecycle.
 

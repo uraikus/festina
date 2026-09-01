@@ -319,6 +319,47 @@ class TestThreadGracefulShutdown:
         assert process.returncode == 143
         assert "worker exiting" in process.stdout.read()
 
+    def test_sigterm_driven_on_exit_can_drain_a_final_write(self, tmp_path, cli_mod):
+        # claude.md #232 (uraikus/festina#91): the signal-driven shape
+        # of the issue's own scenario -- the process is idling in its
+        # event loop, SIGTERM arrives, `on exit(code:int)` fires a last
+        # write to a DatabaseURL thread and drain()s it. The teardown
+        # that follows (festina_thread_kill_all, which discards a
+        # thread's queue exactly like kill()) must find nothing left to
+        # discard, and the row must be on disk once the process is
+        # gone. test_codegen's own TestThreadDrain covers close(0);
+        # this is the path a real Ctrl-C/window-close takes instead.
+        import sqlite3
+        process = self._run_background(tmp_path, cli_mod, """
+        table Written { n:int }
+        thread writer {
+            DatabaseURL = 'sigterm_drain.sqlite'
+            on message(caller:thread, msg:int) {
+                sqlite('INSERT INTO Written (n) VALUES (?)', [msg])
+            }
+        }
+        void func tick() { }
+        on exit(code:int) {
+            writer.postMessage(code + 100)
+            writer.drain()
+            log('drained on the way out')
+        }
+        setInterval(tick, 1000)
+        log('ready')
+        """)
+        time.sleep(0.3)
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=10)
+        assert process.returncode == 143
+        out = process.stdout.read()
+        assert "drained on the way out" in out, out
+        rows = sqlite3.connect(tmp_path / "sigterm_drain.sqlite").execute(
+            "SELECT n FROM Written").fetchall()
+        # on exit's `code` is 143 for SIGTERM (see the SIGTERM tests
+        # above), so the row is 243 -- which also proves the exit
+        # handler saw the real signal code, not a stale 0.
+        assert rows == [(243,)]
+
     def test_no_orphaned_thread_survives_after_the_parent_exits(self, tmp_path, cli_mod):
         # A declared `thread` is an OS thread INSIDE the same process,
         # not a separate one -- the only way it could "survive" the

@@ -16604,6 +16604,87 @@ class TestThreadReplyCallback:
         assert result.returncode == 0, result.stdout + result.stderr
         assert result.stdout.strip().splitlines() == ["A: 10", "B: 20"]
 
+    def test_replies_arriving_out_of_registration_order_keep_the_list_intact(
+            self, compile_and_run):
+        # claude.md #232: the one removal shape claude.md #230's own
+        # fix has that neither of its tests exercised -- removing the
+        # TAIL of a list that is NOT thereby emptied. Main registers
+        # cbSlow (to a thread that stalls ~200ms before replying) then
+        # cbFast; the fast reply arrives first, removing the tail
+        # node while the head survives, so pending_callbacks_tail must
+        # be walked back to the head node, not left dangling or set
+        # to NULL. Then the slow reply empties the list, and a THIRD
+        # send proves the list is still perfectly usable after both
+        # removal shapes in a row. Output order is therefore forced,
+        # not racy: fast, slow, third.
+        source = """
+        int seen = 0
+        void func finish() {
+            seen = seen + 1
+            if seen == 3 { close(0) }
+        }
+        void func onSlow(r:int) { log(`slow ${r}`) finish() }
+        void func onFast(r:int) { log(`fast ${r}`) finish() }
+        void func onThird(r:int) { log(`third ${r}`) finish() }
+        thread slow {
+            on message(w:thread, msg:int) {
+                int s = now()
+                while now() - s < 200 { }
+                w.reply(msg)
+            }
+        }
+        thread fast {
+            on message(w:thread, msg:int) { w.reply(msg) }
+        }
+        slow.postMessage(1).callback(onSlow)
+        fast.postMessage(2).callback(onFast)
+        fast.postMessage(3).callback(onThird)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip().splitlines() == ["fast 2", "third 3", "slow 1"]
+
+    def test_many_outstanding_replies_across_a_pool_all_resolve(self, compile_and_run):
+        # claude.md #232: dynamic coverage of the pending-callback list
+        # under a removal order NOTHING controls -- four real OS
+        # threads racing to reply, so main's single list has entries
+        # removed from the head, the middle and the tail in whatever
+        # interleaving the scheduler produces this run, while new
+        # registrations keep appending at the tail throughout (each
+        # callback fires a fresh send until its own chain is done).
+        # Every one of the 4 x 30 chained round trips must resolve to
+        # its own callback exactly once: the count and the checksum
+        # both pin that, whatever order it happened in.
+        source = """
+        int done = 0
+        int sum = 0
+        int DEPTH = 30
+        thread pool[4] {
+            on message(w:thread, msg:int) { w.reply(msg) }
+        }
+        void func onReply(r:int) {
+            done = done + 1
+            sum = sum + r
+            int lane = r % 4
+            int step = Math.floorDiv(r, 4)
+            if step + 1 < DEPTH {
+                pool[lane].postMessage(r + 4).callback(onReply)
+            }
+            if done == 4 * DEPTH {
+                log(`${done} ${sum}`)
+                close(0)
+            }
+        }
+        pool[0].postMessage(0).callback(onReply)
+        pool[1].postMessage(1).callback(onReply)
+        pool[2].postMessage(2).callback(onReply)
+        pool[3].postMessage(3).callback(onReply)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        # values 0..119 each exactly once: 120 callbacks, sum 119*120/2
+        assert result.stdout.strip() == "120 7140"
+
     def test_an_out_of_range_pool_index_registers_no_callback(self, compile_and_run):
         # claude.md #218: the registration used to be emitted BEFORE
         # the pool's own bounds check, so an out-of-range index left a
@@ -17093,6 +17174,155 @@ class TestThreadDrain:
         assert db.exists()
         rows = sqlite3.connect(db).execute("SELECT n FROM Written").fetchall()
         assert rows == [(42,)]
+
+    def test_drain_blocks_until_every_queued_message_has_run(self, compile_and_run, tmp_path):
+        # claude.md #232: the blocking guarantee itself, checked from
+        # INSIDE the program rather than after it exits, across
+        # deliberately uneven batch sizes (1, then a burst, then 1
+        # again -- the list draining fully to empty and refilling is
+        # exactly the shape that matters). The worker appends one byte
+        # per message to a file; after each drain() main re-reads the
+        # file and the byte count must equal everything sent so far,
+        # every single time. A drain() that returned early -- while a
+        # message was dequeued but still mid-append, or still queued --
+        # shows up as a short count at that exact batch.
+        source = """
+        thread worker {
+            blob out = 'progress.txt'
+            on message(w:thread, msg:int) {
+                out.append('x')
+            }
+        }
+        arr[int] batches = [1, 7, 3, 25, 1, 60, 12, 100, 2]
+        int sent = 0
+        int b = 0
+        while b < batches.length {
+            int k = 0
+            while k < batches[b] {
+                worker.postMessage(k)
+                k = k + 1
+            }
+            sent = sent + batches[b]
+            worker.drain()
+            blob check = 'progress.txt'
+            int have = check.toText().split('').length
+            if have != sent {
+                log(`short at batch ${b}: have ${have}, sent ${sent}`)
+                close(1)
+            }
+            b = b + 1
+        }
+        log(`all ${sent} landed`)
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "all 211 landed"
+
+    def test_drain_works_on_a_thread_with_its_own_http_context(self, compile_and_run):
+        # claude.md #232: a thread that declared an HTTP-shaped handler
+        # runs the OTHER worker-loop shape (the bounded 20ms poll of
+        # festina_thread_main's http branch, never blocking on its own
+        # condvar). drain() must work identically there -- the
+        # dispatching flag and its condvar live in the shared
+        # try_dispatch_one path both loop shapes call, so this pins
+        # that the polling shape clears/broadcasts too, not just the
+        # blocking one every other test here happens to use.
+        source = """
+        thread worker {
+            blob out = 'polled.txt'
+            on request(req:http) { }
+            on message(w:thread, msg:int) {
+                out.append('x')
+            }
+        }
+        int i = 0
+        while i < 40 {
+            worker.postMessage(i)
+            i = i + 1
+        }
+        worker.drain()
+        blob check = 'polled.txt'
+        log(check.toText().split('').length)
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "40"
+
+    def test_drain_from_on_exit_makes_a_final_write_durable(self, compile_and_run, tmp_path):
+        # claude.md #232: the headline use case from uraikus/festina#91
+        # verbatim -- the exit handler itself fires the last write and
+        # drains, and it must land even though process teardown (which
+        # discards a thread's queue, like kill()) follows immediately.
+        source = """
+        table Written { n:int }
+        thread writer {
+            DatabaseURL = 'exit_drain.sqlite'
+            on message(caller:thread, msg:int) {
+                sqlite('INSERT INTO Written (n) VALUES (?)', [msg])
+            }
+        }
+        on exit(code:int) {
+            writer.postMessage(99)
+            writer.drain()
+            log('drained in on exit')
+        }
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "drained in on exit" in result.stdout
+        rows = sqlite3.connect(tmp_path / "exit_drain.sqlite").execute(
+            "SELECT n FROM Written").fetchall()
+        assert rows == [(99,)]
+
+    def test_drain_returns_before_pending_replies_reach_main(self, compile_and_run):
+        # claude.md #232: pins a semantic that is easy to assume the
+        # other way. drain() waits for the WORKER to finish processing
+        # -- including its own .reply() call -- but a reply is
+        # delivered to main's callback by main's own event loop, which
+        # only runs once top-level code has returned. So the line
+        # after drain() always runs BEFORE the callback, never after.
+        # (drain() is about durability of the worker's own side
+        # effects, not about round-trip completion; api.md says so.)
+        source = """
+        void func onReply(r:int) {
+            log(`reply ${r}`)
+            close(0)
+        }
+        thread worker {
+            on message(w:thread, msg:int) { w.reply(msg * 2) }
+        }
+        worker.postMessage(21).callback(onReply)
+        worker.drain()
+        log('drained')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip().splitlines() == ["drained", "reply 42"]
+
+    def test_an_out_of_range_pool_drain_is_a_silent_no_op(self, compile_and_run):
+        # claude.md #232: same "test, don't fail" convention every
+        # other pool[i] lifecycle method already has -- and the
+        # in-range drain right after it must still genuinely wait.
+        source = """
+        thread pool[2] {
+            blob out = 'pool.txt'
+            on message(w:thread, msg:int) { out.append('x') }
+        }
+        pool[5].drain()
+        pool[0].postMessage(1)
+        pool[1].postMessage(2)
+        pool[0].drain()
+        pool[1].drain()
+        blob check = 'pool.txt'
+        log(check.toText().split('').length)
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "2"
 
     def test_drain_on_a_never_started_thread_is_a_safe_no_op(self, compile_and_run):
         # claude.md #231: a thread with no `on message`/`postMessage`
