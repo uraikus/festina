@@ -39,6 +39,8 @@
         <a href="#canvas">Canvas vs HTML canvas / MonoGame</a>
         <a href="#http-benchmark">HTTP vs Rust/Go/Bun</a>
         <a class="sub" href="#http-reading-these-numbers">Reading these numbers</a>
+        <a href="#http-threaded">HTTP: single-threaded vs. pool</a>
+        <a class="sub" href="#http-threaded-reading">Reading these numbers</a>
       </div>
     </nav>
   </aside>
@@ -398,6 +400,80 @@
           <li><strong><code>/json</code></strong> exercises more than <code>/</code>: Festina's route builds a struct and renders it through the same JSON-via-<code>.toText()</code> path every other container response already uses, not a hand-built string the way <code>/</code> sends one — so a gap between the two routes for Festina specifically reflects that serialization cost, not connection handling.</li>
           <li>Rust's and Go's numbers here are <em>not</em> what those languages' idiomatic HTTP stacks would report — seeing "Rust is only Nx faster than Festina at HTTP" from this section should be read as "at matching, single-threaded connection handling," not as a claim about <code>hyper</code>/<code>axum</code> or <code>net/http</code> in general, which support keep-alive by default too but add a multi-threaded accept loop and years of tuning this comparison deliberately holds constant.</li>
           <li>No WebSocket throughput benchmark exists yet — <code>on message</code> traffic has a very different shape (persistent connections, small frequent frames) from a request/response load test, and would need its own methodology rather than reusing <code>wrk</code>'s HTTP-request model.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="http-threaded">
+        <h2>HTTP: single-threaded vs. thread pool <a class="anchor" href="#http-threaded">#</a></h2>
+        <p>
+          The section above measures Festina's single HTTP event loop
+          against other languages' own single-threaded raw-socket
+          servers — a deliberately fair, apples-to-apples comparison.
+          This section instead compares Festina against
+          <strong>itself</strong>: what a
+          <code>thread pool[N] { on request(req:http) { ... } }</code>
+          (a <a href="api.html#thread-http">private per-thread HTTP
+          context</a>) plus <a href="api.html#thread-giverequest"><code>NAME.giveRequest(r)</code></a>
+          actually buys a program that does real CPU-bound work per
+          request, the pattern
+          <a href="https://github.com/uraikus/festina/blob/main/examples/threaded_http_server.f"><code>examples/threaded_http_server.f</code></a>
+          demonstrates.
+        </p>
+        <p>
+          Two servers (source in
+          <a href="https://github.com/uraikus/festina/tree/main/benchmarks/http_threaded">benchmarks/http_threaded/</a>),
+          both answering the same two routes — <code>/</code> (no work,
+          a control) and <code>/slow</code> (a
+          closed-form-resistant polynomial-hash loop, the same
+          technique <code>loop_sum.f</code> above uses, tuned to
+          ~2,000,000 iterations so a single request takes a few
+          milliseconds of real CPU time):
+        </p>
+        <ul>
+          <li><strong>single-threaded</strong> (<code>server_single.f</code>) does <code>/slow</code>'s own work directly in the one top-level <code>on request</code> handler, on Festina's single HTTP event-loop thread — every concurrent <code>/slow</code> request queues up behind whichever one is currently computing.</li>
+          <li><strong>thread pool[N]</strong> (<code>server_pool.f</code>, <code>N</code> = this machine's own CPU count by default) hands every <code>/slow</code> request off to the next of <code>N</code> worker threads via <code>giveRequest</code>, so up to <code>N</code> requests are genuinely computed in parallel, on <code>N</code> different CPU cores, before any of them respond. <code>/</code> is answered directly by main in both servers, unchanged — it's included to confirm the pool's own round-robin dispatch adds no meaningful overhead to a request that never needed handing off in the first place.</li>
+        </ul>
+        <p class="muted">
+          Each <code>wrk</code> run: 4 threads, 50 open connections, 5
+          seconds, against one route at a time — otherwise the
+          identical methodology the section above already uses (no
+          explicit <code>Connection: close</code> forcing here, since
+          both servers are the same language/runtime with the same
+          keep-alive behavior; there's no cross-language asymmetry to
+          correct for). Reproduce locally:
+        </p>
+        <pre class="code"><span class="mut">$</span> python3 benchmarks/http_threaded/run_http_threaded_benchmark.py
+<span class="mut">$</span> python3 benchmarks/http_threaded/run_http_threaded_benchmark.py --update-doc
+<span class="mut">$</span> python3 benchmarks/http_threaded/run_http_threaded_benchmark.py --pool-size 8 --duration 10s</pre>
+
+        <p class="muted">Last run: 2026-09-01 on this machine (4 CPUs), <code>wrk -t4 -c50 -d5s</code> per route, pool size 4.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>no work, control (/)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr></thead>
+            <tbody>
+              <tr><td>single-threaded</td><td class="num">74,673</td><td class="num">0.66 ms</td><td class="num">8.19 MB/s</td></tr>
+              <tr class="row-festina"><td>thread pool[4]</td><td class="num">49,093</td><td class="num">1.03 ms</td><td class="num">5.38 MB/s</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>CPU-bound work (/slow)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr></thead>
+            <tbody>
+              <tr><td>single-threaded</td><td class="num">92</td><td class="num">491.28 ms</td><td class="num">0.01 MB/s</td></tr>
+              <tr class="row-festina"><td>thread pool[4]</td><td class="num">256</td><td class="num">185.33 ms</td><td class="num">0.03 MB/s</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><code>/slow</code> speedup from the pool: <strong>2.77x</strong> (pool size 4, this machine has 4 CPUs).</p>
+
+        <h3 id="http-threaded-reading">Reading these numbers <a class="anchor" href="#http-threaded-reading">#</a></h3>
+        <ul>
+          <li><strong><code>/</code> (no work) should perform about the same on both servers</strong> — neither variant's own connection-accept/parse/respond path changed at all; only whether <code>/slow</code>'s own CPU-bound work is serialized or parallelized did. A meaningful gap here would mean the pool's own round-robin dispatch itself is expensive, not that the pool is "working" — it shouldn't be, since <code>/</code> never goes through <code>giveRequest</code> in either server.</li>
+          <li><strong><code>/slow</code>'s own speedup is bounded by real CPU core count, not <code>N</code></strong> — a pool bigger than the machine's own core count just adds contention, not more genuine parallelism; <code>--pool-size</code> defaults to <code>os.cpu_count()</code> for exactly this reason.</li>
+          <li><strong>Every handed-off request pays a small, real hand-off latency</strong> — a receive-only worker thread's own combined loop polls on a bounded timeout (<code>FESTINA_THREAD_HTTP_POLL_MS</code>, 20ms) rather than waking instantly the way a dedicated OS thread blocked on <code>accept()</code> would, so under <em>low</em> concurrency (one request at a time, nothing else queued) a handed-off request can be slightly <em>slower</em> end-to-end than the single-threaded baseline answering it directly — the pool's own advantage only shows up once there's more concurrent CPU-bound work than one thread can get through serially, which is exactly what these numbers measure.</li>
+          <li>This is a same-machine, same-process-family comparison (no network hop) measuring exactly one thing — how much a real, additional workload on the SAME hardware benefits from being spread across more than one of Festina's own execution threads — not a general claim about optimal pool sizing for a production workload, which depends heavily on how CPU-bound (vs. I/O-bound) the real work actually is.</li>
         </ul>
       </section>
 

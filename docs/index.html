@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Festina — a fast, simple language that compiles to native code</title>
-<meta name="description" content="Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, and timers built in.">
+<meta name="description" content="Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, timers, and threads built in.">
 <meta name="theme-color" content="#7c1f1b">
 <meta name="color-scheme" content="light">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%237c1f1b'/%3E%3Crect x='4' y='4' width='56' height='56' fill='none' stroke='%2393731f' stroke-width='2'/%3E%3Ctext x='33' y='49' text-anchor='middle' font-family='Georgia, Times New Roman, serif' font-style='italic' font-weight='700' font-size='42' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
@@ -422,11 +422,12 @@
 
 <div id="top"></div>
 <section class="hero">
-  <span class="eyebrow">Version 0.17 · MIT Licensed · Linux · macOS · Windows</span>
+  <span class="eyebrow">Version 0.31 · MIT Licensed · Linux · macOS · Windows</span>
   <h1>A fast, simple language <em>that compiles to native code.</em></h1>
   <p class="motto">
     Drop the interpreter, the runtime overhead, and the boilerplate —
-    SQLite, graphics, audio, timers, and an HTTP/WebSocket server, built
+    SQLite, graphics, audio, timers, threads, and an HTTP/WebSocket server,
+    built
     directly into the language.
   </p>
   <div class="ctas">
@@ -487,26 +488,33 @@ Hello, Festina!</pre>
     <div class="entry">
       <div class="numeral">IV</div>
       <div>
+        <h3>Real threads, without the footguns</h3>
+        <p><code>thread worker { ... }</code> runs on its own OS thread and can't touch a global or reach into another thread at all — every message across the boundary is a deep copy, so there is no shared mutable state to race on. Send with <code>worker.postMessage(x)</code>, answer with <code>t.reply(y)</code>, get the answer back with <code>.callback(fn)</code>, and scale out with <code>thread pool[N] { ... }</code>.</p>
+      </div>
+    </div>
+    <div class="entry">
+      <div class="numeral">V</div>
+      <div>
         <h3>Automatic memory, manual override</h3>
         <p>Values are reclaimed for you — and <code>free spritesheet</code> / <code>delete map.key</code> exist for the moments you know the lifetime better than the compiler does.</p>
       </div>
     </div>
     <div class="entry">
-      <div class="numeral">V</div>
+      <div class="numeral">VI</div>
       <div>
         <h3>Readable syntax, real guarantees</h3>
         <p>Template strings, ternaries, familiar control flow — but every condition is a real <code>bool</code>, and everything is statically typed and checked before it runs.</p>
       </div>
     </div>
     <div class="entry">
-      <div class="numeral">VI</div>
+      <div class="numeral">VII</div>
       <div>
         <h3>Slim by default</h3>
         <p>A compiled program only links what it actually uses — skip graphics and audio in your source, and the binary skips Cairo, X11, and ALSA too.</p>
       </div>
     </div>
     <div class="entry">
-      <div class="numeral">VII</div>
+      <div class="numeral">VIII</div>
       <div>
         <h3>Minimal setup, by design</h3>
         <p>The fewest dependencies that get the job done, failing loudly and clearly the moment one is actually missing.</p>
@@ -618,6 +626,12 @@ setInterval(tick, 500)
 <span class="cm">// Maps -- text-keyed, object-literal-flavored</span>
 <span class="kw">map[int]</span> npcHealths = { <span class="str">'npc1'</span>: 10, <span class="str">'npc2'</span>: 15 }
 npcHealths[<span class="str">'npc1'</span>] = 30
+
+<span class="cm">// Threads -- isolated, message-passing, no shared mutable state</span>
+<span class="kw">thread</span> doubler {
+    <span class="kw">on</span> message(sender:<span class="kw">thread</span>, msg:<span class="kw">int</span>) { sender.reply(msg * 2) }
+}
+doubler.postMessage(21).callback(<span class="kw">void</span> (answer:<span class="kw">int</span>) =&gt; log(answer))
 
 <span class="cm">// Config straight from the environment, no extra library</span>
 <span class="kw">text</span> apiKey = environment.API_KEY</pre>
@@ -832,7 +846,7 @@ npcHealths[<span class="str">'npc1'</span>] = 30
     <h2>Project status</h2>
     <div class="status-line">
       <span class="dot"></span>
-      <span><strong>2093 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
+      <span><strong>2213 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
     </div>
     <p class="section-intro">
       The compiler frontend, LLVM codegen backend, and native C runtime are

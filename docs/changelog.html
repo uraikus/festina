@@ -33,6 +33,20 @@
     <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
     <nav class="toc" id="toc">
       <div class="nav-group">
+        <a href="#v0-31">0.31 — 2026-09-01</a>
+        <a href="#v0-30">0.30 — 2026-09-01</a>
+        <a href="#v0-29">0.29 — 2026-09-01</a>
+        <a href="#v0-28">0.28 — 2026-09-01</a>
+        <a href="#v0-27">0.27 — 2026-09-01</a>
+        <a href="#v0-26">0.26 — 2026-09-01</a>
+        <a href="#v0-25">0.25 — 2026-09-01</a>
+        <a href="#v0-24">0.24 — 2026-09-01</a>
+        <a href="#v0-23">0.23 — 2026-09-01</a>
+        <a href="#v0-22">0.22 — 2026-09-01</a>
+        <a href="#v0-21">0.21 — 2026-09-01</a>
+        <a href="#v0-20">0.20 — 2026-09-01</a>
+        <a href="#v0-19">0.19 — 2026-09-01</a>
+        <a href="#v0-18">0.18 — 2026-09-01</a>
         <a href="#v0-17">0.17 — 2026-09-01</a>
         <a href="#v0-16">0.16 — 2026-09-01</a>
         <a href="#v0-15">0.15 — 2026-09-01</a>
@@ -75,6 +89,169 @@
         implementation record predating 0.1 lives in
         <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>.
       </p>
+
+      <section class="doc-section" id="v0-31">
+        <h2><span class="version-badge">0.31</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-31">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>An out-of-range thread-pool index no longer registers a dead callback.</strong> <code>pool[99].postMessage(x).callback(fn)</code> registered <code>fn</code> before the bounds check, so it could never fire and its slot was never reclaimed. The whole expression is a clean no-op now.</li>
+          <li><strong><code>.reply()</code> with no message in flight</strong> (a second reply to one message, or a <code>thread</code> value stashed in a struct/array/map and replied to later) silently dropped the reply and leaked its payload. It now releases the payload and delivers nothing. Every other path that can drop a reply — including one still queued when its target is killed — releases it correctly too.</li>
+          <li><strong>Error messages naming a thread type</strong> printed the compiler's own internal repr (<code>ThreadType(None)</code>) instead of <code>thread</code>. <code>log()</code> and template interpolation of a thread value now give the same specific "has no text form" error <code>img</code>/<code>aud</code> already did, and the "thread has no field X" error no longer suggests a method that doesn't exist on a thread value.</li>
+          <li>A broken intra-document link in api.md (<code>#http--websocket-servers</code>).</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong>Thread messaging is faster.</strong> The pending-callback list appends instead of prepending, turning the ordinary in-order reply case from O(N^2) into an O(1) lookup (measured on the identical program built both ways: 0.06s → 0.04s at 5,000 in-flight sends, 0.92s → 0.47s at 20,000), and a worker now takes its inbound mutex once per message instead of twice.</li>
+          <li><strong>api.md's Threads section reorganized</strong> into ten subsections with working cross-references, plus newly documented behavior: reply at most once per message, <code>kill()</code> drops pending callbacks, a thread value has no text form, and a pool compiles its body once per instance (a compiled-size cost worth knowing before picking a large <code>N</code>).</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #218</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-30">
+        <h2><span class="version-badge">0.30</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-30">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>t.reply(response)</code> / <code>NAME.postMessage(x).callback(fn)</code></strong> — a general request/response mechanism on top of thread messaging. A thread's (or main's) reply type is fixed by its first <code>.reply(...)</code> call; every <code>postMessage(x)</code> call site targeting a receiver with a reply type must chain <code>.callback(fn)</code> to receive it, or it's a compile error. <code>.reply()</code> never triggers <code>on message</code> on the receiving end — it's a separate delivery path straight to <code>fn</code>, which runs back on whichever OS thread originally sent the message.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong><code>festina_thread_kill</code>'s leftover-message cleanup was type-confused</strong> for a queued <code>giveRequest</code> hand-off — it called the wrong release function on the wrong struct shape. Now kind-aware; a killed thread's own pending <code>.callback(fn)</code> registrations are also freed (never invoked) so a later <code>live()</code> respawn can't inherit stale ones.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #217</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-29">
+        <h2><span class="version-badge">0.29</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-29">#</a></h2>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong><code>worker:thread</code> (the <code>on message(worker:thread, msg:T)</code> parameter) is never <code>null</code> any more.</strong> When main is the sender, <code>worker</code> is now a real, singleton <code>thread</code> value — check the new <code>.main:bool</code> field to tell it apart from an ordinary worker's own handle. Comparing a <code>thread</code> value against <code>null</code> is now a compile error naming <code>.main</code> as the replacement. This is Phase 1 of a larger messaging redesign; <code>.reply()</code>/<code>.callback()</code> and the removal of <code>sqlite()</code> are separate, later changes.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #216</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-28">
+        <h2><span class="version-badge">0.28</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-28">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>examples/threaded_http_server.f</code></strong> and <strong><code>benchmarks/http_threaded/</code></strong> — a real example and a <code>wrk</code>-based benchmark showing <code>thread pool[N]</code> + <code>NAME.giveRequest(r)</code> computing genuine per-request CPU-bound work across more than one OS thread at once, with a single-threaded baseline for comparison. See <a href="benchmark.html#http-threaded">benchmark.md's new "HTTP: single-threaded vs. thread pool" section</a> for measured numbers.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>A <code>thread pool[N]</code> can no longer declare its own <code>DatabaseURL</code>.</strong> Every instance in a pool shares one declared body, so this would have meant <code>N</code> independent, uncoordinated sqlite connections into the identical literal file at once — now a compile error naming the fix.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #215</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-27">
+        <h2><span class="version-badge">0.27</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-27">#</a></h2>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong>Docs/tests/release consolidation for the <code>thread</code> extensions plan</strong> (thread pools, thread-private functions, wider builtin access, private per-thread HTTP contexts, live connection hand-off — 0.22 through 0.26). Audited api.md's Threads/HTTP sections end to end; clarified the "Sendable types" paragraph's own wording now that a live <code>http</code> request can be handed off (not cloned, not sent through <code>postMessage</code>) via <code>giveRequest</code>. Full, unfiltered <code>scripts/leak_stress.sh</code> and <code>scripts/thread_tsan_stress.sh</code> runs (every stress program, not just this plan's own additions) both clean.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #214</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-26">
+        <h2><span class="version-badge">0.26</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-26">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>Live connection hand-off: <code>NAME.giveRequest(r)</code>.</strong> The main program, having accepted a live request on its own port, may hand it directly to a thread — that thread's own <code>on request</code> fires for it, on the connection's own live socket. Legal only from main, only onto a thread that has declared its own <code>on request</code>, and only for a manually-managed <code>http?</code> value (reusing <code>T?</code> rather than a new compile-time move-checker). First cut: plain (non-TLS) connections only.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #213</a> for the full design, including a real ThreadSanitizer-caught data race found and fixed during this phase's own verification.</p>
+      </section>
+
+      <section class="doc-section" id="v0-25">
+        <h2><span class="version-badge">0.25</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-25">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>Private per-thread HTTP context.</strong> A <code>thread { }</code> may now declare <code>on request(req:http)</code><wbr>/<code>on upgrade(s:socket)</code><wbr>/<code>on socketMessage(s:socket, msg:blob)</code><wbr>/<code>on socketClose(s:socket)</code> — the identical four handlers the main program's own top-level HTTP/WebSocket support already has — and, once it has declared at least one, call <code>openPort()</code><wbr>/<code>closePort()</code><wbr>/<code>openSecurePort()</code>. This gives the thread a fully private connection table and listener set, never shared with the main program's own HTTP context or with any other thread's, so a program can serve real, concurrent traffic on more than one port from more than one OS thread with no coordination needed between them. The blocking http client form (<code>req.send()</code> with zero arguments) also works from inside a thread body, targeting any other context's port; a thread must never target its own listener from inside that same thread (a documented, structural deadlock, not a bug) — see <a href="api.html#thread-http">api.md's new "A thread's own HTTP context" section</a>.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #212</a> for the full design, including the <code>__thread</code> conversion of <code>festina_runtime_http.c</code>'s own connection/listener/handler state and a real leak this phase's own sanitizer verification caught and fixed.</p>
+      </section>
+
+      <section class="doc-section" id="v0-24">
+        <h2><span class="version-badge">0.24</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-24">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>Wider builtin access inside a <code>thread { }</code> body.</strong> <code>regex()</code>, <code>mkdir()</code>, and <code>ls()</code> are now callable from inside a thread's own handlers and private funcs, alongside the blocking, 1-argument <code>exec(args)</code>. Each is safe with zero runtime changes: <code>regex()</code>'s memoization slot is a per-call-site codegen global, never shared between threads; <code>mkdir()</code>/<code>ls()</code> are thin, purely local POSIX wrappers; <code>exec(args)</code>'s <code>fork()</code>/<code>execvp()</code>/<code>waitpid()</code> only ever touches the calling thread. The non-blocking, 2-argument <code>exec(args, callback)</code> form stays rejected inside a thread body — its callback always runs on the main program's own OS thread regardless of which thread dispatched it, a genuine cross-thread isolation violation if allowed.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #211</a> for the full design, including how this was verified against the actual C runtime rather than assumed from names alone.</p>
+      </section>
+
+      <section class="doc-section" id="v0-23">
+        <h2><span class="version-badge">0.23</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-23">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>Thread-private helper functions.</strong> A <code>func</code> declared directly in a <code>thread { }</code> body's own top level (a sibling of its state vars/<code>on load</code>/<code>on message</code>/<code>on exit</code>) is now callable from that one thread's own handlers and other private funcs, with direct read/write access to that thread's own state. Two private funcs may call each other regardless of declaration order. An ordinary top-level <code>func</code> remains completely uncallable from inside a thread body, unchanged. Each thread pool instance gets its own independent copy of every private func, closing over that one instance's own state.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #210</a> for the full design.</p>
+      </section>
+
+      <section class="doc-section" id="v0-22">
+        <h2><span class="version-badge">0.22</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-22">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>thread NAME[N] { ... }</code> — thread pools.</strong> Declares <code>N</code> fully independent instances of the same thread body, each its own OS thread, private state, and inbound queue. Addressed with <code>NAME[i]</code> (any <code>int</code> expression) everywhere a singleton thread's own bare <code>NAME</code> would be used — <code>pool[i].postMessage(x)</code><wbr>/<code>.kill()</code><wbr>/<code>.live(callback)</code><wbr>/<code>.isAlive()</code> all work identically to the singleton form, just per-instance. An out-of-range index is a silent no-op, matching <code>NAME.isAlive()</code>'s own established "test, don't fail" convention rather than crashing or raising.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #209</a> for the full design.</p>
+      </section>
+
+      <section class="doc-section" id="v0-21">
+        <h2><span class="version-badge">0.21</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-21">#</a></h2>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong><code>thread</code> messaging is now a single, unified model</strong> — replaces per-thread <code>NAME.onMessage(callback)</code> registration with one global top-level <code>on message(worker:thread, msg:T)</code> handler that declares its own message type directly. A thread's own inbound handler now uses the identical <code>(worker:thread, msg:T)</code> shape (previously <code>on message(p:T)</code>); <code>worker</code> identifies the sender and is <code>null</code> when the message was sent by the main program. Threads may now message each other directly via <code>NAME.postMessage(x)</code> from inside another thread's own body (lifecycle control — <code>kill()</code>/<code>live()</code>/<code>isAlive()</code> — remains main-program-only). <strong>Breaking:</strong> any program using <code>NAME.onMessage(...)</code> or a thread's old single-parameter <code>on message(p:T)</code> needs updating to the new form.</li>
+          <li><strong>The top-level WebSocket frame handler is renamed from <code>on message(s:socket, msg:blob)</code> to <code>on socketMessage(s:socket, msg:blob)</code></strong> — frees the <code>on message</code> name for the unified messaging model above; behavior is unchanged, only the name. <strong>Breaking:</strong> update any <code>on message(s:socket, ...)</code> declaration to <code>on socketMessage</code>.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #208</a> for the full design and migration notes.</p>
+      </section>
+
+      <section class="doc-section" id="v0-20">
+        <h2><span class="version-badge">0.20</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-20">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>A <code>thread</code> with its own <code>DatabaseURL</code> now closes its private sqlite handle on <code>kill()</code></strong> — previously, a <code>kill()</code>/<code>live()</code> cycle reopened a fresh handle every time without closing the old one (a real, small, per-cycle leak: one <code>sqlite3*</code> plus an open fd). Confirmed via a real LeakSanitizer report before the fix and a clean one after (<code>tests/<wbr>stress/<wbr>thread_db_kill_live_churn.f</code>). See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #207</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-19">
+        <h2><span class="version-badge">0.19</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-19">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong><code>.toStruct(T)</code>/<code>.toArr(T)</code> now decode <code>\u</code> unicode escapes</strong> — previously threw <code>"... not yet supported"</code> on any JSON string containing a <code>\uXXXX</code> escape, including a UTF-16 surrogate pair (astral-plane codepoints); raw, un-escaped UTF-8 bytes were always fine, but a producer that specifically <code>\u</code>-escaped non-ASCII text could never be parsed. Now decodes both BMP codepoints and surrogate pairs into their real UTF-8 encoding, with a clear, catchable throw for malformed input (an unpaired surrogate, invalid hex, a truncated escape). See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #206</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-18">
+        <h2><span class="version-badge">0.18</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-18">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>A real heap-use-after-free</strong>: assigning an ordinary, automatically-managed struct value into a manually-managed (<code>T?</code>) enum binding (<code>enum Shape = Circle; Shape? shape; ...; shape = c</code> for an existing <code>Circle c</code>) compiled without error and left <code>shape</code> dangling once <code>c</code> went out of scope and its own automatic release freed it — <code>check_assignable</code>'s enum member-coercion rule never accounted for <code>manually_managed</code>. Now correctly rejected as a type mismatch; a <em>fresh</em> member value (<code>Shape? shape = makeCircle()</code>) is unaffected.</li>
+          <li>A manually-managed <code>blob?</code>/<code>regex?</code> thread-message parameter's own method calls (<code>p.write(...)</code>, <code>p.test(...)</code>) inside <code>on message</code> could fail to compile, or compile to invalid LLVM IR — a handful of exact-equality type checks in codegen.py (predating <code>T?</code>) never accounted for the flag, and <code>regex</code>/<code>http</code>/<code>socket</code> were never taught that a manually-managed instance can now reach code paths an ordinary one never could. Fixed; see <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #205</a>.</li>
+        </ul>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li>Real per-type test coverage for a manually-managed value crossing a <code>thread</code> boundary — <code>arr[T]</code><wbr>/<code>map[T]</code><wbr>/<code>enum</code><wbr>/<code>img</code><wbr>/<code>blob</code><wbr>/<code>aud</code><wbr>/<code>regex</code><wbr>/<code>url</code> each get a dedicated compile-and-run round-trip proof (<code>tests/<wbr>test_manually_managed.py<wbr>::TestThreadReferenceSharingPerType</code>), alongside struct's own existing one.</li>
+        </ul>
+      </section>
 
       <section class="doc-section" id="v0-17">
         <h2><span class="version-badge">0.17</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-17">#</a></h2>
