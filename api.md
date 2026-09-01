@@ -3256,12 +3256,12 @@ already open.
 
 A thread that declares an HTTP-shaped handler but never calls
 `openPort()` of its own still gets this private, receive-only context
-— it simply never accepts a connection on its own; nothing currently
-sends it one either (a program's only way to reach it is its own
-`openPort()`'d listener), so today this is only useful in combination
-with `on message`'s own inter-thread messaging. `postMessage` (bare or
-named) works from inside any of these four handlers exactly like it
-does from `on load`/`on message`/`on exit` or a private func.
+— it simply never accepts a connection on its own; a live connection
+still reaches it whenever the main program hands one off directly (see
+[Live connection hand-off](#threads) below), or via `on message`'s own
+inter-thread messaging. `postMessage` (bare or named) works from
+inside any of these four handlers exactly like it does from
+`on load`/`on message`/`on exit` or a private func.
 
 The http client form — `req.send()` with zero arguments — also works
 from inside a thread body (it touches no shared connection-table state
@@ -3283,6 +3283,75 @@ two threads, including two instances of the same pool) racing to bind
 the identical port number fails exactly the way it would outside this
 language entirely (the OS refuses the second bind); give each its own
 port.
+
+**Live connection hand-off: `NAME.giveRequest(r)`.** The main program,
+having accepted a live request on its own port, may hand it directly
+to a thread — that thread's own `on request` fires for it, on the
+connection's own live socket, exactly as if THAT thread had accepted
+it itself:
+
+```festina
+thread worker {
+    on request(req:http) {
+        req.send({'code': 200, 'body': 'handled by worker'})
+    }
+}
+
+on request(req:http?) {
+    worker.giveRequest(req)
+}
+
+openPort(8080)
+```
+
+`giveRequest` is legal only from the main program (like `kill()`/
+`live()`/`isAlive()`, a thread may not call it — including on itself or
+another thread), and only onto a thread that has already declared its
+own `on request`. The argument must be a **manually-managed `http?`**
+value — main's own top-level `on request` handler must declare its
+`req` parameter with the `?` suffix (see [`T?` — manually-managed
+values](#t-manually-managed-values) above) for this to be legal at
+all; an ordinary, auto-managed `req:http` is rejected outright, since
+main's own end-of-handler cleanup would still release it out from
+under the thread it was just handed to. **There is no compile-time
+check that main's own code never touches `r` again after handing it
+off** — the same accepted-risk contract `T?` itself already carries
+(claude.md #202): once handed off, the connection belongs entirely to
+the receiving thread, and reading or writing `r` afterward is
+undefined. In exchange, this costs nothing to make safe at the
+value level: a manually-managed value was never auto-retained or
+auto-released to begin with, so there's no automatic cleanup left to
+race against the receiving thread's own use.
+
+A request that arrives with nothing in its own body ever calling
+`ok()`/`redirect()`/`send()`/`upgrade()` still gets the same forgiving
+default (`200`, empty body) whether it was answered directly or handed
+off — a hand-off doesn't change that behavior. A thread receiving a
+handed-off request needs no `openPort()` of its own at all — the
+receive-only context [above](#threads) is exactly what makes this
+useful even for a thread that never listens on any port itself, e.g. a
+dedicated worker that only ever handles requests main routes to it.
+
+**First-cut scope, documented, not silently absent:**
+- **Plain (non-TLS) connections only.** A request accepted on an
+  `openSecurePort()` listener cannot be handed off yet — `giveRequest`
+  is a silent no-op for one (nothing crashes; the connection simply
+  stays with main, unresponded, until its own `on request` returns and
+  gets the same default-200 fallback above).
+- **A connection already answered, or already upgraded to a
+  WebSocket, cannot be handed off either** — both are silent no-ops
+  for the identical "test, don't fail" reason.
+- **Never hand a thread a request whose eventual answer depends on
+  that same thread's own blocking client call to the connection that
+  triggered it.** A thread has only one OS thread servicing both its
+  own accept loop and any blocking `req.send()` it makes (see
+  [Per-thread HTTP context](#threads) above) — if a thread's own
+  client request happens to be routed BACK to itself (directly, or
+  indirectly through main handing off every request main receives to
+  that one thread, including ones that thread's own code triggered),
+  nothing is left running to ever answer it, and the call waits
+  forever. Route a driving/verifying client call through a different
+  thread than the one receiving the hand-off.
 
 ## Audio
 

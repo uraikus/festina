@@ -1110,6 +1110,17 @@ class _ThreadInfo:
         # `database_url` already gives sqlite()/sqliteInt()/
         # sqliteFloat()/sqliteText().
         self.has_http_handler = False
+        # claude.md #213 (Phase 5 -- giveRequest): WHICH of the four
+        # this thread declared, by name -- has_http_handler alone
+        # can't tell `NAME.giveRequest(r)` (which specifically
+        # requires an `on request`, since that's the one handler it
+        # dispatches) apart from a thread that only declared, say,
+        # `on socketClose`. Populated by the identical hoisting
+        # pre-scan that sets has_http_handler, same reasoning (order-
+        # independent -- a thread declaring `on request` AFTER some
+        # other statement that doesn't care shouldn't matter here
+        # either).
+        self.declared_http_handlers = set()
 
 
 class AnalyzedProgram:
@@ -2895,10 +2906,10 @@ def analyze(program, filename="<string>"):
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                if callee.prop not in ("postMessage", "kill", "live", "isAlive"):
+                if callee.prop not in ("postMessage", "kill", "live", "isAlive", "giveRequest"):
                     raise CompileError(
                         f"thread '{thread_name}' has no method '{callee.prop}' -- only "
-                        f"postMessage/kill/live/isAlive are supported",
+                        f"postMessage/kill/live/isAlive/giveRequest are supported",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid method receiver",
                     )
@@ -2915,8 +2926,9 @@ def analyze(program, filename="<string>"):
                     raise CompileError(
                         f"'{thread_name}.{callee.prop}(...)' cannot be called from "
                         f"inside a thread body -- only the main program controls a "
-                        f"thread's own lifecycle (threads may message each other via "
-                        f"postMessage, but not kill/live/isAlive each other)",
+                        f"thread's own lifecycle and hands off live connections "
+                        f"(threads may message each other via postMessage, but not "
+                        f"kill/live/isAlive/giveRequest each other)",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
@@ -2948,6 +2960,61 @@ def analyze(program, filename="<string>"):
                     # does, with no special-casing needed here.
                     check_assignable(info.inbound_type, arg_type, expr.args[0],
                                       what="postMessage() argument")
+                    return None
+                if callee.prop == "giveRequest":
+                    # claude.md #213 (Phase 5): main-only (already
+                    # enforced above, the same gate kill/live/isAlive
+                    # get), and legal only when the target thread has
+                    # declared its own `on request` -- that's the ONE
+                    # handler giveRequest ever dispatches, so "declared
+                    # SOME http handler" (has_http_handler, Phase 4's
+                    # own gate) isn't specific enough here.
+                    if "request" not in info.declared_http_handlers:
+                        raise CompileError(
+                            f"'{thread_name}.giveRequest(...)' requires thread "
+                            f"'{thread_name}' to have declared its own "
+                            f"'on request(req:http)' handler -- nothing else would "
+                            f"ever receive a handed-off request",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid declaration",
+                        )
+                    if len(expr.args) != 1:
+                        raise CompileError(
+                            f"giveRequest() expects exactly 1 argument, got "
+                            f"{len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    # claude.md #213: reuses T? (claude.md #202/#203)
+                    # rather than a new compile-time move-checker (per
+                    # explicit follow-up during this feature's design)
+                    # -- legal only when the argument's OWN static type
+                    # is manually-managed `http?`, i.e. it flowed in
+                    # from an `on request(req:http?)` parameter (or
+                    # another http? binding derived from one). A
+                    # manually-managed value is never auto-retained or
+                    # auto-released by design, so handing it away costs
+                    # nothing to make safe from codegen's own side --
+                    # there is no automatic release racing against the
+                    # receiving thread's own use, because there was
+                    # never any automatic release to begin with. Giving
+                    # away an ordinary (auto-managed) `http` -- one NOT
+                    # declared `?` -- is rejected outright: main's own
+                    # end-of-scope cleanup would still release it right
+                    # out from under the thread this just handed it to.
+                    arg_type = infer(expr.args[0], scope)
+                    if (not isinstance(arg_type, types_mod.HttpType)
+                            or not getattr(arg_type, "manually_managed", False)):
+                        raise CompileError(
+                            f"giveRequest() requires a manually-managed 'http?' "
+                            f"value, found {types_mod.type_name(arg_type)} -- declare "
+                            f"the receiving 'on request(req:http?)' handler's own "
+                            f"parameter with '?' (see claude.md #202's own T? "
+                            f"feature): an ordinary, auto-managed 'http' would still "
+                            f"be released out from under the thread this hands it to",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
                     return None
                 if callee.prop == "kill":
                     if expr.args:
@@ -4432,9 +4499,11 @@ def analyze(program, filename="<string>"):
         # needless, surprising restriction on ordinary code (writing
         # `on load()` first, `on request(...)` below it, is the most
         # natural order to write this in).
-        info.has_http_handler = any(
-            isinstance(stmt, ast.EventHandler) and stmt.name in _THREAD_HTTP_HANDLER_NAMES
-            for stmt in thread_body)
+        info.declared_http_handlers = {
+            stmt.name for stmt in thread_body
+            if isinstance(stmt, ast.EventHandler) and stmt.name in _THREAD_HTTP_HANDLER_NAMES
+        }
+        info.has_http_handler = bool(info.declared_http_handlers)
         # claude.md #210: thread-private helper functions -- a `func`
         # declared directly in a thread's own body (a sibling of its
         # state vars/on load/on message/on exit, not nested inside one

@@ -1065,6 +1065,25 @@ void festina_register_http_service_hooks(void);
  * public function in this header. */
 void festina_thread_http_service_pass(int timeout_ms);
 void festina_thread_http_teardown(void);
+/* claude.md #213 (Phase 5 -- giveRequest): also defined in
+ * festina_runtime_http.c, also declared here purely so the
+ * definitions there are checked against a declared signature.
+ * festina_conn_detach resolves an http payload's own conn_id,
+ * verifies it's still a live, plain (non-TLS), not-yet-responded-to,
+ * non-upgraded connection, detaches it from THIS calling thread's own
+ * (`__thread`) connection table, and returns a heap-owned copy of it
+ * (or NULL, a silent no-op, if any of that isn't true) -- called from
+ * codegen-generated IR, on whichever thread calls `NAME.giveRequest`
+ * (today, always main -- semantic.py's own gate). Codegen then passes
+ * that opaque `ptr` straight to festina_thread_give_request above,
+ * never touching it itself. festina_thread_deliver_given_request is
+ * the OTHER end -- the hook festina_thread_set_http_context wires as
+ * `give_request_deliver`, called on the RECEIVING thread's own OS
+ * thread once dequeued, which re-attaches the connection (via the
+ * static festina_conn_attach) and dispatches this thread's own
+ * `on request`. */
+void *festina_conn_detach(void *http_payload);
+void festina_thread_deliver_given_request(void *payload);
 
 /* claude.md #195 Phase 2: `thread NAME { ... }` -- one pthread per
  * declared thread, two mutex+condvar-guarded FIFO queues (inbound,
@@ -1095,6 +1114,24 @@ void festina_thread_http_teardown(void);
  * festina_thread_register's own `in_release`/`out_release`
  * parameters below, and codegen.py's _thread_payload_release_fn. */
 typedef struct FestinaThreadHandle FestinaThreadHandle;
+
+/* claude.md #213 (Phase 5 -- giveRequest): the payload for one
+ * GIVE_REQUEST-kind FestinaThreadMsg (festina_runtime_thread.c's own
+ * internal struct, not itself in this header) -- deliberately just
+ * two opaque pointers, defined HERE (not privately in either .c file)
+ * since festina_thread_give_request (thread.c) builds it and
+ * festina_thread_deliver_given_request (http.c) unpacks it; neither
+ * TU needs to know what the other's own pointer actually points to
+ * (thread.c never dereferences `conn`/`http_value`, http.c never
+ * dereferences anything ABOUT this struct beyond its own two fields).
+ * `conn` is the festina_conn_detach'd connection (an opaque `FestinaConn*`
+ * as far as this header/thread.c are concerned); `http_value` is the
+ * SAME (never cloned) FestinaHttpValue payload the sending program's
+ * own `req` referred to. */
+typedef struct {
+    void *conn;
+    void *http_value;
+} FestinaGiveRequestPayload;
 
 /* Registers a new thread (its registry slot, queues, and the three
  * handler function pointers this thread's own `on load`/`on message`/
@@ -1190,9 +1227,33 @@ void festina_thread_set_db_close(FestinaThreadHandle *h, void (*db_close)(void))
  * gets this call, so both stay NULL and festina_thread_main's own
  * checks below are plain no-ops for it, same as on_load/on_message/
  * on_exit/db_close already are when undeclared. */
+/* claude.md #213 (Phase 5 -- giveRequest): `give_request_deliver`,
+ * widened onto this same call/struct -- festina_thread_deliver_given_
+ * request (festina_runtime_http.c), invoked from festina_thread_main's
+ * own dispatch loop (via a NEW FestinaThreadMsg kind, see that file's
+ * own doc comment) for a connection handed to THIS thread via
+ * `NAME.giveRequest(r)`. Wired unconditionally for every http-context
+ * thread, the same as service_pass/teardown -- a thread that never
+ * declared `on request` specifically just never has this hook
+ * actually invoked (semantic.py's own giveRequest gate guarantees the
+ * SENDING side only ever targets one that did), so there's no reason
+ * to track a fourth, narrower condition here. */
 void festina_thread_set_http_context(FestinaThreadHandle *h,
                                      void (*service_pass)(int timeout_ms),
-                                     void (*teardown)(void));
+                                     void (*teardown)(void),
+                                     void (*give_request_deliver)(void *payload));
+/* claude.md #213: enqueues a connection handed off via
+ * `NAME.giveRequest(r)` onto h's own inbound queue, tagged as a
+ * DIFFERENT kind from an ordinary postMessage (see FestinaThreadMsg's
+ * own doc comment) -- dispatched, once dequeued, by calling h's own
+ * give_request_deliver(http_value) after first re-attaching `conn`
+ * (opaque here -- this file never looks inside it; only
+ * festina_runtime_http.c's own festina_conn_attach does) into THIS
+ * thread's own (now correctly `__thread`-local, once this runs on its
+ * own OS thread) connection table. Always sent with no `sender` (this
+ * is legal only from main -- see semantic.py's own gate), unlike
+ * festina_thread_post's own sender parameter. */
+void festina_thread_give_request(FestinaThreadHandle *h, void *conn, void *http_value);
 /* `NAME.kill()`: blocking -- signals the worker to stop, pthread_joins
  * it, then discards anything still sitting in its inbound queue
  * (a real, deliberate choice: "kill" means stop now, not "finish

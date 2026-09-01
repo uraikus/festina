@@ -1079,3 +1079,90 @@ class TestThreadHttpContext:
         }
         """
         semantic.analyze(parser.parse(source))
+
+
+class TestGiveRequest:
+    """claude.md #213 (Phase 5): `NAME.giveRequest(r)` -- live
+    connection hand-off. Legal only from main, only when `r`'s own
+    static type is manually-managed `http?` (reusing T?, claude.md
+    #202/#203 -- no compile-time move-checker), and only when the
+    target thread has declared its own `on request`."""
+
+    def test_giveRequest_to_a_thread_with_on_request_is_accepted(self, parser, semantic):
+        source = """
+        thread w { on request(req:http) { req.ok() } }
+        on request(req:http?) { w.giveRequest(req) }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_an_ordinary_auto_managed_http_is_rejected(self, parser, semantic, errors):
+        # claude.md #213: NOT declaring `?` means main's own end-of-
+        # scope cleanup would still release it out from under the
+        # thread this hands it to -- rejected outright, no move-
+        # checker needed to catch this specific, always-wrong case.
+        source = """
+        thread w { on request(req:http) { req.ok() } }
+        on request(req:http) { w.giveRequest(req) }
+        """
+        with pytest.raises(errors.CompileError, match="requires a manually-managed 'http\\?' value"):
+            semantic.analyze(parser.parse(source))
+
+    def test_target_thread_with_no_on_request_is_rejected(self, parser, semantic, errors):
+        source = """
+        thread w { on load() { } }
+        on request(req:http?) { w.giveRequest(req) }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="requires thread 'w' to have declared its own 'on request"):
+            semantic.analyze(parser.parse(source))
+
+    def test_target_thread_with_only_some_other_http_handler_is_rejected(self, parser, semantic, errors):
+        # claude.md #213: has_http_handler alone (any of the four)
+        # isn't specific enough -- giveRequest dispatches on_request
+        # specifically.
+        source = """
+        thread w { on socketClose(s:socket) { } }
+        on request(req:http?) { w.giveRequest(req) }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="requires thread 'w' to have declared its own 'on request"):
+            semantic.analyze(parser.parse(source))
+
+    def test_wrong_argument_count_is_rejected(self, parser, semantic, errors):
+        source = """
+        thread w { on request(req:http) { req.ok() } }
+        on request(req:http?) { w.giveRequest() }
+        """
+        with pytest.raises(errors.CompileError, match="expects exactly 1 argument"):
+            semantic.analyze(parser.parse(source))
+
+    def test_giveRequest_from_inside_a_thread_body_is_rejected(self, parser, semantic, errors):
+        # claude.md #213: main-only, the same gate kill/live/isAlive
+        # already get -- a thread has no business handing off a
+        # connection it didn't itself accept.
+        source = """
+        thread w { on request(req:http) { req.ok() } }
+        thread other {
+            on message(sender:thread, msg:int) {
+                w.giveRequest(msg)
+            }
+        }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="cannot be called from inside a thread body"):
+            semantic.analyze(parser.parse(source))
+
+    def test_giveRequest_on_a_thread_with_no_such_method_lists_it(self, parser, semantic, errors):
+        source = """
+        thread w { on load() { } }
+        w.frobnicate()
+        """
+        with pytest.raises(errors.CompileError, match="giveRequest"):
+            semantic.analyze(parser.parse(source))
+
+    def test_giveRequest_on_a_pool_instance_is_accepted(self, parser, semantic):
+        source = """
+        thread w[2] { on request(req:http) { req.ok() } }
+        on request(req:http?) { w[0].giveRequest(req) }
+        """
+        semantic.analyze(parser.parse(source))

@@ -1582,9 +1582,18 @@ class CodeGen:
             # nothing, so they're declared the same `ptr`-typed way
             # every other function-pointer-valued argument already is
             # in this file.
-            "declare void @festina_thread_set_http_context(ptr, ptr, ptr)",
+            "declare void @festina_thread_set_http_context(ptr, ptr, ptr, ptr)",
             "declare void @festina_thread_http_service_pass(i32)",
             "declare void @festina_thread_http_teardown()",
+            # claude.md #213 (Phase 5 -- giveRequest): festina_conn_detach
+            # lives in festina_runtime_http.c (it needs http internals);
+            # festina_thread_give_request lives in
+            # festina_runtime_thread.c (it treats the detached
+            # connection as an opaque ptr, never looking inside it) --
+            # see each one's own doc comment for the full split.
+            "declare ptr @festina_conn_detach(ptr)",
+            "declare void @festina_thread_give_request(ptr, ptr, ptr)",
+            "declare void @festina_thread_deliver_given_request(ptr)",
             "declare void @festina_thread_kill(ptr)",
             "declare void @festina_thread_live(ptr, ptr)",
             "declare i8 @festina_thread_is_alive(ptr)",
@@ -10943,6 +10952,55 @@ class CodeGen:
                         lines.append(f"  br label %{end_label}")
                         self._start_block(end_label, lines)
                     return "0", None
+                if callee.prop == "giveRequest":
+                    # claude.md #213: `val` is a bare `ptr` -- the raw,
+                    # never-cloned FestinaHttpValue payload semantic.py
+                    # already proved is manually-managed (http?), so no
+                    # coercion/box/retain-release cleanup is needed at
+                    # all here (the identical "never touched again"
+                    # reasoning _emit_thread_postmessage_cleanup's own
+                    # manually-managed early return already relies on
+                    # for postMessage -- this is that same case, just
+                    # with no cleanup call to make since there's
+                    # nothing left for it to skip). festina_conn_detach
+                    # resolves `val`'s own conn_id, verifies it's still
+                    # a live, plain (non-TLS), not-yet-responded-to,
+                    # non-upgraded connection, and returns a heap copy
+                    # of that connection's own state with ownership of
+                    # every field inside it (fd included) -- or NULL,
+                    # a silent no-op (this runtime's own established
+                    # "test, don't fail" convention for anything thread-
+                    # related), if any of that isn't true any more.
+                    val, _vtype = self._emit_expr(expr.args[0], env, lines)
+                    detached = self.tmp()
+                    lines.append(f"  {detached} = call ptr @festina_conn_detach(ptr {val})")
+                    is_null = self.tmp()
+                    lines.append(f"  {is_null} = icmp eq ptr {detached}, null")
+                    give_label = self.label("giverequest.ok")
+                    skip_label = self.label("giverequest.skip")
+                    lines.append(f"  br i1 {is_null}, label %{skip_label}, label %{give_label}")
+                    self._start_block(give_label, lines)
+                    # claude.md #213: festina_thread_give_request lives
+                    # in festina_runtime_thread.c, not http.c -- it
+                    # never looks inside `detached` (an opaque `ptr` as
+                    # far as that translation unit is concerned),
+                    # enqueuing it as a distinct message KIND on the
+                    # target's own inbound queue, dispatched via a
+                    # hook (festina_thread_deliver_given_request) this
+                    # thread's own on_load already wired in (see
+                    # festina_thread_set_http_context, widened for
+                    # this phase) -- the same opaque-hook shape
+                    # festina_thread_http_service_pass/_teardown
+                    # already established in claude.md #212.
+                    lines.append(
+                        f"  call void @festina_thread_give_request(ptr {handle}, "
+                        f"ptr {detached}, ptr {val})")
+                    lines.append(f"  br label %{skip_label}")
+                    self._start_block(skip_label, lines)
+                    if end_label is not None:
+                        lines.append(f"  br label %{end_label}")
+                        self._start_block(end_label, lines)
+                    return "0", None
                 if callee.prop == "kill":
                     lines.append(f"  call void @festina_thread_kill(ptr {handle})")
                     if end_label is not None:
@@ -12650,9 +12708,20 @@ class CodeGen:
                 # what keeps the two translation units independently
                 # linkable).
                 if tinfo.get("has_http_context"):
+                    # claude.md #213 (Phase 5): the third hook,
+                    # festina_thread_deliver_given_request -- wired the
+                    # identical unconditional way as the other two
+                    # (every http-context thread gets it, regardless of
+                    # whether it specifically declared `on request`;
+                    # the hook itself no-ops safely if this thread's
+                    # own g_request_handler happens to be NULL, though
+                    # semantic.py's own giveRequest gate already
+                    # guarantees the SENDING side only ever targets a
+                    # thread that did declare one).
                     main_lines.append(
                         f"  call void @festina_thread_set_http_context(ptr %__thread_{tname}, "
-                        f"ptr @festina_thread_http_service_pass, ptr @festina_thread_http_teardown)")
+                        f"ptr @festina_thread_http_service_pass, ptr @festina_thread_http_teardown, "
+                        f"ptr @festina_thread_deliver_given_request)")
                 main_lines.append(f"  call void @festina_thread_spawn(ptr %__thread_{tname})")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and

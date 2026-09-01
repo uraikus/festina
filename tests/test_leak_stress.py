@@ -599,4 +599,12 @@ class TestLeakStress:
             # festina_runtime_http.c (and, since it uses the client
             # form, festina_runtime_https.c) at all.
             "thread_http_context_churn.f",
+            # claude.md #213: NAME.giveRequest(r) -- real, concurrent,
+            # at-volume connection hand-offs (main accepts, detaches,
+            # hands to a thread; a third thread drives real client
+            # requests) -- so a leak in the retain/release accounting
+            # festina_conn_detach's own doc comment works through (or
+            # a leaked FestinaConn/FestinaGiveRequestPayload transfer
+            # block itself) would show up here.
+            "thread_giverequest_churn.f",
         }

@@ -9,6 +9,23 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.26] - 2026-09-01
+
+### Added
+
+- **Live connection hand-off: `NAME.giveRequest(r)`.** The main
+  program, having accepted a live request on its own port, may hand
+  it directly to a thread -- that thread's own `on request` fires for
+  it, on the connection's own live socket. Legal only from main, only
+  onto a thread that has declared its own `on request`, and only for
+  a manually-managed `http?` value (reusing `T?` rather than a new
+  compile-time move-checker). First cut: plain (non-TLS) connections
+  only.
+
+See claude.md #213 for the full design, including a real
+ThreadSanitizer-caught data race found and fixed during this phase's
+own verification.
+
 ## [0.25] - 2026-09-01
 
 ### Added

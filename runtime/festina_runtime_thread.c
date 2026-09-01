@@ -32,7 +32,25 @@
 #include <pthread.h>
 #include "festina_runtime.h"
 
+/* claude.md #213 (Phase 5 -- giveRequest): what kind of thing
+ * `payload` actually is -- ORDINARY is every message this runtime has
+ * ever had before this phase (a boxed Festina value, released via
+ * `in_release` once the handler returns); GIVE_REQUEST is new: a
+ * connection handed off via `NAME.giveRequest(r)`, whose own payload
+ * is a small FestinaGiveRequestPayload (festina_runtime_http.c, never
+ * looked inside from this file) needing an entirely different
+ * dispatch -- re-attach the connection, then call a registered hook,
+ * never the ordinary in_release/on_message pair at all. Kept on the
+ * QUEUE ITEM rather than inferred from anything else, since a plain
+ * `void*` payload carries no type information of its own to dispatch
+ * on. */
+typedef enum {
+    FESTINA_THREAD_MSG_ORDINARY,
+    FESTINA_THREAD_MSG_GIVE_REQUEST,
+} FestinaThreadMsgKind;
+
 typedef struct FestinaThreadMsg {
+    FestinaThreadMsgKind kind;
     void *payload;
     /* claude.md #208: which thread SENT this one -- NULL for main,
      * or the sending thread's own FestinaThreadHandle* when one
@@ -42,7 +60,9 @@ typedef struct FestinaThreadMsg {
      * outbound queue can only ever be filled by that one thread),
      * and handed straight through to whichever handler eventually
      * dequeues this message -- see festina_thread_main's own inbound
-     * dispatch and festina_thread_drain_impl's own outbound one. */
+     * dispatch and festina_thread_drain_impl's own outbound one.
+     * Always NULL for a GIVE_REQUEST message (claude.md #213: legal
+     * only from main). */
     void *sender;
     struct FestinaThreadMsg *next;
 } FestinaThreadMsg;
@@ -106,6 +126,12 @@ struct FestinaThreadHandle {
      * condvar -- see that function's own comment. */
     void (*http_service_pass)(int timeout_ms);
     void (*http_teardown)(void);
+    /* claude.md #213 (Phase 5): dispatches one GIVE_REQUEST message --
+     * see festina_thread_set_http_context's own doc comment in
+     * festina_runtime.h. Set alongside the two above, at the same
+     * time, always non-NULL whenever they are (this thread has an
+     * HTTP context) and NULL otherwise. */
+    void (*give_request_deliver)(void *payload);
 
     struct FestinaThreadHandle *next; /* registry linked list */
 };
@@ -153,6 +179,20 @@ static int festina_thread_try_dispatch_one(FestinaThreadHandle *h, int *killed_o
     if (!msg) return 0;
 
     msg->next = NULL;
+    if (msg->kind == FESTINA_THREAD_MSG_GIVE_REQUEST) {
+        /* claude.md #213: a connection handed off via
+         * NAME.giveRequest(r) -- an entirely different dispatch from
+         * the ordinary on_message/in_release pair just below: no
+         * `sender` (always NULL, see FestinaThreadMsg's own doc
+         * comment), and the payload is never released through
+         * in_release at all (give_request_deliver owns that decision
+         * itself, freeing its own small wrapper struct once it's
+         * handed the unwrapped http value off to on_request -- see
+         * festina_thread_deliver_given_request, festina_runtime_http.c). */
+        if (h->give_request_deliver) h->give_request_deliver(msg->payload);
+        free(msg);
+        return 1;
+    }
     if (h->on_message) h->on_message(msg->sender, msg->payload);
     h->in_release(msg->payload);
     free(msg);
@@ -280,6 +320,7 @@ void festina_thread_spawn(FestinaThreadHandle *h) {
 void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload) {
     FestinaThreadMsg *m = malloc(sizeof(*m));
     if (!m) festina_fail("out of memory posting a thread message");
+    m->kind = FESTINA_THREAD_MSG_ORDINARY;
     m->payload = payload;
     m->sender = sender;
     m->next = NULL;
@@ -301,6 +342,7 @@ void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload) {
      * sender argument to take. */
     FestinaThreadMsg *m = malloc(sizeof(*m));
     if (!m) festina_fail("out of memory posting a thread outbound message");
+    m->kind = FESTINA_THREAD_MSG_ORDINARY;
     m->payload = payload;
     m->sender = h;
     m->next = NULL;
@@ -316,9 +358,39 @@ void festina_thread_set_db_close(FestinaThreadHandle *h, void (*db_close)(void))
 
 void festina_thread_set_http_context(FestinaThreadHandle *h,
                                      void (*service_pass)(int timeout_ms),
-                                     void (*teardown)(void)) {
+                                     void (*teardown)(void),
+                                     void (*give_request_deliver)(void *payload)) {
     h->http_service_pass = service_pass;
     h->http_teardown = teardown;
+    h->give_request_deliver = give_request_deliver;
+}
+
+void festina_thread_give_request(FestinaThreadHandle *h, void *conn, void *http_value) {
+    /* claude.md #213: mirrors festina_thread_post's own lock/enqueue/
+     * signal shape exactly, just building a GIVE_REQUEST-kind message
+     * instead of an ORDINARY one, with `sender` always NULL (legal
+     * only from main -- semantic.py's own gate) and `payload` NOT a
+     * boxed Festina value at all (it's a small
+     * FestinaGiveRequestPayload, festina_runtime_http.c's own, built
+     * right here so that struct's layout never needs to be known in
+     * this file). festina_thread_try_dispatch_one's own kind check is
+     * what keeps this from ever being mistaken for an ordinary
+     * message needing on_message/in_release. */
+    FestinaGiveRequestPayload *p = malloc(sizeof(*p));
+    if (!p) festina_fail("out of memory handing off a request");
+    p->conn = conn;
+    p->http_value = http_value;
+    FestinaThreadMsg *m = malloc(sizeof(*m));
+    if (!m) festina_fail("out of memory handing off a request");
+    m->kind = FESTINA_THREAD_MSG_GIVE_REQUEST;
+    m->payload = p;
+    m->sender = NULL;
+    m->next = NULL;
+    pthread_mutex_lock(&h->in_lock);
+    if (h->in_tail) h->in_tail->next = m; else h->in_head = m;
+    h->in_tail = m;
+    pthread_mutex_unlock(&h->in_lock);
+    pthread_cond_signal(&h->in_cond);
 }
 
 void festina_thread_kill(FestinaThreadHandle *h) {

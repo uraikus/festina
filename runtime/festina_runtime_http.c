@@ -1734,25 +1734,67 @@ static void *festina_build_headers_map(FestinaConn *c) {
     return map;
 }
 
-static void festina_dispatch_request(FestinaConn *c) {
-    char *url = festina_build_inbound_url(c);
-    void *headers = festina_build_headers_map(c);
-    /* claude.md #162: `code` is festina_null_int() -- a live inbound
-     * request has no status code of its own (see the http type's own
-     * doc comment: null until a response exists) -- and conn_id is
-     * THIS connection's own, so .ok()/.redirect()/.upgrade()/.send(res)
-     * all reach it correctly. */
-    void *payload = festina_http_value_new(url, c->method, FESTINA_NULL_INT, headers,
-                                           c->body, c->body_len, c->conn_id, NULL);
-    free(url);
-    if (g_request_handler) g_request_handler(payload);
-    /* c may be gone (the peer could theoretically vanish mid-handler
-     * via another fd's event, though nothing in THIS handler's own
-     * body can close arbitrary other connections) -- re-look-up by id
-     * rather than trusting the stale pointer across the callback. */
-    FestinaConn *fresh = festina_conn_by_id(c->conn_id);
+/* claude.md #213 (Phase 5): set by festina_conn_detach, right below,
+ * to THIS calling thread's own conn_id whenever a detach succeeds --
+ * `__thread`, not a plain global, since it's read back by THIS SAME
+ * thread's own festina_finish_request_dispatch call immediately
+ * after `on request` returns (both always run on one calling OS
+ * thread's own sequential control flow for one connection at a time,
+ * never concurrently with another thread's own copy of this exact
+ * dance) -- see festina_finish_request_dispatch's own doc comment for
+ * why this exists and what it fixes. */
+static __thread int64_t g_last_detached_conn_id = 0;
+
+/* claude.md #213 (Phase 5): the post-"on request"-call half of
+ * dispatching a request -- split out of festina_dispatch_request so
+ * festina_thread_deliver_given_request (a handed-off request,
+ * delivered on a DIFFERENT thread than the one that accepted it) can
+ * run the IDENTICAL fallback-response/websocket-upgrade/keep-alive
+ * logic rather than a hand-duplicated (and easy to let drift) copy of
+ * it. `conn_id` rather than a `FestinaConn*` -- the connection may be
+ * gone by the time this runs (the peer could vanish mid-handler, OR
+ * `on request` called NAME.giveRequest(r) on it -- see below), so
+ * both callers already need to re-look-up by id rather than trust a
+ * pointer across the `on request` call; taking the id directly here
+ * means there's only ONE such re-lookup, not two slightly different
+ * ones.
+ *
+ * claude.md #213: releasing `payload` here is where a REAL
+ * ThreadSanitizer-caught data race lived in this feature's first
+ * draft -- confirmed directly, not theoretical. That draft had
+ * festina_conn_detach RETAIN the payload (so it could survive both
+ * this thread's own unconditional release AND the receiving thread's
+ * own eventual one), but both releases are plain, non-atomic
+ * decrements (this project's own established convention --
+ * festina_retain/_release_check's own doc comments -- rests entirely
+ * on the guarantee that no two threads ever touch the SAME refcounted
+ * pointer's header concurrently), and once a connection is handed off
+ * the SAME payload genuinely IS reachable from two threads at once
+ * for a brief window, breaking that guarantee outright -- TSan caught
+ * it immediately on the very first real stress run. The fix removes
+ * the race at its root instead of reaching for an atomic decrement
+ * (which would be a narrower exception to an invariant this whole
+ * runtime otherwise relies on everywhere): a connection that was
+ * SUCCESSFULLY detached during the handler call is skipped here
+ * entirely -- no release at all -- so this payload's refcount is only
+ * EVER touched by one thread at a time, for its whole life: this
+ * thread's own release when nothing was handed off, or (exclusively)
+ * the receiving thread's own release, via its OWN
+ * festina_finish_request_dispatch call, once delivered. Construction
+ * (+1), exactly one release (-1), on exactly one thread, always --
+ * simpler than the retain-on-both-sides draft AND correct, not just
+ * differently racy. */
+static void festina_finish_request_dispatch(int64_t conn_id, void *payload) {
+    FestinaConn *fresh = festina_conn_by_id(conn_id);
+    if (!fresh) {
+        if (g_last_detached_conn_id == conn_id) {
+            g_last_detached_conn_id = 0; /* consumed -- never stays set past the request it names */
+            return; /* handed off: the RECEIVING thread's own dispatch owns the release now */
+        }
+        festina_release_http(payload); /* genuinely gone (the peer vanished mid-handler) -- still ours to free */
+        return;
+    }
     festina_release_http(payload);
-    if (!fresh) return;
     if (fresh->mode == FESTINA_CONN_WEBSOCKET) {
         fresh->ever_upgraded = 1;
         if (g_upgrade_handler) {
@@ -1793,6 +1835,27 @@ static void festina_dispatch_request(FestinaConn *c) {
     } else {
         festina_conn_teardown(fresh);
     }
+}
+
+static void festina_dispatch_request(FestinaConn *c) {
+    char *url = festina_build_inbound_url(c);
+    void *headers = festina_build_headers_map(c);
+    /* claude.md #162: `code` is festina_null_int() -- a live inbound
+     * request has no status code of its own (see the http type's own
+     * doc comment: null until a response exists) -- and conn_id is
+     * THIS connection's own, so .ok()/.redirect()/.upgrade()/.send(res)
+     * all reach it correctly. */
+    void *payload = festina_http_value_new(url, c->method, FESTINA_NULL_INT, headers,
+                                           c->body, c->body_len, c->conn_id, NULL);
+    free(url);
+    int64_t conn_id = c->conn_id;
+    if (g_request_handler) g_request_handler(payload);
+    /* c may be gone (the peer could theoretically vanish mid-handler
+     * via another fd's event, though nothing in THIS handler's own
+     * body can close arbitrary other connections) -- festina_finish_
+     * request_dispatch re-looks-up by id rather than trusting the
+     * stale `c` pointer across the callback. */
+    festina_finish_request_dispatch(conn_id, payload);
 }
 
 static void festina_dispatch_ws_frame(FestinaConn *c, uint8_t opcode,
@@ -2766,6 +2829,138 @@ void *festina_http_headers(void *payload) {
 static FestinaConn *festina_live_conn(void *payload) {
     int64_t conn_id = FESTINA_HTTP_FROM_PAYLOAD(payload)->conn_id;
     return conn_id ? festina_conn_by_id(conn_id) : NULL;
+}
+
+/* claude.md #213 (Phase 5 -- giveRequest): detaches `http_payload`'s
+ * own live connection from THIS calling thread's own connection table
+ * (main's, always -- semantic.py's own gate) for hand-off to another
+ * thread, returning a heap-owned copy of its full state (fd included)
+ * -- or NULL, a silent no-op, if any of the following isn't true:
+ * still alive, plain (non-TLS -- Phase 5's own v1 scope, documented in
+ * api.md), a plain HTTP request still being read (not an upgraded
+ * WebSocket), not already responded to. Every OTHER teardown path in
+ * this file (festina_conn_teardown, the keep-alive reset) closes the
+ * fd and frees every owned buffer; this one deliberately does neither
+ * -- ownership of all of it (fd, buf, method, path, headers, body,
+ * every other heap pointer inside FestinaConn) moves wholesale into
+ * the returned copy via one shallow struct copy, exactly the same
+ * "hand the pointer to the new owner, don't clone what it points to"
+ * reasoning `_emit_thread_clone_value`'s own manually-managed early
+ * return already established at the Festina-value level -- this is
+ * that same idea applied to the OS-level connection underneath one.
+ *
+ * Sets g_last_detached_conn_id (just above festina_finish_request_
+ * dispatch, further up this file) on success -- see that variable's
+ * own doc comment, and festina_finish_request_dispatch's, for the
+ * full reasoning: `http_payload`'s own refcount is NOT touched here
+ * at all (an earlier draft retained it here, to survive both this
+ * thread's own pending release and the receiving thread's own later
+ * one -- a real, ThreadSanitizer-caught data race, two threads
+ * decrementing the identical non-atomic refcount header with no
+ * ordering between them). Instead, this flag is what lets THIS
+ * thread's own still-to-run festina_finish_request_dispatch call skip
+ * releasing it entirely, leaving the payload's single, original
+ * (construction-time) reference to be released exactly once, by
+ * exactly one thread -- the receiving one, once delivered. */
+void *festina_conn_detach(void *http_payload) {
+    FestinaConn *c = festina_live_conn(http_payload);
+    if (!c || !c->alive) return NULL;
+    if (c->tls != NULL) return NULL; /* TLS hand-off not supported yet -- api.md's own documented v1 scope */
+    if (c->mode != FESTINA_CONN_READING_REQUEST) return NULL; /* not an upgraded WebSocket */
+    if (c->responded) return NULL; /* already answered -- nothing sensible left to hand off */
+
+    FestinaConn *copy = malloc(sizeof(FestinaConn));
+    if (!copy) festina_fail("out of memory detaching a connection for hand-off");
+    *copy = *c;
+    g_last_detached_conn_id = c->conn_id;
+    festina_conn_index_remove(c->conn_id);
+    /* claude.md #152's own free-list recycling, verbatim -- the SLOT
+     * (an array index) is reusable by a future accept() on THIS
+     * thread's own listener; the conn_id itself never repeats
+     * (festina_next_conn_id's own process-wide counter, claude.md
+     * #212), and everything c used to own now belongs to `copy`, so
+     * zeroing c here (not freeing anything through it) is correct --
+     * there is nothing left in it TO free. */
+    memset(c, 0, sizeof(*c));
+    int64_t slot = c - g_conns;
+    if (g_conn_free_count == g_conn_free_capacity) {
+        g_conn_free_capacity = g_conn_free_capacity ? g_conn_free_capacity * 2 : 8;
+        int64_t *grown = realloc(g_conn_free_slots, (size_t)g_conn_free_capacity * sizeof(int64_t));
+        if (!grown) festina_fail("out of memory growing the connection free-slot list");
+        g_conn_free_slots = grown;
+    }
+    g_conn_free_slots[g_conn_free_count++] = slot;
+    return copy;
+}
+
+/* claude.md #213: the OTHER end of festina_conn_detach -- inserts a
+ * detached connection's own state into THIS calling thread's own
+ * (now correctly `__thread`-local, since this always runs from
+ * festina_thread_deliver_given_request, itself always called from the
+ * receiving thread's own combined loop) connection table, re-keying
+ * `g_conn_index` under the SAME conn_id (never regenerated -- it's
+ * already baked into the http value this connection's response
+ * methods look it up from). Mirrors festina_conn_new_slot's own
+ * slot-acquisition shape exactly, deliberately NOT calling that
+ * function directly -- it also assigns a FRESH conn_id and memsets
+ * the slot, neither of which applies here (this connection already
+ * has real state to install, not a blank one to initialize). */
+static void festina_conn_attach(FestinaConn *transferred) {
+    int64_t slot;
+    if (g_conn_free_count > 0) {
+        slot = g_conn_free_slots[--g_conn_free_count];
+    } else {
+        if (g_conn_count == g_conn_capacity) {
+            g_conn_capacity = g_conn_capacity ? g_conn_capacity * 2 : 8;
+            FestinaConn *grown = realloc(g_conns, (size_t)g_conn_capacity * sizeof(FestinaConn));
+            if (!grown) festina_fail("out of memory growing the connection table");
+            g_conns = grown;
+        }
+        slot = g_conn_count++;
+    }
+    g_conns[slot] = *transferred;
+    festina_conn_index_put(g_conns[slot].conn_id, slot);
+    /* claude.md #167: refreshes the idle-tracking clock for its new
+     * context -- the time it spent detached/queued (however brief)
+     * shouldn't count against this connection's own keep-alive reap
+     * deadline once it's actually being serviced again. */
+    g_conns[slot].last_activity = festina_now_seconds();
+    free(transferred);
+}
+
+/* claude.md #213: the give_request_deliver hook festina_thread_set_
+ * http_context wires onto every http-context thread's own
+ * FestinaThreadHandle -- called from festina_thread_try_dispatch_one
+ * (festina_runtime_thread.c) once a GIVE_REQUEST message is dequeued,
+ * always on the RECEIVING thread's own OS thread. Re-attaches the
+ * connection FIRST (so `g_request_handler`'s own call -- reaching for
+ * conn_id via festina_live_conn, exactly like an ordinarily-accepted
+ * request already does -- finds it in THIS thread's own table, not
+ * gone), then dispatches through the identical festina_finish_
+ * request_dispatch path festina_dispatch_request itself uses, so a
+ * handed-off request gets the exact same fallback-response/websocket-
+ * upgrade/keep-alive behavior an ordinarily-accepted one already
+ * does -- not a narrower, hand-off-specific version of it. */
+void festina_thread_deliver_given_request(void *payload) {
+    FestinaGiveRequestPayload *p = (FestinaGiveRequestPayload *)payload;
+    FestinaConn *conn = (FestinaConn *)p->conn;
+    int64_t conn_id = conn->conn_id;
+    festina_conn_attach(conn);
+    if (g_request_handler) {
+        g_request_handler(p->http_value);
+    }
+    /* claude.md #213: THIS thread's own g_last_detached_conn_id is 0
+     * here (a worker thread never calls festina_conn_detach itself),
+     * so festina_finish_request_dispatch always takes its ordinary,
+     * non-skipped path below -- releasing the payload's own single
+     * original reference exactly once, right here, on exactly this
+     * one thread (see festina_conn_detach's own doc comment for the
+     * full reasoning this and its "skip the release" half are two
+     * sides of). Correct even when g_request_handler happened to be
+     * NULL (semantic.py's own gate guarantees it never is in
+     * practice, but this stays a plain, harmless release either way). */
+    festina_finish_request_dispatch(conn_id, p->http_value);
+    free(p);
 }
 
 /* claude.md #167: the one piece of every server-side response that now

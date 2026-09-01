@@ -16841,3 +16841,58 @@ class TestThreadHttpContext:
         result = compile_and_run(source)
         assert result.returncode == 0, result.stdout + result.stderr
         assert "started" in result.stdout
+
+
+class TestGiveRequest:
+    """claude.md #213 (Phase 5): real, compiled-and-run proof that
+    `NAME.giveRequest(r)` -- live connection hand-off -- genuinely
+    works end to end: a real external client connects to MAIN's own
+    port, main hands the live connection to a thread via giveRequest,
+    and that THREAD's own `on request` -- running on a different OS
+    thread than the one that accepted the connection -- answers it
+    directly on the same underlying socket."""
+
+    def test_a_handed_off_request_is_answered_by_the_receiving_thread(
+            self, compile_and_run_server):
+        source = """
+        thread worker {
+            on request(req:http) {
+                req.send({'code': 200, 'body': 'handled by worker'})
+            }
+        }
+
+        on request(req:http?) {
+            worker.giveRequest(req)
+        }
+
+        openPort(__PORT__)
+        """
+        server = compile_and_run_server(source)
+        status, _headers, body = server.http_get("/")
+        assert status == 200
+        assert body == b"handled by worker"
+
+    def test_a_thread_forgetting_to_respond_still_gets_the_default_200(
+            self, compile_and_run_server):
+        # claude.md #213: a handed-off request goes through the exact
+        # same festina_finish_request_dispatch fallback path an
+        # ordinarily-accepted one does -- proof this ISN'T a narrower,
+        # hand-off-specific dispatch that forgot the fallback.
+        source = """
+        thread worker {
+            int served = 0
+            on request(req:http) {
+                served = served + 1
+            }
+        }
+
+        on request(req:http?) {
+            worker.giveRequest(req)
+        }
+
+        openPort(__PORT__)
+        """
+        server = compile_and_run_server(source)
+        status, _headers, body = server.http_get("/")
+        assert status == 200
+        assert body == b""
