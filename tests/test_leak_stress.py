@@ -608,4 +608,12 @@ class TestLeakStress:
             # dispatched/removed) or a leaked reply payload box would
             # show up here.
             "thread_reply_callback_churn.f",
+            # claude.md #231 (uraikus/festina#91): NAME.drain() -- real
+            # churn of the new dispatching/drained_cond state
+            # FestinaThreadHandle gained for this feature, at volume,
+            # both for an ordinary thread (drained after every single
+            # send, the tightest interleaving) and a pool. A leaked
+            # message, a double-free, or a missed/duplicate broadcast
+            # would show up here.
+            "thread_drain_churn.f",
         }

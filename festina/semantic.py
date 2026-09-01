@@ -3050,10 +3050,11 @@ def analyze(program, filename="<string>"):
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                if callee.prop not in ("postMessage", "kill", "live", "isAlive", "giveRequest"):
+                if callee.prop not in ("postMessage", "kill", "live", "isAlive", "giveRequest",
+                                        "drain"):
                     raise CompileError(
                         f"thread '{thread_name}' has no method '{callee.prop}' -- only "
-                        f"postMessage/kill/live/isAlive/giveRequest are supported",
+                        f"postMessage/kill/live/isAlive/giveRequest/drain are supported",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid method receiver",
                     )
@@ -3072,7 +3073,7 @@ def analyze(program, filename="<string>"):
                         f"inside a thread body -- only the main program controls a "
                         f"thread's own lifecycle and hands off live connections "
                         f"(threads may message each other via postMessage, but not "
-                        f"kill/live/isAlive/giveRequest each other)",
+                        f"kill/live/isAlive/giveRequest/drain each other)",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
@@ -3164,6 +3165,26 @@ def analyze(program, filename="<string>"):
                     if expr.args:
                         raise CompileError(
                             f"kill() expects no arguments, got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    return None
+                if callee.prop == "drain":
+                    # claude.md #231 (uraikus/festina#91): blocks until
+                    # `thread_name`'s own inbound queue is fully
+                    # processed -- everything already queued at the
+                    # moment this call runs, no new messages accepted
+                    # meanwhile changes that -- distinct from kill(),
+                    # which explicitly does NOT wait and discards
+                    # anything still queued. Same main-only,
+                    # no-arguments shape as kill(); a dead (never
+                    # live()'d, or already kill()'d) thread's own drain
+                    # is a safe no-op at the runtime level, not rejected
+                    # here -- draining nothing is a valid thing to ask
+                    # for.
+                    if expr.args:
+                        raise CompileError(
+                            f"drain() expects no arguments, got {len(expr.args)}",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )

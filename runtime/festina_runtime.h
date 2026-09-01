@@ -1285,6 +1285,27 @@ void festina_thread_give_request(FestinaThreadHandle *h, void *conn, void *http_
  * is already not alive. isAlive() is guaranteed false the moment this
  * returns. */
 void festina_thread_kill(FestinaThreadHandle *h);
+/* claude.md #231 (uraikus/festina#91): `NAME.drain()` -- blocking, the
+ * DELIBERATE opposite of kill()'s own "discard, don't wait" choice:
+ * blocks the calling (main) thread until h's own inbound queue is
+ * fully processed -- everything queued at the moment this call is
+ * made, no new arrivals meanwhile changes that. Unlike kill(), this
+ * does NOT stop the thread or discard anything; h keeps running (and
+ * accepting new messages) once this returns, exactly as before. A
+ * thread that is not currently alive (never live()'d, or already
+ * kill()'d) has nothing to drain and this returns immediately. Exists
+ * specifically so `on close()`/`on exit(code:int)` can fire off a
+ * final async job (e.g. a database write on a thread with its own
+ * DatabaseURL) and then wait for it to actually land before the
+ * process-exit teardown that follows discards anything still
+ * in-flight -- see festina_thread_kill_all's own doc comment for that
+ * teardown. Named festina_thread_wait_drained (not festina_thread_
+ * drain) to avoid colliding with the existing, unrelated
+ * festina_thread_drain(void) further below -- that one drains every
+ * declared thread's own OUTBOUND queue into main's own dispatch, part
+ * of the existing hook triple main's event loops already poll; this
+ * one waits on ONE thread's own INBOUND queue instead. */
+void festina_thread_wait_drained(FestinaThreadHandle *h);
 /* `NAME.live(callback)`: respawns a killed thread (running on_load()
  * again) and calls callback(true) once the new OS thread has actually
  * been created. If h is already alive, this is a no-op that still

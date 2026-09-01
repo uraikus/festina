@@ -3211,7 +3211,7 @@ top-level `func` there. Each pool instance
 every private func, closing over that ONE instance's own state, exactly
 like its handlers already do.
 
-### Lifecycle: `kill()`, `live()`, `isAlive()`
+### Lifecycle: `kill()`, `live()`, `isAlive()`, `drain()`
 
 ```festina
 log(worker.isAlive())        // true
@@ -3231,9 +3231,42 @@ log(worker.isAlive())        // true
 - `NAME.live(callback)` respawns a killed thread and calls
   `callback(true)` once it's running again.
 - `NAME.isAlive()` reads whether the thread is currently running.
+- `NAME.drain()` blocks until the thread has finished processing
+  everything already queued for it — the deliberate opposite of
+  `kill()`'s own discard-don't-wait choice. Unlike `kill()`, the thread
+  keeps running afterward (still alive, still accepting new messages);
+  this only waits, it never stops anything. A thread that isn't
+  currently alive has nothing to drain and this returns immediately.
 
-These three are callable **only** from the main program — a thread may
-message another thread, but may not control its lifecycle.
+```festina
+thread writer {
+    DatabaseURL = 'writes.sqlite'
+    on message(caller:thread, msg:int) {
+        sqlite('INSERT INTO Log (n) VALUES (?)', [msg])
+    }
+}
+
+on close() {
+    writer.postMessage(finalValue)
+    writer.drain()   // blocks until the INSERT above has actually run
+}
+```
+
+This is what makes a thread with its own [`DatabaseURL`](#a-threads-own-database-databaseurl)
+safe to use for work that must survive the program exiting: without an
+explicit `drain()`, a message posted right before `close()` (or a
+window's own close button, or a SIGINT/SIGTERM-driven
+[graceful shutdown](#graceful-shutdown)) races the thread being killed
+during exit's own teardown — the send might land, or the thread might
+be stopped first with that message still sitting unprocessed in its
+queue, discarded exactly like `kill()`'s own documented behavior above.
+`on close()`/`on exit(code:int)` are the natural place to call it:
+both already run to completion before any teardown begins, so a
+`postMessage(x)` immediately followed by `drain()` there is a reliable
+"fire this off and be sure it landed before we exit" pattern.
+
+All four of these are callable **only** from the main program — a
+thread may message another thread, but may not control its lifecycle.
 
 If the main program exits (including via `close(code)` or a
 SIGINT/SIGTERM-driven [graceful shutdown](#graceful-shutdown)), every
