@@ -545,4 +545,12 @@ class TestLeakStress:
             # shape needed to catch a leaked/raced prepared-statement
             # cache entry, which no single-threaded sqlite test could.
             "thread_db_churn.f",
+            # claude.md #202 Phase 2: `T?` crossing a `thread` boundary
+            # -- an ownership shape neither thread_churn.f nor
+            # thread_db_churn.f exercises: the payload is the SENDER's
+            # own shared raw pointer, never a clone, so the receiving
+            # side must explicitly `free` it itself (nothing auto-
+            # manages it on either side) -- miss that free and every
+            # one of these leaks, unmissable at this volume.
+            "thread_manually_managed_churn.f",
         }

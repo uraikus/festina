@@ -1092,7 +1092,24 @@ def _is_thread_sendable_type(t, structs, enums, _seen_structs=frozenset()):
     (tied to the single main-thread connection table -- claude.md
     #151), `regex` (an escaping regex has no retained pattern text to
     recompile from -- claude.md #86), and `table` (query-result rows
-    are not a general value type)."""
+    are not a general value type).
+
+    claude.md #202 Phase 2: `T?` -- checked first, ahead of even the
+    scalar cases, since a manually-managed value crosses a thread
+    boundary by sharing its own raw reference (codegen's
+    _emit_thread_clone_value), never a deep clone -- no structural walk
+    needed at all, so this is sendable regardless of what's inside it,
+    INCLUDING a genuinely self-referencing (cyclic) struct/arr[T]/
+    map[T], which an ordinary (non-manually-managed) one of the same
+    shape is correctly still rejected for elsewhere (codegen's
+    _is_cyclic_type/_is_thread_clonable_type) -- there is no clone
+    recursion left to loop forever on a cyclic VALUE when nothing is
+    ever cloned. Sound for the identical reason sharing a manually-
+    managed value's pointer across threads is sound at all: neither
+    side's automatic bookkeeping ever touches its refcount, so there is
+    no non-atomic increment/decrement for two threads to race on."""
+    if getattr(t, "manually_managed", False):
+        return True
     if t in _THREAD_SENDABLE_SCALAR_TYPES:
         return True
     if t == types_mod.PrimitiveType("blob") or isinstance(
@@ -3942,18 +3959,6 @@ def analyze(program, filename="<string>"):
         the type before it ever reaches postMessage, so this function
         sees a single, already-consistent EnumType and never needs to
         invent one itself."""
-        # claude.md #202: see the identical guard + comment on the
-        # inbound ('on message') side above -- Phase 2 work, not yet
-        # implemented.
-        if getattr(new_type, "manually_managed", False):
-            raise CompileError(
-                f"postMessage({types_mod.type_name(new_type)}) -- a manually-"
-                f"managed ('T?') type cannot yet cross a thread boundary -- "
-                f"postMessage/on message reference-sharing for manually-managed "
-                f"values is not implemented in this phase",
-                file=filename, line=getattr(node, "line", 0), column=getattr(node, "column", 0),
-                category="invalid function argument type",
-            )
         if not _is_thread_sendable_type(new_type, structs, enums):
             raise CompileError(
                 f"postMessage({types_mod.type_name(new_type)}) -- "
@@ -4106,25 +4111,6 @@ def analyze(program, filename="<string>"):
                         msg_type = apply_manually_managed(
                             resolve(stmt.params[0].type_expr, stmt),
                             stmt.params[0].manually_managed)
-                        # claude.md #202: reference-sharing for a manually-
-                        # managed message type is Phase 2 work (not yet
-                        # implemented) -- reject it explicitly here rather
-                        # than silently letting _is_thread_sendable_type's
-                        # own isinstance-based checks treat it as an
-                        # ordinary sendable type and fall back to deep-
-                        # clone behavior, which would quietly defeat the
-                        # whole point of `T?` for anything crossing a
-                        # thread boundary.
-                        if getattr(msg_type, "manually_managed", False):
-                            raise CompileError(
-                                f"'on message(p:{types_mod.type_name(msg_type)})': "
-                                f"a manually-managed ('T?') type cannot yet cross a "
-                                f"thread boundary -- postMessage/on message "
-                                f"reference-sharing for manually-managed values is "
-                                f"not implemented in this phase",
-                                file=filename, line=stmt.line, column=stmt.column,
-                                category="invalid function argument type",
-                            )
                         if not _is_thread_sendable_type(msg_type, structs, enums):
                             raise CompileError(
                                 f"'on message(p:{types_mod.type_name(msg_type)})': "
@@ -4254,7 +4240,17 @@ def analyze(program, filename="<string>"):
                     file=filename, line=stmt.line, column=stmt.column,
                     category="invalid statement",
                 )
-            if sym.kind == "parameter":
+            # claude.md #202: a manually-managed parameter is exempt --
+            # it was never auto-retained on entry and never auto-
+            # released at the callee's own scope exit (codegen's own
+            # _emit_param_bindings gates both on `p.manually_managed`),
+            # so it is NOT "borrowed" in the sense the check just below
+            # means: nothing else is waiting to release it, on either
+            # side, ever, unless something explicitly does. A thread's
+            # own `on message(p:T?)` handler -- the whole point of
+            # Phase 2's own reference-sharing design -- is the single
+            # most common place that "something" naturally is.
+            if sym.kind == "parameter" and not getattr(sym.type, "manually_managed", False):
                 # A parameter is a BORROWED reference (claude.md #84) --
                 # the caller's value, which the caller will release.
                 raise CompileError(

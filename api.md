@@ -2651,13 +2651,62 @@ field typed `T?`, a function's `T?` return type) — a manually-managed
 value only ever lives in a variable or parameter binding directly, so
 there's always exactly one place responsible for freeing it.
 
-**Passing a `Circle?` across a `thread` boundary isn't supported yet**
-— `on message(p:Circle?)` and `postMessage`ing a manually-managed value
-both raise a clear compile error naming this. That's planned future
-work, not a permanent restriction: crossing threads is the one place a
-manually-managed value's own "nothing auto-manages it" property
-actually matters beyond a single thread, and needs its own design pass
-before it opens up.
+**A manually-managed parameter can be `free`d, unlike an ordinary
+one.** Freeing an ordinary parameter is a compile error — it borrows
+its caller's value, and the caller is the one that releases it. A
+`T?` parameter has no such caller-side release waiting to happen
+(nothing ever auto-manages it, on either side of a call), so `free`ing
+it is exactly as legitimate as freeing any other `T?` binding:
+
+```festina
+void func consume(c:Circle?) {
+    log(c.x)
+    free c                     // fine -- c was never "borrowed"
+}
+```
+
+**Crossing a `thread` boundary shares the reference, never clones
+it** — `postMessage`/`on message` deep-clone every other value type
+(claude.md #195), but a manually-managed one crosses by handing the
+raw reference straight to the other side, exactly like an ordinary
+alias within one thread does. Both directions work the same way:
+
+```festina
+struct Circle { x:int y:int }
+
+thread Worker {
+    on message(p:Circle?) {
+        p.x = 99                   // mutates the SAME value the sender holds
+        postMessage(p)              // echoes the same reference back, no clone
+    }
+}
+
+Circle? c
+void func onReply(x:Circle?) {
+    log(x.x)                       // 99
+    log(c.x)                       // 99 -- c itself changed, proving no clone happened
+}
+Worker.onMessage(void (x:Circle?) => onReply(x))
+c.x = 1
+Worker.postMessage(c)
+```
+
+This is sound for the identical reason `T?`'s own automatic-management
+opt-out is sound in the first place: the whole safety argument behind
+deep-cloning everything else (claude.md #195) is that this runtime's
+retain/release counters are non-atomic, correct only because exactly
+one thread ever touches a given value's refcount. A manually-managed
+value's refcount is *never* touched by either side's automatic
+bookkeeping — nothing here can race on the mechanism a shared,
+ordinary value's clone exists specifically to avoid racing on. What's
+left is exactly what "manually managed" already means, now spanning
+two threads instead of one: don't read and write the same value from
+both sides at the same instant without your own synchronization, and
+call `free`/`delete` exactly once, from whichever side is provably
+done with it. Aliasing a manually-managed value never bumps its
+refcount, on either side of a `postMessage` — two bindings (a sender's
+and a receiver's) referencing the same value share exactly one
+reference, and `free`ing it through either one frees it for both.
 
 ### `free`
 

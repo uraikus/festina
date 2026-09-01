@@ -4061,6 +4061,21 @@ void festina_release(void *payload) {
     }
 }
 
+/* claude.md #202 Phase 2: the release function `T?` crossing a
+ * `thread` boundary gets on the RECEIVING side, in place of a real
+ * festina_release/_release_fn_for cascade -- a manually-managed
+ * value's payload is the sender's own shared raw pointer, never a
+ * clone (see festina/codegen.py's _emit_thread_clone_value), so
+ * neither side owns an independent reference to release: the sender
+ * never touched its own refcount posting it, and the receiver must
+ * not touch it either, once its handler/callback returns. The whole
+ * safety argument is that NEITHER side's automatic bookkeeping ever
+ * looks at this payload's refcount at all -- only an explicit
+ * free()/delete() the program itself calls does. */
+void festina_noop_release(void *payload) {
+    (void)payload;
+}
+
 
 /* ---- maps -- claude.md #72, rebuilt into a real hash table by #175 ---- */
 

@@ -1492,6 +1492,16 @@ class CodeGen:
             "declare ptr @festina_image_clone(ptr)",
             "declare ptr @festina_audio_clone(ptr)",
             "declare ptr @festina_url_clone(ptr)",
+            # claude.md #202 Phase 2: `T?` crossing a thread boundary --
+            # the payload is the shared raw pointer itself (see
+            # _emit_thread_clone_value's own manually-managed early
+            # return), so the RECEIVING side must never release it
+            # (neither side owns an independent reference to release --
+            # see festina_noop_release's own doc comment in
+            # runtime/festina_runtime.c). _thread_payload_release_fn
+            # returns this instead of a real release cascade for a
+            # manually-managed payload type.
+            "declare void @festina_noop_release(ptr)",
             "declare ptr @festina_blob_from_bytes(ptr, i64)",
             "declare void @festina_blob_release(ptr)",
             "declare ptr @festina_blob_to_text(ptr)",
@@ -2824,7 +2834,18 @@ class CodeGen:
         message in the first place -- see _emit_thread_box) --
         `@free` is passed anyway rather than NULL, since NULL is never
         called there (a font box is never a fresh allocation), simply
-        for one less "maybe-NULL" branch in the C runtime."""
+        for one less "maybe-NULL" branch in the C runtime.
+
+        claude.md #202 Phase 2: `T?` -- a manually-managed payload is
+        the SENDER's own shared raw pointer (see _emit_thread_clone_
+        value's own early return), never a clone, so the receiving
+        side must never release it -- `@festina_noop_release` instead
+        of a real release cascade, checked first, ahead of every other
+        case (a manually-managed value can be any of struct/arr[T]/
+        map[T]/enum/blob/img/aud/url, so this must win over all of
+        them)."""
+        if _is_manually_managed(type_):
+            return "@festina_noop_release"
         if type_ == TEXT or isinstance(type_, types_mod.FontType):
             return "@free"
         if self._is_thread_handle_type(type_) or isinstance(type_, self._THREAD_PASSTHROUGH_PTR_TYPES):
@@ -2853,7 +2874,20 @@ class CodeGen:
         refcount-bounded cascade, so it's rejected outright here rather
         than risking a stack overflow/hang at runtime (a documented,
         narrower scope cut, not a silent gap -- see
-        _check_thread_clonable_type's own error message)."""
+        _check_thread_clonable_type's own error message).
+
+        claude.md #202 Phase 2: `T?` -- checked first, ahead of even
+        the scalar cases, since no clone is ever attempted for a
+        manually-managed value at all (the payload is the sender's own
+        shared raw pointer -- see _emit_thread_clone_value's own early
+        return) -- there is nothing here left to prove clonable. A
+        genuine, correctly-reasoned side effect: a SELF-REFERENCING
+        manually-managed struct/arr[T]/map[T] is sendable, even though
+        an ordinary one of the same shape is rejected below by
+        `_is_cyclic_type` -- there is no clone recursion left to loop
+        forever on a cyclic value when nothing is being cloned."""
+        if _is_manually_managed(type_):
+            return True
         if type_ in (INT, FLOAT, BOOL, TEXT) or isinstance(
                 type_, (types_mod.ColorType, types_mod.FontType)):
             return True
@@ -2930,6 +2964,16 @@ class CodeGen:
         plain node-only _is_owning_refcounted_source check
         _release_owned_receiver itself uses -- is what correctly
         recognizes a coercion-minted fresh value for what it is."""
+        # claude.md #202 Phase 2: `T?` -- _emit_thread_box never
+        # cloned `val` in the first place (see _emit_thread_clone_
+        # value's own early return), so there is no fresh temporary
+        # here to release: `val` itself IS the payload now, still the
+        # program's own single shared reference to it, exactly as
+        # untouched as it was before this call. Releasing it here
+        # would drop that shared reference out from under the payload
+        # that now also points at it.
+        if _is_manually_managed(target_type):
+            return
         if target_type == TEXT:
             self._free_text_temp(source_expr, val, vtype, lines)
         elif _is_refcounted(target_type) and self._refcounted_source_is_fresh(source_expr, vtype, target_type):
@@ -2955,7 +2999,20 @@ class CodeGen:
         _emit_thread_box's matching comment); and, for every other
         (scalar) type, `val` itself unchanged -- an int/float/bool/
         color value is already its own independent copy the moment
-        it's loaded into a register, nothing to clone at all."""
+        it's loaded into a register, nothing to clone at all.
+
+        claude.md #202 Phase 2: `T?` -- one early exception to "always
+        an independent copy": a manually-managed value's own raw
+        pointer becomes the payload directly, no clone at all. This is
+        sound for the identical reason sharing its pointer across a
+        thread boundary is sound in the first place (see claude.md
+        #202's own design note): nothing on EITHER side's automatic
+        bookkeeping ever touches this value's refcount, so there is no
+        non-atomic increment/decrement for two threads to race on --
+        the only thing `festina_retain`/`festina_release_check` being
+        non-atomic could ever have corrupted."""
+        if _is_manually_managed(type_):
+            return val
         if type_ == TEXT:
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_text_own(ptr {val})")

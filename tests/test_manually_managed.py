@@ -213,18 +213,39 @@ class TestSemantic:
         with pytest.raises(Exception):
             semantic.analyze(parser.parse("void func f() { regex? r = /abc/ }"))
 
-    def test_manually_managed_thread_message_type_is_rejected(self, parser, semantic):
+    def test_manually_managed_thread_message_type_is_accepted(self, parser, semantic):
+        # claude.md #202 Phase 2: a manually-managed message type is a
+        # real, supported inbound type now -- shares the reference
+        # rather than deep-cloning it (see TestRuntime's own real
+        # round-trip proof below).
         source = """
         struct Circle { x:int y:int }
         thread Worker {
             on message(p:Circle?) { log('got') }
         }
         """
-        with pytest.raises(Exception) as exc_info:
-            semantic.analyze(parser.parse(source))
-        assert "manually-managed" in str(exc_info.value)
+        semantic.analyze(parser.parse(source))
 
-    def test_manually_managed_post_message_is_rejected(self, parser, semantic):
+    def test_manually_managed_post_message_is_accepted(self, parser, semantic):
+        source = """
+        struct Circle { x:int y:int }
+        thread Worker {
+            on message(p:Circle?) { log('got') }
+        }
+        void func f() {
+            Circle? c
+            Worker.postMessage(c)
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_mismatched_manually_managed_and_plain_message_type_is_still_rejected(
+            self, parser, semantic):
+        # claude.md #202 Phase 2: `Circle?`/`Circle` remain genuinely
+        # distinct, non-interchangeable types even across a thread
+        # boundary -- this is an ordinary type mismatch
+        # (check_assignable at the postMessage() call site), unrelated
+        # to whether manually-managed values can cross threads at all.
         source = """
         struct Circle { x:int y:int }
         thread Worker {
@@ -310,3 +331,44 @@ class TestRuntime:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "42"
+
+    def test_manually_managed_thread_message_shares_the_reference_not_a_clone(
+            self, compile_and_run):
+        # claude.md #202 Phase 2: the direct, positive proof no clone
+        # ever happened, in either direction -- Worker mutates the
+        # struct it received THROUGH ITS OWN `on message` parameter,
+        # then echoes it back unchanged (bare `postMessage(p)`, the
+        # thread -> main direction, also never clones a manually-
+        # managed value). If EITHER direction had deep-cloned instead
+        # of sharing the reference, the mutation would be invisible on
+        # one side or the other: `x.x` (the echo main's own callback
+        # receives) would still show it even after a clone, but `c.x`
+        # (main's own ORIGINAL binding, never itself touched by main
+        # after the initial postMessage call) could only show 99 if
+        # Worker's mutation landed on the exact same underlying memory
+        # `c` still points to.
+        source = """
+        struct Circle { x:int y:int }
+
+        thread Worker {
+            on message(p:Circle?) {
+                p.x = 99
+                postMessage(p)
+            }
+        }
+
+        Circle? c
+
+        void func onReply(x:Circle?) {
+            log(x.x)
+            log(c.x)
+            close(0)
+        }
+
+        Worker.onMessage(void (x:Circle?) => onReply(x))
+        c.x = 1
+        Worker.postMessage(c)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["99", "99"]

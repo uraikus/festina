@@ -60,14 +60,6 @@ and AddressSanitizer/LeakSanitizer coverage for the target.
   come from an event-handler parameter to begin with, never a
   literal, so `?` on the parameter itself is all a real program needs.
   See [api.md](api.md#t-manually-managed-values).
-- **Passing a manually-managed (`T?`) value across a `thread` boundary
-  isn't supported yet** — `on message(p:T?)` and `postMessage`ing one
-  both raise a clear compile error. Planned follow-up work: share the
-  raw reference rather than deep-cloning (the way every other
-  `postMessage` value does today), since nothing auto-manages a `T?`
-  value's refcount on either side for the clone-safety argument to
-  protect against in the first place. See
-  [api.md](api.md#t-manually-managed-values).
 
 ## Memory model
 

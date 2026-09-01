@@ -9,6 +9,24 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.16] - 2026-09-01
+
+### Added
+
+- `postMessage`/`on message` now share the raw reference for a
+  manually-managed (`T?`) value crossing a `thread` boundary, instead
+  of deep-cloning it like every other value type — a mutation made on
+  one side is visible on the other, since it's the identical
+  underlying value, not a copy. Sound because nothing on either side's
+  automatic bookkeeping ever touches a manually-managed value's
+  refcount, so there is nothing for two threads to race on.
+- A manually-managed parameter can now be `free`d — it was never
+  "borrowed" the way an ordinary parameter is, since nothing
+  auto-manages it on either side of a call.
+
+See [claude.md #203](claude.md) for the full design and implementation
+record.
+
 ## [0.15] - 2026-09-01
 
 ### Added

@@ -1381,6 +1381,13 @@ void festina_release(void *payload);
  * per-struct wrappers call it through their own declaration). */
 int8_t festina_release_check(void *payload);
 
+/* claude.md #202 Phase 2: the release function `T?` crossing a
+ * `thread` boundary gets on the RECEIVING side -- a genuine no-op,
+ * since the payload is the sender's own shared raw pointer, never a
+ * clone, and neither side's automatic bookkeeping may ever touch its
+ * refcount. See its own definition in festina_runtime.c. */
+void festina_noop_release(void *payload);
+
 /* claude.md #120: the type-blind state half of cycle collection --
  * synchronous single-root trial deletion (Bacon-Rajan), driven by
  * compiler-generated per-type traversal functions whenever a value of
