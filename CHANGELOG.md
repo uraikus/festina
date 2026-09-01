@@ -9,6 +9,31 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.21] - 2026-09-01
+
+### Changed
+
+- **`thread` messaging is now a single, unified model** — replaces
+  per-thread `NAME.onMessage(callback)` registration with one global
+  top-level `on message(worker:thread, msg:T)` handler that declares
+  its own message type directly. A thread's own inbound handler now
+  uses the identical `(worker:thread, msg:T)` shape (previously
+  `on message(p:T)`); `worker` identifies the sender and is `null`
+  when the message was sent by the main program. Threads may now
+  message each other directly via `NAME.postMessage(x)` from inside
+  another thread's own body (lifecycle control — `kill()`/`live()`/
+  `isAlive()` — remains main-program-only). **Breaking:** any program
+  using `NAME.onMessage(...)` or a thread's old single-parameter
+  `on message(p:T)` needs updating to the new form.
+- **The top-level WebSocket frame handler is renamed from
+  `on message(s:socket, msg:blob)` to `on socketMessage(s:socket,
+  msg:blob)`** — frees the `on message` name for the unified messaging
+  model above; behavior is unchanged, only the name. **Breaking:**
+  update any `on message(s:socket, ...)` declaration to
+  `on socketMessage`.
+
+See claude.md #208 for the full design and migration notes.
+
 ## [0.20] - 2026-09-01
 
 ### Fixed
