@@ -16017,6 +16017,54 @@ class TestThreads:
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["true", "false", "true", "true"]
 
+    def test_kill_then_live_reopens_a_genuinely_working_database_handle(
+            self, compile_and_run, tmp_path):
+        # claude.md #207: a kill()/live() cycle used to leak the old
+        # sqlite3*/fd pair (on_load unconditionally opened a fresh
+        # handle over the top of one never closed on kill()) -- this
+        # pins the BEHAVIORAL half (leak-freedom itself is an ASan/
+        # LeakSanitizer question, covered by
+        # tests/stress/thread_db_kill_live_churn.f under
+        # scripts/leak_stress.sh): several kill()/live() cycles in a
+        # row, each blocking and deterministic exactly like
+        # test_kill_then_isalive_is_false_then_live_revives_it just
+        # above, then a real on message() round trip against the
+        # THREAD's OWN database proves the handle live() just reopened
+        # actually works, not just that the process didn't crash.
+        db = tmp_path / "worker.sqlite"
+        source = f"""
+        table Hits {{ n:int }}
+        thread worker {{
+            DatabaseURL = '{db}'
+            on message(p:int) {{
+                sqlite('INSERT INTO Hits (n) VALUES (?)', [p])
+                int total = sqliteInt('SELECT count(*) FROM Hits')
+                postMessage(total)
+            }}
+        }}
+        int cycle = 0
+        while cycle < 5 {{
+            worker.kill()
+            worker.live(void (ok:bool) => log(ok))
+            cycle = cycle + 1
+        }}
+        void func onReply(x:int) {{
+            log(x)
+            close(0)
+        }}
+        worker.onMessage(void (x:int) => onReply(x))
+        worker.postMessage(1)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        lines = result.stdout.strip().splitlines()
+        assert lines[:5] == ["true"] * 5
+        # A fresh db file, one INSERT total (the single postMessage
+        # after the cycles) -- proves the handle live() reopened the
+        # LAST time is a real, working connection against the thread's
+        # own database, not a stale or reused one.
+        assert lines[5] == "1"
+
     def test_main_thread_death_kills_a_still_idle_child_thread(self, compile_and_run):
         # claude.md #195: "if the main thread dies, kill all child
         # threads" -- festina_program_exit runs the exit handler (if

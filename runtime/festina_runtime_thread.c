@@ -78,6 +78,13 @@ struct FestinaThreadHandle {
      * Set once, at registration, and never NULL. */
     void (*in_release)(void *payload);
     void (*out_release)(void *payload);
+    /* claude.md #207: closes this thread's own private sqlite handle,
+     * if it declared one -- NULL for a thread with no DatabaseURL
+     * (festina_thread_set_db_close is simply never called for one),
+     * so festina_thread_main's own check below is a plain no-op for
+     * it, same shape on_load/on_message/on_exit already have. Set at
+     * most once, right after registration, never from the worker. */
+    void (*db_close)(void);
 
     struct FestinaThreadHandle *next; /* registry linked list */
 };
@@ -132,6 +139,20 @@ static void *festina_thread_main(void *arg) {
         free(msg);
     }
     if (h->on_exit) h->on_exit(0);
+    /* claude.md #207: this thread's own worker is genuinely stopping
+     * now -- whether that's an explicit NAME.kill() or
+     * festina_thread_kill_all() at process teardown, either way
+     * nothing on this thread will touch its own private sqlite handle
+     * again, so this is the one guaranteed point to close it. Runs
+     * AFTER on_exit(0) (the user's own handler may still want to
+     * query its thread's database on the way out) and BEFORE `alive`
+     * flips to 0 (so a concurrent festina_thread_live on another
+     * thread can never observe "alive" while the handle it's about to
+     * reopen via on_load is still mid-close). A later NAME.live()
+     * calls on_load again, which reopens a genuinely fresh handle --
+     * this is what makes that kill()/live() cycle no longer leak the
+     * old one. */
+    if (h->db_close) h->db_close();
     pthread_mutex_lock(&h->in_lock);
     h->alive = 0;
     pthread_mutex_unlock(&h->in_lock);
@@ -199,6 +220,10 @@ void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload) {
 
 void festina_thread_set_out_callback(FestinaThreadHandle *h, void (*out_callback)(void *payload)) {
     h->out_callback = out_callback;
+}
+
+void festina_thread_set_db_close(FestinaThreadHandle *h, void (*db_close)(void)) {
+    h->db_close = db_close;
 }
 
 void festina_thread_kill(FestinaThreadHandle *h) {

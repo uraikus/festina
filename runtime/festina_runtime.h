@@ -299,6 +299,22 @@ void festina_sync_table(sqlite3 *db, const char *table_name,
  * @__festina_db's own default in codegen.py) is a safe no-op. */
 void festina_db_close(sqlite3 *db);
 
+/* claude.md #207: closes ONE thread's own private sqlite handle (a
+ * `thread` block's own `DatabaseURL`) at the point that thread's own
+ * worker actually stops, whether via an explicit `NAME.kill()` or via
+ * process teardown's own festina_thread_kill_all -- registered per
+ * thread through festina_thread_set_db_close (festina_runtime_thread.c),
+ * never called directly from codegen. Deliberately NOT festina_db_close
+ * reused as-is: see this function's own comment in festina_runtime.c
+ * for why finalizing the ENTIRE process-wide statement-cache registry
+ * (what festina_db_close does, correctly, for the one-time real
+ * process-shutdown case) would corrupt every OTHER still-running
+ * thread's -- or main's own -- cached prepared statements if run here
+ * instead. A NULL db is a safe no-op (a thread with no DatabaseURL of
+ * its own never gets this registered in the first place, but the check
+ * costs nothing). */
+void festina_thread_db_close(sqlite3 *db);
+
 /*
  * claude.md #32-34: sqlite() queries.
  *
@@ -1114,6 +1130,23 @@ void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload);
  * message -- see festina_thread_drain's own doc comment on what
  * happens to anything posted before this call runs. */
 void festina_thread_set_out_callback(FestinaThreadHandle *h, void (*out_callback)(void *payload));
+/* claude.md #207: registers the (zero-argument) closure that closes
+ * THIS thread's own private sqlite handle -- codegen emits a tiny
+ * per-thread trampoline (loads `@__festina_thread_NAME_db`, calls
+ * festina_thread_db_close on it, stores null back) and passes it here
+ * once, right after festina_thread_register, but ONLY for a thread
+ * that actually declared its own DatabaseURL (db_global is not None);
+ * a thread with no DatabaseURL never gets this call at all, so
+ * db_close stays NULL and festina_thread_main's own check below is a
+ * plain no-op for it, same as on_load/on_message/on_exit already are
+ * when a thread doesn't declare one. Called from festina_thread_main
+ * itself, once, right after on_exit(0) -- i.e. exactly when this
+ * thread's own worker is about to stop, whether that's an explicit
+ * `NAME.kill()` or festina_thread_kill_all() at process teardown --
+ * so a subsequent `NAME.live()`'s own on_load reopens a genuinely
+ * fresh handle instead of leaking the old one, which is the actual
+ * bug this closes. */
+void festina_thread_set_db_close(FestinaThreadHandle *h, void (*db_close)(void));
 /* `NAME.kill()`: blocking -- signals the worker to stop, pthread_joins
  * it, then discards anything still sitting in its inbound queue
  * (a real, deliberate choice: "kill" means stop now, not "finish

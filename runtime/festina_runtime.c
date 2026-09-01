@@ -2646,6 +2646,17 @@ sqlite3 *festina_db_open(const char *path) {
  * never shares an LLVM global with another thread's, or with main's),
  * so it is never actually touched by two threads and needs no lock. */
 static sqlite3_stmt **g_cached_stmts = NULL;
+/* claude.md #207: parallel to g_cached_stmts (same index, same count/
+ * cap, grown and shrunk together) -- the sqlite3* each cached
+ * statement was PREPARED AGAINST. Added specifically so
+ * festina_thread_db_close (below) can finalize only the entries that
+ * belong to the one connection it's closing, leaving every other
+ * thread's -- and main's own -- still-live cached statements alone;
+ * festina_db_close's own indiscriminate "finalize everything" loop
+ * predates this and is intentionally left as-is (it only ever runs
+ * once, at real process shutdown, when nothing else is still using
+ * the registry). */
+static sqlite3 **g_cached_stmt_dbs = NULL;
 static int g_cached_stmt_count = 0;
 static int g_cached_stmt_cap = 0;
 static void (*g_stmt_cache_lock)(void) = NULL;
@@ -2672,8 +2683,14 @@ sqlite3_stmt *festina_sqlite_prepare_cached(sqlite3 *db, const char *sql,
                                        (size_t)g_cached_stmt_cap * sizeof(*grown));
         if (!grown) festina_fail("out of memory caching a statement");
         g_cached_stmts = grown;
+        sqlite3 **dbs_grown = realloc(g_cached_stmt_dbs,
+                                      (size_t)g_cached_stmt_cap * sizeof(*dbs_grown));
+        if (!dbs_grown) festina_fail("out of memory caching a statement");
+        g_cached_stmt_dbs = dbs_grown;
     }
-    g_cached_stmts[g_cached_stmt_count++] = stmt;
+    g_cached_stmts[g_cached_stmt_count] = stmt;
+    g_cached_stmt_dbs[g_cached_stmt_count] = db;
+    g_cached_stmt_count++;
     if (g_stmt_cache_unlock) g_stmt_cache_unlock();
     *slot = stmt;
     return stmt;
@@ -2977,6 +2994,47 @@ void festina_db_close(sqlite3 *db) {
     int rc = sqlite3_close(db);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "festina_db_close: sqlite3_close returned %d (%s) -- "
+                "a statement or blob handle was still open\n", rc, sqlite3_errmsg(db));
+    }
+}
+
+/* claude.md #207: closes ONE thread's own private sqlite handle, at the
+ * point that thread's own worker actually stops (see
+ * festina_runtime_thread.c's own festina_thread_main and
+ * festina_thread_set_db_close) -- deliberately NOT festina_db_close
+ * reused as-is, because that function's own finalize loop walks the
+ * ENTIRE process-wide g_cached_stmts registry unconditionally, which
+ * is only safe to do once, at real process shutdown, when nothing
+ * else is still running. Calling it from a thread that's merely being
+ * killed (a `kill()`/`live()` cycle, or one thread exiting while
+ * others -- or main -- are still alive and querying their OWN,
+ * different connections) would finalize every OTHER live thread's
+ * cached prepared statements out from under it, corrupting state a
+ * still-running thread has no reason to expect changed.
+ *
+ * Scoped correctly instead: only finalizes the registry entries this
+ * DB's own connection actually owns (g_cached_stmt_dbs tracks that
+ * per entry, added specifically for this), compacting the arrays in
+ * place, then closes -- leaving every other connection's own cached
+ * statements untouched. */
+void festina_thread_db_close(sqlite3 *db) {
+    if (!db) return;
+    if (g_stmt_cache_lock) g_stmt_cache_lock();
+    int w = 0;
+    for (int i = 0; i < g_cached_stmt_count; i++) {
+        if (g_cached_stmt_dbs[i] == db) {
+            sqlite3_finalize(g_cached_stmts[i]);
+            continue;
+        }
+        g_cached_stmts[w] = g_cached_stmts[i];
+        g_cached_stmt_dbs[w] = g_cached_stmt_dbs[i];
+        w++;
+    }
+    g_cached_stmt_count = w;
+    if (g_stmt_cache_unlock) g_stmt_cache_unlock();
+    int rc = sqlite3_close(db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "festina_thread_db_close: sqlite3_close returned %d (%s) -- "
                 "a statement or blob handle was still open\n", rc, sqlite3_errmsg(db));
     }
 }

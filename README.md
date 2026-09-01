@@ -11,7 +11,7 @@ into the language, not bolted on as libraries.
 
 Version 0.1 — see [CHANGELOG.md](CHANGELOG.md).
 
-[![Tests](https://img.shields.io/badge/tests-2113%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-2114%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -221,7 +221,7 @@ frame about twice as fast as Chromium's.
 ## Project status
 
 The compiler frontend, LLVM codegen backend, and native C runtime are
-real and tested: **2113 tests, 0 failures** (9 more skip cleanly when
+real and tested: **2114 tests, 0 failures** (9 more skip cleanly when
 their optional tooling isn't installed — see
 [setup.md](setup.md#running-the-test-suite)). Every language construct
 in the [specification](claude.md) is implemented end to end, not just

@@ -9,6 +9,18 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.20] - 2026-09-01
+
+### Fixed
+
+- **A `thread` with its own `DatabaseURL` now closes its private
+  sqlite handle on `kill()`** — previously, a `kill()`/`live()` cycle
+  reopened a fresh handle every time without closing the old one (a
+  real, small, per-cycle leak: one `sqlite3*` plus an open fd).
+  Confirmed via a real LeakSanitizer report before the fix and a clean
+  one after (`tests/stress/thread_db_kill_live_churn.f`). See
+  claude.md #207.
+
 ## [0.19] - 2026-09-01
 
 ### Fixed

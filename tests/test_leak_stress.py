@@ -545,6 +545,15 @@ class TestLeakStress:
             # shape needed to catch a leaked/raced prepared-statement
             # cache entry, which no single-threaded sqlite test could.
             "thread_db_churn.f",
+            # claude.md #207: the OTHER half of a thread's own private
+            # sqlite handle thread_db_churn.f can't exercise -- that
+            # file's own worker stays alive for the whole run, so it
+            # never proves a kill()/live() cycle actually closes the
+            # OLD handle before on_load reopens a fresh one. 500 real
+            # kill()/live() cycles (each blocking: kill() joins, live()
+            # spawns), so a leaked sqlite3*/fd pair per cycle is
+            # unmissable.
+            "thread_db_kill_live_churn.f",
             # claude.md #202 Phase 2: `T?` crossing a `thread` boundary
             # -- an ownership shape neither thread_churn.f nor
             # thread_db_churn.f exercises: the payload is the SENDER's

@@ -1513,6 +1513,11 @@ class CodeGen:
             "declare void @festina_thread_post(ptr, ptr)",
             "declare void @festina_thread_post_outbound(ptr, ptr)",
             "declare void @festina_thread_set_out_callback(ptr, ptr)",
+            # claude.md #207: closes a thread's own private sqlite
+            # handle when its worker actually stops (kill()/process
+            # teardown) -- see _emit_thread_db_close_trampoline.
+            "declare void @festina_thread_set_db_close(ptr, ptr)",
+            "declare void @festina_thread_db_close(ptr)",
             "declare void @festina_thread_kill(ptr)",
             "declare void @festina_thread_live(ptr, ptr)",
             "declare i8 @festina_thread_is_alive(ptr)",
@@ -3468,6 +3473,7 @@ class CodeGen:
             "outbound_type": info.outbound_type,
             "onmessage_cb_global": None,   # set the first time NAME.onMessage(...) is emitted
             "out_trampoline": None,        # set the first time NAME.onMessage(...) is emitted
+            "db_global": None,             # set below, only if this thread declared its own DatabaseURL
         }
         if info.inbound_type is not None:
             self._check_thread_clonable_type(info.inbound_type, "an 'on message' parameter", decl)
@@ -3516,6 +3522,7 @@ class CodeGen:
         if info.database_url is not None:
             db_global = f"@__festina_thread_{decl.name}_db"
             self.extra_globals.append(f"{db_global} = global ptr null")
+            self.threads[decl.name]["db_global"] = db_global
         thread_ctx = (decl.name, handle_global, info.outbound_type, db_global)
         on_load_symbol = self._emit_thread_on_load(decl.name, state_inits, on_load_decl, state_env, thread_ctx)
         on_message_symbol = self._emit_thread_on_message(
@@ -3717,6 +3724,40 @@ class CodeGen:
         self.func_defs.extend(body)
         self.func_defs.append("")
         return trampoline_name
+
+    def _emit_thread_db_close_trampoline(self, thread_name, db_global):
+        """claude.md #207: a zero-argument closure registered with
+        festina_thread_set_db_close, called from festina_thread_main
+        itself right as this thread's own worker stops (an explicit
+        NAME.kill() or process teardown alike) -- see that call site's
+        own doc comment in festina_runtime_thread.c. Reads this
+        thread's own `db_global` (an LLVM global, only reachable from
+        generated code, which is exactly why this trampoline needs to
+        exist at all rather than the runtime just being handed the
+        pointer directly: the runtime registers the closure once, at
+        thread setup, long before the actual sqlite3* value exists),
+        closes it through festina_thread_db_close (NOT festina_db_close
+        -- see that function's own doc comment in festina_runtime.c for
+        why reusing the real-process-shutdown one here would corrupt
+        every other thread's/main's own still-live cached statements),
+        then stores null back -- defensive tidiness only (a later
+        NAME.live() reopens a fresh handle via on_load regardless of
+        what's currently in db_global), matching the "leave no stale
+        pointer behind" convention every other release call site in
+        this file already follows. Emitted once per thread that
+        declared its own DatabaseURL (never for one that didn't --
+        db_global is None there, and this is simply never called)."""
+        symbol = f"@__festina_thread_{thread_name}_db_close_trampoline"
+        body = [f"define void {symbol}() {{", "entry:"]
+        db_val = self.tmp()
+        body.append(f"  {db_val} = load ptr, ptr {db_global}")
+        body.append(f"  call void @festina_thread_db_close(ptr {db_val})")
+        body.append(f"  store ptr null, ptr {db_global}")
+        body.append("  ret void")
+        body.append("}")
+        self.func_defs.extend(body)
+        self.func_defs.append("")
+        return symbol
 
     # ---- statements ----
     def _emit_free(self, stmt, env, lines):
@@ -12125,6 +12166,22 @@ class CodeGen:
                     f"ptr {on_load_sym}, ptr {on_message_sym}, ptr {on_exit_sym}, "
                     f"ptr {in_release}, ptr {out_release})")
                 main_lines.append(f"  store ptr %__thread_{tname}, ptr {handle_global}")
+                # claude.md #207: registered BEFORE spawn, same as
+                # in_release/out_release just above (festina_thread_
+                # register's own parameters) -- set once, here, never
+                # touched again, so there's no window after the OS
+                # thread actually starts where db_close could still be
+                # NULL. Only for a thread that declared its own
+                # DatabaseURL; db_global stays None for one that
+                # didn't, and this is simply skipped for it (its
+                # db_close stays NULL, the same no-op every other
+                # undeclared handler already is).
+                db_global = tinfo["db_global"]
+                if db_global is not None:
+                    db_close_sym = self._emit_thread_db_close_trampoline(tname, db_global)
+                    main_lines.append(
+                        f"  call void @festina_thread_set_db_close(ptr %__thread_{tname}, "
+                        f"ptr {db_close_sym})")
                 main_lines.append(f"  call void @festina_thread_spawn(ptr %__thread_{tname})")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and

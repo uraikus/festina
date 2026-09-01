@@ -67,14 +67,6 @@ as the manual override. What remains open:
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.
-- **A `thread` with its own `DatabaseURL` never explicitly closes its
-  private sqlite handle on `kill()`** — a `kill()`/`live()` cycle
-  reopens a fresh handle each time without closing the old one (a
-  real, small, per-cycle leak: one `sqlite3*` plus an open fd), simply
-  reclaimed by the OS at process exit like every other still-open
-  handle. Matches the main program's own database, whose handle
-  likewise isn't closed on the `close(code)`/signal-driven exit path
-  either. See [api.md](api.md#threads).
 - **A `throw` reached from a called function leaks that function's own
   locals**, and, structurally the same issue, **`.toStruct()`/
   `.toArr()` leak whatever they'd already built when a parse fails
