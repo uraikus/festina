@@ -9,6 +9,103 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.31] - 2026-09-01
+
+### Fixed
+
+- **An out-of-range thread-pool index no longer registers a dead
+  callback.** `pool[99].postMessage(x).callback(fn)` registered `fn`
+  before the bounds check, so it could never fire and its slot was
+  never reclaimed. The whole expression is a clean no-op now.
+- **`.reply()` with no message in flight** (a second reply to one
+  message, or a `thread` value stashed in a struct/array/map and
+  replied to later) silently dropped the reply and leaked its payload.
+  It now releases the payload and delivers nothing. Every other path
+  that can drop a reply -- including one still queued when its target
+  is killed -- releases it correctly too.
+- **Error messages naming a thread type** printed the compiler's own
+  internal repr (`ThreadType(None)`) instead of `thread`. `log()` and
+  template interpolation of a thread value now give the same specific
+  "has no text form" error `img`/`aud` already did, and the "thread has
+  no field X" error no longer suggests a method that doesn't exist on a
+  thread value.
+- A broken intra-document link in api.md (`#http--websocket-servers`).
+
+### Changed
+
+- **Thread messaging is faster.** The pending-callback list appends
+  instead of prepending, turning the ordinary in-order reply case from
+  O(N^2) into an O(1) lookup (measured on the identical program built
+  both ways: 0.06s -> 0.04s at 5,000 in-flight sends, 0.92s -> 0.47s at
+  20,000), and a worker now takes its inbound mutex once per message
+  instead of twice.
+- **api.md's Threads section reorganized** into ten subsections with
+  working cross-references, plus newly documented behavior: reply at
+  most once per message, `kill()` drops pending callbacks, a thread
+  value has no text form, and a pool compiles its body once per
+  instance (a compiled-size cost worth knowing before picking a large
+  `N`).
+
+See claude.md #218.
+
+## [0.30] - 2026-09-01
+
+### Added
+
+- **`t.reply(response)` / `NAME.postMessage(x).callback(fn)`** -- a
+  general request/response mechanism on top of thread messaging. A
+  thread's (or main's) reply type is fixed by its first `.reply(...)`
+  call; every `postMessage(x)` call site targeting a receiver with a
+  reply type must chain `.callback(fn)` to receive it, or it's a
+  compile error. `.reply()` never triggers `on message` on the
+  receiving end -- it's a separate delivery path straight to `fn`,
+  which runs back on whichever OS thread originally sent the message.
+
+### Fixed
+
+- **`festina_thread_kill`'s leftover-message cleanup was type-confused**
+  for a queued `giveRequest` hand-off -- it called the wrong release
+  function on the wrong struct shape. Now kind-aware; a killed
+  thread's own pending `.callback(fn)` registrations are also freed
+  (never invoked) so a later `live()` respawn can't inherit stale ones.
+
+See claude.md #217.
+
+## [0.29] - 2026-09-01
+
+### Changed
+
+- **`worker:thread` (the `on message(worker:thread, msg:T)` parameter)
+  is never `null` any more.** When main is the sender, `worker` is now a
+  real, singleton `thread` value -- check the new `.main:bool` field to
+  tell it apart from an ordinary worker's own handle. Comparing a
+  `thread` value against `null` is now a compile error naming `.main`
+  as the replacement. This is Phase 1 of a larger messaging redesign;
+  `.reply()`/`.callback()` and the removal of `sqlite()` are separate,
+  later changes.
+
+See claude.md #216.
+
+## [0.28] - 2026-09-01
+
+### Added
+
+- **`examples/threaded_http_server.f`** and **`benchmarks/http_threaded/`**
+  -- a real example and a `wrk`-based benchmark showing `thread pool[N]`
+  + `NAME.giveRequest(r)` computing genuine per-request CPU-bound work
+  across more than one OS thread at once, with a single-threaded
+  baseline for comparison. See benchmark.md's new "HTTP:
+  single-threaded vs. thread pool" section for measured numbers.
+
+### Fixed
+
+- **A `thread pool[N]` can no longer declare its own `DatabaseURL`.**
+  Every instance in a pool shares one declared body, so this would have
+  meant `N` independent, uncoordinated sqlite connections into the
+  identical literal file at once -- now a compile error naming the fix.
+
+See claude.md #215.
+
 ## [0.27] - 2026-09-01
 
 ### Changed

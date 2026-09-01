@@ -15882,6 +15882,32 @@ class TestThreads:
         assert result.returncode == 0
         assert result.stdout.strip() == "42"
 
+    def test_worker_dot_main_reads_true_only_when_sent_by_main(self, compile_and_run):
+        # claude.md #216: `worker` is never null any more -- `worker.main`
+        # is the real replacement for claude.md #208's old "worker ==
+        # null" check. main -> worker sees main=true; worker -> main
+        # (the reply) sees main=false, since it genuinely came from the
+        # worker thread, not main.
+        source = """
+        on message(worker:thread, msg:int) {
+            log(`main got ${msg} from main=${worker.main}`)
+            close(0)
+        }
+        thread worker {
+            on message(worker:thread, msg:int) {
+                log(`worker got ${msg} from main=${worker.main}`)
+                postMessage(msg * 2)
+            }
+        }
+        worker.postMessage(21)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == (
+            "worker got 21 from main=true\n"
+            "main got 42 from main=false"
+        )
+
     def test_text_message_round_trip(self, compile_and_run):
         source = """
         on message(worker:thread, msg:text) {
@@ -16127,6 +16153,31 @@ class TestThreads:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["2", "11"]
+
+    def test_thread_to_thread_message_sees_worker_dot_main_false(self, compile_and_run):
+        # claude.md #216: a thread-to-thread send is genuinely NOT from
+        # main -- `worker.main` on the receiving end must read false,
+        # distinct from a main-originated send (covered above). `a`
+        # posts back -1 instead of the real value if it ever observed
+        # `worker.main` as true, so a wrong flip fails loudly rather
+        # than just passing coincidentally.
+        source = """
+        on message(worker:thread, msg:int) {
+            log(msg)
+            close(0)
+        }
+        thread a {
+            on message(worker:thread, msg:int) {
+                postMessage(worker.main ? -1 : msg)
+            }
+        }
+        thread b {
+            on load() { a.postMessage(99) }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "99"
 
     def test_a_self_referencing_struct_message_type_is_a_clear_not_yet_error(self, parser, semantic, codegen, errors):
         # claude.md #197 Phase 3: struct/arr[T]/map[T] are clonable
@@ -16499,6 +16550,202 @@ class TestThreads:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "main done"
+
+
+class TestThreadReplyCallback:
+    """claude.md #217: `t.reply(response)` / `NAME.postMessage(x).
+    callback(fn)` -- the real, compiled-and-run counterpart to
+    tests/test_threads.py's semantic coverage."""
+
+    def test_main_to_worker_reply_round_trip(self, compile_and_run):
+        # main sends with .callback, worker's own on message fires
+        # normally (proving .reply doesn't replace ordinary delivery),
+        # then replies -- the callback fires on main with the reply
+        # value, not a second on_message dispatch.
+        source = """
+        void func onReply(r:int) {
+            log(`reply: ${r}`)
+            close(0)
+        }
+        thread worker {
+            on message(worker:thread, msg:int) {
+                log(`worker got: ${msg}`)
+                worker.reply(msg * 10)
+            }
+        }
+        worker.postMessage(21).callback(onReply)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["worker got: 21", "reply: 210"]
+
+    def test_worker_to_main_bare_reply_round_trip(self, compile_and_run):
+        # a worker sends to main via the bare form with .callback;
+        # main's own top-level on message fires normally, then replies
+        # -- the callback fires back on the WORKER's own OS thread.
+        source = """
+        void func onReply(r:int) {
+            log(`worker reply: ${r}`)
+        }
+        void func finish() {
+            close(0)
+        }
+        on message(worker:thread, msg:int) {
+            log(`main got: ${msg}`)
+            worker.reply(msg + 1)
+            // claude.md #217: the callback this send registered fires
+            // on the WORKER's own OS thread, asynchronously -- a short
+            // setTimeout (the same pattern this suite's own timer
+            // tests already use to let background work land before
+            // close()) gives it time to log before the process exits.
+            setTimeout(finish, 200)
+        }
+        thread worker {
+            on load() {
+                postMessage(5).callback(onReply)
+            }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["main got: 5", "worker reply: 6"]
+
+    def test_reply_does_not_trigger_on_message_again(self, compile_and_run):
+        # claude.md #217: `.reply()` is a completely separate delivery
+        # path -- the sender's own `on message` must NOT fire a second
+        # time when the reply arrives.
+        source = """
+        int mainMessageCount = 0
+        void func onReply(r:int) {
+            log(`callback: ${r}`)
+            close(0)
+        }
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg + 1)
+            }
+        }
+        worker.postMessage(1).callback(onReply)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # exactly one line -- the callback -- never a second on_message
+        # dispatch on the reply's own arrival
+        assert result.stdout.strip().splitlines() == ["callback: 2"]
+
+    def test_two_outstanding_replies_resolve_to_the_right_callbacks(self, compile_and_run):
+        # claude.md #217: two DIFFERENT txn ids, in flight from the
+        # SAME sender at once, must each resolve to their own callback
+        # -- not the other's.
+        source = """
+        int seen = 0
+        void func onA(r:int) {
+            log(`A: ${r}`)
+            seen = seen + 1
+            if seen == 2 { close(0) }
+        }
+        void func onB(r:int) {
+            log(`B: ${r}`)
+            seen = seen + 1
+            if seen == 2 { close(0) }
+        }
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg)
+            }
+        }
+        worker.postMessage(100).callback(onA)
+        worker.postMessage(200).callback(onB)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        lines = sorted(result.stdout.strip().splitlines())
+        assert lines == ["A: 100", "B: 200"]
+
+    def test_an_out_of_range_pool_index_registers_no_callback(self, compile_and_run):
+        # claude.md #218: the registration used to be emitted BEFORE
+        # the pool's own bounds check, so an out-of-range index left a
+        # pending callback that could never fire (its send never
+        # happened) sitting on the sender's list forever. The whole
+        # expression must be a no-op -- and the in-range send right
+        # after it must still work, proving the fix didn't just disable
+        # the feature.
+        source = """
+        void func onReply(r:int) { log(`cb ${r}`) }
+        void func done() { log('done') close(0) }
+        thread pool[2] {
+            on message(w:thread, msg:int) { w.reply(msg * 10) }
+        }
+        pool[5].postMessage(1).callback(onReply)
+        pool[0].postMessage(7).callback(onReply)
+        setTimeout(done, 300)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["cb 70", "done"]
+
+    def test_replying_twice_to_one_message_delivers_only_the_first(self, compile_and_run):
+        # claude.md #218: the first reply consumes the only pending
+        # callback slot; the second has nothing to answer. It must be
+        # discarded cleanly (and its payload released -- the leak side
+        # of this is covered at volume by
+        # tests/stress/thread_reply_callback_churn.f).
+        source = """
+        void func onReply(r:int) { log(`cb ${r}`) }
+        void func done() { log('done') close(0) }
+        thread worker {
+            on message(w:thread, msg:int) { w.reply(msg) w.reply(msg + 100) }
+        }
+        worker.postMessage(1).callback(onReply)
+        setTimeout(done, 300)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["cb 1", "done"]
+
+    def test_replying_from_a_thread_value_that_outlived_its_dispatch_is_a_no_op(
+            self, compile_and_run):
+        # claude.md #218: a `thread` value stashed in a struct field
+        # (also legal in an arr[thread]/map[thread]) can be replied to
+        # long after the message it identifies was finished -- there is
+        # no pending callback left to answer, so this must deliver
+        # nothing and release the payload rather than enqueuing a
+        # message that gets silently dropped on arrival (which is what
+        # it did before, leaking the payload with it).
+        source = """
+        struct Holder { t:thread }
+        Holder h
+        void func onReply(r:text) { log(`cb ${r}`) }
+        void func ignore(r:int) { }
+        void func later() {
+            h.t.reply(999)
+            log('stale reply was a no-op')
+            close(0)
+        }
+        thread worker { on message(w:thread, msg:text) { w.reply(`echo:${msg}`) } }
+        on message(w:thread, msg:int) { h.t = w  log(`main got ${msg}`) }
+        thread pinger { on load() { postMessage(5).callback(ignore) } }
+        worker.postMessage('hi').callback(onReply)
+        setTimeout(later, 300)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert "stale reply was a no-op" in result.stdout
+        assert "cb echo:hi" in result.stdout
+
+    def test_a_thread_value_has_no_text_form(self, parser, semantic, codegen, errors):
+        # claude.md #218: these used to fall through to codegen's own
+        # generic fallbacks ("only supports primitive values", and a
+        # template error that didn't even name the file) -- a thread
+        # value now gets img/aud's own specific message.
+        for src in ("thread worker { on message(w:thread, msg:int) { log(w) } }\n"
+                    "worker.postMessage(1)\n",
+                    "thread worker { on message(w:thread, msg:int) { log(`${w}`) } }\n"
+                    "worker.postMessage(1)\n"):
+            program = parser.parse(src)
+            analyzed = semantic.analyze(program)
+            with pytest.raises(codegen.CodegenError, match="no text form"):
+                codegen.CodeGen(analyzed, filename="main.f").generate(program)
 
 
 class TestThreadPools:

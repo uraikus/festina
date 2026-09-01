@@ -431,28 +431,43 @@ class TestThreadMessagePassing:
         analyzed = semantic.analyze(parser.parse(source))
         assert analyzed.main_message_type is not None
 
-    def test_worker_parameter_is_null_when_sent_by_main(self, parser, semantic):
+    def test_worker_dot_main_is_true_when_sent_by_main(self, parser, semantic):
+        # claude.md #216: `worker` is never null any more -- when main
+        # is the sender, `worker.main` reads true instead.
         source = """
         on message(worker:thread, msg:int) {
-            if (worker == null) { log('from main') }
+            if (worker.main) { log('from main') }
         }
         thread myWorker { on load() { postMessage(1) } }
         """
         semantic.analyze(parser.parse(source))
 
+    def test_worker_compared_against_null_is_rejected(self, parser, semantic, errors):
+        # claude.md #216: claude.md #208's own "worker == null" design
+        # is gone -- `worker` is never null, so comparing it against
+        # null is now a clear compile error pointing at `.main`.
+        source = """
+        on message(worker:thread, msg:int) {
+            if (worker == null) { log('x') }
+        }
+        thread myWorker { on load() { postMessage(1) } }
+        """
+        with pytest.raises(errors.CompileError, match="never null.*\\.main"):
+            semantic.analyze(parser.parse(source))
+
     def test_two_thread_values_cannot_be_compared_to_each_other(
             self, parser, semantic, errors):
-        # claude.md #208: `worker` may only ever be compared against
-        # null -- comparing two real thread values against each other
-        # hits the invalid-LLVM-IR struct-equality hazard this
-        # language's `==`/`!=` codegen has for any non-null pointer-
-        # shaped comparison, so it's rejected here at the semantic
-        # layer instead, with a clear Festina-level message. (There is
-        # no way to spell a SECOND, distinct `thread`-typed binding in
-        # ordinary Festina code at all -- `thread` is deliberately not
-        # constructible, only ever delivered via `worker` -- so this
-        # compares `worker` against itself, which is enough to exercise
-        # the "two thread values" guard either way.)
+        # claude.md #208 (still true after #216): comparing two real
+        # thread values against each other hits the invalid-LLVM-IR
+        # struct-equality hazard this language's `==`/`!=` codegen has
+        # for any non-null pointer-shaped comparison, so it's rejected
+        # here at the semantic layer instead, with a clear Festina-level
+        # message. (There is no way to spell a SECOND, distinct
+        # `thread`-typed binding in ordinary Festina code at all --
+        # `thread` is deliberately not constructible, only ever
+        # delivered via `worker` -- so this compares `worker` against
+        # itself, which is enough to exercise the "two thread values"
+        # guard either way.)
         source = """
         on message(worker:thread, msg:int) {
             if (worker == worker) { log('x') }
@@ -653,6 +668,145 @@ class TestThreadDatabaseUrl:
             semantic.analyze(parser.parse(source))
 
 
+class TestReplyCallback:
+    """claude.md #217: `t.reply(response)` / `NAME.postMessage(x).
+    callback(fn)`."""
+
+    def test_reply_and_callback_round_trip_type_checks(self, parser, semantic):
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg * 2)
+            }
+        }
+        void func onReply(r:int) { log(r) }
+        worker.postMessage(21).callback(onReply)
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_bare_postmessage_without_callback_when_target_replies_is_rejected(
+            self, parser, semantic, errors):
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg * 2)
+            }
+        }
+        worker.postMessage(21)
+        """
+        with pytest.raises(errors.CompileError, match="must chain '.callback\\(fn\\)'"):
+            semantic.analyze(parser.parse(source))
+
+    def test_callback_on_a_target_that_never_replies_is_rejected(self, parser, semantic, errors):
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                log(msg)
+            }
+        }
+        void func onReply(r:int) { log(r) }
+        worker.postMessage(21).callback(onReply)
+        """
+        with pytest.raises(errors.CompileError, match="requires a target that replies"):
+            semantic.analyze(parser.parse(source))
+
+    def test_callback_type_mismatch_is_rejected(self, parser, semantic, errors):
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg * 2)
+            }
+        }
+        void func onReply(r:text) { log(r) }
+        worker.postMessage(21).callback(onReply)
+        """
+        with pytest.raises(errors.CompileError, match="callback\\(\\) expects func\\[int\\]:void"):
+            semantic.analyze(parser.parse(source))
+
+    def test_reply_type_is_fixed_by_the_first_call_and_enforced_after(
+            self, parser, semantic, errors):
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg)
+                worker.reply('not an int')
+            }
+        }
+        void func onReply(r:int) { log(r) }
+        worker.postMessage(21).callback(onReply)
+        """
+        with pytest.raises(errors.CompileError, match="reply\\(\\) argument"):
+            semantic.analyze(parser.parse(source))
+
+    def test_main_can_reply_to_a_worker_that_sends_via_bare_postmessage(self, parser, semantic):
+        source = """
+        void func onReply(r:int) { log(r) }
+        on message(worker:thread, msg:int) {
+            worker.reply(msg + 1)
+        }
+        thread worker {
+            on load() { postMessage(5).callback(onReply) }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_bare_postmessage_to_main_without_callback_when_main_replies_is_rejected(
+            self, parser, semantic, errors):
+        source = """
+        on message(worker:thread, msg:int) {
+            worker.reply(msg + 1)
+        }
+        thread worker {
+            on load() { postMessage(5) }
+        }
+        """
+        with pytest.raises(errors.CompileError, match="must chain '.callback\\(fn\\)'"):
+            semantic.analyze(parser.parse(source))
+
+    def test_errors_name_the_type_as_thread_not_the_internal_repr(
+            self, parser, semantic, errors, types_mod):
+        # claude.md #218: types.type_name had no ThreadType case at all,
+        # so every user-facing message about a thread value printed this
+        # compiler's own Python repr ("ThreadType(None)").
+        assert types_mod.type_name(types_mod.ThreadType(None)) == "thread"
+        assert types_mod.type_name(types_mod.ThreadType("w")) == "thread 'w'"
+        source = """
+        thread worker { on message(w:thread, msg:int) { log(msg) } }
+        on message(w:thread, msg:int) { int x = w }
+        thread other { on load() { postMessage(1) } }
+        """
+        with pytest.raises(errors.CompileError, match="of type thread to int"):
+            semantic.analyze(parser.parse(source))
+
+    def test_the_no_such_field_error_does_not_suggest_postmessage(
+            self, parser, semantic, errors):
+        # claude.md #218: `.postMessage()` is a method on a declared
+        # thread's NAME, never on a thread VALUE -- the old message
+        # pointed someone writing `w.postMessage(x)` straight back at
+        # the thing that had just failed.
+        source = """
+        thread other { on message(w:thread, msg:int) { log(msg) } }
+        thread worker { on message(w:thread, msg:int) { w.postMessage(msg) } }
+        worker.postMessage(1)
+        """
+        with pytest.raises(errors.CompileError, match=r"\.reply\(x\)") as excinfo:
+            semantic.analyze(parser.parse(source))
+        assert "someThread.postMessage(x)" in str(excinfo.value)
+
+    def test_reply_is_legal_only_on_the_generic_thread_type(self, parser, semantic, errors):
+        # `.reply` is only recognized on a value of the GENERIC `thread`
+        # type (a `worker`/`t` parameter) -- calling it as a plain
+        # method name on anything else falls through to an ordinary
+        # "unknown method" error, not a silent no-op.
+        source = """
+        struct Circle { x:int }
+        Circle c = { x: 1 }
+        c.reply(1)
+        """
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(parser.parse(source))
+
+
 class TestThreadReservedName:
     def test_postmessage_cannot_be_declared_as_a_function(self, parser, semantic, errors):
         program = parser.parse("void func postMessage() { }")
@@ -749,6 +903,35 @@ class TestThreadPools:
         thread other { on load() { pool[0].postMessage(1) } }
         """
         semantic.analyze(parser.parse(source))
+
+    def test_a_pool_declaring_its_own_databaseurl_is_rejected(self, parser, semantic, errors):
+        # claude.md #215: a pool shares ONE _ThreadInfo (and therefore
+        # one database_url) across every instance -- every instance
+        # would open its own independent, uncoordinated connection to
+        # the SAME literal file at the same time, a genuine hazard an
+        # ordinary singleton thread's own DatabaseURL never has.
+        source = """
+        thread pool[3] {
+            DatabaseURL = './pool.sqlite'
+            on load() { }
+        }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="thread pool 'pool\\[3\\]' cannot declare its own DatabaseURL"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_pool_instance_still_cannot_call_sqlite_without_a_database(
+            self, parser, semantic, errors):
+        # claude.md #199 Phase 5's own existing gate (database_url is
+        # None) already covers a pool for free, since a pool's own
+        # database_url can now never be set at all (the check above).
+        source = """
+        thread pool[3] {
+            on load() { sqlite('SELECT 1', []) }
+        }
+        """
+        with pytest.raises(errors.CompileError, match="hasn't declared its own database"):
+            semantic.analyze(parser.parse(source))
 
 
 class TestThreadPrivateFunctions:

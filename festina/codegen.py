@@ -1301,6 +1301,12 @@ class CodeGen:
                                                 # [3 x ptr] memo slot global ({pattern copy, flags
                                                 # copy, compiled}) -- see _emit_regex_call /
                                                 # festina_regex_compile_memo
+        self._reply_trampoline_cache = {}      # claude.md #217: reply_type -> its own generated
+                                                # `.callback(fn)` dispatch trampoline's symbol name --
+                                                # see _emit_reply_callback_trampoline; ONE trampoline
+                                                # per distinct reply_type suffices (every send site
+                                                # targeting a given thread/main shares that one
+                                                # target's own single reply_type)
         self._cyclic_type_cache = {}           # claude.md #120: type_name -> bool ("can this type
                                                 # reach itself through managed edges") -- the gate on
                                                 # ALL cycle-collection machinery; acyclic types never
@@ -1553,13 +1559,45 @@ class CodeGen:
             # claude.md #195 Phase 2: `thread NAME { ... }`.
             "declare ptr @festina_thread_register(ptr, ptr, ptr, ptr, ptr)",
             "declare void @festina_thread_spawn(ptr)",
+            # claude.md #216: the singleton handle standing in for
+            # "main" as a real, non-null `thread` value -- returned by
+            # festina_thread_get_main_handle, passed as festina_thread_
+            # post's own `sender` argument whenever a send originates
+            # from main's own top-level code (replaces claude.md #208's
+            # literal `null` there), and checked by festina_thread_
+            # is_main for `.main` field reads.
+            "declare ptr @festina_thread_get_main_handle()",
+            "declare i8 @festina_thread_is_main(ptr)",
             # claude.md #208: festina_thread_post's own `sender` param
-            # (2nd) -- `null` when called from main, or the calling
-            # thread's own handle when a thread messages another
-            # thread directly (see the ThreadType Member-call
-            # postMessage codegen, above).
-            "declare void @festina_thread_post(ptr, ptr, ptr)",
-            "declare void @festina_thread_post_outbound(ptr, ptr)",
+            # (2nd) -- the main singleton handle when called from main,
+            # or the calling thread's own handle when a thread messages
+            # another thread directly (see the ThreadType Member-call
+            # postMessage codegen, above). claude.md #217: both gained a
+            # trailing `i64` txn_id -- 0 for an ordinary send, or a real
+            # id from festina_thread_alloc_txn_id() when `.callback(fn)`
+            # is chained (see _emit_bare_postmessage_send/_emit_named_
+            # postmessage_send's own shared `txn_val` parameter).
+            "declare void @festina_thread_post(ptr, ptr, ptr, i64)",
+            "declare void @festina_thread_post_outbound(ptr, ptr, i64)",
+            # claude.md #217: `.reply(T)` / `.postMessage(x).callback(fn)`.
+            # alloc_txn_id mints a fresh, process-wide, monotonic id (one
+            # atomic counter, mirroring festina_runtime_http.c's own
+            # g_next_conn_id); register_callback records ONE pending
+            # `.callback(fn)` on the SENDING handle's own list, keyed by
+            # that id (self=the sender's own handle: the main singleton
+            # when called from main, or self._current_thread_ctx's
+            # handle from inside a thread body -- the same "which handle
+            # am I" resolution postMessage's own sender argument already
+            # needs); reply delivers a boxed reply value from `dest`
+            # (self=the calling thread's own handle, needed only to
+            # route a reply-to-main through THAT handle's own outbound
+            # queue -- see festina_thread_reply's own C-side doc
+            # comment) back to whichever handle sent the original
+            # message this answers, using the calling thread's own
+            # ambient "which message am I currently handling" state.
+            "declare i64 @festina_thread_alloc_txn_id()",
+            "declare void @festina_thread_register_callback(ptr, i64, ptr, ptr)",
+            "declare void @festina_thread_reply(ptr, ptr, ptr, ptr)",
             # claude.md #208: replaces the old per-thread
             # festina_thread_set_out_callback -- ONE handler,
             # registered once, receives every thread's own outbound
@@ -3184,6 +3222,119 @@ class CodeGen:
                 f"struct/arr[T]/map[T]/enum built acyclically from those) is "
                 f"supported",
                 file=self.filename, line=getattr(node, "line", 0))
+
+    def _emit_bare_postmessage_send(self, args, env, lines, txn_val="0"):
+        """claude.md #195/#208/#217: the bare, context-implicit form --
+        "send FROM the thread currently being emitted, TO the main
+        program" -- semantic.py already proved this call site is
+        inside exactly one thread's own body and that its argument's
+        inferred type matches the program's own top-level `on message`
+        declared type (self.analyzed.main_message_type -- ONE program-
+        wide type now, not a per-thread one; see claude.md #208's own
+        note on why the old per-thread outbound_type/onMessage(callback)
+        mechanism is gone). Codegen only has to box the value and hand
+        it to the runtime's own outbound queue for whichever thread
+        self._current_thread_ctx names -- festina_thread_post_outbound
+        sets the SENDER field on the queued item to the handle it's
+        called with itself, so no separate sender argument is needed
+        here. `txn_val` (claude.md #217) is "0" for an ordinary send,
+        or a real allocated txn id when `.callback(fn)` wraps this same
+        call (see the combined-pattern codegen, below) -- factored out
+        of the plain postMessage(x) call site so both share this one
+        implementation."""
+        _thread_name, handle_global, _db_global = self._current_thread_ctx
+        outbound_type = self.analyzed.main_message_type
+        val, vtype = self._emit_expr(args[0], env, lines)
+        val = self._coerce(val, vtype, outbound_type, lines, source_expr=args[0])
+        handle = self.tmp()
+        lines.append(f"  {handle} = load ptr, ptr {handle_global}")
+        box = self._emit_thread_box(val, outbound_type, lines)
+        lines.append(f"  call void @festina_thread_post_outbound(ptr {handle}, ptr {box}, i64 {txn_val})")
+        self._emit_thread_postmessage_cleanup(args[0], val, vtype, outbound_type, lines)
+
+    def _emit_thread_target_handle(self, receiver, pool_index_expr, env, lines):
+        """claude.md #209 (factored out for #217's `.callback()`
+        combined-pattern codegen, which needs this identical resolution
+        a second time): resolves a `NAME`/`pool[i]` receiver to its
+        runtime FestinaThreadHandle*, alongside its own declared
+        inbound_type. `pool_index_expr` non-None means `receiver` is a
+        pool name indexed at that expression -- an out-of-range index
+        is a SILENT NO-OP (this language's own established "test, don't
+        fail" convention), so the actual op (whatever the caller emits
+        next) must run only inside the bounds-checked block this opens;
+        `end_label`/`oob_pred` are None for an ordinary (non-pool)
+        receiver, where none of this applies. The caller is responsible
+        for closing the branch (`br label %end_label` + `_start_block
+        (end_label, ...)`) once it's done, exactly as before this was
+        factored out."""
+        end_label = None
+        oob_pred = None
+        if pool_index_expr is not None:
+            pinfo = self.thread_pools[receiver.name]
+            inbound_type = pinfo["inbound_type"]
+            n = pinfo["pool_size"]
+            idx_val, _ = self._emit_expr(pool_index_expr, env, lines)
+            in_range = self.tmp()
+            lines.append(f"  {in_range} = icmp ult i64 {idx_val}, {n}")
+            oob_pred = self.cur_block
+            in_range_label = self.label("pool.inrange")
+            end_label = self.label("pool.end")
+            lines.append(f"  br i1 {in_range}, label %{in_range_label}, label %{end_label}")
+            self._start_block(in_range_label, lines)
+            # claude.md #209: double indirection -- the pool's own
+            # `[N x ptr]` global holds N compile-time-constant handle-
+            # global ADDRESSES (one per instance, built once in
+            # _emit_thread_pool_decl); GEP selects the SLOT at the
+            # runtime index, the first load reads which handle global
+            # that slot names, the second reads that instance's own
+            # actual (runtime-registered) FestinaThreadHandle* -- the
+            # same value a singleton's own single `load ptr, ptr
+            # {handle_global}` reads directly below.
+            slot = self.tmp()
+            lines.append(
+                f"  {slot} = getelementptr inbounds [{n} x ptr], ptr "
+                f"{pinfo['handles_array_global']}, i64 0, i64 {idx_val}")
+            handle_global_addr = self.tmp()
+            lines.append(f"  {handle_global_addr} = load ptr, ptr {slot}")
+            handle = self.tmp()
+            lines.append(f"  {handle} = load ptr, ptr {handle_global_addr}")
+        else:
+            tinfo = self.threads[receiver.name]
+            inbound_type = tinfo["inbound_type"]
+            handle_global = tinfo["handle_global"]
+            handle = self.tmp()
+            lines.append(f"  {handle} = load ptr, ptr {handle_global}")
+        return handle, inbound_type, end_label, oob_pred
+
+    def _emit_named_postmessage_send(self, handle, inbound_type, args, env, lines, txn_val="0"):
+        """claude.md #208/#217: `NAME.postMessage(x)` (or `pool[i].
+        postMessage(x)`) -- legal from main OR from inside ANOTHER
+        thread's own body now -- the sender passed to festina_thread_
+        post is the main singleton (claude.md #216: `worker` is never
+        null any more) for main, or the CALLING thread's own handle
+        (loaded from self._current_thread_ctx, which is set while
+        emitting a thread's own on_load/on_message/on_exit body -- see
+        _emit_bare_postmessage_send's identical pattern) when this call
+        site is itself inside another thread's body. `handle`/
+        `inbound_type` are the already-resolved target values the
+        caller's own pool-index bounds-check machinery (or plain
+        singleton lookup) produced -- this only emits the send itself,
+        so that bounds-check wrapping stays exactly where it already
+        was. `txn_val` (claude.md #217) mirrors _emit_bare_postmessage_
+        send's own parameter -- "0" for an ordinary send, or a real
+        allocated txn id when `.callback(fn)` wraps this call (see the
+        combined-pattern codegen, below)."""
+        val, vtype = self._emit_expr(args[0], env, lines)
+        val = self._coerce(val, vtype, inbound_type, lines, source_expr=args[0])
+        box = self._emit_thread_box(val, inbound_type, lines)
+        if self._current_thread_ctx is not None:
+            sender = self.tmp()
+            lines.append(f"  {sender} = load ptr, ptr {self._current_thread_ctx[1]}")
+        else:
+            sender = self.tmp()
+            lines.append(f"  {sender} = call ptr @festina_thread_get_main_handle()")
+        lines.append(f"  call void @festina_thread_post(ptr {handle}, ptr {sender}, ptr {box}, i64 {txn_val})")
+        self._emit_thread_postmessage_cleanup(args[0], val, vtype, inbound_type, lines)
 
     def _emit_thread_postmessage_cleanup(self, source_expr, val, vtype, target_type, lines):
         """claude.md #197 Phase 3: releases postMessage(x)'s own
@@ -5847,13 +5998,26 @@ class CodeGen:
             # bytes up to the first NUL -- which is exactly what its
             # explicit toText() does, and the two must not disagree.
             lines.append(f"  {out} = call ptr @festina_blob_to_text(ptr {val})")
-        elif isinstance(type_, (types_mod.ImageType, types_mod.AudioType)):
+        elif isinstance(type_, (types_mod.ImageType, types_mod.AudioType,
+                                types_mod.ThreadType)):
+            # claude.md #218: `thread` joins img/aud here rather than
+            # falling through to the generic "cannot interpolate"
+            # message below -- a thread value is an opaque identity
+            # token (see ThreadType's own doc comment), so rendering it
+            # could only ever print a raw pointer, and the specific
+            # message is the one that tells a reader what to do instead
+            # (`worker.main`, or an ordinary value the thread sent).
             raise CodegenError(
                 f"a value of type {types_mod.type_name(type_)} has no text "
                 f"form and cannot appear in log() or a template",
                 file=self.filename)
         else:
-            raise CodegenError(f"cannot interpolate a value of type {types_mod.type_name(type_)}")
+            # claude.md #218: `file=` here too -- without it this
+            # fallback reported `<string>:0:0`, naming neither the file
+            # nor anything else a reader could act on.
+            raise CodegenError(
+                f"cannot interpolate a value of type {types_mod.type_name(type_)}",
+                file=self.filename)
         return out
 
     def _emit_sendable_body(self, val, vtype, lines):
@@ -7542,6 +7706,17 @@ class CodeGen:
             # none of this, but doesn't hurt from it either.
             self._minted_values.add(id(expr))
             return out, result_type
+        if isinstance(obj_type, types_mod.ThreadType) and expr.prop == "main":
+            # claude.md #216: `worker.main` -- a bare runtime call, no
+            # ownership question at all (a `thread` value is a bare,
+            # non-refcounted `ptr`, per ThreadType's own doc comment;
+            # `_release_owned_receiver` below is a no-op for it via
+            # `_is_refcounted`, called anyway for consistency with
+            # every other field-read branch here).
+            out = self.tmp()
+            lines.append(f"  {out} = call i8 @festina_thread_is_main(ptr {obj_val})")
+            self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+            return out, types_mod.PrimitiveType("bool")
         if isinstance(obj_type, types_mod.SocketType) and expr.prop == "state":
             # claude.md #151: s.state -- the SAME live map every call
             # for this connection (see festina_socket_state's own doc
@@ -10314,31 +10489,7 @@ class CodeGen:
         if isinstance(callee, ast.Identifier):
             name = callee.name
             if name == "postMessage" and self._current_thread_ctx is not None:
-                # claude.md #195/#208: the bare, context-implicit form
-                # -- "send FROM the thread currently being emitted, TO
-                # the main program" -- semantic.py already proved this
-                # call site is inside exactly one thread's own body and
-                # that its argument's inferred type matches the
-                # program's own top-level `on message` declared type
-                # (self.analyzed.main_message_type -- ONE program-wide
-                # type now, not a per-thread one; see claude.md #208's
-                # own note on why the old per-thread outbound_type/
-                # onMessage(callback) mechanism is gone). Codegen only
-                # has to box the value and hand it to the runtime's own
-                # outbound queue for whichever thread
-                # self._current_thread_ctx names -- festina_thread_
-                # post_outbound sets the SENDER field on the queued
-                # item to the handle it's called with itself, so no
-                # separate sender argument is needed here.
-                _thread_name, handle_global, _db_global = self._current_thread_ctx
-                outbound_type = self.analyzed.main_message_type
-                val, vtype = self._emit_expr(expr.args[0], env, lines)
-                val = self._coerce(val, vtype, outbound_type, lines, source_expr=expr.args[0])
-                handle = self.tmp()
-                lines.append(f"  {handle} = load ptr, ptr {handle_global}")
-                box = self._emit_thread_box(val, outbound_type, lines)
-                lines.append(f"  call void @festina_thread_post_outbound(ptr {handle}, ptr {box})")
-                self._emit_thread_postmessage_cleanup(expr.args[0], val, vtype, outbound_type, lines)
+                self._emit_bare_postmessage_send(expr.args, env, lines)
                 return "0", None
             if name == "log":
                 val, vtype = self._emit_expr(expr.args[0], env, lines)
@@ -10362,7 +10513,12 @@ class CodeGen:
                     lines.append(f"  call void @free(ptr {rendered})")
                     self._release_owned_receiver(expr.args[0], val, vtype, lines)
                     return "0", None
-                if isinstance(vtype, (types_mod.ImageType, types_mod.AudioType)):
+                if isinstance(vtype, (types_mod.ImageType, types_mod.AudioType,
+                                      types_mod.ThreadType)):
+                    # claude.md #218: `thread` gets img/aud's own
+                    # specific "no text form" message rather than the
+                    # generic "only primitives right now" fallback just
+                    # below -- see _to_text's matching branch.
                     raise CodegenError(
                         f"log() cannot print a value of type "
                         f"{types_mod.type_name(vtype)} -- it has no text form",
@@ -10857,6 +11013,113 @@ class CodeGen:
                         self._free_text_temp(arg_expr, val, vtype, lines)
                 return out, ret_type
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
+        if (isinstance(callee, ast.Member) and not callee.computed and callee.prop == "reply"):
+            dest_val, dest_type = self._emit_expr(callee.obj, env, lines)
+            if isinstance(dest_type, types_mod.ThreadType) and dest_type.name is None:
+                # claude.md #217: `t.reply(response)` -- semantic.py
+                # already proved `dest_type` is the generic thread type
+                # and fixed the reply_type this receiving context
+                # (main's own top-level handler, or a specific thread's
+                # own) uses. `self_handle` names WHERE this reply is
+                # coming FROM (needed only so festina_thread_reply can
+                # route a reply-TO-main through the calling thread's
+                # own outbound queue -- see its own C-side doc
+                # comment); `dest_val` (already emitted above) names
+                # WHERE it's going. Does not touch on_message at all --
+                # a completely separate runtime dispatch path.
+                reply_type = (self.analyzed.threads[self._current_thread_ctx[0]].reply_type
+                              if self._current_thread_ctx is not None
+                              else self.analyzed.main_reply_type)
+                val, vtype = self._emit_expr(expr.args[0], env, lines)
+                val = self._coerce(val, vtype, reply_type, lines, source_expr=expr.args[0])
+                box = self._emit_thread_box(val, reply_type, lines)
+                self_handle = self.tmp()
+                if self._current_thread_ctx is not None:
+                    lines.append(f"  {self_handle} = load ptr, ptr {self._current_thread_ctx[1]}")
+                else:
+                    lines.append(f"  {self_handle} = call ptr @festina_thread_get_main_handle()")
+                # claude.md #218: the 4th argument is how to release
+                # THIS reply's own payload if it ever turns out to have
+                # nothing to dispatch to (replied twice for one
+                # message, or still queued when its target is kill()'d)
+                # -- the receiving side can't name the sender's own
+                # reply_type, so the sender records it here. See
+                # FestinaThreadMsg's own `release` field.
+                reply_release = self._thread_payload_release_fn(reply_type)
+                lines.append(
+                    f"  call void @festina_thread_reply(ptr {self_handle}, ptr {dest_val}, "
+                    f"ptr {box}, ptr {reply_release})")
+                self._emit_thread_postmessage_cleanup(expr.args[0], val, vtype, reply_type, lines)
+                return "0", None
+        if (isinstance(callee, ast.Member) and not callee.computed and callee.prop == "callback"
+                and isinstance(callee.obj, ast.Call) and self._is_postmessage_callee(callee.obj.callee)):
+            # claude.md #217: `NAME.postMessage(x).callback(fn)` -- the
+            # combined pattern, handled as one unit exactly like
+            # semantic.py's own recognition of it. Registers `fn` (via
+            # a generated, target-specific unboxing trampoline -- see
+            # _emit_reply_callback_trampoline) on the SENDING handle's
+            # own pending-callback list under a freshly minted txn id,
+            # THEN emits the ordinary send (reusing _emit_bare_
+            # postmessage_send/_emit_named_postmessage_send/
+            # _emit_thread_target_handle completely unchanged) with
+            # that txn id instead of the default "0" -- the dispatch
+            # loop on the RECEIVING end sets it as that thread's own
+            # ambient "currently replying to" state right before
+            # on_message runs, so a `t.reply(...)` call made during
+            # that dispatch (if any) knows which slot to satisfy.
+            pm_callee = callee.obj.callee
+            pm_args = callee.obj.args
+            reply_type = self._postmessage_reply_type(pm_callee)
+            trampoline = self._emit_reply_callback_trampoline(reply_type)
+
+            def emit_register_and_send(handle, inbound_type):
+                """claude.md #218: registration and send, emitted
+                TOGETHER at whatever point the caller has established
+                is actually reached. For a pool receiver that means
+                INSIDE the bounds-checked block -- registering ahead of
+                it (which this originally did) meant an out-of-range
+                `pool[i].postMessage(x).callback(fn)` registered a
+                pending callback whose send never happened, so `fn`
+                could never fire and its slot sat on the sender's own
+                list forever. An out-of-range pool index is a silent
+                no-op for the whole expression now, callback included,
+                matching what `pool[i].postMessage(x)` alone already
+                does with its own argument (also only evaluated
+                in-range)."""
+                fn_val, _fn_type = self._emit_expr(expr.args[0], env, lines)
+                txn = self.tmp()
+                lines.append(f"  {txn} = call i64 @festina_thread_alloc_txn_id()")
+                self_handle = self.tmp()
+                if self._current_thread_ctx is not None:
+                    lines.append(f"  {self_handle} = load ptr, ptr {self._current_thread_ctx[1]}")
+                else:
+                    lines.append(f"  {self_handle} = call ptr @festina_thread_get_main_handle()")
+                lines.append(
+                    f"  call void @festina_thread_register_callback(ptr {self_handle}, i64 {txn}, "
+                    f"ptr {trampoline}, ptr {fn_val})")
+                if handle is None:
+                    self._emit_bare_postmessage_send(pm_args, env, lines, txn_val=txn)
+                else:
+                    self._emit_named_postmessage_send(
+                        handle, inbound_type, pm_args, env, lines, txn_val=txn)
+
+            if isinstance(pm_callee, ast.Identifier):
+                emit_register_and_send(None, None)
+            else:
+                pool_index_expr = None
+                receiver = pm_callee.obj
+                if (isinstance(receiver, ast.Member) and receiver.computed
+                        and isinstance(receiver.obj, ast.Identifier)
+                        and receiver.obj.name in self.thread_pools):
+                    pool_index_expr = receiver.prop
+                    receiver = receiver.obj
+                handle, inbound_type, end_label, _oob_pred = self._emit_thread_target_handle(
+                    receiver, pool_index_expr, env, lines)
+                emit_register_and_send(handle, inbound_type)
+                if end_label is not None:
+                    lines.append(f"  br label %{end_label}")
+                    self._start_block(end_label, lines)
+            return "0", None
         if isinstance(callee, ast.Member) and not callee.computed:
             # claude.md #195 Phase 2 (widened by #209): NAME.postMessage/
             # kill/live/isAlive, and now ALSO pool[i].<same four> --
@@ -10890,64 +11153,10 @@ class CodeGen:
                 # ordinary (non-pool) receiver, where none of this
                 # applies and the op runs completely unconditionally,
                 # exactly as before.
-                end_label = None
-                oob_pred = None
-                if pool_index_expr is not None:
-                    pinfo = self.thread_pools[receiver.name]
-                    inbound_type = pinfo["inbound_type"]
-                    n = pinfo["pool_size"]
-                    idx_val, _ = self._emit_expr(pool_index_expr, env, lines)
-                    in_range = self.tmp()
-                    lines.append(f"  {in_range} = icmp ult i64 {idx_val}, {n}")
-                    oob_pred = self.cur_block
-                    in_range_label = self.label("pool.inrange")
-                    end_label = self.label("pool.end")
-                    lines.append(f"  br i1 {in_range}, label %{in_range_label}, label %{end_label}")
-                    self._start_block(in_range_label, lines)
-                    # claude.md #209: double indirection -- the pool's
-                    # own `[N x ptr]` global holds N compile-time-
-                    # constant handle-global ADDRESSES (one per
-                    # instance, built once in _emit_thread_pool_decl);
-                    # GEP selects the SLOT at the runtime index, the
-                    # first load reads which handle global that slot
-                    # names, the second reads that instance's own
-                    # actual (runtime-registered) FestinaThreadHandle*
-                    # -- the same value a singleton's own single `load
-                    # ptr, ptr {handle_global}` reads directly below.
-                    slot = self.tmp()
-                    lines.append(
-                        f"  {slot} = getelementptr inbounds [{n} x ptr], ptr "
-                        f"{pinfo['handles_array_global']}, i64 0, i64 {idx_val}")
-                    handle_global_addr = self.tmp()
-                    lines.append(f"  {handle_global_addr} = load ptr, ptr {slot}")
-                    handle = self.tmp()
-                    lines.append(f"  {handle} = load ptr, ptr {handle_global_addr}")
-                else:
-                    tinfo = self.threads[receiver.name]
-                    inbound_type = tinfo["inbound_type"]
-                    handle_global = tinfo["handle_global"]
-                    handle = self.tmp()
-                    lines.append(f"  {handle} = load ptr, ptr {handle_global}")
+                handle, inbound_type, end_label, oob_pred = self._emit_thread_target_handle(
+                    receiver, pool_index_expr, env, lines)
                 if callee.prop == "postMessage":
-                    # claude.md #208: legal from main OR from inside
-                    # ANOTHER thread's own body now -- the sender
-                    # passed to festina_thread_post is `null` for main,
-                    # or the CALLING thread's own handle (loaded from
-                    # self._current_thread_ctx, which is set while
-                    # emitting a thread's own on_load/on_message/
-                    # on_exit body -- see _emit_call's bare postMessage
-                    # branch for the identical pattern) when this call
-                    # site is itself inside another thread's body.
-                    val, vtype = self._emit_expr(expr.args[0], env, lines)
-                    val = self._coerce(val, vtype, inbound_type, lines, source_expr=expr.args[0])
-                    box = self._emit_thread_box(val, inbound_type, lines)
-                    if self._current_thread_ctx is not None:
-                        sender = self.tmp()
-                        lines.append(f"  {sender} = load ptr, ptr {self._current_thread_ctx[1]}")
-                    else:
-                        sender = "null"
-                    lines.append(f"  call void @festina_thread_post(ptr {handle}, ptr {sender}, ptr {box})")
-                    self._emit_thread_postmessage_cleanup(expr.args[0], val, vtype, inbound_type, lines)
+                    self._emit_named_postmessage_send(handle, inbound_type, expr.args, env, lines)
                     if end_label is not None:
                         lines.append(f"  br label %{end_label}")
                         self._start_block(end_label, lines)
@@ -11758,6 +11967,69 @@ class CodeGen:
                 return out, ret_type
         raise CodegenError("only calls to named functions are implemented",
                             file=self.filename, line=getattr(expr, "line", 0))
+
+    @staticmethod
+    def _is_postmessage_callee(c):
+        """claude.md #217: codegen-side mirror of semantic.py's own
+        identically-named helper -- True for a bare `postMessage`
+        Identifier callee, or a `NAME.postMessage`/`pool[i].
+        postMessage` Member callee. Trusts the AST shape completely
+        (semantic.py already fully validated it)."""
+        if isinstance(c, ast.Identifier) and c.name == "postMessage":
+            return True
+        return isinstance(c, ast.Member) and not c.computed and c.prop == "postMessage"
+
+    def _postmessage_reply_type(self, pm_callee):
+        """claude.md #217: given a postMessage call's own callee (bare
+        Identifier, or a `NAME`/`pool[i]` Member -- see
+        _is_postmessage_callee), returns that target's reply_type
+        (None if it never replies). `self.analyzed.threads[name]` is
+        the SAME `_ThreadInfo` semantic.py itself populated
+        `reply_type` onto (including under every mangled pool instance
+        name -- see _emit_thread_pool_decl's own aliasing), so this
+        needs no separate plumbing of its own."""
+        if isinstance(pm_callee, ast.Identifier):
+            return self.analyzed.main_reply_type
+        receiver = pm_callee.obj
+        if isinstance(receiver, ast.Member) and receiver.computed and isinstance(receiver.obj, ast.Identifier):
+            receiver = receiver.obj
+        return self.analyzed.threads[receiver.name].reply_type
+
+    def _emit_reply_callback_trampoline(self, reply_type):
+        """claude.md #217: generates and registers (self.func_defs) a
+        small internal function bridging festina_thread_reply's own
+        fixed C dispatch shape (a REPLY-kind message looked up by
+        txn_id -- see festina_runtime_thread.c's own FestinaPendingCallback)
+        to the user's real `.callback(fn)` function, whose LLVM-level
+        signature depends on the target's own reply_type. Mirrors
+        _emit_map_foreach_trampoline's own shape exactly: unbox the
+        payload as the concrete reply_type (_emit_thread_unbox_into,
+        the SAME unboxing every on_message adapter already uses), call
+        `%user_fn` with it, then release the box
+        (_thread_payload_release_fn(reply_type) -- nothing else ever
+        frees a REPLY payload, unlike an ORDINARY message's box, which
+        the runtime's own in_release call already balances after
+        on_message returns). Cached per reply_type
+        (self._reply_trampoline_cache) since every send site targeting
+        the same thread (or main) shares that one target's single
+        reply_type -- never more than one trampoline per target."""
+        cached = self._reply_trampoline_cache.get(reply_type)
+        if cached is not None:
+            return cached
+        uid = self._unique()
+        trampoline_name = f"@__festina_replytrampoline_{uid}"
+        llvm_ty = _llvm_type(reply_type)
+        body = [f"define void {trampoline_name}(ptr %payload, ptr %user_fn) {{", "entry:"]
+        self._emit_thread_unbox_into("%payload", reply_type, "%val", body)
+        body.append(f"  call void %user_fn({llvm_ty} %val)")
+        release_fn = self._thread_payload_release_fn(reply_type)
+        body.append(f"  call void {release_fn}(ptr %payload)")
+        body.append("  ret void")
+        body.append("}")
+        self.func_defs.extend(body)
+        self.func_defs.append("")
+        self._reply_trampoline_cache[reply_type] = trampoline_name
+        return trampoline_name
 
     def _emit_map_foreach_trampoline(self, value_type, callback_name):
         """claude.md #72: generates and registers (self.func_defs) a

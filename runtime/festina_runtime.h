@@ -1164,21 +1164,63 @@ FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
  * coming back) can respawn without re-registering a whole new handle
  * (and therefore a whole new, empty pair of queues) each time. */
 void festina_thread_spawn(FestinaThreadHandle *h);
+/* claude.md #216: the singleton standing in for "main" as a real,
+ * non-null `thread` value -- see festina_runtime_thread.c's own
+ * g_main_handle doc comment. Passed as festina_thread_post's own
+ * `sender` whenever a send genuinely originates from main. */
+FestinaThreadHandle *festina_thread_get_main_handle(void);
+/* claude.md #216: `worker.main` -- true only for the singleton
+ * festina_thread_get_main_handle returns, false for every ordinary,
+ * festina_thread_register'd handle. `handle` is `void*` (not
+ * `FestinaThreadHandle*`) purely so codegen never needs this opaque
+ * struct's own layout, matching every other thread-handle-consuming
+ * declaration in this header. */
+int8_t festina_thread_is_main(void *handle);
 /* claude.md #208: `NAME.postMessage(x)` from main OR from inside
  * ANOTHER thread's own body (threads may message each other directly
  * now, not just main) -- clones x into `payload` (codegen's own job,
  * see above) and enqueues it on h's INBOUND queue, waking the worker
- * if it's blocked waiting. `sender` is NULL when called from main, or
- * the CALLING thread's own handle when this is a thread-to-thread
- * send -- delivered straight through to h's own `on_message` as its
- * first argument (the `worker:thread` parameter every `on message`
- * handler now declares). */
-void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload);
+ * if it's blocked waiting. claude.md #216: `sender` is
+ * festina_thread_get_main_handle() when called from main (never NULL
+ * any more -- `worker:thread` has no null case left), or the CALLING
+ * thread's own handle when this is a thread-to-thread send --
+ * delivered straight through to h's own `on_message` as its first
+ * argument (the `worker:thread` parameter every `on message` handler
+ * now declares). */
+void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload, int64_t txn_id);
 /* `postMessage(x)` called from INSIDE this thread's own body: enqueues
  * on h's own OUTBOUND queue instead -- drained on the MAIN thread only
  * (see festina_thread_drain below), never processed by the worker
  * itself. */
-void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload);
+void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload, int64_t txn_id);
+/* claude.md #217: `.reply(T)` / `NAME.postMessage(x).callback(fn)`.
+ * alloc_txn_id mints a fresh, process-wide, monotonic id (0 reserved
+ * for "no callback expected", the default on an ordinary send).
+ * register_callback records ONE pending `.callback(fn)` on `self`'s
+ * own list (self = the SENDING handle -- main's singleton, or the
+ * calling thread's own handle), called ahead of the actual send;
+ * `trampoline` is codegen-generated, unboxes a reply payload as the
+ * target's own concrete reply type and calls `user_fn` with it (one
+ * trampoline per distinct reply type, shared by every send site
+ * targeting that same thread/main). festina_thread_reply delivers a
+ * boxed reply value from `self` (the calling thread's own handle,
+ * used only to route a reply-to-main through THAT handle's own
+ * outbound queue) to `dest` (the original sender), tagged with the
+ * calling thread's own ambient "which message am I currently
+ * handling" state -- never triggers on_message on the receiving end. */
+int64_t festina_thread_alloc_txn_id(void);
+void festina_thread_register_callback(FestinaThreadHandle *self, int64_t txn_id,
+                                      void (*trampoline)(void *payload, void *user_fn),
+                                      void *user_fn);
+/* claude.md #218: `release` is how to free `payload` if this reply
+ * turns out to have nothing to dispatch to -- the receiving side knows
+ * only its OWN inbound type, never the sender's reply type, so the
+ * sender records the right function here. Also used when a reply is
+ * still queued at kill() time. `festina_thread_reply` releases the
+ * payload and delivers nothing at all if no message is currently being
+ * dispatched on the calling thread (nothing could ever answer it). */
+void festina_thread_reply(FestinaThreadHandle *self, FestinaThreadHandle *dest, void *payload,
+                          void (*release)(void *payload));
 /* claude.md #208: registers the ONE handler for everything sent to
  * main, from any thread -- replaces the old per-thread
  * festina_thread_set_out_callback (one dynamic `NAME.onMessage(...)`

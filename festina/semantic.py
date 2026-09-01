@@ -766,7 +766,7 @@ _EVENT_SIGNATURES = {
 # inside a thread body, one written at the top level for main).
 _THREAD_EVENT_SIGNATURES = {
     "load": ((), "no parameters"),
-    "message": (None, "(worker:thread, msg:T) -- worker is null when sent by main"),
+    "message": (None, "(worker:thread, msg:T) -- worker.main is true when sent by main"),
     "exit": ((_INT,), "(code:int)"),
     # claude.md #212 (Phase 4 -- private per-thread HTTP context): the
     # SAME four names/signatures _EVENT_SIGNATURES already declares
@@ -838,8 +838,14 @@ def _check_message_handler_params(params, node, filename, structs, tables, enums
     if not _is_thread_sendable_type(msg_type, structs, enums):
         raise CompileError(
             f"'on message(worker:thread, msg:{types_mod.type_name(msg_type)})': "
+            # claude.md #218: `thread` belongs in this list too -- it
+            # became a real, holdable value type in claude.md #208/#216
+            # and is genuinely one of the types someone can try to send
+            # (directly, or nested in a struct), so leaving it out made
+            # the error name every unsendable type EXCEPT the one the
+            # reader was actually holding.
             f"{types_mod.type_name(msg_type)} cannot cross a thread boundary -- "
-            f"func/http/socket/regex/table values are not sendable (see "
+            f"func/http/socket/regex/table/thread values are not sendable (see "
             f"claude.md #195's own list)",
             file=filename, line=node.line, column=node.column,
             category="invalid function argument type",
@@ -1121,11 +1127,30 @@ class _ThreadInfo:
         # other statement that doesn't care shouldn't matter here
         # either).
         self.declared_http_handlers = set()
+        # claude.md #217: this thread's own reply type -- unlike
+        # inbound_type (DECLARED, on `on message`'s own `msg`
+        # parameter), reply_type is INFERRED, from the first
+        # `t.reply(...)` call site textually inside this thread's own
+        # body (any handler, or a thread-private func reached from
+        # one) -- None until then. There is no separate declaration
+        # syntax for it (the user's own request didn't specify one),
+        # so it works the same way claude.md #208's own now-removed
+        # outbound-type inference used to, just scoped to ONE thread
+        # and fixed by the FIRST call rather than merged across many --
+        # every later `t.reply(...)` call in the same thread is
+        # check_assignable'd against whatever the first one fixed
+        # (enum-coercion included, exactly like an ordinary parameter).
+        # Every `NAME.postMessage(x)` call site targeting a thread with
+        # a non-None reply_type must chain `.callback(fn)` (fn's own
+        # parameter type checked against this), or it's a compile
+        # error -- see the `.callback` combined-pattern recognition in
+        # _infer_call.
+        self.reply_type = None
 
 
 class AnalyzedProgram:
     def __init__(self, symbols, structs, tables, enums, imports, threads=None,
-                 main_message_type=None):
+                 main_message_type=None, main_reply_type=None):
         self.symbols = symbols
         self.structs = structs
         self.tables = tables
@@ -1141,6 +1166,11 @@ class AnalyzedProgram:
         # declaration, so it has no `_ThreadInfo` of its own to live
         # on -- this is its counterpart).
         self.main_message_type = main_message_type
+        # claude.md #217: main's own reply type -- the exact
+        # counterpart of `_ThreadInfo.reply_type`, for when main's own
+        # top-level `on message` handler calls `worker.reply(x)`. None
+        # until the first such call is analyzed (main never replies).
+        self.main_reply_type = main_reply_type
 
 
 def resolve_type_name(type_expr, structs, tables, enums=None, filename="<string>", node=None):
@@ -1407,6 +1437,15 @@ def analyze(program, filename="<string>"):
     # compile error, same as referencing any other not-yet-declared
     # name would be.
     _main_message_type = [None]
+    # claude.md #217: main's own reply type -- the exact counterpart of
+    # `_ThreadInfo.reply_type`, for when main's own top-level `on
+    # message` handler calls `worker.reply(x)` (a worker replying to
+    # ITS sender, when that sender is main). Set by the first such call
+    # found while analyzing the top-level handler's body; every
+    # `NAME.postMessage(x)` call site made FROM INSIDE a thread body,
+    # targeting main via the bare form, checks against this the same
+    # way a named send checks against a thread's own reply_type.
+    _main_reply_type = [None]
     # claude.md #142: one monotonic counter for every arrow-function
     # expression's own synthesized name (__festina_arrow_N) -- a plain
     # int, not a list-wrapped closure cell, since every read/increment
@@ -2035,29 +2074,36 @@ def analyze(program, filename="<string>"):
                     # same as every other binary operator.
                     or (left in _NUMERIC_TYPES and right in _NUMERIC_TYPES)
                 )
-                # claude.md #208: `thread == thread` (two genuine,
-                # non-null values) is deliberately NOT supported --
-                # `worker:thread`'s own only sanctioned comparison is
-                # against `null` ("is this from main"), which routes
-                # through codegen's own generic ptr-vs-null fast path
-                # (_emit_binop) and is unaffected by this check (NULL
-                # on either side already made `compatible` True above).
-                # Two real thread values reaching codegen's OTHER,
-                # non-null equality path would hit the identical
-                # pre-existing "icmp eq i64 <a ptr>" invalid-IR bug
-                # struct == struct already has (confirmed directly,
-                # unrelated to this feature, out of scope to fix here)
-                # -- rejected here instead of silently shipping a new
-                # instance of it.
-                if (compatible and isinstance(left, types_mod.ThreadType)
-                        and isinstance(right, types_mod.ThreadType)):
-                    raise CompileError(
-                        f"'{expr.op}' between two thread values is not supported -- "
-                        f"a 'worker:thread' parameter may only be compared against "
-                        f"null (to check whether it was sent by the main program)",
-                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
-                        category="invalid operand type",
-                    )
+                # claude.md #216: `worker:thread` is never `null` any
+                # more (claude.md #208's own "null when sent by main"
+                # design is gone -- see ThreadType's own doc comment and
+                # the `.main` field access above), so comparing one
+                # against `null` is dead code now, not a live "is this
+                # from main" check -- rejected with a pointer at `.main`
+                # rather than silently compiling to an always-false
+                # comparison. `thread == thread` (two genuine values)
+                # stays unsupported too, unchanged from claude.md #208:
+                # codegen's non-null equality path would hit the
+                # identical pre-existing "icmp eq i64 <a ptr>" invalid-
+                # IR bug struct == struct already has (confirmed
+                # directly, unrelated to this feature, out of scope to
+                # fix here).
+                if isinstance(left, types_mod.ThreadType) or isinstance(right, types_mod.ThreadType):
+                    if left is NULL or right is NULL:
+                        raise CompileError(
+                            f"'{expr.op}' against null is not supported for a thread "
+                            f"value any more -- a 'worker:thread' parameter is never "
+                            f"null, use '.main' to check whether it was sent by the "
+                            f"main program",
+                            file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                            category="invalid operand type",
+                        )
+                    if isinstance(left, types_mod.ThreadType) and isinstance(right, types_mod.ThreadType):
+                        raise CompileError(
+                            f"'{expr.op}' between two thread values is not supported",
+                            file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                            category="invalid operand type",
+                        )
                 if not compatible:
                     raise CompileError(
                         f"cannot compare {types_mod.type_name(left)} and "
@@ -2377,6 +2423,36 @@ def analyze(program, filename="<string>"):
                 file=filename, line=expr.line, column=expr.column,
                 category="invalid field access",
             )
+        if isinstance(obj_type, types_mod.ThreadType):
+            # claude.md #216: `worker`/`t` (a `thread`-typed value,
+            # always the generic `ThreadType(None)` variant -- the only
+            # one ordinary code ever HOLDS a value of, per ThreadType's
+            # own doc comment) is never `null` any more -- when main is
+            # the sender, `worker` is a real, singleton handle
+            # (festina_thread_get_main_handle at the runtime level) with
+            # `.main` reading true. This is the ONE field on `thread`;
+            # `.postMessage`/`.reply`/`.callback` stay methods (Call-on-
+            # Member, handled in _infer_call, matching every other
+            # method-only type here -- ImageType/HttpType/SocketType
+            # above all split fields vs. methods the identical way).
+            if expr.prop == "main":
+                return _BOOL
+            # claude.md #218: the old wording here suggested
+            # `.postMessage()` as the fix, which is wrong for exactly
+            # the case that reaches this branch -- `.postMessage()` is
+            # not a method on a `thread` VALUE at all, it's a method on
+            # a declared thread's own NAME (a different receiver
+            # entirely, dispatched by name). Someone writing
+            # `w.postMessage(x)` inside a handler was being pointed
+            # straight back at the thing that just failed.
+            raise CompileError(
+                f"thread has no field '{expr.prop}' -- a thread value has "
+                f"'.main' and '.reply(x)' (reply to the message being "
+                f"handled); to send a NEW message, name the target thread, "
+                f"e.g. 'someThread.postMessage(x)'",
+                file=filename, line=expr.line, column=expr.column,
+                category="invalid field access",
+            )
         # claude.md #38: aud's play()/stop()/isPlaying() are only
         # recognized as Call-on-Member patterns (see _infer_call) --
         # this branch is for a bare `music.play` reference with no
@@ -2389,6 +2465,44 @@ def analyze(program, filename="<string>"):
             file=filename, line=expr.line, column=expr.column,
             category="invalid field access",
         )
+
+    def _is_postmessage_callee(c):
+        """claude.md #217: True for a bare `postMessage` Identifier
+        callee, or a `NAME.postMessage`/`pool[i].postMessage` Member
+        callee -- the two shapes `.callback()`'s own combined-pattern
+        recognition (below) needs to tell apart from an unrelated
+        `.callback()` receiver (blob/img/aud's own file-loading one,
+        claude.md #165/#171, whose receiver can ALSO be an arbitrary
+        Call -- `getPath().callback(fn)` -- so checking `isinstance(...,
+        ast.Call)` alone isn't specific enough)."""
+        if isinstance(c, ast.Identifier) and c.name == "postMessage":
+            return True
+        return isinstance(c, ast.Member) and not c.computed and c.prop == "postMessage"
+
+    def _postmessage_target_reply_type(call_node):
+        """claude.md #217: given a Call node already known to be a
+        postMessage send (bare or named/pool -- see
+        _is_postmessage_callee), returns (reply_type, target_desc) --
+        `reply_type` is None if that target never replies (or hasn't
+        been analyzed yet, which never happens in practice: a named
+        target must be declared, hence fully analyzed, before any call
+        site referencing it, per this whole file's "declared before
+        referenced" rule -- see analyze_thread's own doc comment).
+        `target_desc` is a short name for error messages ('the main
+        program', or 'thread_name'). Returns (None, None) if this
+        somehow isn't a postMessage call at all (defensive; every
+        caller already checked _is_postmessage_callee first)."""
+        callee = call_node.callee
+        if isinstance(callee, ast.Identifier) and callee.name == "postMessage":
+            return (_main_reply_type[0], "the main program")
+        if isinstance(callee, ast.Member) and not callee.computed and callee.prop == "postMessage":
+            receiver = callee.obj
+            if (isinstance(receiver, ast.Member) and receiver.computed
+                    and isinstance(receiver.obj, ast.Identifier) and receiver.obj.name in threads):
+                receiver = receiver.obj  # claude.md #209: pool[i] -> the pool's own name
+            if isinstance(receiver, ast.Identifier) and receiver.name in threads:
+                return (threads[receiver.name].reply_type, receiver.name)
+        return (None, None)
 
     def _infer_call(expr, scope):
         callee = expr.callee
@@ -2850,6 +2964,91 @@ def analyze(program, filename="<string>"):
                 check_assignable(param_type, arg_type, callee,
                                   what=f"argument '{param.name}' of '{name}'")
             return sym.type
+        if (isinstance(callee, ast.Member) and not callee.computed
+                and callee.prop == "reply" and infer(callee.obj, scope) == types_mod.ThreadType(None)):
+            # claude.md #217: `t.reply(response)` -- legal on ANY
+            # expression of the GENERIC thread type (there is no other
+            # way to obtain one at all, per ThreadType's own doc
+            # comment -- it only ever arrives via an `on message`
+            # parameter, so gating on TYPE alone is exactly as precise
+            # as gating on "is this literally the `worker` parameter"
+            # would be, with none of the extra plumbing that would
+            # need). Which "receiver context" this reply BELONGS to
+            # (main's own top-level `on message`, or a specific
+            # thread's own) is read off `_current_thread[0]` -- the
+            # SAME switch bare `postMessage(x)` already uses to choose
+            # between `_main_message_type[0]` and a thread's own
+            # `inbound_type`. First call fixes reply_type; every later
+            # one in the same context is check_assignable'd against it
+            # (enum-coercion included). Does NOT trigger `on message`
+            # on the receiving end -- delivered through an entirely
+            # separate runtime path (festina_thread_reply), dispatched
+            # straight to whichever `.callback(fn)` is waiting.
+            if len(expr.args) != 1:
+                raise CompileError(
+                    f"reply() expects exactly 1 argument, got {len(expr.args)}",
+                    file=filename, line=callee.line, column=callee.column,
+                    category="invalid function argument type",
+                )
+            arg_type = infer(expr.args[0], scope)
+            reply_slot = _current_thread[0].reply_type if _current_thread[0] is not None else _main_reply_type[0]
+            if reply_slot is None:
+                reply_slot = arg_type
+            else:
+                check_assignable(reply_slot, arg_type, expr.args[0], what="reply() argument")
+            if _current_thread[0] is not None:
+                _current_thread[0].reply_type = reply_slot
+            else:
+                _main_reply_type[0] = reply_slot
+            return None
+        if (isinstance(callee, ast.Member) and not callee.computed and callee.prop == "callback"
+                and isinstance(callee.obj, ast.Call) and _is_postmessage_callee(callee.obj.callee)):
+            # claude.md #217: `NAME.postMessage(x).callback(fn)` -- the
+            # combined pattern, recognized as ONE unit (mirrors the
+            # existing `<text>.callback(fn)` file-loading precedent's
+            # own "match the AST shape directly" style, claude.md
+            # #165/#171) rather than trying to make postMessage's own
+            # return type carry a synthetic "pending" marker forward.
+            # `infer(callee.obj, scope)` runs postMessage's own EXISTING
+            # validation completely unchanged (arity, "declares no
+            # handler" check, inbound_type check_assignable) -- reused
+            # as-is, not duplicated. postMessage's own branches never
+            # look at reply_type at all; enforcing "must chain
+            # .callback()" is entirely this branch's and the ExprStmt-
+            # level bare-send check's job (see analyze_statement) --
+            # together they cover the only two syntactically valid
+            # positions a postMessage call can appear in (a bare
+            # statement, or wrapped in exactly this pattern).
+            infer(callee.obj, scope)
+            reply_type, target_desc = _postmessage_target_reply_type(callee.obj)
+            if reply_type is None:
+                raise CompileError(
+                    f"'.callback(...)' requires a target that replies -- "
+                    f"{target_desc or 'this target'} has no 't.reply(...)' anywhere "
+                    f"in its body, so this callback would never run",
+                    file=filename, line=callee.line, column=callee.column,
+                    category="invalid declaration",
+                )
+            if len(expr.args) != 1:
+                raise CompileError(
+                    f"callback() expects exactly 1 argument (the func to call with "
+                    f"the reply), got {len(expr.args)}",
+                    file=filename, line=callee.line, column=callee.column,
+                    category="invalid function argument type",
+                )
+            fn_type = infer(expr.args[0], scope)
+            if (not isinstance(fn_type, types_mod.FuncType)
+                    or len(fn_type.param_types) != 1
+                    or fn_type.return_type is not None
+                    or fn_type.param_types[0] != reply_type):
+                raise CompileError(
+                    f"callback() expects func[{types_mod.type_name(reply_type)}]:void "
+                    f"to match {target_desc}'s own reply type, found "
+                    f"{types_mod.type_name(fn_type)}",
+                    file=filename, line=callee.line, column=callee.column,
+                    category="invalid function argument type",
+                )
+            return None
         if isinstance(callee, ast.Member) and not callee.computed:
             # claude.md #195: a thread's own five methods, checked by
             # name against the `threads` dict directly (the same
@@ -4368,7 +4567,7 @@ def analyze(program, filename="<string>"):
                 )
             _main_message_type[0] = _check_message_handler_params(
                 decl.params, decl, filename, structs, tables, enums,
-                "(worker:thread, msg:T) -- worker is null when sent by main")
+                "(worker:thread, msg:T) -- worker.main is true when sent by main")
             handler_scope = Scope(global_scope)
             for p in decl.params:
                 ptype = apply_manually_managed(resolve(p.type_expr, decl), p.manually_managed)
@@ -4453,6 +4652,38 @@ def analyze(program, filename="<string>"):
         for i, stmt in enumerate(thread_body):
             if not _is_thread_database_url_stmt(stmt):
                 continue
+            if decl.pool_size is not None:
+                # claude.md #215: a `thread NAME[N] { ... }` pool
+                # shares ONE `_ThreadInfo` (and therefore one
+                # `database_url`) across every instance -- the body is
+                # textually identical, so a `DatabaseURL = '<literal>'`
+                # here would be the SAME literal path for all N of
+                # them. Each instance still gets its OWN sqlite3*
+                # handle (festina_db_open runs once per instance, in
+                # that instance's own on_load), so N instances would
+                # mean N independent, uncoordinated connections into
+                # the identical file, at the same time, from N real OS
+                # threads -- not the "never shared" isolation
+                # `DatabaseURL` gives an ordinary singleton thread at
+                # all. Rejected outright, the same "don't allow a
+                # construction that's a genuine hazard, not just an
+                # unusual one" call the whole-program DatabaseURL
+                # conflict check below already makes for two ordinary
+                # threads naming the same file.
+                raise CompileError(
+                    f"thread pool '{decl.name}[{decl.pool_size}]' cannot declare "
+                    f"its own DatabaseURL -- every instance in the pool would open "
+                    f"its own independent connection to the SAME literal file "
+                    f"concurrently, with no coordination between them (unlike an "
+                    f"ordinary singleton thread's own DatabaseURL, which is always "
+                    f"private to that one thread). Give each instance a genuinely "
+                    f"distinct database of its own with an ordinary (non-pool) "
+                    f"thread declared per instance instead, or have pool workers "
+                    f"message a single dedicated database thread rather than "
+                    f"querying sqlite directly.",
+                    file=filename, line=stmt.expr.line, column=stmt.expr.column,
+                    category="invalid declaration",
+                )
             if i != 0:
                 raise CompileError(
                     f"thread '{decl.name}': DatabaseURL = ... must be the "
@@ -4836,6 +5067,28 @@ def analyze(program, filename="<string>"):
             analyze_block(stmt, scope, return_type, loop_depth)
         elif isinstance(stmt, ast.ExprStmt):
             infer(stmt.expr, scope)
+            # claude.md #217: a BARE postMessage(x)/NAME.postMessage(x)
+            # statement -- not wrapped in `.callback(...)` (that shape
+            # is `Call(Member(_, "callback"), ...)` at the statement's
+            # own top level, never reaching here with a postMessage
+            # callee) -- is a compile error once its target has a
+            # reply_type, since nothing would ever be able to receive
+            # the reply it might send. This and the `.callback()`
+            # combined-pattern branch in _infer_call together cover the
+            # only two syntactically valid positions for a postMessage
+            # call.
+            if isinstance(stmt.expr, ast.Call) and _is_postmessage_callee(stmt.expr.callee):
+                reply_type, target_desc = _postmessage_target_reply_type(stmt.expr)
+                if reply_type is not None:
+                    raise CompileError(
+                        f"{target_desc} replies to messages -- "
+                        f"'.postMessage(...)' here must chain '.callback(fn)' "
+                        f"(fn:func[{types_mod.type_name(reply_type)}]:void) to "
+                        f"receive it, or use a target that never replies",
+                        file=filename, line=getattr(stmt.expr, "line", 0),
+                        column=getattr(stmt.expr, "column", 0),
+                        category="invalid declaration",
+                    )
         # unrecognized statement kinds are ignored (no-op)
 
     def analyze_block(block, parent_scope, return_type, loop_depth=0):
@@ -4985,4 +5238,5 @@ def analyze(program, filename="<string>"):
                 )
 
     return AnalyzedProgram(global_scope.vars, structs, tables, enums, imports, threads,
-                            main_message_type=_main_message_type[0])
+                            main_message_type=_main_message_type[0],
+                            main_reply_type=_main_reply_type[0])
