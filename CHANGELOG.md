@@ -9,6 +9,21 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.29] - 2026-09-01
+
+### Changed
+
+- **`worker:thread` (the `on message(worker:thread, msg:T)` parameter)
+  is never `null` any more.** When main is the sender, `worker` is now a
+  real, singleton `thread` value -- check the new `.main:bool` field to
+  tell it apart from an ordinary worker's own handle. Comparing a
+  `thread` value against `null` is now a compile error naming `.main`
+  as the replacement. This is Phase 1 of a larger messaging redesign;
+  `.reply()`/`.callback()` and the removal of `sqlite()` are separate,
+  later changes.
+
+See claude.md #216.
+
 ## [0.28] - 2026-09-01
 
 ### Added

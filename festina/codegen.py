@@ -1553,10 +1553,19 @@ class CodeGen:
             # claude.md #195 Phase 2: `thread NAME { ... }`.
             "declare ptr @festina_thread_register(ptr, ptr, ptr, ptr, ptr)",
             "declare void @festina_thread_spawn(ptr)",
+            # claude.md #216: the singleton handle standing in for
+            # "main" as a real, non-null `thread` value -- returned by
+            # festina_thread_get_main_handle, passed as festina_thread_
+            # post's own `sender` argument whenever a send originates
+            # from main's own top-level code (replaces claude.md #208's
+            # literal `null` there), and checked by festina_thread_
+            # is_main for `.main` field reads.
+            "declare ptr @festina_thread_get_main_handle()",
+            "declare i8 @festina_thread_is_main(ptr)",
             # claude.md #208: festina_thread_post's own `sender` param
-            # (2nd) -- `null` when called from main, or the calling
-            # thread's own handle when a thread messages another
-            # thread directly (see the ThreadType Member-call
+            # (2nd) -- the main singleton handle when called from main,
+            # or the calling thread's own handle when a thread messages
+            # another thread directly (see the ThreadType Member-call
             # postMessage codegen, above).
             "declare void @festina_thread_post(ptr, ptr, ptr)",
             "declare void @festina_thread_post_outbound(ptr, ptr)",
@@ -7542,6 +7551,17 @@ class CodeGen:
             # none of this, but doesn't hurt from it either.
             self._minted_values.add(id(expr))
             return out, result_type
+        if isinstance(obj_type, types_mod.ThreadType) and expr.prop == "main":
+            # claude.md #216: `worker.main` -- a bare runtime call, no
+            # ownership question at all (a `thread` value is a bare,
+            # non-refcounted `ptr`, per ThreadType's own doc comment;
+            # `_release_owned_receiver` below is a no-op for it via
+            # `_is_refcounted`, called anyway for consistency with
+            # every other field-read branch here).
+            out = self.tmp()
+            lines.append(f"  {out} = call i8 @festina_thread_is_main(ptr {obj_val})")
+            self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+            return out, types_mod.PrimitiveType("bool")
         if isinstance(obj_type, types_mod.SocketType) and expr.prop == "state":
             # claude.md #151: s.state -- the SAME live map every call
             # for this connection (see festina_socket_state's own doc
@@ -10931,13 +10951,15 @@ class CodeGen:
                 if callee.prop == "postMessage":
                     # claude.md #208: legal from main OR from inside
                     # ANOTHER thread's own body now -- the sender
-                    # passed to festina_thread_post is `null` for main,
-                    # or the CALLING thread's own handle (loaded from
-                    # self._current_thread_ctx, which is set while
-                    # emitting a thread's own on_load/on_message/
-                    # on_exit body -- see _emit_call's bare postMessage
-                    # branch for the identical pattern) when this call
-                    # site is itself inside another thread's body.
+                    # passed to festina_thread_post is the main
+                    # singleton (claude.md #216: `worker` is never null
+                    # any more) for main, or the CALLING thread's own
+                    # handle (loaded from self._current_thread_ctx,
+                    # which is set while emitting a thread's own
+                    # on_load/on_message/on_exit body -- see
+                    # _emit_call's bare postMessage branch for the
+                    # identical pattern) when this call site is itself
+                    # inside another thread's body.
                     val, vtype = self._emit_expr(expr.args[0], env, lines)
                     val = self._coerce(val, vtype, inbound_type, lines, source_expr=expr.args[0])
                     box = self._emit_thread_box(val, inbound_type, lines)
@@ -10945,7 +10967,8 @@ class CodeGen:
                         sender = self.tmp()
                         lines.append(f"  {sender} = load ptr, ptr {self._current_thread_ctx[1]}")
                     else:
-                        sender = "null"
+                        sender = self.tmp()
+                        lines.append(f"  {sender} = call ptr @festina_thread_get_main_handle()")
                     lines.append(f"  call void @festina_thread_post(ptr {handle}, ptr {sender}, ptr {box})")
                     self._emit_thread_postmessage_cleanup(expr.args[0], val, vtype, inbound_type, lines)
                     if end_label is not None:

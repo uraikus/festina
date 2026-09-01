@@ -431,28 +431,43 @@ class TestThreadMessagePassing:
         analyzed = semantic.analyze(parser.parse(source))
         assert analyzed.main_message_type is not None
 
-    def test_worker_parameter_is_null_when_sent_by_main(self, parser, semantic):
+    def test_worker_dot_main_is_true_when_sent_by_main(self, parser, semantic):
+        # claude.md #216: `worker` is never null any more -- when main
+        # is the sender, `worker.main` reads true instead.
         source = """
         on message(worker:thread, msg:int) {
-            if (worker == null) { log('from main') }
+            if (worker.main) { log('from main') }
         }
         thread myWorker { on load() { postMessage(1) } }
         """
         semantic.analyze(parser.parse(source))
 
+    def test_worker_compared_against_null_is_rejected(self, parser, semantic, errors):
+        # claude.md #216: claude.md #208's own "worker == null" design
+        # is gone -- `worker` is never null, so comparing it against
+        # null is now a clear compile error pointing at `.main`.
+        source = """
+        on message(worker:thread, msg:int) {
+            if (worker == null) { log('x') }
+        }
+        thread myWorker { on load() { postMessage(1) } }
+        """
+        with pytest.raises(errors.CompileError, match="never null.*\\.main"):
+            semantic.analyze(parser.parse(source))
+
     def test_two_thread_values_cannot_be_compared_to_each_other(
             self, parser, semantic, errors):
-        # claude.md #208: `worker` may only ever be compared against
-        # null -- comparing two real thread values against each other
-        # hits the invalid-LLVM-IR struct-equality hazard this
-        # language's `==`/`!=` codegen has for any non-null pointer-
-        # shaped comparison, so it's rejected here at the semantic
-        # layer instead, with a clear Festina-level message. (There is
-        # no way to spell a SECOND, distinct `thread`-typed binding in
-        # ordinary Festina code at all -- `thread` is deliberately not
-        # constructible, only ever delivered via `worker` -- so this
-        # compares `worker` against itself, which is enough to exercise
-        # the "two thread values" guard either way.)
+        # claude.md #208 (still true after #216): comparing two real
+        # thread values against each other hits the invalid-LLVM-IR
+        # struct-equality hazard this language's `==`/`!=` codegen has
+        # for any non-null pointer-shaped comparison, so it's rejected
+        # here at the semantic layer instead, with a clear Festina-level
+        # message. (There is no way to spell a SECOND, distinct
+        # `thread`-typed binding in ordinary Festina code at all --
+        # `thread` is deliberately not constructible, only ever
+        # delivered via `worker` -- so this compares `worker` against
+        # itself, which is enough to exercise the "two thread values"
+        # guard either way.)
         source = """
         on message(worker:thread, msg:int) {
             if (worker == worker) { log('x') }

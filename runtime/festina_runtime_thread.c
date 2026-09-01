@@ -133,8 +133,40 @@ struct FestinaThreadHandle {
      * HTTP context) and NULL otherwise. */
     void (*give_request_deliver)(void *payload);
 
+    /* claude.md #216: set only for the one process-wide singleton
+     * below -- every REGISTERED thread (festina_thread_register) is
+     * the ordinary kind, `is_main` always 0. Read-only after this
+     * handle's own construction (either at static-init time for the
+     * singleton, or `calloc`'s own zero-fill for an ordinary one), so
+     * no lock is needed to read it from festina_thread_is_main. */
+    int is_main;
+
     struct FestinaThreadHandle *next; /* registry linked list */
 };
+
+/* claude.md #216: "worker is null when sent by main" (claude.md #208)
+ * is gone -- `worker:thread` is never null now, so main itself needs a
+ * real, non-NULL, singleton `thread` value to pass as `sender`
+ * whenever a send genuinely originates from main's own top-level code
+ * (see festina_thread_get_main_handle, and the codegen call site this
+ * replaces claude.md #208's literal `null` at). This is an IDENTITY
+ * token only -- it is never pthread_create'd, never put in g_registry,
+ * never has on_load/on_message/on_exit/in_release set, and its own
+ * in_lock/in_cond/out_lock are simply never touched (every delivery
+ * path that might target it checks `is_main` FIRST and routes through
+ * the existing outbound-to-main queue/handler instead -- see
+ * festina_thread_reply in the reply/callback work this singleton was
+ * introduced alongside). Zero-initialized like any other handle would
+ * be from calloc; `.is_main = 1` is the one field that differs. */
+static FestinaThreadHandle g_main_handle = { .is_main = 1 };
+
+FestinaThreadHandle *festina_thread_get_main_handle(void) {
+    return &g_main_handle;
+}
+
+int8_t festina_thread_is_main(void *handle) {
+    return ((FestinaThreadHandle *)handle)->is_main ? (int8_t)1 : (int8_t)0;
+}
 
 static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static FestinaThreadHandle *g_registry = NULL;

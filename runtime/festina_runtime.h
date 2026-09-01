@@ -1164,15 +1164,29 @@ FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
  * coming back) can respawn without re-registering a whole new handle
  * (and therefore a whole new, empty pair of queues) each time. */
 void festina_thread_spawn(FestinaThreadHandle *h);
+/* claude.md #216: the singleton standing in for "main" as a real,
+ * non-null `thread` value -- see festina_runtime_thread.c's own
+ * g_main_handle doc comment. Passed as festina_thread_post's own
+ * `sender` whenever a send genuinely originates from main. */
+FestinaThreadHandle *festina_thread_get_main_handle(void);
+/* claude.md #216: `worker.main` -- true only for the singleton
+ * festina_thread_get_main_handle returns, false for every ordinary,
+ * festina_thread_register'd handle. `handle` is `void*` (not
+ * `FestinaThreadHandle*`) purely so codegen never needs this opaque
+ * struct's own layout, matching every other thread-handle-consuming
+ * declaration in this header. */
+int8_t festina_thread_is_main(void *handle);
 /* claude.md #208: `NAME.postMessage(x)` from main OR from inside
  * ANOTHER thread's own body (threads may message each other directly
  * now, not just main) -- clones x into `payload` (codegen's own job,
  * see above) and enqueues it on h's INBOUND queue, waking the worker
- * if it's blocked waiting. `sender` is NULL when called from main, or
- * the CALLING thread's own handle when this is a thread-to-thread
- * send -- delivered straight through to h's own `on_message` as its
- * first argument (the `worker:thread` parameter every `on message`
- * handler now declares). */
+ * if it's blocked waiting. claude.md #216: `sender` is
+ * festina_thread_get_main_handle() when called from main (never NULL
+ * any more -- `worker:thread` has no null case left), or the CALLING
+ * thread's own handle when this is a thread-to-thread send --
+ * delivered straight through to h's own `on_message` as its first
+ * argument (the `worker:thread` parameter every `on message` handler
+ * now declares). */
 void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload);
 /* `postMessage(x)` called from INSIDE this thread's own body: enqueues
  * on h's own OUTBOUND queue instead -- drained on the MAIN thread only

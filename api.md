@@ -3028,9 +3028,13 @@ below).
 **Sending and receiving.** Every message receiver — the main program,
 or a specific `thread` — declares its own inbound type directly with
 one `on message(worker:thread, msg:T)` handler, the *same* shape in
-both places: `worker` identifies who sent the message (`null` when it
-was sent by the main program), and `msg:T` is the receiver's own
-choice of type. There is exactly **one** `on message` at the top
+both places: `worker` identifies who sent the message and is never
+`null` — check `worker.main` (a `bool`) to tell whether it was sent by
+the main program, since main itself is a real `thread` value here too
+— and `msg:T` is the receiver's own choice of type. `thread`'s only
+other operation is `.postMessage()`; comparing a `thread` value against
+`null`, or against another `thread` value, is a compile error. There is
+exactly **one** `on message` at the top
 level for the whole program — it's what a bare `postMessage(x)`
 (inside any thread's own body) sends to. `NAME.postMessage(x)` sends
 `x` to a specific thread `NAME`, checked against *that thread's own*

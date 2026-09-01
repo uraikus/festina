@@ -46,11 +46,11 @@ void func maybeDone() {
 }
 
 on message(worker:thread, msg:int) {
-    if worker == null {
+    if worker.main {
         // never sent by main directly (this handler only ever
         // receives from `worker`/`pool`, both real threads) -- kept
-        // here anyway as a direct proof `worker == null` itself is
-        // false on this path, mirroring claude.md #208's own coverage.
+        // here anyway as a direct proof `worker.main` itself is false
+        // on this path, mirroring claude.md #216's own coverage.
         log('unexpected: sent by main')
     }
     repliesSeen = repliesSeen + 1

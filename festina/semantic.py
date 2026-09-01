@@ -766,7 +766,7 @@ _EVENT_SIGNATURES = {
 # inside a thread body, one written at the top level for main).
 _THREAD_EVENT_SIGNATURES = {
     "load": ((), "no parameters"),
-    "message": (None, "(worker:thread, msg:T) -- worker is null when sent by main"),
+    "message": (None, "(worker:thread, msg:T) -- worker.main is true when sent by main"),
     "exit": ((_INT,), "(code:int)"),
     # claude.md #212 (Phase 4 -- private per-thread HTTP context): the
     # SAME four names/signatures _EVENT_SIGNATURES already declares
@@ -2035,29 +2035,36 @@ def analyze(program, filename="<string>"):
                     # same as every other binary operator.
                     or (left in _NUMERIC_TYPES and right in _NUMERIC_TYPES)
                 )
-                # claude.md #208: `thread == thread` (two genuine,
-                # non-null values) is deliberately NOT supported --
-                # `worker:thread`'s own only sanctioned comparison is
-                # against `null` ("is this from main"), which routes
-                # through codegen's own generic ptr-vs-null fast path
-                # (_emit_binop) and is unaffected by this check (NULL
-                # on either side already made `compatible` True above).
-                # Two real thread values reaching codegen's OTHER,
-                # non-null equality path would hit the identical
-                # pre-existing "icmp eq i64 <a ptr>" invalid-IR bug
-                # struct == struct already has (confirmed directly,
-                # unrelated to this feature, out of scope to fix here)
-                # -- rejected here instead of silently shipping a new
-                # instance of it.
-                if (compatible and isinstance(left, types_mod.ThreadType)
-                        and isinstance(right, types_mod.ThreadType)):
-                    raise CompileError(
-                        f"'{expr.op}' between two thread values is not supported -- "
-                        f"a 'worker:thread' parameter may only be compared against "
-                        f"null (to check whether it was sent by the main program)",
-                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
-                        category="invalid operand type",
-                    )
+                # claude.md #216: `worker:thread` is never `null` any
+                # more (claude.md #208's own "null when sent by main"
+                # design is gone -- see ThreadType's own doc comment and
+                # the `.main` field access above), so comparing one
+                # against `null` is dead code now, not a live "is this
+                # from main" check -- rejected with a pointer at `.main`
+                # rather than silently compiling to an always-false
+                # comparison. `thread == thread` (two genuine values)
+                # stays unsupported too, unchanged from claude.md #208:
+                # codegen's non-null equality path would hit the
+                # identical pre-existing "icmp eq i64 <a ptr>" invalid-
+                # IR bug struct == struct already has (confirmed
+                # directly, unrelated to this feature, out of scope to
+                # fix here).
+                if isinstance(left, types_mod.ThreadType) or isinstance(right, types_mod.ThreadType):
+                    if left is NULL or right is NULL:
+                        raise CompileError(
+                            f"'{expr.op}' against null is not supported for a thread "
+                            f"value any more -- a 'worker:thread' parameter is never "
+                            f"null, use '.main' to check whether it was sent by the "
+                            f"main program",
+                            file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                            category="invalid operand type",
+                        )
+                    if isinstance(left, types_mod.ThreadType) and isinstance(right, types_mod.ThreadType):
+                        raise CompileError(
+                            f"'{expr.op}' between two thread values is not supported",
+                            file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                            category="invalid operand type",
+                        )
                 if not compatible:
                     raise CompileError(
                         f"cannot compare {types_mod.type_name(left)} and "
@@ -2374,6 +2381,26 @@ def analyze(program, filename="<string>"):
             raise CompileError(
                 f"socket has no field '{expr.prop}' (socket has .state, "
                 f".send() and .close())",
+                file=filename, line=expr.line, column=expr.column,
+                category="invalid field access",
+            )
+        if isinstance(obj_type, types_mod.ThreadType):
+            # claude.md #216: `worker`/`t` (a `thread`-typed value,
+            # always the generic `ThreadType(None)` variant -- the only
+            # one ordinary code ever HOLDS a value of, per ThreadType's
+            # own doc comment) is never `null` any more -- when main is
+            # the sender, `worker` is a real, singleton handle
+            # (festina_thread_get_main_handle at the runtime level) with
+            # `.main` reading true. This is the ONE field on `thread`;
+            # `.postMessage`/`.reply`/`.callback` stay methods (Call-on-
+            # Member, handled in _infer_call, matching every other
+            # method-only type here -- ImageType/HttpType/SocketType
+            # above all split fields vs. methods the identical way).
+            if expr.prop == "main":
+                return _BOOL
+            raise CompileError(
+                f"thread has no field '{expr.prop}' (thread has .main; "
+                f"messaging is done with .postMessage()/.reply())",
                 file=filename, line=expr.line, column=expr.column,
                 category="invalid field access",
             )
@@ -4368,7 +4395,7 @@ def analyze(program, filename="<string>"):
                 )
             _main_message_type[0] = _check_message_handler_params(
                 decl.params, decl, filename, structs, tables, enums,
-                "(worker:thread, msg:T) -- worker is null when sent by main")
+                "(worker:thread, msg:T) -- worker.main is true when sent by main")
             handler_scope = Scope(global_scope)
             for p in decl.params:
                 ptype = apply_manually_managed(resolve(p.type_expr, decl), p.manually_managed)

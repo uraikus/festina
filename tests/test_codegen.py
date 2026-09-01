@@ -15882,6 +15882,32 @@ class TestThreads:
         assert result.returncode == 0
         assert result.stdout.strip() == "42"
 
+    def test_worker_dot_main_reads_true_only_when_sent_by_main(self, compile_and_run):
+        # claude.md #216: `worker` is never null any more -- `worker.main`
+        # is the real replacement for claude.md #208's old "worker ==
+        # null" check. main -> worker sees main=true; worker -> main
+        # (the reply) sees main=false, since it genuinely came from the
+        # worker thread, not main.
+        source = """
+        on message(worker:thread, msg:int) {
+            log(`main got ${msg} from main=${worker.main}`)
+            close(0)
+        }
+        thread worker {
+            on message(worker:thread, msg:int) {
+                log(`worker got ${msg} from main=${worker.main}`)
+                postMessage(msg * 2)
+            }
+        }
+        worker.postMessage(21)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == (
+            "worker got 21 from main=true\n"
+            "main got 42 from main=false"
+        )
+
     def test_text_message_round_trip(self, compile_and_run):
         source = """
         on message(worker:thread, msg:text) {
@@ -16127,6 +16153,31 @@ class TestThreads:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["2", "11"]
+
+    def test_thread_to_thread_message_sees_worker_dot_main_false(self, compile_and_run):
+        # claude.md #216: a thread-to-thread send is genuinely NOT from
+        # main -- `worker.main` on the receiving end must read false,
+        # distinct from a main-originated send (covered above). `a`
+        # posts back -1 instead of the real value if it ever observed
+        # `worker.main` as true, so a wrong flip fails loudly rather
+        # than just passing coincidentally.
+        source = """
+        on message(worker:thread, msg:int) {
+            log(msg)
+            close(0)
+        }
+        thread a {
+            on message(worker:thread, msg:int) {
+                postMessage(worker.main ? -1 : msg)
+            }
+        }
+        thread b {
+            on load() { a.postMessage(99) }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "99"
 
     def test_a_self_referencing_struct_message_type_is_a_clear_not_yet_error(self, parser, semantic, codegen, errors):
         # claude.md #197 Phase 3: struct/arr[T]/map[T] are clonable

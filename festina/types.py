@@ -106,7 +106,13 @@ class ThreadType:
     value only ever arrives via message delivery (the sender's own
     handle, boxed by the runtime at every postMessage/bare-postMessage
     send site), so no widening/narrowing conversion between the named
-    and generic forms is needed anywhere in this compiler."""
+    and generic forms is needed anywhere in this compiler.
+
+    claude.md #216: `worker` is never `null` any more -- when main is
+    the sender, it's a real singleton handle (`is_main` set at the
+    runtime level), exposed to Festina code as the one field on
+    `thread`, `.main:bool` (see semantic.py's ThreadType field-access
+    branch)."""
     name: str | None
 
     def __repr__(self):
