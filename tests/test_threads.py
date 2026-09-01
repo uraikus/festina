@@ -20,10 +20,11 @@ import pytest
 
 class TestThreadDecl:
     """Grammar: `thread NAME { ... }` -- no parens, ever (claude.md
-    #195's own "no header type at all" design note: the inbound type
-    is whatever `on message(p:T)` declares inside the body, the
-    outbound type is inferred from that same body's own postMessage(x)
-    call sites)."""
+    #195/#208's own "no header type at all" design note: a thread's
+    own inbound type is whatever `on message(worker:thread, msg:T)`
+    declares inside the body -- DECLARED directly, never inferred,
+    the same way main's own top-level `on message` handler declares
+    its own `msg` type)."""
 
     def test_empty_thread_parses_and_analyzes(self, parser, semantic):
         semantic.analyze(parser.parse("thread myWorker { }"))
@@ -35,8 +36,8 @@ class TestThreadDecl:
             on load() {
                 state['ready'] = 'true'
             }
-            on message(p:int) {
-                log(p)
+            on message(worker:thread, msg:int) {
+                log(msg)
             }
             on exit(code:int) {
             }
@@ -71,13 +72,14 @@ class TestThreadDecl:
             semantic.analyze(parser.parse(source))
 
     def test_duplicate_on_message_is_rejected(self, parser, semantic, errors):
-        source = "thread myWorker { on message(p:int) { } on message(p:int) { } }"
+        source = ("thread myWorker { on message(worker:thread, msg:int) { } "
+                   "on message(worker:thread, msg:int) { } }")
         with pytest.raises(errors.CompileError, match="already declares 'on message'"):
             semantic.analyze(parser.parse(source))
 
     def test_on_message_with_wrong_arity_is_rejected(self, parser, semantic, errors):
-        source = "thread myWorker { on message(a:int, b:int) { } }"
-        with pytest.raises(errors.CompileError, match="exactly.*parameter"):
+        source = "thread myWorker { on message(a:thread, b:int, c:int) { } }"
+        with pytest.raises(errors.CompileError, match="must declare"):
             semantic.analyze(parser.parse(source))
 
     def test_on_load_takes_no_parameters(self, parser, semantic, errors):
@@ -178,7 +180,7 @@ class TestThreadIsolation:
         thread myWorker {
             map[text] state
             on load() { state['a'] = 'x' }
-            on message(p:int) { state['b'] = 'y' }
+            on message(worker:thread, msg:int) { state['b'] = 'y' }
         }
         myWorker.postMessage(1)
         """
@@ -223,7 +225,7 @@ class TestThreadIsolation:
         source = """
         struct Packet { username:text }
         thread myWorker {
-            on message(p:Packet) { log(p.username) }
+            on message(worker:thread, msg:Packet) { log(msg.username) }
         }
         myWorker.postMessage(p)
         """
@@ -256,12 +258,12 @@ class TestThreadSendableTypes:
 
     @pytest.mark.parametrize("msg_type", ["int", "float", "bool", "text", "blob", "img", "aud", "url"])
     def test_scalar_and_handle_types_are_sendable(self, parser, semantic, msg_type):
-        source = f"thread myWorker {{ on message(p:{msg_type}) {{ }} }}"
+        source = f"thread myWorker {{ on message(worker:thread, msg:{msg_type}) {{ }} }}"
         semantic.analyze(parser.parse(source))
 
     @pytest.mark.parametrize("msg_type", ["http", "socket", "regex"])
     def test_connection_bound_types_are_rejected(self, parser, semantic, errors, msg_type):
-        source = f"thread myWorker {{ on message(p:{msg_type}) {{ }} }}"
+        source = f"thread myWorker {{ on message(worker:thread, msg:{msg_type}) {{ }} }}"
         with pytest.raises(errors.CompileError, match="cannot cross a thread boundary"):
             semantic.analyze(parser.parse(source))
 
@@ -269,7 +271,7 @@ class TestThreadSendableTypes:
         source = """
         struct Bad { s:socket }
         thread myWorker {
-            on message(p:Bad) { }
+            on message(worker:thread, msg:Bad) { }
         }
         """
         with pytest.raises(errors.CompileError, match="cannot cross a thread boundary"):
@@ -279,15 +281,15 @@ class TestThreadSendableTypes:
         source = """
         struct Packet { username:text data:int }
         thread myWorker {
-            on message(p:Packet) { }
+            on message(worker:thread, msg:Packet) { }
         }
         """
         semantic.analyze(parser.parse(source))
 
     def test_arr_and_map_of_sendable_element_types_are_sendable(self, parser, semantic):
         source = """
-        thread a { on message(p:arr[int]) { } }
-        thread b { on message(p:map[text]) { } }
+        thread a { on message(worker:thread, msg:arr[int]) { } }
+        thread b { on message(worker:thread, msg:map[text]) { } }
         """
         semantic.analyze(parser.parse(source))
 
@@ -295,22 +297,25 @@ class TestThreadSendableTypes:
         source = """
         enum DataPacket = int, text
         thread myWorker {
-            on message(p:DataPacket) { }
+            on message(worker:thread, msg:DataPacket) { }
         }
         """
         semantic.analyze(parser.parse(source))
 
 
 class TestThreadMessagePassing:
-    """claude.md #195: `NAME.postMessage(x)` (main -> thread) and bare
-    `postMessage(x)` (thread -> main) -- both directions inferred, both
-    with a symmetric "no dead sends" compile error when nothing would
-    ever receive them."""
+    """claude.md #208: `NAME.postMessage(x)` (main -> thread, or thread
+    -> thread) and bare `postMessage(x)` (thread -> main) both check
+    against a receiver's own DECLARED `on message(worker:thread, msg:T)`
+    handler -- never inferred/merged. Since a real analysis pass runs
+    in strict textual program order (see analyze()'s own third loop),
+    a receiver's `on message` handler must be declared textually
+    BEFORE any send that targets it is analyzed, exactly like any other
+    "declared before referenced" rule this language already has."""
 
     def test_postmessage_type_must_match_the_inbound_type(self, parser, semantic, errors):
         source = """
-        thread myWorker { on message(p:int) { } }
-        myWorker.onMessage(void (x:int) => log(x))
+        thread myWorker { on message(worker:thread, msg:int) { } }
         myWorker.postMessage('wrong type')
         """
         with pytest.raises(errors.CompileError, match="postMessage"):
@@ -325,57 +330,71 @@ class TestThreadMessagePassing:
         with pytest.raises(errors.CompileError, match="declares no 'on message' handler"):
             semantic.analyze(parser.parse(source))
 
-    def test_a_thread_that_posts_but_is_never_onmessaged_is_rejected(
+    def test_a_bare_postmessage_with_no_top_level_on_message_handler_is_rejected(
             self, parser, semantic, errors):
+        # claude.md #208: replaces the old, end-of-analyze() "no dead
+        # sends" check -- a bare postMessage(x) targets main, checked
+        # directly against `_main_message_type[0]`, which stays None
+        # when the program never declares a top-level
+        # `on message(worker:thread, msg:T)` handler at all.
         source = "thread myWorker { on load() { postMessage(1) } }"
-        with pytest.raises(errors.CompileError, match="nothing ever registers"):
+        with pytest.raises(errors.CompileError, match="no top-level 'on message"):
             semantic.analyze(parser.parse(source))
 
-    def test_a_thread_that_never_posts_needs_no_onmessage_registration(
+    def test_a_thread_that_never_posts_to_main_needs_no_top_level_handler(
             self, parser, semantic):
-        # A thread that only ever RECEIVES messages, never sends any,
-        # is not an error -- nothing would ever arrive at .onMessage()
-        # regardless of whether it's registered.
+        # A thread that only ever RECEIVES messages (from main, via the
+        # named form), never sends any of its own, needs no top-level
+        # `on message` declared anywhere -- nothing here would ever
+        # need one.
         source = """
-        thread myWorker { on message(p:int) { } }
+        thread myWorker { on message(worker:thread, msg:int) { } }
         myWorker.postMessage(5)
         """
         semantic.analyze(parser.parse(source))
 
-    def test_onmessage_before_any_postmessage_call_site_is_still_fine(
-            self, parser, semantic):
-        # claude.md #195: the "no dead sends" check for the outbound
-        # direction only runs once, at the very end of analyze() --
-        # .onMessage() itself may be registered anywhere in the
-        # program relative to the thread's own postMessage call sites
-        # (unlike the thread's own declaration, which values/calls
-        # elsewhere in the program DO need to come after -- see
-        # TestThreadIsolation's own ordering test).
+    def test_bare_postmessage_requires_the_top_level_handler_declared_first(
+            self, parser, semantic, errors):
+        # Analysis runs in strict textual program order -- a bare
+        # postMessage(x) call site analyzed BEFORE the top-level
+        # `on message` handler it would target is analyzed sees
+        # `_main_message_type[0]` still None, same as if no handler
+        # were declared anywhere at all.
         source = """
         thread myWorker { on load() { postMessage(1) } }
-        myWorker.onMessage(void (x:int) => log(x))
+        on message(worker:thread, msg:int) { log(msg) }
+        """
+        with pytest.raises(errors.CompileError, match="no top-level 'on message"):
+            semantic.analyze(parser.parse(source))
+
+    def test_bare_postmessage_works_once_the_top_level_handler_is_declared_first(
+            self, parser, semantic):
+        source = """
+        on message(worker:thread, msg:int) { log(msg) }
+        thread myWorker { on load() { postMessage(1) } }
         """
         semantic.analyze(parser.parse(source))
 
-    def test_onmessage_callback_type_must_match_the_outbound_type(
+    def test_bare_postmessage_argument_type_must_match_the_top_level_handler(
             self, parser, semantic, errors):
         source = """
+        on message(worker:thread, msg:text) { log(msg) }
         thread myWorker { on load() { postMessage(1) } }
-        myWorker.onMessage(void (x:text) => log(x))
         """
-        with pytest.raises(errors.CompileError, match="onMessage"):
+        with pytest.raises(errors.CompileError, match="postMessage"):
             semantic.analyze(parser.parse(source))
 
-    def test_more_than_one_distinct_outbound_type_is_rejected(self, parser, semantic, errors):
-        # claude.md #195: postMessage(1) and postMessage('x') from the
-        # SAME thread, with nothing unifying them -- an EARLIER design
-        # auto-synthesized an anonymous enum here, and it was a dead
-        # end: NAME.onMessage(callback)'s own parameter type has to be
-        # WRITTEN in real Festina syntax, and there is no syntax that
-        # could ever spell a compiler-invented, unnamed type. Rejected
-        # instead, with a message pointing at the actual fix (see the
-        # test right below).
+    def test_a_second_postmessage_call_with_a_mismatched_type_is_rejected(
+            self, parser, semantic, errors):
+        # claude.md #208: there is no more "posts more than one type"
+        # inference -- `msg`'s type is DECLARED once, by the top-level
+        # `on message` handler, and every send checks against that
+        # fixed type directly (an earlier design auto-synthesized an
+        # anonymous enum from scattered call sites instead, and it was
+        # a dead end -- see _check_message_handler_params's own
+        # history comment).
         source = """
+        on message(worker:thread, msg:int) { log(msg) }
         thread myWorker {
             on load() {
                 postMessage(1)
@@ -383,21 +402,20 @@ class TestThreadMessagePassing:
             }
         }
         """
-        with pytest.raises(errors.CompileError, match="posts more than one type"):
+        with pytest.raises(errors.CompileError, match="postMessage"):
             semantic.analyze(parser.parse(source))
 
-    def test_multiple_outbound_types_work_via_a_real_named_enum(self, parser, semantic):
-        # The fix the rejection above points at -- mirrors the INBOUND
-        # direction's own already-working "more than one type -> a
-        # real, pre-declared enum" convention exactly, symmetric in
-        # both directions now. Assigning `1`/`'x'` INTO an `Out`-typed
-        # local first (check_assignable's own enum-member coercion,
-        # claude.md #176) is what makes each site's inferred type
-        # already EnumType('Out') by the time postMessage sees it, so
-        # both call sites agree and .onMessage(void (x:Out) => ...) has
-        # a real name to spell.
+    def test_postmessage_of_multiple_enum_member_types_works_via_the_declared_enum(
+            self, parser, semantic):
+        # The fix the rejection above points at: assigning `1`/`'x'`
+        # INTO an `Out`-typed local first (check_assignable's own
+        # enum-member coercion, claude.md #176) makes each call site's
+        # argument type already EnumType('Out') by the time postMessage
+        # checks it against the top-level handler's own declared
+        # `msg:Out` type.
         source = """
         enum Out = int, text
+        on message(worker:thread, msg:Out) { log(typeof msg) }
         thread myWorker {
             on load() {
                 Out a = 1
@@ -406,11 +424,59 @@ class TestThreadMessagePassing:
                 postMessage(b)
             }
         }
-        myWorker.onMessage(void (x:Out) => log(typeof x))
         """
         analyzed = semantic.analyze(parser.parse(source))
-        info = analyzed.threads["myWorker"]
-        assert info.has_onmessage is True
+        assert analyzed.main_message_type is not None
+
+    def test_worker_parameter_is_null_when_sent_by_main(self, parser, semantic):
+        source = """
+        on message(worker:thread, msg:int) {
+            if (worker == null) { log('from main') }
+        }
+        thread myWorker { on load() { postMessage(1) } }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_two_thread_values_cannot_be_compared_to_each_other(
+            self, parser, semantic, errors):
+        # claude.md #208: `worker` may only ever be compared against
+        # null -- comparing two real thread values against each other
+        # hits the invalid-LLVM-IR struct-equality hazard this
+        # language's `==`/`!=` codegen has for any non-null pointer-
+        # shaped comparison, so it's rejected here at the semantic
+        # layer instead, with a clear Festina-level message. (There is
+        # no way to spell a SECOND, distinct `thread`-typed binding in
+        # ordinary Festina code at all -- `thread` is deliberately not
+        # constructible, only ever delivered via `worker` -- so this
+        # compares `worker` against itself, which is enough to exercise
+        # the "two thread values" guard either way.)
+        source = """
+        on message(worker:thread, msg:int) {
+            if (worker == worker) { log('x') }
+        }
+        thread myWorker { on load() { postMessage(1) } }
+        """
+        with pytest.raises(errors.CompileError, match="between two thread values"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_thread_may_postmessage_another_thread_directly(self, parser, semantic):
+        # claude.md #208: the "messaging only" inter-thread capability
+        # -- a thread body may NAME.postMessage(x) another thread
+        # directly, not just main.
+        source = """
+        thread a { on message(worker:thread, msg:int) { } }
+        thread b { on load() { a.postMessage(1) } }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_a_thread_still_cannot_kill_live_or_isalive_another_thread(
+            self, parser, semantic, errors):
+        source = """
+        thread a { on load() { } }
+        thread b { on load() { a.kill() } }
+        """
+        with pytest.raises(errors.CompileError, match="cannot be called from inside a thread body"):
+            semantic.analyze(parser.parse(source))
 
 
 class TestThreadLifecycleMethods:

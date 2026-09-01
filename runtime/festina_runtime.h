@@ -1101,7 +1101,7 @@ typedef struct FestinaThreadHandle FestinaThreadHandle;
  * invoked on that side, so the runtime never needs a NULL check
  * before calling either one). */
 FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
-                                             void (*on_message)(void *payload),
+                                             void (*on_message)(void *sender, void *payload),
                                              void (*on_exit)(int64_t code),
                                              void (*in_release)(void *payload),
                                              void (*out_release)(void *payload));
@@ -1111,25 +1111,32 @@ FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
  * coming back) can respawn without re-registering a whole new handle
  * (and therefore a whole new, empty pair of queues) each time. */
 void festina_thread_spawn(FestinaThreadHandle *h);
-/* `NAME.postMessage(x)` from the MAIN thread's own call sites: clones
- * x into `payload` (codegen's own job, see above) and enqueues it on
- * h's INBOUND queue, waking the worker if it's blocked waiting. */
-void festina_thread_post(FestinaThreadHandle *h, void *payload);
+/* claude.md #208: `NAME.postMessage(x)` from main OR from inside
+ * ANOTHER thread's own body (threads may message each other directly
+ * now, not just main) -- clones x into `payload` (codegen's own job,
+ * see above) and enqueues it on h's INBOUND queue, waking the worker
+ * if it's blocked waiting. `sender` is NULL when called from main, or
+ * the CALLING thread's own handle when this is a thread-to-thread
+ * send -- delivered straight through to h's own `on_message` as its
+ * first argument (the `worker:thread` parameter every `on message`
+ * handler now declares). */
+void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload);
 /* `postMessage(x)` called from INSIDE this thread's own body: enqueues
  * on h's own OUTBOUND queue instead -- drained on the MAIN thread only
  * (see festina_thread_drain below), never processed by the worker
  * itself. */
 void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload);
-/* `NAME.onMessage(callback)`: registers the trampoline codegen built
- * for h's own inferred outbound type (unboxes `payload` and makes the
- * real indirect call through whatever Festina callback value the
- * call site's own global currently holds -- see
- * _emit_exec_callback_trampoline's own doc comment in codegen.py for
- * the shape this mirrors). Only ever called from the main thread,
- * before festina_thread_drain can ever actually invoke it for a given
- * message -- see festina_thread_drain's own doc comment on what
- * happens to anything posted before this call runs. */
-void festina_thread_set_out_callback(FestinaThreadHandle *h, void (*out_callback)(void *payload));
+/* claude.md #208: registers the ONE handler for everything sent to
+ * main, from any thread -- replaces the old per-thread
+ * festina_thread_set_out_callback (one dynamic `NAME.onMessage(...)`
+ * registration per thread, each installing its own codegen-built
+ * trampoline). Called at most once, from main()'s own prologue,
+ * before any thread's own worker starts -- see festina_thread_drain's
+ * own doc comment on what happens to anything posted before this call
+ * runs (nothing: no thread can post anything until it's spawned,
+ * which always happens strictly after this registration in the same
+ * prologue). */
+void festina_set_global_message_handler(void (*handler)(void *sender, void *payload));
 /* claude.md #207: registers the (zero-argument) closure that closes
  * THIS thread's own private sqlite handle -- codegen emits a tiny
  * per-thread trampoline (loads `@__festina_thread_NAME_db`, calls
@@ -1182,13 +1189,14 @@ int8_t festina_thread_is_alive(FestinaThreadHandle *h);
  * ANY declared thread is still alive, which is what makes "a thread
  * should idle" actually keep the process running -- and
  * festina_thread_drain() -- delivers every declared thread's own
- * outbound queue to its registered onMessage() callback, one thread's
- * worth at a time, IF that thread has one registered yet (a message
- * posted before the corresponding `.onMessage()` call has run -- a
- * real possibility, since every thread spawns in main()'s prologue,
- * before __festina_main()'s own top-level statements, one of which is
- * what registers it -- simply stays queued rather than being silently
- * dropped; the next drain after registration flushes it) -- are polled
+ * outbound queue to the ONE registered top-level `on message` handler
+ * (claude.md #208; see festina_set_global_message_handler above), one
+ * thread's worth at a time, a no-op entirely if nothing is registered
+ * at all (a program with threads but no top-level `on message`
+ * handler -- semantic.py already rejects the OTHER gap, a bare
+ * postMessage(x) with nothing declared to receive it, at its own call
+ * site, so this can only ever be "no sender ever posts anything
+ * outbound," never "something's queued with nowhere to go"). Are polled
  * once per iteration by all three of this runtime's blocking loops
  * (festina_run_timer_loop here, festina_run_http_loop, and
  * festina_run_event_loop), the same "all three poll the same two

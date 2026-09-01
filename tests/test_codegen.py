@@ -15867,16 +15867,15 @@ class TestThreads:
 
     def test_int_message_round_trip(self, compile_and_run):
         source = """
-        thread worker {
-            on message(p:int) {
-                postMessage(p * 2)
-            }
-        }
-        void func onReply(x:int) {
-            log(x)
+        on message(worker:thread, msg:int) {
+            log(msg)
             close(0)
         }
-        worker.onMessage(void (x:int) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:int) {
+                postMessage(msg * 2)
+            }
+        }
         worker.postMessage(21)
         """
         result = compile_and_run(source)
@@ -15885,16 +15884,15 @@ class TestThreads:
 
     def test_text_message_round_trip(self, compile_and_run):
         source = """
-        thread echoer {
-            on message(p:text) {
-                postMessage(`echo:${p}`)
-            }
-        }
-        void func onReply(x:text) {
-            log(x)
+        on message(worker:thread, msg:text) {
+            log(msg)
             close(0)
         }
-        echoer.onMessage(void (x:text) => onReply(x))
+        thread echoer {
+            on message(worker:thread, msg:text) {
+                postMessage(`echo:${msg}`)
+            }
+        }
         echoer.postMessage('hi')
         """
         result = compile_and_run(source)
@@ -15903,16 +15901,15 @@ class TestThreads:
 
     def test_float_message_round_trip(self, compile_and_run):
         source = """
-        thread worker {
-            on message(p:float) {
-                postMessage(p + 0.5)
-            }
-        }
-        void func onReply(x:float) {
-            log(x)
+        on message(worker:thread, msg:float) {
+            log(msg)
             close(0)
         }
-        worker.onMessage(void (x:float) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:float) {
+                postMessage(msg + 0.5)
+            }
+        }
         worker.postMessage(1.5)
         """
         result = compile_and_run(source)
@@ -15921,16 +15918,15 @@ class TestThreads:
 
     def test_bool_message_round_trip(self, compile_and_run):
         source = """
-        thread worker {
-            on message(p:bool) {
-                postMessage(!p)
-            }
-        }
-        void func onReply(x:bool) {
-            log(x)
+        on message(worker:thread, msg:bool) {
+            log(msg)
             close(0)
         }
-        worker.onMessage(void (x:bool) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:bool) {
+                postMessage(!msg)
+            }
+        }
         worker.postMessage(true)
         """
         result = compile_and_run(source)
@@ -15939,16 +15935,15 @@ class TestThreads:
 
     def test_on_load_fires_before_any_inbound_message_and_can_post_on_its_own(self, compile_and_run):
         source = """
+        on message(worker:thread, msg:text) {
+            log(msg)
+            close(0)
+        }
         thread worker {
             on load() {
                 postMessage('ready')
             }
         }
-        void func onReply(x:text) {
-            log(x)
-            close(0)
-        }
-        worker.onMessage(void (x:text) => onReply(x))
         """
         result = compile_and_run(source)
         assert result.returncode == 0
@@ -15966,24 +15961,23 @@ class TestThreads:
         # thread), so three sends from main arrive, and are answered,
         # in the order they were sent.
         source = """
-        thread counter {
-            int total = 0
-            on message(p:int) {
-                total = total + p
-                postMessage(total)
-            }
-        }
         int repliesSeen = 0
         int lastVal = 0
-        void func onReply(x:int) {
+        on message(worker:thread, msg:int) {
             repliesSeen = repliesSeen + 1
-            lastVal = x
+            lastVal = msg
             if repliesSeen == 3 {
                 log(lastVal)
                 close(0)
             }
         }
-        counter.onMessage(void (x:int) => onReply(x))
+        thread counter {
+            int total = 0
+            on message(worker:thread, msg:int) {
+                total = total + msg
+                postMessage(total)
+            }
+        }
         counter.postMessage(1)
         counter.postMessage(2)
         counter.postMessage(3)
@@ -16033,11 +16027,15 @@ class TestThreads:
         # actually works, not just that the process didn't crash.
         db = tmp_path / "worker.sqlite"
         source = f"""
+        on message(worker:thread, msg:int) {{
+            log(msg)
+            close(0)
+        }}
         table Hits {{ n:int }}
         thread worker {{
             DatabaseURL = '{db}'
-            on message(p:int) {{
-                sqlite('INSERT INTO Hits (n) VALUES (?)', [p])
+            on message(worker:thread, msg:int) {{
+                sqlite('INSERT INTO Hits (n) VALUES (?)', [msg])
                 int total = sqliteInt('SELECT count(*) FROM Hits')
                 postMessage(total)
             }}
@@ -16048,11 +16046,6 @@ class TestThreads:
             worker.live(void (ok:bool) => log(ok))
             cycle = cycle + 1
         }}
-        void func onReply(x:int) {{
-            log(x)
-            close(0)
-        }}
-        worker.onMessage(void (x:int) => onReply(x))
         worker.postMessage(1)
         """
         result = compile_and_run(source)
@@ -16088,17 +16081,19 @@ class TestThreads:
         assert result.stdout == "main done\nworker exiting\n"
 
     def test_two_independent_threads_do_not_collide(self, compile_and_run):
+        # claude.md #208: ONE global top-level `on message` handler now
+        # receives everything sent to main from EITHER thread -- there
+        # is no per-thread `.onMessage()` registration any more to keep
+        # the two replies apart by callback identity, so which of the
+        # two real OS threads actually FINISHES first (and so posts
+        # its reply first) is genuine, unordered concurrency, not a
+        # FIFO-drain-order guarantee -- confirmed directly (an earlier
+        # draft of this test asserted a fixed arrival order and failed
+        # intermittently). Sorted into seenA/seenB by VALUE instead
+        # (thread a's reply is always < 10, thread b's is always >=
+        # 10), so the assertion is independent of which one arrives
+        # first.
         source = """
-        thread a {
-            on message(p:int) {
-                postMessage(p + 1)
-            }
-        }
-        thread b {
-            on message(p:int) {
-                postMessage(p + 10)
-            }
-        }
         int seenA = 0
         int seenB = 0
         void func checkDone() {
@@ -16108,16 +16103,24 @@ class TestThreads:
                 close(0)
             }
         }
-        void func onA(x:int) {
-            seenA = x
+        on message(worker:thread, msg:int) {
+            if msg < 10 {
+                seenA = msg
+            } else {
+                seenB = msg
+            }
             checkDone()
         }
-        void func onB(x:int) {
-            seenB = x
-            checkDone()
+        thread a {
+            on message(worker:thread, msg:int) {
+                postMessage(msg + 1)
+            }
         }
-        a.onMessage(void (x:int) => onA(x))
-        b.onMessage(void (x:int) => onB(x))
+        thread b {
+            on message(worker:thread, msg:int) {
+                postMessage(msg + 10)
+            }
+        }
         a.postMessage(1)
         b.postMessage(1)
         """
@@ -16136,8 +16139,8 @@ class TestThreads:
         source = """
         struct Node { val:int next:Node }
         thread worker {
-            on message(p:Node) {
-                log(p.val)
+            on message(worker:thread, msg:Node) {
+                log(msg.val)
             }
         }
         Node n
@@ -16151,20 +16154,19 @@ class TestThreads:
     def test_struct_message_round_trip(self, compile_and_run):
         source = """
         struct Point { x:int y:int label:text }
+        on message(worker:thread, msg:Point) {
+            log(msg.x)
+            log(msg.y)
+            log(msg.label)
+            close(0)
+        }
         thread worker {
-            on message(p:Point) {
-                Point out = p
-                out.x = p.x + 1
+            on message(worker:thread, msg:Point) {
+                Point out = msg
+                out.x = msg.x + 1
                 postMessage(out)
             }
         }
-        void func onReply(x:Point) {
-            log(x.x)
-            log(x.y)
-            log(x.label)
-            close(0)
-        }
-        worker.onMessage(void (x:Point) => onReply(x))
         Point pt
         pt.x = 10
         pt.y = 20
@@ -16177,26 +16179,25 @@ class TestThreads:
 
     def test_array_message_round_trip(self, compile_and_run):
         source = """
+        on message(worker:thread, msg:arr[text]) {
+            int i = 0
+            while i < msg.length {
+                log(msg[i])
+                i = i + 1
+            }
+            close(0)
+        }
         thread worker {
-            on message(p:arr[text]) {
+            on message(worker:thread, msg:arr[text]) {
                 arr[text] out = []
                 int i = 0
-                while i < p.length {
-                    out.push(`echo:${p[i]}`)
+                while i < msg.length {
+                    out.push(`echo:${msg[i]}`)
                     i = i + 1
                 }
                 postMessage(out)
             }
         }
-        void func onReply(x:arr[text]) {
-            int i = 0
-            while i < x.length {
-                log(x[i])
-                i = i + 1
-            }
-            close(0)
-        }
-        worker.onMessage(void (x:arr[text]) => onReply(x))
         arr[text] xs = ['a', 'b', 'c']
         worker.postMessage(xs)
         """
@@ -16206,20 +16207,19 @@ class TestThreads:
 
     def test_map_message_round_trip(self, compile_and_run):
         source = """
+        on message(worker:thread, msg:map[int]) {
+            log(msg['a'])
+            log(msg['b'])
+            close(0)
+        }
         thread worker {
-            on message(p:map[int]) {
+            on message(worker:thread, msg:map[int]) {
                 map[int] out = {}
-                out['a'] = p['a'] * 2
-                out['b'] = p['b'] * 2
+                out['a'] = msg['a'] * 2
+                out['b'] = msg['b'] * 2
                 postMessage(out)
             }
         }
-        void func onReply(x:map[int]) {
-            log(x['a'])
-            log(x['b'])
-            close(0)
-        }
-        worker.onMessage(void (x:map[int]) => onReply(x))
         map[int] m = {}
         m['a'] = 5
         m['b'] = 7
@@ -16232,18 +16232,17 @@ class TestThreads:
     def test_mixed_enum_message_round_trip(self, compile_and_run):
         source = """
         enum DataPacket = int, text
+        on message(worker:thread, msg:DataPacket) {
+            log(typeof msg)
+            close(0)
+        }
         thread worker {
-            on message(p:DataPacket) {
-                log(typeof p)
+            on message(worker:thread, msg:DataPacket) {
+                log(typeof msg)
                 DataPacket out = 'echoed'
                 postMessage(out)
             }
         }
-        void func onReply(x:DataPacket) {
-            log(typeof x)
-            close(0)
-        }
-        worker.onMessage(void (x:DataPacket) => onReply(x))
         DataPacket p = 42
         worker.postMessage(p)
         """
@@ -16256,19 +16255,18 @@ class TestThreads:
         struct Circle { radius:int }
         struct Square { side:int }
         enum Shape = Circle, Square
-        thread worker {
-            on message(p:Shape) {
-                postMessage(p)
-            }
-        }
-        void func onReply(x:Shape) {
-            log(typeof x)
-            if typeof x == 'Circle' {
-                log(x.radius)
+        on message(worker:thread, msg:Shape) {
+            log(typeof msg)
+            if typeof msg == 'Circle' {
+                log(msg.radius)
             }
             close(0)
         }
-        worker.onMessage(void (x:Shape) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:Shape) {
+                postMessage(msg)
+            }
+        }
         Circle c
         c.radius = 99
         Shape s = c
@@ -16288,16 +16286,15 @@ class TestThreads:
         # proving a genuine deep clone, not a shared handle.
         (tmp_path / "source.txt").write_text("blob-payload")
         source = """
-        thread worker {
-            on message(p:blob) {
-                postMessage(p)
-            }
-        }
-        void func onReply(x:blob) {
-            log(x.toText())
+        on message(worker:thread, msg:blob) {
+            log(msg.toText())
             close(0)
         }
-        worker.onMessage(void (x:blob) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:blob) {
+                postMessage(msg)
+            }
+        }
         blob b = 'source.txt'
         worker.postMessage(b)
         b.write('mutated-after-send')
@@ -16314,19 +16311,18 @@ class TestThreads:
         # the drawn pixels survive the clone back out to the main
         # thread.
         source = """
-        thread worker {
-            on message(p:img) {
-                color blue = 'blue'
-                p.drawRect(0, 0, 20, 20, blue)
-                postMessage(p)
-            }
-        }
-        void func onReply(x:img) {
+        on message(worker:thread, msg:img) {
             color blue = 'blue'
-            log(x.getPixelColor(5, 5) == blue)
+            log(msg.getPixelColor(5, 5) == blue)
             close(0)
         }
-        worker.onMessage(void (x:img) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:img) {
+                color blue = 'blue'
+                msg.drawRect(0, 0, 20, 20, blue)
+                postMessage(msg)
+            }
+        }
         img pic = blankImage(20, 20)
         worker.postMessage(pic)
         """
@@ -16343,16 +16339,15 @@ class TestThreads:
         # carries real, correctly-cloned audio data.
         _write_wav(tmp_path / "clip.wav", duration_s=0.05)
         source = """
-        thread worker {
-            on message(p:aud) {
-                postMessage(p)
-            }
-        }
-        void func onReply(x:aud) {
-            x.saveCopy('echo.wav')
+        on message(worker:thread, msg:aud) {
+            msg.saveCopy('echo.wav')
             close(0)
         }
-        worker.onMessage(void (x:aud) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:aud) {
+                postMessage(msg)
+            }
+        }
         aud clip = 'clip.wav'
         worker.postMessage(clip)
         """
@@ -16368,18 +16363,17 @@ class TestThreads:
         # festina_map_clone, through the new festina_clone_text_map_
         # value trampoline).
         source = """
-        thread worker {
-            on message(p:url) {
-                postMessage(p)
-            }
-        }
-        void func onReply(x:url) {
-            log(x.hostname)
-            log(x.pathname)
-            log(x.searchParams['a'])
+        on message(worker:thread, msg:url) {
+            log(msg.hostname)
+            log(msg.pathname)
+            log(msg.searchParams['a'])
             close(0)
         }
-        worker.onMessage(void (x:url) => onReply(x))
+        thread worker {
+            on message(worker:thread, msg:url) {
+                postMessage(msg)
+            }
+        }
         url u = parseURL('https://example.com/path?a=1')
         worker.postMessage(u)
         """
@@ -16404,20 +16398,19 @@ class TestThreads:
         sqlite('INSERT INTO MainItem (id) VALUES (1)')
 
         table WorkerItem { id:int label:text }
+        on message(worker:thread, msg:text) {
+            log(msg)
+            close(0)
+        }
         thread worker {
             DatabaseURL = 'worker_only.sqlite'
-            on message(p:int) {
+            on message(worker:thread, msg:int) {
                 sqlite('INSERT INTO WorkerItem (id, label) VALUES (?, ?)',
-                       [p, `from-worker-${p}`])
+                       [msg, `from-worker-${msg}`])
                 arr[WorkerItem] rows = sqlite('SELECT * FROM WorkerItem')
                 postMessage(rows[0].label)
             }
         }
-        void func onReply(x:text) {
-            log(x)
-            close(0)
-        }
-        worker.onMessage(void (x:text) => onReply(x))
         worker.postMessage(42)
         """
         result = compile_and_run(source)
@@ -16481,8 +16474,8 @@ class TestThreads:
         source = """
         enum DataPacket = int, text
         thread worker {
-            on message(p:DataPacket) {
-                log(typeof p)
+            on message(worker:thread, msg:DataPacket) {
+                log(typeof msg)
             }
         }
         worker.postMessage('direct-literal-hello')

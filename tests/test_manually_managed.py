@@ -276,7 +276,7 @@ class TestSemantic:
         source = """
         struct Circle { x:int y:int }
         thread Worker {
-            on message(p:Circle?) { log('got') }
+            on message(worker:thread, msg:Circle?) { log('got') }
         }
         """
         semantic.analyze(parser.parse(source))
@@ -285,7 +285,7 @@ class TestSemantic:
         source = """
         struct Circle { x:int y:int }
         thread Worker {
-            on message(p:Circle?) { log('got') }
+            on message(worker:thread, msg:Circle?) { log('got') }
         }
         void func f() {
             Circle? c
@@ -304,7 +304,7 @@ class TestSemantic:
         source = """
         struct Circle { x:int y:int }
         thread Worker {
-            on message(p:Circle) { log('got') }
+            on message(worker:thread, msg:Circle) { log('got') }
         }
         void func f() {
             Circle? c
@@ -374,8 +374,8 @@ class TestSemantic:
         semantic.analyze(parser.parse(source))
 
     @pytest.mark.parametrize("decl", [
-        "on message(p:http?) { log('got') }",
-        "on message(p:socket?) { log('got') }",
+        "on message(worker:thread, msg:http?) { log('got') }",
+        "on message(worker:thread, msg:socket?) { log('got') }",
     ])
     def test_manually_managed_http_and_socket_message_types_are_accepted(
             self, parser, semantic, decl):
@@ -490,13 +490,6 @@ class TestRuntime:
         source = """
         struct Circle { x:int y:int }
 
-        thread Worker {
-            on message(p:Circle?) {
-                p.x = 99
-                postMessage(p)
-            }
-        }
-
         Circle? c
 
         void func onReply(x:Circle?) {
@@ -505,7 +498,17 @@ class TestRuntime:
             close(0)
         }
 
-        Worker.onMessage(void (x:Circle?) => onReply(x))
+        on message(worker:thread, msg:Circle?) {
+            onReply(msg)
+        }
+
+        thread Worker {
+            on message(worker:thread, msg:Circle?) {
+                msg.x = 99
+                postMessage(msg)
+            }
+        }
+
         c.x = 1
         Worker.postMessage(c)
         """
@@ -576,13 +579,6 @@ class TestThreadReferenceSharingPerType:
 
     def test_arr_shares_the_reference_not_a_clone(self, compile_and_run):
         source = """
-        thread Worker {
-            on message(p:arr[int]?) {
-                p.push(99)
-                postMessage(p)
-            }
-        }
-
         arr[int]? xs = [1, 2]
 
         void func onReply(x:arr[int]?) {
@@ -591,7 +587,17 @@ class TestThreadReferenceSharingPerType:
             close(0)
         }
 
-        Worker.onMessage(void (x:arr[int]?) => onReply(x))
+        on message(worker:thread, msg:arr[int]?) {
+            onReply(msg)
+        }
+
+        thread Worker {
+            on message(worker:thread, msg:arr[int]?) {
+                msg.push(99)
+                postMessage(msg)
+            }
+        }
+
         Worker.postMessage(xs)
         """
         result = compile_and_run(source)
@@ -600,13 +606,6 @@ class TestThreadReferenceSharingPerType:
 
     def test_map_shares_the_reference_not_a_clone(self, compile_and_run):
         source = """
-        thread Worker {
-            on message(p:map[int]?) {
-                p['k'] = 99
-                postMessage(p)
-            }
-        }
-
         map[int]? m = {'k': 1}
 
         void func onReply(x:map[int]?) {
@@ -615,7 +614,17 @@ class TestThreadReferenceSharingPerType:
             close(0)
         }
 
-        Worker.onMessage(void (x:map[int]?) => onReply(x))
+        on message(worker:thread, msg:map[int]?) {
+            onReply(msg)
+        }
+
+        thread Worker {
+            on message(worker:thread, msg:map[int]?) {
+                msg['k'] = 99
+                postMessage(msg)
+            }
+        }
+
         Worker.postMessage(m)
         """
         result = compile_and_run(source)
@@ -641,13 +650,6 @@ class TestThreadReferenceSharingPerType:
             return c
         }
 
-        thread Worker {
-            on message(p:Shape?) {
-                p.x = 99
-                postMessage(p)
-            }
-        }
-
         Shape? shape = makeCircle()
 
         void func onReply(x:Shape?) {
@@ -656,7 +658,17 @@ class TestThreadReferenceSharingPerType:
             close(0)
         }
 
-        Worker.onMessage(void (x:Shape?) => onReply(x))
+        on message(worker:thread, msg:Shape?) {
+            onReply(msg)
+        }
+
+        thread Worker {
+            on message(worker:thread, msg:Shape?) {
+                msg.x = 99
+                postMessage(msg)
+            }
+        }
+
         Worker.postMessage(shape)
         """
         result = compile_and_run(source)
@@ -668,14 +680,6 @@ class TestThreadReferenceSharingPerType:
         # the image's own in-memory pixel buffer directly -- the same
         # kind of observable, in-place mutation a struct field gives.
         source = f"""
-        thread Worker {{
-            on message(p:img?) {{
-                color red = 'red'
-                p.drawPixel(0, 0, red)
-                postMessage(p)
-            }}
-        }}
-
         img? sheet = '{sprite_sheet_png}'
         color red = 'red'
 
@@ -685,7 +689,18 @@ class TestThreadReferenceSharingPerType:
             close(0)
         }}
 
-        Worker.onMessage(void (x:img?) => onReply(x))
+        on message(worker:thread, msg:img?) {{
+            onReply(msg)
+        }}
+
+        thread Worker {{
+            on message(worker:thread, msg:img?) {{
+                color red = 'red'
+                msg.drawPixel(0, 0, red)
+                postMessage(msg)
+            }}
+        }}
+
         Worker.postMessage(sheet)
         """
         result = compile_and_run(source, env={"DISPLAY": ""})
@@ -704,13 +719,6 @@ class TestThreadReferenceSharingPerType:
         # stopped recognizing it as blob at all. See codegen.py's
         # `_bare_type` for the fix.
         source = """
-        thread Worker {
-            on message(p:blob?) {
-                p.write('mutated')
-                postMessage(p)
-            }
-        }
-
         blob? b = 'data.bin'
 
         void func onReply(x:blob?) {
@@ -719,7 +727,17 @@ class TestThreadReferenceSharingPerType:
             close(0)
         }
 
-        Worker.onMessage(void (x:blob?) => onReply(x))
+        on message(worker:thread, msg:blob?) {
+            onReply(msg)
+        }
+
+        thread Worker {
+            on message(worker:thread, msg:blob?) {
+                msg.write('mutated')
+                postMessage(msg)
+            }
+        }
+
         Worker.postMessage(b)
         """
         result = compile_and_run(source)
@@ -743,13 +761,6 @@ class TestThreadReferenceSharingPerType:
         # playLoop(), not assumed.
         shutil.copy(_WAV_FIXTURE, tmp_path / "beep.wav")
         source = """
-        thread Worker {
-            on message(p:aud?) {
-                p.playLoop()
-                postMessage(p)
-            }
-        }
-
         aud? clip = 'beep.wav'
 
         void func onReply(x:aud?) {
@@ -759,7 +770,17 @@ class TestThreadReferenceSharingPerType:
             close(0)
         }
 
-        Worker.onMessage(void (x:aud?) => onReply(x))
+        on message(worker:thread, msg:aud?) {
+            onReply(msg)
+        }
+
+        thread Worker {
+            on message(worker:thread, msg:aud?) {
+                msg.playLoop()
+                postMessage(msg)
+            }
+        }
+
         Worker.postMessage(clip)
         """
         result = compile_and_run(source, env=audio_null_env)
@@ -784,13 +805,6 @@ class TestThreadReferenceSharingPerType:
         # not a same-address proof; the codegen fix itself is what
         # matters here, not this test's own assertions.
         source = """
-        thread Worker {
-            on message(p:regex?) {
-                log(p.test('abc'))
-                postMessage(p)
-            }
-        }
-
         regex? r = /^ab/
 
         void func onReply(x:regex?) {
@@ -799,7 +813,17 @@ class TestThreadReferenceSharingPerType:
             close(0)
         }
 
-        Worker.onMessage(void (x:regex?) => onReply(x))
+        on message(worker:thread, msg:regex?) {
+            onReply(msg)
+        }
+
+        thread Worker {
+            on message(worker:thread, msg:regex?) {
+                log(msg.test('abc'))
+                postMessage(msg)
+            }
+        }
+
         Worker.postMessage(r)
         """
         result = compile_and_run(source)
@@ -815,12 +839,6 @@ class TestThreadReferenceSharingPerType:
         # above, and for the identical underlying reason (an immutable
         # value's identity is not behaviorally observable in Festina).
         source = """
-        thread Worker {
-            on message(p:url?) {
-                postMessage(p)
-            }
-        }
-
         url? u = parseURL('https://example.com/path')
 
         void func onReply(x:url?) {
@@ -829,7 +847,16 @@ class TestThreadReferenceSharingPerType:
             close(0)
         }
 
-        Worker.onMessage(void (x:url?) => onReply(x))
+        on message(worker:thread, msg:url?) {
+            onReply(msg)
+        }
+
+        thread Worker {
+            on message(worker:thread, msg:url?) {
+                postMessage(msg)
+            }
+        }
+
         Worker.postMessage(u)
         """
         result = compile_and_run(source)

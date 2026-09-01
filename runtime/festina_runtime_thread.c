@@ -34,6 +34,16 @@
 
 typedef struct FestinaThreadMsg {
     void *payload;
+    /* claude.md #208: which thread SENT this one -- NULL for main,
+     * or the sending thread's own FestinaThreadHandle* when one
+     * thread messages another directly. Set once, at post time
+     * (festina_thread_post's own new parameter, or implicitly `h`
+     * itself in festina_thread_post_outbound, since a thread's own
+     * outbound queue can only ever be filled by that one thread),
+     * and handed straight through to whichever handler eventually
+     * dequeues this message -- see festina_thread_main's own inbound
+     * dispatch and festina_thread_drain_impl's own outbound one. */
+    void *sender;
     struct FestinaThreadMsg *next;
 } FestinaThreadMsg;
 
@@ -60,15 +70,12 @@ struct FestinaThreadHandle {
     pthread_mutex_t out_lock;
     FestinaThreadMsg *out_head;
     FestinaThreadMsg *out_tail;
-    /* Set at most once, from the main thread only, by
-     * festina_thread_set_out_callback -- never written from the worker
-     * thread, so reading it (unlocked) from festina_thread_drain_impl,
-     * also main-thread-only, is race-free by construction, not by
-     * accident. */
-    void (*out_callback)(void *payload);
 
     void (*on_load)(void);
-    void (*on_message)(void *payload);
+    /* claude.md #208: `sender` is the FIRST argument now (NULL for
+     * main, or another thread's own handle) -- see FestinaThreadMsg's
+     * own `sender` field. */
+    void (*on_message)(void *sender, void *payload);
     void (*on_exit)(int64_t code);
     /* claude.md #197 Phase 3: the function to call to release ONE
      * delivered payload, on each queue's own receiving side -- `free`
@@ -134,7 +141,7 @@ static void *festina_thread_main(void *arg) {
         pthread_mutex_unlock(&h->in_lock);
 
         msg->next = NULL;
-        if (h->on_message) h->on_message(msg->payload);
+        if (h->on_message) h->on_message(msg->sender, msg->payload);
         h->in_release(msg->payload);
         free(msg);
     }
@@ -160,7 +167,7 @@ static void *festina_thread_main(void *arg) {
 }
 
 FestinaThreadHandle *festina_thread_register(void (*on_load)(void),
-                                             void (*on_message)(void *payload),
+                                             void (*on_message)(void *sender, void *payload),
                                              void (*on_exit)(int64_t code),
                                              void (*in_release)(void *payload),
                                              void (*out_release)(void *payload)) {
@@ -191,10 +198,11 @@ void festina_thread_spawn(FestinaThreadHandle *h) {
     }
 }
 
-void festina_thread_post(FestinaThreadHandle *h, void *payload) {
+void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload) {
     FestinaThreadMsg *m = malloc(sizeof(*m));
     if (!m) festina_fail("out of memory posting a thread message");
     m->payload = payload;
+    m->sender = sender;
     m->next = NULL;
     pthread_mutex_lock(&h->in_lock);
     if (h->in_tail) h->in_tail->next = m; else h->in_head = m;
@@ -207,19 +215,20 @@ void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload) {
     /* Called from INSIDE this thread's own on_load/on_message/on_exit
      * -- i.e. always from h's own single worker thread, never
      * concurrently with itself, so out_lock only ever needs to
-     * exclude the main thread's own drain, not another producer. */
+     * exclude the main thread's own drain, not another producer.
+     * claude.md #208: `sender` is always `h` itself here -- a
+     * thread's own outbound queue can only ever be filled by that
+     * one thread's own bare postMessage(x), so there is no separate
+     * sender argument to take. */
     FestinaThreadMsg *m = malloc(sizeof(*m));
     if (!m) festina_fail("out of memory posting a thread outbound message");
     m->payload = payload;
+    m->sender = h;
     m->next = NULL;
     pthread_mutex_lock(&h->out_lock);
     if (h->out_tail) h->out_tail->next = m; else h->out_head = m;
     h->out_tail = m;
     pthread_mutex_unlock(&h->out_lock);
-}
-
-void festina_thread_set_out_callback(FestinaThreadHandle *h, void (*out_callback)(void *payload)) {
-    h->out_callback = out_callback;
 }
 
 void festina_thread_set_db_close(FestinaThreadHandle *h, void (*db_close)(void)) {
@@ -269,6 +278,24 @@ static int64_t festina_thread_outstanding_impl(void) {
     return count;
 }
 
+/* claude.md #208: the ONE handler for everything sent to main, from
+ * ANY thread -- replaces the old per-handle out_callback (set via the
+ * now-removed festina_thread_set_out_callback, one dynamic
+ * registration per thread) with a single, statically-known function
+ * pointer, registered once via festina_set_global_message_handler,
+ * mirroring the exact hook-seam shape festina_set_thread_hooks/
+ * festina_set_stmt_cache_hooks already use (a NULL-by-default global,
+ * a plain setter, no locking needed since it's set at most once,
+ * before any thread's own worker starts, and never written again).
+ * Read (unlocked) only from festina_thread_drain_impl, main-thread-
+ * only, so this is race-free by the same construction those other
+ * hooks already rely on. */
+static void (*g_global_message_handler)(void *sender, void *payload) = NULL;
+
+void festina_set_global_message_handler(void (*handler)(void *sender, void *payload)) {
+    g_global_message_handler = handler;
+}
+
 static void festina_thread_drain_impl(void) {
     /* claude.md #195 Phase 2: the registry only ever GROWS (every
      * declared thread registers once, in main()'s own prologue, before
@@ -276,18 +303,18 @@ static void festina_thread_drain_impl(void) {
      * thread, so a lock here only needs to protect against a
      * (nonexistent, in practice) concurrent register -- taken anyway
      * for the same reason festina_thread_outstanding_impl does. */
+    if (!g_global_message_handler) return; /* claude.md #208: nothing registered at all -- nothing to drain to */
     pthread_mutex_lock(&g_registry_lock);
     FestinaThreadHandle *list = g_registry;
     pthread_mutex_unlock(&g_registry_lock);
     for (FestinaThreadHandle *h = list; h; h = h->next) {
-        if (!h->out_callback) continue; /* see festina_thread_drain's own doc comment */
         pthread_mutex_lock(&h->out_lock);
         FestinaThreadMsg *done = h->out_head;
         h->out_head = h->out_tail = NULL;
         pthread_mutex_unlock(&h->out_lock);
         while (done) {
             FestinaThreadMsg *next = done->next;
-            h->out_callback(done->payload);
+            g_global_message_handler(done->sender, done->payload);
             h->out_release(done->payload);
             free(done);
             done = next;

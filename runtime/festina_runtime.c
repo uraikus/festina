@@ -4107,10 +4107,12 @@ void festina_run_timer_loop(void) {
         }
         festina_fire_expired_timers();
         festina_async_io_drain();
-        /* claude.md #195 Phase 2: delivers any thread's own pending
-         * outbound message(s) to its registered onMessage() callback,
-         * same placement as festina_async_io_drain just above -- a
-         * no-op for a program with no `thread` declaration at all. */
+        /* claude.md #195/#208: delivers any thread's own pending
+         * outbound message(s) to the ONE registered top-level `on
+         * message` handler, same placement as festina_async_io_drain
+         * just above -- a no-op for a program with no `thread`
+         * declaration at all, or one that declares threads but never
+         * a top-level `on message` handler. */
         festina_thread_drain();
     }
 }
