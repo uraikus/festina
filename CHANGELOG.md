@@ -9,6 +9,29 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.30] - 2026-09-01
+
+### Added
+
+- **`t.reply(response)` / `NAME.postMessage(x).callback(fn)`** -- a
+  general request/response mechanism on top of thread messaging. A
+  thread's (or main's) reply type is fixed by its first `.reply(...)`
+  call; every `postMessage(x)` call site targeting a receiver with a
+  reply type must chain `.callback(fn)` to receive it, or it's a
+  compile error. `.reply()` never triggers `on message` on the
+  receiving end -- it's a separate delivery path straight to `fn`,
+  which runs back on whichever OS thread originally sent the message.
+
+### Fixed
+
+- **`festina_thread_kill`'s leftover-message cleanup was type-confused**
+  for a queued `giveRequest` hand-off -- it called the wrong release
+  function on the wrong struct shape. Now kind-aware; a killed
+  thread's own pending `.callback(fn)` registrations are also freed
+  (never invoked) so a later `live()` respawn can't inherit stale ones.
+
+See claude.md #217.
+
 ## [0.29] - 2026-09-01
 
 ### Changed

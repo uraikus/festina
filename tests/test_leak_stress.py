@@ -607,4 +607,13 @@ class TestLeakStress:
             # a leaked FestinaConn/FestinaGiveRequestPayload transfer
             # block itself) would show up here.
             "thread_giverequest_churn.f",
+            # claude.md #217: t.reply(response)/NAME.postMessage(x).
+            # callback(fn) -- real, concurrent, at-volume request/
+            # response traffic in both directions (main sending with a
+            # reply expected, and a worker sending to main via the bare
+            # form with a reply expected), so a leaked
+            # FestinaPendingCallback node (registered but never
+            # dispatched/removed) or a leaked reply payload box would
+            # show up here.
+            "thread_reply_callback_churn.f",
         }

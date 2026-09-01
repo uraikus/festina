@@ -1187,12 +1187,32 @@ int8_t festina_thread_is_main(void *handle);
  * delivered straight through to h's own `on_message` as its first
  * argument (the `worker:thread` parameter every `on message` handler
  * now declares). */
-void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload);
+void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload, int64_t txn_id);
 /* `postMessage(x)` called from INSIDE this thread's own body: enqueues
  * on h's own OUTBOUND queue instead -- drained on the MAIN thread only
  * (see festina_thread_drain below), never processed by the worker
  * itself. */
-void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload);
+void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload, int64_t txn_id);
+/* claude.md #217: `.reply(T)` / `NAME.postMessage(x).callback(fn)`.
+ * alloc_txn_id mints a fresh, process-wide, monotonic id (0 reserved
+ * for "no callback expected", the default on an ordinary send).
+ * register_callback records ONE pending `.callback(fn)` on `self`'s
+ * own list (self = the SENDING handle -- main's singleton, or the
+ * calling thread's own handle), called ahead of the actual send;
+ * `trampoline` is codegen-generated, unboxes a reply payload as the
+ * target's own concrete reply type and calls `user_fn` with it (one
+ * trampoline per distinct reply type, shared by every send site
+ * targeting that same thread/main). festina_thread_reply delivers a
+ * boxed reply value from `self` (the calling thread's own handle,
+ * used only to route a reply-to-main through THAT handle's own
+ * outbound queue) to `dest` (the original sender), tagged with the
+ * calling thread's own ambient "which message am I currently
+ * handling" state -- never triggers on_message on the receiving end. */
+int64_t festina_thread_alloc_txn_id(void);
+void festina_thread_register_callback(FestinaThreadHandle *self, int64_t txn_id,
+                                      void (*trampoline)(void *payload, void *user_fn),
+                                      void *user_fn);
+void festina_thread_reply(FestinaThreadHandle *self, FestinaThreadHandle *dest, void *payload);
 /* claude.md #208: registers the ONE handler for everything sent to
  * main, from any thread -- replaces the old per-thread
  * festina_thread_set_out_callback (one dynamic `NAME.onMessage(...)`

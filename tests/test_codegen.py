@@ -16552,6 +16552,117 @@ class TestThreads:
         assert result.stdout.strip() == "main done"
 
 
+class TestThreadReplyCallback:
+    """claude.md #217: `t.reply(response)` / `NAME.postMessage(x).
+    callback(fn)` -- the real, compiled-and-run counterpart to
+    tests/test_threads.py's semantic coverage."""
+
+    def test_main_to_worker_reply_round_trip(self, compile_and_run):
+        # main sends with .callback, worker's own on message fires
+        # normally (proving .reply doesn't replace ordinary delivery),
+        # then replies -- the callback fires on main with the reply
+        # value, not a second on_message dispatch.
+        source = """
+        void func onReply(r:int) {
+            log(`reply: ${r}`)
+            close(0)
+        }
+        thread worker {
+            on message(worker:thread, msg:int) {
+                log(`worker got: ${msg}`)
+                worker.reply(msg * 10)
+            }
+        }
+        worker.postMessage(21).callback(onReply)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["worker got: 21", "reply: 210"]
+
+    def test_worker_to_main_bare_reply_round_trip(self, compile_and_run):
+        # a worker sends to main via the bare form with .callback;
+        # main's own top-level on message fires normally, then replies
+        # -- the callback fires back on the WORKER's own OS thread.
+        source = """
+        void func onReply(r:int) {
+            log(`worker reply: ${r}`)
+        }
+        void func finish() {
+            close(0)
+        }
+        on message(worker:thread, msg:int) {
+            log(`main got: ${msg}`)
+            worker.reply(msg + 1)
+            // claude.md #217: the callback this send registered fires
+            // on the WORKER's own OS thread, asynchronously -- a short
+            // setTimeout (the same pattern this suite's own timer
+            // tests already use to let background work land before
+            // close()) gives it time to log before the process exits.
+            setTimeout(finish, 200)
+        }
+        thread worker {
+            on load() {
+                postMessage(5).callback(onReply)
+            }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["main got: 5", "worker reply: 6"]
+
+    def test_reply_does_not_trigger_on_message_again(self, compile_and_run):
+        # claude.md #217: `.reply()` is a completely separate delivery
+        # path -- the sender's own `on message` must NOT fire a second
+        # time when the reply arrives.
+        source = """
+        int mainMessageCount = 0
+        void func onReply(r:int) {
+            log(`callback: ${r}`)
+            close(0)
+        }
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg + 1)
+            }
+        }
+        worker.postMessage(1).callback(onReply)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # exactly one line -- the callback -- never a second on_message
+        # dispatch on the reply's own arrival
+        assert result.stdout.strip().splitlines() == ["callback: 2"]
+
+    def test_two_outstanding_replies_resolve_to_the_right_callbacks(self, compile_and_run):
+        # claude.md #217: two DIFFERENT txn ids, in flight from the
+        # SAME sender at once, must each resolve to their own callback
+        # -- not the other's.
+        source = """
+        int seen = 0
+        void func onA(r:int) {
+            log(`A: ${r}`)
+            seen = seen + 1
+            if seen == 2 { close(0) }
+        }
+        void func onB(r:int) {
+            log(`B: ${r}`)
+            seen = seen + 1
+            if seen == 2 { close(0) }
+        }
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg)
+            }
+        }
+        worker.postMessage(100).callback(onA)
+        worker.postMessage(200).callback(onB)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        lines = sorted(result.stdout.strip().splitlines())
+        assert lines == ["A: 100", "B: 200"]
+
+
 class TestThreadPools:
     """claude.md #209: `thread NAME[N] { ... }` -- real, compiled-and-
     run proof that N pool instances are genuinely independent (private

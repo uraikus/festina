@@ -47,25 +47,65 @@
 typedef enum {
     FESTINA_THREAD_MSG_ORDINARY,
     FESTINA_THREAD_MSG_GIVE_REQUEST,
+    /* claude.md #217: a `t.reply(x)` delivery -- dispatched entirely
+     * differently from ORDINARY: never calls `on_message`, instead
+     * looked up by `txn_id` in the RECEIVING handle's own pending-
+     * callback list (registered by whichever `.postMessage(x).
+     * callback(fn)` call site sent the ORIGINAL message this is a
+     * reply to) and delivered straight to that `fn`. See
+     * festina_thread_reply and the dispatch branches in
+     * festina_thread_try_dispatch_one/festina_thread_drain_impl. */
+    FESTINA_THREAD_MSG_REPLY,
 } FestinaThreadMsgKind;
 
 typedef struct FestinaThreadMsg {
     FestinaThreadMsgKind kind;
     void *payload;
-    /* claude.md #208: which thread SENT this one -- NULL for main,
-     * or the sending thread's own FestinaThreadHandle* when one
-     * thread messages another directly. Set once, at post time
-     * (festina_thread_post's own new parameter, or implicitly `h`
-     * itself in festina_thread_post_outbound, since a thread's own
-     * outbound queue can only ever be filled by that one thread),
-     * and handed straight through to whichever handler eventually
-     * dequeues this message -- see festina_thread_main's own inbound
-     * dispatch and festina_thread_drain_impl's own outbound one.
-     * Always NULL for a GIVE_REQUEST message (claude.md #213: legal
-     * only from main). */
+    /* claude.md #208: which thread SENT this one -- the main singleton
+     * (claude.md #216) for main, or the sending thread's own
+     * FestinaThreadHandle* when one thread messages another directly.
+     * Set once, at post time (festina_thread_post's own new parameter,
+     * or implicitly `h` itself in festina_thread_post_outbound, since
+     * a thread's own outbound queue can only ever be filled by that
+     * one thread), and handed straight through to whichever handler
+     * eventually dequeues this message -- see festina_thread_main's
+     * own inbound dispatch and festina_thread_drain_impl's own
+     * outbound one. Always NULL for a GIVE_REQUEST message (claude.md
+     * #213: legal only from main). */
     void *sender;
+    /* claude.md #217: 0 for an ordinary send with no callback
+     * expected; otherwise the id festina_thread_alloc_txn_id() minted
+     * for a `.postMessage(x).callback(fn)` send -- set into the
+     * calling thread's own ambient `g_current_reply_txn` right before
+     * `on_message` runs (festina_thread_try_dispatch_one /
+     * festina_thread_drain_impl), so a `t.reply(...)` call made DURING
+     * that dispatch knows which pending callback slot to satisfy. Also
+     * the lookup key on a REPLY-kind message's own receiving end. */
+    int64_t txn_id;
     struct FestinaThreadMsg *next;
 } FestinaThreadMsg;
+
+/* claude.md #217: one pending `.callback(fn)` registration, made by
+ * `.postMessage(x).callback(fn)` on the SENDING handle's own list
+ * (self-only: written and later read/removed exclusively by that one
+ * handle's own OS thread -- a thread only ever registers its OWN
+ * sends and only ever dispatches its OWN queues, main included via
+ * g_main_handle, so this list needs no lock at all, unlike in_head/
+ * out_head which genuinely cross threads). `trampoline` is codegen-
+ * generated, ONE per target (thread or main) that has a reply_type --
+ * unboxes `payload` as that target's own concrete reply type and calls
+ * `user_fn` with it; `user_fn` is the actual Festina `func[T]:void`
+ * value passed to `.callback(fn)` at this specific call site. A reply
+ * that never arrives leaves its slot here forever (a small, bounded,
+ * documented characteristic -- matches this runtime's general "a
+ * result nobody asked for again is nobody's problem" stance, not a
+ * hazard this design tries to close). */
+typedef struct FestinaPendingCallback {
+    int64_t txn_id;
+    void (*trampoline)(void *payload, void *user_fn);
+    void *user_fn;
+    struct FestinaPendingCallback *next;
+} FestinaPendingCallback;
 
 struct FestinaThreadHandle {
     pthread_t thread;
@@ -141,6 +181,14 @@ struct FestinaThreadHandle {
      * no lock is needed to read it from festina_thread_is_main. */
     int is_main;
 
+    /* claude.md #217: this handle's own pending `.callback(fn)`
+     * registrations -- see FestinaPendingCallback's own doc comment
+     * for why this needs no lock. Singly-linked, walked linearly on
+     * both insert and remove; expected volume is small (one entry per
+     * message this handle has sent expecting a reply and not yet
+     * gotten one), so no hash table is warranted. */
+    FestinaPendingCallback *pending_callbacks;
+
     struct FestinaThreadHandle *next; /* registry linked list */
 };
 
@@ -172,9 +220,33 @@ static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static FestinaThreadHandle *g_registry = NULL;
 
 static void festina_thread_free_msg_list(FestinaThreadMsg *m, void (*release_fn)(void *)) {
+    /* claude.md #217: `release_fn` is only ever correct for an
+     * ORDINARY message -- it's this THREAD's own declared inbound_
+     * type's release function, and every ordinary payload was boxed
+     * to match it. A GIVE_REQUEST payload is a small
+     * FestinaGiveRequestPayload*, never a boxed Festina value at all
+     * (calling release_fn on it would be a genuine type-confusion
+     * crash, a pre-existing latent bug this phase's own REPLY case
+     * made worth fixing alongside); its own small wrapper struct is
+     * freed directly instead (a documented, narrow gap: the
+     * connection it names is simply never returned to any listener --
+     * kill()'ing a thread mid-hand-off is rare enough not to warrant
+     * reaching into festina_runtime_http.c's own machinery here). A
+     * REPLY payload WAS boxed the same way an ordinary send is, but
+     * this generic cleanup function has no way to know which
+     * reply_type it is (that varies per SENDER, unlike inbound_type,
+     * which is fixed per receiving thread) -- left unreleased, the
+     * same narrow, documented leak FestinaPendingCallback's own doc
+     * comment already accepts for "a reply that never arrives" (this
+     * is that same case, just via kill() instead of simply never
+     * calling .reply()). */
     while (m) {
         FestinaThreadMsg *next = m->next;
-        release_fn(m->payload);
+        if (m->kind == FESTINA_THREAD_MSG_ORDINARY) {
+            release_fn(m->payload);
+        } else if (m->kind == FESTINA_THREAD_MSG_GIVE_REQUEST) {
+            free(m->payload);
+        }
         free(m);
         m = next;
     }
@@ -192,6 +264,118 @@ static void festina_thread_free_msg_list(FestinaThreadMsg *m, void (*release_fn)
  * this call), and sets *killed_out if kill_requested was seen while
  * holding the lock (the caller must stop, exactly like the old
  * inline check did). */
+/* claude.md #217: "which pending callback is THIS thread currently
+ * answering, if any" -- 0 (no callback pending) unless the message
+ * currently being dispatched on THIS calling thread was sent via
+ * `.postMessage(x).callback(fn)`. Set right before `on_message` runs
+ * (both dispatch points below), read by festina_thread_reply when a
+ * `t.reply(...)` call happens during that SAME dispatch. `__thread`,
+ * not a plain global -- every thread dispatches its own queue
+ * independently and concurrently, so this must never be shared (the
+ * same invariant every other piece of per-thread dispatch state in
+ * this runtime already keeps, e.g. festina_runtime_http.c's own
+ * connection tables after claude.md #212). */
+static __thread int64_t g_current_reply_txn = 0;
+
+/* claude.md #217: one atomic, process-wide, monotonic counter for
+ * `.postMessage(x).callback(fn)`'s own txn ids -- mirrors
+ * festina_runtime_http.c's own g_next_conn_id/g_next_conn_id_lock
+ * exactly (mutex-protected rather than a compiler intrinsic, matching
+ * this runtime's own established convention for this exact shape of
+ * counter). Ids never repeat for the life of the process; 0 is
+ * reserved to mean "no callback expected" (FestinaThreadMsg's own
+ * default), so this starts at 1. */
+static int64_t g_next_txn_id = 1;
+static pthread_mutex_t g_next_txn_id_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int64_t festina_thread_alloc_txn_id(void) {
+    pthread_mutex_lock(&g_next_txn_id_lock);
+    int64_t id = g_next_txn_id++;
+    pthread_mutex_unlock(&g_next_txn_id_lock);
+    return id;
+}
+
+/* claude.md #217: records ONE pending `.callback(fn)` on `self`'s own
+ * list -- `self` is always the SENDING handle (the main singleton, or
+ * the calling thread's own handle), and this list is only ever
+ * written and later read/removed by that SAME handle's own OS thread
+ * (see FestinaPendingCallback's own doc comment for why that needs no
+ * lock). Called ahead of the actual send (festina_thread_post/
+ * _post_outbound), so the slot already exists by the time any reply
+ * could possibly arrive. */
+void festina_thread_register_callback(FestinaThreadHandle *self, int64_t txn_id,
+                                      void (*trampoline)(void *payload, void *user_fn),
+                                      void *user_fn) {
+    FestinaPendingCallback *cb = malloc(sizeof(*cb));
+    if (!cb) festina_fail("out of memory registering a reply callback");
+    cb->txn_id = txn_id;
+    cb->trampoline = trampoline;
+    cb->user_fn = user_fn;
+    cb->next = self->pending_callbacks;
+    self->pending_callbacks = cb;
+}
+
+/* claude.md #217: `t.reply(x)` -- `self` is the CALLING thread's own
+ * handle (the main singleton, or self._current_thread_ctx's handle at
+ * the codegen level), needed ONLY to route a reply-to-main through
+ * THAT handle's own outbound queue (the exact path an ordinary bare
+ * `postMessage(x)` already uses to reach main -- see
+ * festina_thread_post_outbound); `dest` is WHERE this reply is going
+ * (the `worker`/`t` value the handler was itself called with -- the
+ * original sender, main's own singleton included). Reads the ambient
+ * g_current_reply_txn (set by whichever dispatch point below is
+ * currently running `on_message` on this SAME calling thread) to tag
+ * the delivered message -- this is what lets the eventual receiver
+ * find the right pending-callback slot. Does NOT invoke on_message on
+ * the receiving end at all; see festina_thread_try_dispatch_one's own
+ * REPLY branch and festina_thread_drain_impl's own. */
+void festina_thread_reply(FestinaThreadHandle *self, FestinaThreadHandle *dest, void *payload) {
+    FestinaThreadMsg *m = malloc(sizeof(*m));
+    if (!m) festina_fail("out of memory replying to a thread message");
+    m->kind = FESTINA_THREAD_MSG_REPLY;
+    m->payload = payload;
+    m->sender = self;
+    m->txn_id = g_current_reply_txn;
+    m->next = NULL;
+    if (dest->is_main) {
+        pthread_mutex_lock(&self->out_lock);
+        if (self->out_tail) self->out_tail->next = m; else self->out_head = m;
+        self->out_tail = m;
+        pthread_mutex_unlock(&self->out_lock);
+    } else {
+        pthread_mutex_lock(&dest->in_lock);
+        if (dest->in_tail) dest->in_tail->next = m; else dest->in_head = m;
+        dest->in_tail = m;
+        pthread_mutex_unlock(&dest->in_lock);
+        pthread_cond_signal(&dest->in_cond);
+    }
+}
+
+/* claude.md #217: looks up and removes ONE pending callback from `h`'s
+ * own list by txn_id (see FestinaPendingCallback's own doc comment on
+ * why this needs no lock) -- returns 1 and runs it (unboxing/releasing
+ * the payload, calling the user's own fn) if found, 0 (a defensive,
+ * should-never-happen case: this runtime's own static enforcement --
+ * semantic.py's ".callback() required" check -- guarantees every
+ * REPLY-kind message's txn_id was genuinely registered by whoever sent
+ * the original message) otherwise, in which case `payload` is
+ * deliberately left unreleased rather than guessed at with the wrong
+ * release function. */
+static int festina_thread_dispatch_reply(FestinaThreadHandle *h, int64_t txn_id, void *payload) {
+    FestinaPendingCallback **link = &h->pending_callbacks;
+    while (*link) {
+        if ((*link)->txn_id == txn_id) {
+            FestinaPendingCallback *cb = *link;
+            *link = cb->next;
+            cb->trampoline(payload, cb->user_fn);
+            free(cb);
+            return 1;
+        }
+        link = &(*link)->next;
+    }
+    return 0;
+}
+
 static int festina_thread_try_dispatch_one(FestinaThreadHandle *h, int *killed_out) {
     pthread_mutex_lock(&h->in_lock);
     if (h->kill_requested) {
@@ -225,7 +409,17 @@ static int festina_thread_try_dispatch_one(FestinaThreadHandle *h, int *killed_o
         free(msg);
         return 1;
     }
+    if (msg->kind == FESTINA_THREAD_MSG_REPLY) {
+        /* claude.md #217: never touches on_message/in_release at all
+         * -- dispatched straight to whichever `.callback(fn)` this
+         * thread's own earlier send registered. */
+        festina_thread_dispatch_reply(h, msg->txn_id, msg->payload);
+        free(msg);
+        return 1;
+    }
+    g_current_reply_txn = msg->txn_id;
     if (h->on_message) h->on_message(msg->sender, msg->payload);
+    g_current_reply_txn = 0;
     h->in_release(msg->payload);
     free(msg);
     return 1;
@@ -349,12 +543,13 @@ void festina_thread_spawn(FestinaThreadHandle *h) {
     }
 }
 
-void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload) {
+void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload, int64_t txn_id) {
     FestinaThreadMsg *m = malloc(sizeof(*m));
     if (!m) festina_fail("out of memory posting a thread message");
     m->kind = FESTINA_THREAD_MSG_ORDINARY;
     m->payload = payload;
     m->sender = sender;
+    m->txn_id = txn_id;
     m->next = NULL;
     pthread_mutex_lock(&h->in_lock);
     if (h->in_tail) h->in_tail->next = m; else h->in_head = m;
@@ -363,7 +558,7 @@ void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload) {
     pthread_cond_signal(&h->in_cond);
 }
 
-void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload) {
+void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload, int64_t txn_id) {
     /* Called from INSIDE this thread's own on_load/on_message/on_exit
      * -- i.e. always from h's own single worker thread, never
      * concurrently with itself, so out_lock only ever needs to
@@ -371,12 +566,15 @@ void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload) {
      * claude.md #208: `sender` is always `h` itself here -- a
      * thread's own outbound queue can only ever be filled by that
      * one thread's own bare postMessage(x), so there is no separate
-     * sender argument to take. */
+     * sender argument to take. claude.md #217: `txn_id` is 0 for an
+     * ordinary send, or a real allocated id when `.callback(fn)` was
+     * chained -- see festina_thread_post's own identical parameter. */
     FestinaThreadMsg *m = malloc(sizeof(*m));
     if (!m) festina_fail("out of memory posting a thread outbound message");
     m->kind = FESTINA_THREAD_MSG_ORDINARY;
     m->payload = payload;
     m->sender = h;
+    m->txn_id = txn_id;
     m->next = NULL;
     pthread_mutex_lock(&h->out_lock);
     if (h->out_tail) h->out_tail->next = m; else h->out_head = m;
@@ -442,6 +640,27 @@ void festina_thread_kill(FestinaThreadHandle *h) {
     h->kill_requested = 0; /* reset so a later festina_thread_live can reuse this handle */
     pthread_mutex_unlock(&h->in_lock);
     festina_thread_free_msg_list(leftover, h->in_release);
+
+    /* claude.md #217: any `.callback(fn)` THIS thread itself registered
+     * (for a send it made before dying) can now never be dispatched --
+     * nothing will ever deliver a matching REPLY to a dead handle's
+     * queue, and a LATER live() respawning this same handle must not
+     * inherit stale registrations from a previous life (a genuinely
+     * unrelated future send could reuse the very same txn id -- ids
+     * are only ever unique per-SENDER's own list, never checked
+     * against a handle's past). Freed, never invoked -- `fn` firing
+     * "after" its own thread died would be a phantom callback nobody
+     * asked for. h->pending_callbacks is self-only (see
+     * FestinaPendingCallback's own doc comment), and kill() has just
+     * pthread_join()'d this handle's own OS thread, so nothing else
+     * can be touching this list here either. */
+    FestinaPendingCallback *cb = h->pending_callbacks;
+    h->pending_callbacks = NULL;
+    while (cb) {
+        FestinaPendingCallback *next = cb->next;
+        free(cb);
+        cb = next;
+    }
 }
 
 void festina_thread_live(FestinaThreadHandle *h, void (*callback)(int8_t alive)) {
@@ -492,8 +711,15 @@ static void festina_thread_drain_impl(void) {
      * __festina_main() runs) and is only ever walked from the main
      * thread, so a lock here only needs to protect against a
      * (nonexistent, in practice) concurrent register -- taken anyway
-     * for the same reason festina_thread_outstanding_impl does. */
-    if (!g_global_message_handler) return; /* claude.md #208: nothing registered at all -- nothing to drain to */
+     * for the same reason festina_thread_outstanding_impl does.
+     *
+     * claude.md #217: unlike before, this can NOT early-return just
+     * because g_global_message_handler is NULL (no top-level `on
+     * message` declared) -- main can still legitimately send
+     * `NAME.postMessage(x).callback(fn)` with no top-level `on
+     * message` of its own at all, and a REPLY-kind message answering
+     * one of those must still be drained and dispatched to
+     * g_main_handle's own pending_callbacks regardless. */
     pthread_mutex_lock(&g_registry_lock);
     FestinaThreadHandle *list = g_registry;
     pthread_mutex_unlock(&g_registry_lock);
@@ -504,8 +730,20 @@ static void festina_thread_drain_impl(void) {
         pthread_mutex_unlock(&h->out_lock);
         while (done) {
             FestinaThreadMsg *next = done->next;
-            g_global_message_handler(done->sender, done->payload);
-            h->out_release(done->payload);
+            if (done->kind == FESTINA_THREAD_MSG_REPLY) {
+                /* claude.md #217: a worker replying to something main
+                 * sent it -- dispatched straight to g_main_handle's
+                 * own pending_callbacks, never through
+                 * g_global_message_handler at all. */
+                festina_thread_dispatch_reply(&g_main_handle, done->txn_id, done->payload);
+            } else {
+                if (g_global_message_handler) {
+                    g_current_reply_txn = done->txn_id;
+                    g_global_message_handler(done->sender, done->payload);
+                    g_current_reply_txn = 0;
+                }
+                h->out_release(done->payload);
+            }
             free(done);
             done = next;
         }

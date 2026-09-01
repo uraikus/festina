@@ -3049,6 +3049,59 @@ than one shape to the same receiver needs a pre-declared `enum`
 covering all of them, exactly like an ordinary function parameter
 would.
 
+**Request/response: `.reply(response)` / `.postMessage(x).callback(fn)`.**
+`on message`'s own `worker`/`t` parameter — the value identifying who
+sent a message — has one method beyond `.main` (above): `t.reply(x)`
+sends `x` straight back to whoever sent the message currently being
+handled, completely bypassing `on message` on the receiving end (it
+never fires there) and instead running whichever `.callback(fn)` the
+original sender attached:
+
+```festina
+thread worker {
+    on message(worker:thread, msg:int) {
+        worker.reply(msg * 2)      // answers THIS message's own sender
+    }
+}
+void func onDoubled(result:int) { log(result) }
+worker.postMessage(21).callback(onDoubled)   // logs 42
+```
+
+A thread's (or main's) own **reply type** isn't declared separately —
+it's fixed by the first `t.reply(...)` call found anywhere in that
+receiver's own body, and every later one is checked against it the
+same way an ordinary parameter type is (an `enum` works here too, for
+more than one reply shape). Once a receiver has a reply type, **every**
+`.postMessage(x)` call site targeting it — the bare form included, for
+a worker sending to main — must chain `.callback(fn)` (with
+`fn:func[ReplyType]:void`), or it's a compile error: nothing would
+ever be able to receive a reply that thread might send. Chaining
+`.callback(fn)` onto a target that never calls `.reply()` at all is
+equally a compile error, for the same reason in reverse. This works in
+either direction — main replying to a worker, or a worker replying to
+main or to another worker — and `fn` always runs back on whichever
+side originally sent the message, on that side's own OS thread.
+
+**`fn`'s own body is ordinary code, not thread-isolated — running it
+off main is a real responsibility, not just a detail.** `fn` is a
+plain top-level `func`, so it's free to read/write top-level
+variables; unlike a thread's own `on message` (which the compiler
+blocks from touching top-level state at all), nothing stops `fn` from
+doing so here, and when `fn` was registered by a worker's own send
+(the bare form, or one worker messaging another directly), it runs
+back on *that worker's* OS thread — genuinely concurrently with main
+and every other thread, not marshaled onto main the way `blob`/`img`/
+`aud`'s own `.callback()` is. Two different callbacks touching the
+same top-level variable from two different threads is a real data
+race, caught directly during this feature's own development (a first
+draft of its own stress test raced on exactly this and was rewritten
+once ThreadSanitizer flagged it). Keep an `fn` registered by a
+worker's own send limited to state only that one worker's own replies
+ever touch, or relay the result onward through another `postMessage`
+(itself always safe — every queue this runtime uses is its own
+plain mutex-protected structure) rather than writing to shared state
+directly.
+
 `kill()`/`live()`/`isAlive()` (below) stay callable **only** from the
 main program — a thread may message another thread, but may not
 control its lifecycle.

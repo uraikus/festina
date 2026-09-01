@@ -668,6 +668,115 @@ class TestThreadDatabaseUrl:
             semantic.analyze(parser.parse(source))
 
 
+class TestReplyCallback:
+    """claude.md #217: `t.reply(response)` / `NAME.postMessage(x).
+    callback(fn)`."""
+
+    def test_reply_and_callback_round_trip_type_checks(self, parser, semantic):
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg * 2)
+            }
+        }
+        void func onReply(r:int) { log(r) }
+        worker.postMessage(21).callback(onReply)
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_bare_postmessage_without_callback_when_target_replies_is_rejected(
+            self, parser, semantic, errors):
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg * 2)
+            }
+        }
+        worker.postMessage(21)
+        """
+        with pytest.raises(errors.CompileError, match="must chain '.callback\\(fn\\)'"):
+            semantic.analyze(parser.parse(source))
+
+    def test_callback_on_a_target_that_never_replies_is_rejected(self, parser, semantic, errors):
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                log(msg)
+            }
+        }
+        void func onReply(r:int) { log(r) }
+        worker.postMessage(21).callback(onReply)
+        """
+        with pytest.raises(errors.CompileError, match="requires a target that replies"):
+            semantic.analyze(parser.parse(source))
+
+    def test_callback_type_mismatch_is_rejected(self, parser, semantic, errors):
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg * 2)
+            }
+        }
+        void func onReply(r:text) { log(r) }
+        worker.postMessage(21).callback(onReply)
+        """
+        with pytest.raises(errors.CompileError, match="callback\\(\\) expects func\\[int\\]:void"):
+            semantic.analyze(parser.parse(source))
+
+    def test_reply_type_is_fixed_by_the_first_call_and_enforced_after(
+            self, parser, semantic, errors):
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg)
+                worker.reply('not an int')
+            }
+        }
+        void func onReply(r:int) { log(r) }
+        worker.postMessage(21).callback(onReply)
+        """
+        with pytest.raises(errors.CompileError, match="reply\\(\\) argument"):
+            semantic.analyze(parser.parse(source))
+
+    def test_main_can_reply_to_a_worker_that_sends_via_bare_postmessage(self, parser, semantic):
+        source = """
+        void func onReply(r:int) { log(r) }
+        on message(worker:thread, msg:int) {
+            worker.reply(msg + 1)
+        }
+        thread worker {
+            on load() { postMessage(5).callback(onReply) }
+        }
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_bare_postmessage_to_main_without_callback_when_main_replies_is_rejected(
+            self, parser, semantic, errors):
+        source = """
+        on message(worker:thread, msg:int) {
+            worker.reply(msg + 1)
+        }
+        thread worker {
+            on load() { postMessage(5) }
+        }
+        """
+        with pytest.raises(errors.CompileError, match="must chain '.callback\\(fn\\)'"):
+            semantic.analyze(parser.parse(source))
+
+    def test_reply_is_legal_only_on_the_generic_thread_type(self, parser, semantic, errors):
+        # `.reply` is only recognized on a value of the GENERIC `thread`
+        # type (a `worker`/`t` parameter) -- calling it as a plain
+        # method name on anything else falls through to an ordinary
+        # "unknown method" error, not a silent no-op.
+        source = """
+        struct Circle { x:int }
+        Circle c = { x: 1 }
+        c.reply(1)
+        """
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(parser.parse(source))
+
+
 class TestThreadReservedName:
     def test_postmessage_cannot_be_declared_as_a_function(self, parser, semantic, errors):
         program = parser.parse("void func postMessage() { }")
