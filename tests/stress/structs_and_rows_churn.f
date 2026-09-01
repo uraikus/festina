@@ -153,8 +153,12 @@ while i < 400 {
     free sums
     if keepSum.biggest == null { log('unreachable') }
 
-    // Scalar queries have their own path.
-    total = total + sqliteInt('SELECT count(*) FROM Person')
+    // A one-row, one-column-aliased query round-tripped through a
+    // struct -- the ordinary sqlite() path now covers what used to be
+    // a separate scalar-query convenience call (claude.md #219 removed
+    // sqliteInt/sqliteFloat/sqliteText).
+    arr[Summary] counted = sqlite('SELECT count(*) AS total FROM Person')
+    total = total + counted[0].total
     i = i + 1
 }
 log(total)

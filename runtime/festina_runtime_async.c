@@ -122,15 +122,26 @@ void festina_async_io_run(void *payload, void (*work_fn)(void *),
 }
 
 static int64_t festina_async_io_outstanding_impl(void) {
-    /* No lock -- an int64_t read/write is atomic enough for this
-     * runtime's own existing conventions (the http pool's own
-     * g_async_outstanding is read the same unlocked way from
-     * festina_run_http_loop), and the exact count doesn't matter here,
-     * only whether it's zero -- a one-tick-stale nonzero answer just
-     * means one extra harmless poll iteration, never a missed drain
-     * (g_done_head is always checked under the lock in the drain
-     * function itself, regardless of what this returns). */
-    return g_outstanding;
+    /* claude.md #222: locked, unlike this runtime's other "a plain read
+     * is atomic enough" counters (e.g. festina_thread_is_alive's own
+     * `alive` field) -- those are all written by exactly ONE thread
+     * (the owning thread itself) and read from others, where a single
+     * aligned int64_t read/write genuinely can't tear. g_outstanding
+     * stopped fitting that shape the moment a WORKER thread could call
+     * festina_async_io_run (via a bare `.postMessage(x).callback(fn)`
+     * reply marshaled onto main -- see festina_thread_dispatch_reply
+     * in festina_runtime_thread.c): this is now a genuine multi-WRITER
+     * counter (main's own program code, any number of worker threads),
+     * so an unlocked read is a real, ThreadSanitizer-confirmed data
+     * race, not just an overly cautious label -- caught directly by
+     * scripts/thread_tsan_stress.sh the first time this path was ever
+     * exercised from a thread other than main. Called every loop
+     * iteration from main only, so the lock is uncontended in the
+     * common case and cheap regardless. */
+    pthread_mutex_lock(&g_lock);
+    int64_t n = g_outstanding;
+    pthread_mutex_unlock(&g_lock);
+    return n;
 }
 
 static void festina_async_io_drain_impl(void) {

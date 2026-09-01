@@ -50,8 +50,8 @@ thread dbWorker {
     DatabaseURL = 'worker_db_churn.sqlite'
     on message(worker:thread, msg:int) {
         sqlite('INSERT INTO Ping (n) VALUES (?)', [msg])
-        int total = sqliteInt('SELECT count(*) FROM Ping')
-        postMessage(total)
+        arr[Ping] counted = sqlite('SELECT count(*) AS n FROM Ping')
+        postMessage(counted[0].n)
     }
 }
 
@@ -62,7 +62,8 @@ while i < DB_TOTAL {
     // dbWorker's own -- this is the whole point of this file (see the
     // top comment).
     sqlite('INSERT INTO MainCounter (n) VALUES (?)', [i])
-    int mainTotal = sqliteInt('SELECT count(*) FROM MainCounter')
+    arr[MainCounter] counted = sqlite('SELECT count(*) AS n FROM MainCounter')
+    int mainTotal = counted[0].n
     if mainTotal != i + 1 {
         log('main counter mismatch')
         close(1)

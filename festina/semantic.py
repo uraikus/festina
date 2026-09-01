@@ -35,6 +35,7 @@ bottom of analyze()).
 from . import ast
 import dataclasses
 import math
+import os
 
 from . import types as types_mod
 from .errors import CompileError
@@ -125,9 +126,6 @@ BUILTIN_FUNCTIONS = {
     # claude.md #182: showCursor()/hideCursor() -- toggles the mouse
     # cursor's visibility over the canvas.
     "showCursor", "hideCursor",
-    # claude.md #94: single-value queries, so a scalar result needs no
-    # throwaway `table` declaration (which would create a real table).
-    "sqliteInt", "sqliteFloat", "sqliteText",
     # claude.md #131: exits the program with `code`, running a declared
     # `on exit(code:int)` handler first (see _EVENT_SIGNATURES below) --
     # works with or without a window, unlike mouseDown/.../close's on-
@@ -207,10 +205,6 @@ _BUILTIN_RETURN_TYPES = {
     # claude.md #135: saveCanvas's return type now depends on its own
     # arity (bool with a path, img without) -- handled by its own
     # dedicated branch in _infer_call, not this fixed-per-name table.
-    # claude.md #94
-    "sqliteInt": types_mod.PrimitiveType("int"),
-    "sqliteFloat": types_mod.PrimitiveType("float"),
-    "sqliteText": types_mod.PrimitiveType("text"),
     # claude.md #132
     "mkdir": types_mod.PrimitiveType("bool"),
     "ls": types_mod.ArrayType(types_mod.PrimitiveType("text")),
@@ -428,11 +422,16 @@ _BUILTIN_SIGNATURES = {
 _COLOR = types_mod.ColorType()
 _FONT = types_mod.FontType()
 
-# claude.md #33/#94: every builtin taking (sql, [params]) -- the bound
-# parameter list is a literal array that is explicitly allowed to mix
-# types, so all of them need the same carve-out from the ordinary
-# same-element-type array rule.
-_SQLITE_BUILTINS = frozenset({"sqlite", "sqliteInt", "sqliteFloat", "sqliteText"})
+# claude.md #33/#94/#219: every builtin taking (sql, [params]) -- the
+# bound parameter list is a literal array that is explicitly allowed to
+# mix types, so it needs a carve-out from the ordinary same-element-type
+# array rule. `sqliteInt`/`sqliteFloat`/`sqliteText` (claude.md #94's
+# own single-value-query convenience wrappers) were removed in claude.md
+# #219 -- `sqlite()` itself is the only member left, but this stays a
+# named set (not an inline `name == "sqlite"` check) since every call
+# site below reads as "one of the sql-taking builtins", which is still
+# the real question being asked even with one member.
+_SQLITE_BUILTINS = frozenset({"sqlite"})
 
 _BUILTIN_SIGNATURE_ALTERNATES = {
     # claude.md #91: the one-argument form takes a `color` value, not a
@@ -863,25 +862,18 @@ def _check_message_handler_params(params, node, filename, structs, tables, enums
 # that one private Cairo surface, confirmed safe for concurrent use of
 # DIFFERENT surfaces on different threads. `blankImage` is deliberately
 # NOT here for the identical reason -- it only ever creates a fresh,
-# private surface, nothing shared. `sqlite`/`sqliteInt`/`sqliteFloat`/
-# `sqliteText` are deliberately NOT here (claude.md #199 Phase 5) --
-# each is gated by its own dedicated check in _infer_call instead,
-# since the answer depends on THIS thread's own `database_url` (a
-# thread that declared its own `DatabaseURL` may call them; one that
-# didn't may not), a per-thread question this flat, unconditional set
+# private surface, nothing shared. `sqlite` is deliberately NOT here
+# (claude.md #199 Phase 5) -- it's gated by its own dedicated check in
+# _infer_call instead, since the answer depends on THIS thread's own
+# `database_url` (a thread that declared its own `DatabaseURL` may call
+# it; one that didn't may not), a per-thread question this flat, unconditional set
 # has no way to represent. `exec` is ALSO deliberately not here
-# (claude.md #211) -- the 1-argument (blocking) form's own fork/
-# execvp/waitpid touches no shared state at all (confirmed directly
-# by reading festina_run_argv), but the 2-argument
-# (`exec(args, callback)`, non-blocking) form's own callback is
-# documented to run on MAIN's OS thread regardless of which thread
-# dispatched it (confirmed directly: festina_process_exec_dispatch's
-# own worker only ever computes the exit code; the trampoline that
-# actually invokes the callback runs from festina_async_io_dispatch's
-# own main-thread drain step) -- a real cross-thread-isolation
-# violation the arity alone can't express as a flat name-only set, so
-# `exec` gets its own dedicated arity-aware check instead, mirroring
-# the sqlite one's own shape. `regex`/`mkdir`/`ls` are NOT here either
+# (claude.md #211) -- its only remaining form (claude.md #221 removed
+# the non-blocking `exec(args, callback)` form, whose callback ran on
+# MAIN's OS thread regardless of which thread dispatched it -- a real
+# cross-thread-isolation violation) is the blocking, 1-argument one,
+# whose own fork/execvp/waitpid touches no shared state at all
+# (confirmed directly by reading festina_run_argv). `regex`/`mkdir`/`ls` are NOT here either
 # (claude.md #211) -- confirmed safe by reading each: `regex()`'s own
 # memoization slot is a per-CALL-SITE codegen-generated global
 # (`_regex_memo_slots`, keyed by `id(Call node)`), lexically private
@@ -1094,8 +1086,8 @@ class _ThreadInfo:
         # claude.md #199 Phase 5: this thread's own resolved
         # `DatabaseURL = '<literal>'` first statement (None if it
         # never declared one) -- a thread with one gets its own
-        # private sqlite handle and may call sqlite()/sqliteInt()/
-        # sqliteFloat()/sqliteText(); one without one may not.
+        # private sqlite handle and may call sqlite(); one without
+        # one may not.
         # `database_url_node` is kept only for the whole-program
         # conflict check's own error reporting.
         self.database_url = None
@@ -1113,8 +1105,7 @@ class _ThreadInfo:
         # _THREAD_HTTP_HANDLER_NAMES) -- gates openPort()/closePort()/
         # openSecurePort() for this thread (see _infer_call), the same
         # "gate the builtin on a per-thread capability" shape
-        # `database_url` already gives sqlite()/sqliteInt()/
-        # sqliteFloat()/sqliteText().
+        # `database_url` already gives sqlite().
         self.has_http_handler = False
         # claude.md #213 (Phase 5 -- giveRequest): WHICH of the four
         # this thread declared, by name -- has_http_handler alone
@@ -2549,8 +2540,7 @@ def analyze(program, filename="<string>"):
                 if name in _SQLITE_BUILTINS and _current_thread[0].database_url is None:
                     # claude.md #199 Phase 5: unlike every OTHER
                     # disallowed builtin (a flat, unconditional "never
-                    # from a thread body"), sqlite()/sqliteInt()/
-                    # sqliteFloat()/sqliteText() are allowed for a
+                    # from a thread body"), sqlite() is allowed for a
                     # thread that declared its own private database --
                     # its own separate sqlite3* handle, never crossing
                     # threads, is exactly what makes this safe (see
@@ -2565,29 +2555,6 @@ def analyze(program, filename="<string>"):
                         f"its own database (a thread's first statement may be "
                         f"DatabaseURL = '<path>', giving it a private sqlite "
                         f"handle no other thread or the main program shares)",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
-                if name == "exec" and len(expr.args) == 2:
-                    # claude.md #211: unlike the flat _THREAD_DISALLOWED_
-                    # BUILTINS set just below, `exec`'s own safety
-                    # depends on ARITY, not just its name -- the
-                    # blocking 1-argument form is fine (see this
-                    # module's own comment above _THREAD_DISALLOWED_
-                    # BUILTINS for the confirmed-by-reading reasoning);
-                    # the non-blocking 2-argument form's own callback
-                    # always runs on MAIN's OS thread regardless of
-                    # which thread dispatched it, a real cross-thread-
-                    # isolation violation. Checked here, ahead of the
-                    # flat set (which no longer even lists `exec`), so
-                    # this gets its own specific reason instead of the
-                    # generic "touches shared state" one.
-                    raise CompileError(
-                        f"'exec(args, callback)' cannot be called from inside a "
-                        f"thread body -- its callback always runs on the main "
-                        f"program's own OS thread, regardless of which thread "
-                        f"dispatched it; 'exec(args)' (the blocking, 1-argument "
-                        f"form) is fine",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
@@ -2729,20 +2696,19 @@ def analyze(program, filename="<string>"):
                         category="invalid function argument type",
                     )
                 return _BOOL
-            # claude.md #150/#177: exec(args) -> int (unchanged,
-            # blocking) or exec(args, callback) -> void (new,
-            # non-blocking -- callback receives the real exit code once
-            # the spawned process exits). Return type depends on arity
-            # the same way saveCanvas's own does, so this owns both
-            # shapes in one place rather than splitting exec() across
-            # the generic _BUILTIN_SIGNATURES dict (which can express
-            # neither the arity-dependent return type nor a structurally
-            # -checked callback argument) and a second dedicated branch.
+            # claude.md #150: exec(args) -> int -- spawns args[0] with
+            # args[1:] as its own argv, blocking until it exits, and
+            # answers its real exit code. claude.md #177's own
+            # non-blocking exec(args, callback) form was removed in
+            # claude.md #221 (its callback always ran on main's own OS
+            # thread regardless of which thread dispatched it -- a real
+            # cross-thread-isolation hazard for a language whose whole
+            # thread story is "no shared mutable state to race on" --
+            # so only the always-safe blocking form remains).
             if name == "exec":
-                if len(expr.args) not in (1, 2):
+                if len(expr.args) != 1:
                     raise CompileError(
-                        f"exec() expects 1 argument (args) or 2 (args, and a "
-                        f"callback), got {len(expr.args)}",
+                        f"exec() expects 1 argument (args), got {len(expr.args)}",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
@@ -2755,28 +2721,7 @@ def analyze(program, filename="<string>"):
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
-                if len(expr.args) == 1:
-                    return _INT
-                # claude.md #177: checked structurally, the same
-                # permissive way blob/img/aud's own `.callback()`
-                # already is -- any func[int]:void-typed EXPRESSION,
-                # not restricted to a bare declared-function name the
-                # way setTimeout's own older callback rule is. First-
-                # class function values (claude.md #141) postdate that
-                # restriction; blob/img/aud's `.callback()` already
-                # established the newer, correct precedent this follows.
-                fn_type = infer(expr.args[1], scope)
-                if (not isinstance(fn_type, types_mod.FuncType)
-                        or len(fn_type.param_types) != 1
-                        or fn_type.return_type is not None
-                        or fn_type.param_types[0] != _INT):
-                    raise CompileError(
-                        f"exec()'s second argument expects func[int]:void, "
-                        f"found {types_mod.type_name(fn_type)}",
-                        file=filename, line=callee.line, column=callee.column,
-                        category="invalid function argument type",
-                    )
-                return None
+                return _INT
             if name in ("fail", "troubleshoot"):
                 # claude.md #158: fail(message) is unchanged (1 argument,
                 # any type -- coerced to text at codegen, same as
@@ -5095,6 +5040,35 @@ def analyze(program, filename="<string>"):
         scope = Scope(parent_scope)
         for stmt in block.body:
             analyze_statement(stmt, scope, return_type, loop_depth)
+
+    # claude.md #220: `thread NAME[] { ... }` -- empty brackets, no
+    # literal N -- resolves its own pool size HERE, before anything
+    # else in this function ever reads a ThreadDecl's `pool_size`. The
+    # parser leaves the sentinel string `"auto"` in place (see
+    # parse_thread_decl's own comment); this pass mutates it in place
+    # into a real positive int, so every later reader -- the rest of
+    # this file, all of codegen.py -- never has to know "auto" existed.
+    #
+    # The rule: os.cpu_count() (the machine COMPILING the program, not
+    # necessarily the one that later runs it -- see claude.md #220's
+    # own entry for why compile time was chosen over run time) minus
+    # every OTHER thread the program declares, floored at 1. "Every
+    # other thread" counts an ordinary singleton as 1 and an explicit
+    # `NAME[N]` pool as N; another `NAME[]` auto pool is deliberately
+    # NOT counted here (each auto pool sizes itself independently
+    # against the same fixed total, rather than trying to solve a
+    # system of equations between them -- simple and order-independent,
+    # at the cost of two auto pools on the same machine each getting
+    # the full remaining budget rather than splitting it).
+    _fixed_thread_total = sum(
+        1 if stmt.pool_size is None else stmt.pool_size
+        for stmt in program.body
+        if isinstance(stmt, ast.ThreadDecl) and stmt.pool_size != "auto"
+    )
+    _cpu_count = os.cpu_count() or 1
+    for stmt in program.body:
+        if isinstance(stmt, ast.ThreadDecl) and stmt.pool_size == "auto":
+            stmt.pool_size = max(1, _cpu_count - _fixed_thread_total)
 
     # claude.md #106: every struct and table NAME is registered before
     # any of their fields resolve, so declaration order stops mattering.

@@ -1715,28 +1715,22 @@ void *festina_argv_array(int argc, char **argv) {
     return festina_pieces_finish(&p);
 }
 
-/* ---- claude.md #150: exec(); extended by the exec(args, callback)
- * non-blocking form below (a new claude.md entry) ---- */
+/* ---- claude.md #150: exec() ---- */
 
-/* claude.md #150 (widened): the actual "run this NULL-terminated argv,
- * return the real exit code" logic, one #if branch per platform,
- * extracted out of festina_process_exec below so BOTH the synchronous
- * exec() path and the new non-blocking exec(args, callback) worker
- * (further down) share exactly one copy of this -- particularly the
- * POSIX branch's self-pipe fork/exec/waitpid dance, which is exactly
- * the kind of subtle, easy-to-regress logic that must never exist in
- * two places. Takes an already NULL-terminated argv (no header
- * decoding, no ownership of the strings/array it's given) -- callers
- * decide separately whether that argv borrows its strings (the
- * synchronous path, safe since the caller's own arr[text] outlives the
- * call) or owns independent copies (the async path, needed since its
- * own worker runs after the caller's array may already be gone -- see
- * festina_process_exec_dispatch below). fork() in a multithreaded
- * process only duplicates the calling thread into the child, which
- * execvp()'s immediately after (the standard, safe "fork then exec
- * right away" pattern), and waitpid() here always targets this exact
- * child's own pid, never a wildcard -- so this is just as safe to call
- * from a worker thread as from the main one. */
+/* claude.md #150: the actual "run this NULL-terminated argv, return
+ * the real exit code" logic, one #if branch per platform, extracted
+ * out of festina_process_exec below -- particularly the POSIX
+ * branch's self-pipe fork/exec/waitpid dance, which is exactly the
+ * kind of subtle, easy-to-regress logic that must never exist in two
+ * places. Takes an already NULL-terminated argv (no header decoding,
+ * no ownership of the strings/array it's given) -- the caller's own
+ * arr[text] outlives this whole synchronous call, so these entries can
+ * safely borrow its strings rather than copying them. fork() in a
+ * multithreaded process only duplicates the calling thread into the
+ * child, which execvp()'s immediately after (the standard, safe "fork
+ * then exec right away" pattern), and waitpid() here always targets
+ * this exact child's own pid, never a wildcard -- so this is just as
+ * safe to call from a worker thread as from the main one. */
 #if defined(_WIN32)
 static int64_t festina_run_argv(char *const *argv_c) {
     /* _P_WAIT: spawn and block until it exits, handing back its exit
@@ -1844,126 +1838,6 @@ int64_t festina_process_exec(void *args) {
     int64_t result = festina_run_argv(argv_c);
     free(argv_c);
     return result;
-}
-
-/* claude.md #177 (new entry): exec(args, callback) -- the non-blocking
- * counterpart to exec(args) above, dispatched onto the exact same
- * background worker pool blob/img/aud's own `.callback()` already
- * runs on (festina_async_io_dispatch, see this file's own comment on
- * it and runtime/festina_runtime_async.c). Unlike a blob/img/aud
- * load, there is no natural pointer-shaped "result" value to hand
- * back and mutate in place -- the result is a plain int64_t exit
- * code -- so this uses its own small owned payload instead of reusing
- * a Festina-visible value as one. */
-
-typedef struct FestinaExecPayload {
-    /* Offsets 0 and 8, deliberately: codegen's own generated trampoline
-     * (festina/codegen.py's _emit_exec_callback_trampoline) reads BOTH
-     * fields directly -- `load i64, ptr %payload` for exit_code, then a
-     * `getelementptr {i64, ptr}, ptr %payload, i32 0, i32 1` for
-     * user_callback -- so the trampoline never needs to know this
-     * struct's full shape, only that it starts with exactly these two
-     * fields in this order, the same convention this runtime's other
-     * raw-i64 payload marshaling (_i64_to_map_value/_map_value_to_i64
-     * in codegen.py) already relies on for exit_code alone.
-     *
-     * user_callback exists at all because, unlike a per-call-site
-     * trampoline that could hardcode a fixed symbol (the shape
-     * _emit_map_value_release_trampoline itself uses, since there is
-     * exactly one release function per type), exec(args, callback)'s
-     * own callback is checked the SAME permissive, structural way
-     * blob/img/aud's `.callback()` already is (semantic.py, claude.md
-     * #177) -- any func[int]:void-typed EXPRESSION, not just a bare
-     * declared-function name. That means the real callback can be an
-     * ordinary runtime SSA value (a variable, a struct field, ...),
-     * which a separately-emitted top-level LLVM function could never
-     * reference directly. Routing it through the payload as plain data
-     * -- exactly like exit_code itself -- lets ONE generic trampoline
-     * serve every call site, compile-time-constant or not. */
-    int64_t exit_code;
-    void (*user_callback)(int64_t);
-    char **argv;   /* owned: every string strdup'd, NULL-terminated --
-                    * independent of the caller's own arr[text], which
-                    * codegen releases immediately after dispatching
-                    * (see festina_process_exec_dispatch's own doc
-                    * comment on why this needs its own copy at all,
-                    * unlike the synchronous festina_process_exec
-                    * above). */
-} FestinaExecPayload;
-
-/* Runs on a background worker thread (see festina_runtime_async.c) --
- * matches festina_blob_load_worker's own contract exactly: read
- * whatever the payload already has queued up, write the real result
- * into the SAME payload the main thread will hand to the callback. */
-static void festina_exec_worker(void *payload) {
-    FestinaExecPayload *p = (FestinaExecPayload *)payload;
-    p->exit_code = festina_run_argv(p->argv);
-}
-
-/* release_fn, called on the main thread right after the callback --
- * frees the owned deep copy this payload's own argv holds (both the
- * strings and the array), then the payload struct itself. */
-static void festina_exec_payload_free(void *payload) {
-    FestinaExecPayload *p = (FestinaExecPayload *)payload;
-    if (p->argv) {
-        for (char **a = p->argv; *a; a++) free(*a);
-        free(p->argv);
-    }
-    free(p);
-}
-
-/* codegen's own entry point for exec(args, callback) -- `args` is the
- * identical arr[text] header pointer festina_process_exec itself
- * reads; `user_callback` is the program's real func[int]:void value,
- * carried through as opaque data (see FestinaExecPayload's own comment
- * on why -- it may be an arbitrary runtime value, not just a bare
- * function symbol); `trampoline` is codegen's own single generated
- * void(ptr) wrapper that reads exit_code and user_callback back out of
- * the payload and calls the latter (see
- * _emit_exec_callback_trampoline's own comment for why a trampoline is
- * needed here at all, unlike blob/img/aud's own callback -- those are
- * already ptr-shaped Festina values, an int isn't).
- *
- * Deep-copies `args` into this payload's own argv BEFORE ever queuing
- * the job -- unlike blob's own dispatcher (which only needs to strdup
- * one path string), exec's argument is a whole Festina-managed
- * arr[text], and the worker that actually needs it runs later, quite
- * possibly after codegen has already released the caller's own array
- * (the same release timing the synchronous exec() codegen path
- * already uses, right after this call returns) -- so nothing here can
- * borrow the caller's own strings the way the synchronous path above
- * safely does. */
-void festina_process_exec_dispatch(void *args, void *user_callback,
-                                    void (*trampoline)(void *)) {
-    if (!args) return;
-    int64_t *header = (int64_t *)args;
-    int64_t n = header[0];
-    if (n <= 0) return;
-    char **data;
-    memcpy(&data, &header[1], sizeof(char **));
-
-    char **argv_c = malloc((size_t)(n + 1) * sizeof(char *));
-    if (!argv_c) festina_fail("out of memory dispatching exec()");
-    int64_t copied = 0;
-    for (; copied < n; copied++) {
-        const char *src = data[copied] ? data[copied] : "";
-        argv_c[copied] = strdup(src);
-        if (!argv_c[copied]) {
-            for (int64_t i = 0; i < copied; i++) free(argv_c[i]);
-            free(argv_c);
-            festina_fail("out of memory dispatching exec()");
-        }
-    }
-    argv_c[n] = NULL;
-
-    FestinaExecPayload *payload = malloc(sizeof(*payload));
-    if (!payload) festina_fail("out of memory dispatching exec()");
-    payload->exit_code = -1;
-    payload->user_callback = (void (*)(int64_t))user_callback;
-    payload->argv = argv_c;
-
-    festina_async_io_dispatch(payload, festina_exec_worker, trampoline,
-                               festina_exec_payload_free);
 }
 
 /* ---- claude.md #132: mkdir()/ls() ----
@@ -3095,53 +2969,6 @@ void festina_sqlite_bind_blob(sqlite3_stmt *stmt, int32_t idx, const void *data,
 
 void festina_sqlite_bind_null(sqlite3_stmt *stmt, int32_t idx) {
     sqlite3_bind_null(stmt, idx);
-}
-
-/* claude.md #94: single-value queries.
- *
- * Receiving a result previously meant declaring a `table` to hold the
- * row shape -- and a table declaration CREATES a real table (claude.md
- * #28-31's automatic schema sync), so asking for `count(*)` or one
- * json_extract() left a throwaway table sitting in the database
- * forever. These three take the first column of the first row and
- * finalize, so a scalar query costs no schema at all.
- *
- * A query returning no rows answers with Festina's own null for that
- * type, rather than failing: "no rows matched" is an ordinary result a
- * program should be able to test for, the same reasoning claude.md #57
- * applies to division by zero. */
-int64_t festina_sqlite_scalar_int(sqlite3_stmt *stmt) {
-    int64_t out = festina_null_int();
-    if (sqlite3_step(stmt) == SQLITE_ROW
-            && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
-        out = sqlite3_column_int64(stmt, 0);
-    }
-    festina_sqlite_finish(stmt);
-    return out;
-}
-
-double festina_sqlite_scalar_float(sqlite3_stmt *stmt) {
-    double out = festina_null_float();
-    if (sqlite3_step(stmt) == SQLITE_ROW
-            && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
-        out = sqlite3_column_double(stmt, 0);
-    }
-    festina_sqlite_finish(stmt);
-    return out;
-}
-
-char *festina_sqlite_scalar_text(sqlite3_stmt *stmt) {
-    char *out = NULL;
-    if (sqlite3_step(stmt) == SQLITE_ROW
-            && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
-        const unsigned char *txt = sqlite3_column_text(stmt, 0);
-        /* Copied: sqlite owns that buffer only until the next step or
-         * finalize, and Festina text is always an owned buffer
-         * (claude.md #83). */
-        if (txt) out = strdup((const char *)txt);
-    }
-    festina_sqlite_finish(stmt);
-    return out;
 }
 
 void festina_sqlite_exec(sqlite3_stmt *stmt) {

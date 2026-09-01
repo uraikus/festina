@@ -485,14 +485,6 @@ class TestLeakStress:
             # refcounted `text` member), plus aliasing churn through
             # two enum-typed locals sharing the same struct pointer.
             "enum_churn.f",
-            # claude.md #177: exec(args, callback)'s own new argv-deep-
-            # copy/payload/trampoline path -- concurrent dispatches in
-            # flight together every pass, on both the success path (a
-            # real, quick child process) and the graceful-failure path
-            # (a missing executable, which must still deliver -1 through
-            # the callback rather than leaking the payload it already
-            # allocated), with argv length varying pass to pass.
-            "exec_callback_churn.f",
             # claude.md #184: .sort()'s own comparator trampoline path --
             # the indirect call back into Festina code happens on EVERY
             # comparison, thousands of times per pass, for both a text-

@@ -8744,7 +8744,8 @@ class TestStatementCache:
             total = total + rows[0].v
         }}
         log(total)
-        log(sqliteInt('SELECT count(*) FROM T'))
+        arr[T] counted = sqlite('SELECT count(*) AS id FROM T')
+        log(counted[0].id)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
@@ -13914,58 +13915,38 @@ class TestDrawRectAndCircleBorderColorOverride:
                 semantic.analyze(program, filename="main.f")
 
 
-class TestScalarQueries:
-    """claude.md #94: sqliteInt/sqliteFloat/sqliteText take one value out
-    of a query without a `table` declaration to hold it.
+class TestStructTargetScalarQueries:
+    """claude.md #219: sqliteInt()/sqliteFloat()/sqliteText() (claude.md
+    #94's own single-value-query convenience wrappers) were removed --
+    the schema-free scalar round trip they existed for was already
+    reachable through `sqlite()`'s own general path. A `struct` (unlike
+    a `table`) creates no real table when used as a query target, so
+    `arr[SomeStruct] x = sqlite('SELECT ... AS field FROM ...')` gives
+    the same no-extra-table round trip these wrappers offered, through
+    the one mechanism instead of four."""
 
-    That declaration isn't free: a `table` CREATES a real table
-    (claude.md #28-31's automatic schema sync), so before this, asking
-    for a `count(*)` or a single `json_extract` meant leaving a
-    throwaway table behind in the database forever. These share the
-    prepare-and-bind path `sqlite()` already uses; only the stepping
-    differs.
-
-    A query matching no rows, or whose value is SQL NULL, answers with
-    Festina's own null for that type -- an ordinary result to test for,
-    the same treatment claude.md #57 gives division by zero."""
-
-    def test_scalars_read_values_without_a_result_table(self, compile_and_run):
+    def test_a_struct_target_reads_values_without_a_result_table(
+            self, compile_and_run, tmp_path):
         source = """
         table Post { id:int  title:text  score:float }
+        struct Count { n:int }
+        struct Title { title:text }
+        struct Total { total:float }
         sqlite(`DELETE FROM Post`)
         sqlite(`INSERT INTO Post (id, title, score) VALUES (?, ?, ?)`, [1, 'alpha', 1.5])
         sqlite(`INSERT INTO Post (id, title, score) VALUES (?, ?, ?)`, [2, 'beta', 2.5])
-        log(sqliteInt(`SELECT count(*) FROM Post`))
-        log(sqliteText(`SELECT title FROM Post WHERE id = ?`, [2]))
-        log(sqliteFloat(`SELECT sum(score) FROM Post`))
+        arr[Count] c = sqlite(`SELECT count(*) AS n FROM Post`)
+        log(c[0].n)
+        arr[Title] t = sqlite(`SELECT title FROM Post WHERE id = ?`, [2])
+        log(t[0].title)
+        arr[Total] s = sqlite(`SELECT sum(score) AS total FROM Post`)
+        log(s[0].total)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "2\nbeta\n4\n"
-
-    def test_no_matching_row_is_null(self, compile_and_run):
-        source = """
-        table Post { id:int  title:text }
-        sqlite(`DELETE FROM Post`)
-        log(sqliteText(`SELECT title FROM Post WHERE id = ?`, [99]) == null)
-        log(sqliteInt(`SELECT id FROM Post WHERE id = ?`, [99]) == null)
-        """
-        result = compile_and_run(source)
-        assert result.returncode == 0
-        assert result.stdout == "true\ntrue\n"
-
-    def test_a_scalar_query_creates_no_extra_table(self, compile_and_run, tmp_path):
-        # The gap this exists to close: the only table in the database
-        # afterwards should be the one actually declared.
-        source = """
-        table Post { id:int }
-        sqlite(`DELETE FROM Post`)
-        sqlite(`INSERT INTO Post (id) VALUES (?)`, [1])
-        log(sqliteInt(`SELECT count(*) FROM Post`))
-        """
-        result = compile_and_run(source)
-        assert result.returncode == 0
-        assert result.stdout == "1\n"
+        # The gap the removed wrappers existed to close: the only table
+        # in the database afterwards should be the one actually declared.
         import sqlite3
         db = sqlite3.connect(str(tmp_path / "festina.sqlite"))
         names = sorted(r[0] for r in db.execute(
@@ -13974,13 +13955,30 @@ class TestScalarQueries:
         db.close()
         assert names == ["Post"]
 
-    def test_json1_works_through_scalar_queries(self, compile_and_run):
+    def test_no_matching_row_is_an_empty_array(self, compile_and_run):
+        source = """
+        table Post { id:int  title:text }
+        struct Title { title:text }
+        sqlite(`DELETE FROM Post`)
+        arr[Title] t = sqlite(`SELECT title FROM Post WHERE id = ?`, [99])
+        log(t.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_json1_works_through_a_struct_target(self, compile_and_run):
         # SQLite's JSON1 needs no compiler feature at all -- it is
         # ordinary SQL. This locks in that it stays reachable.
         source = """
-        log(sqliteInt(`SELECT json_extract('{"n":42}','$.n')`))
-        log(sqliteText(`SELECT json_extract('{"name":"ada"}','$.name')`))
-        log(sqliteInt(`SELECT json_array_length('[1,2,3]')`))
+        struct Num { n:int }
+        struct Str { s:text }
+        arr[Num] a = sqlite(`SELECT json_extract('{"n":42}','$.n') AS n`)
+        log(a[0].n)
+        arr[Str] b = sqlite(`SELECT json_extract('{"name":"ada"}','$.name') AS s`)
+        log(b[0].s)
+        arr[Num] c = sqlite(`SELECT json_array_length('[1,2,3]') AS n`)
+        log(c[0].n)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
@@ -13992,6 +13990,8 @@ class TestScalarQueries:
         # through untouched.
         source = """
         table Post { id:int  title:text  body:text }
+        struct Count { n:int }
+        struct Title { title:text }
         sqlite(`DELETE FROM Post`)
         sqlite(`INSERT INTO Post (id, title, body) VALUES (?, ?, ?)`,
                [1, 'Compilers', 'a compiler turns source into machine code'])
@@ -14002,8 +14002,10 @@ class TestScalarQueries:
         sqlite(`DROP TABLE IF EXISTS PostSearch`)
         sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
         sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
-        log(sqliteInt(`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`, ['machine']))
-        log(sqliteText(`SELECT title FROM PostSearch WHERE PostSearch MATCH ? ORDER BY rank`, ['tomatoes']))
+        arr[Count] c = sqlite(`SELECT count(*) AS n FROM PostSearch WHERE PostSearch MATCH ?`, ['machine'])
+        log(c[0].n)
+        arr[Title] t = sqlite(`SELECT title FROM PostSearch WHERE PostSearch MATCH ? ORDER BY rank`, ['tomatoes'])
+        log(t[0].title)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
@@ -15324,123 +15326,18 @@ class TestExec:
         assert exc_info.value.category == "unsupported platform feature"
         assert "exec" in str(exc_info.value)
 
-
-class TestExecCallback:
-    """claude.md #177: exec(args, callback) -- the non-blocking
-    counterpart to exec(args) above, dispatched onto the same
-    background worker pool blob/img/aud's own `.callback()` runs on.
-    Real compile-and-run coverage, matching TestAsyncIoRuntime's own
-    discipline in tests/test_async_io.py."""
-
-    def test_does_not_block(self, compile_and_run):
-        result = compile_and_run("""
-        void func onDone(code:int) {
-            log(`done: ${code}`)
-            close(0)
-        }
-        arr[text] cmd = ['/bin/sh', '-c', 'sleep 1 && exit 0']
-        exec(cmd, onDone)
-        log('dispatched')
-        """)
-        assert result.returncode == 0, result.stdout
-        assert result.stdout.index("dispatched") < result.stdout.index("done:")
-        assert "done: 0" in result.stdout
-
-    def test_program_exits_cleanly_with_no_explicit_close(self, compile_and_run):
-        # No openPort()/graphics/setTimeout/other async_io call anywhere
-        # -- festina_run_timer_loop is entered ONLY because of
-        # uses_async_io (see codegen.py's own widened loop-selection
-        # condition), and must correctly wait for the outstanding exec,
-        # run the callback, THEN exit on its own.
-        result = compile_and_run("""
-        void func onDone(code:int) {
-            log(`done: ${code}`)
-        }
-        arr[text] cmd = ['/bin/echo', 'child ran']
-        exec(cmd, onDone)
-        log('dispatched')
-        """)
-        assert result.returncode == 0, result.stdout
-        assert "child ran" in result.stdout
-        assert "done: 0" in result.stdout
-
-    def test_real_exit_code_is_delivered(self, compile_and_run):
-        result = compile_and_run("""
-        void func onDone(code:int) {
-            log(code)
-            close(0)
-        }
-        arr[text] cmd = ['/bin/sh', '-c', 'exit 42']
-        exec(cmd, onDone)
-        """)
-        assert result.returncode == 0, result.stdout
-        assert result.stdout == "42\n"
-
-    def test_a_missing_executable_delivers_negative_one(self, compile_and_run):
-        result = compile_and_run("""
-        void func onDone(code:int) {
-            log(code)
-            close(0)
-        }
-        arr[text] cmd = ['/no/such/binary/at/all/xyz']
-        exec(cmd, onDone)
-        """)
-        assert result.returncode == 0, result.stdout
-        assert result.stdout == "-1\n"
-
-    def test_multiple_concurrent_execs_all_complete(self, compile_and_run):
-        result = compile_and_run("""
-        int done = 0
-        int total = 0
-        void func onDone(code:int) {
-            done = done + 1
-            total = total + code
-            if done == 5 { close(0) }
-        }
-        arr[text] c1 = ['/bin/sh', '-c', 'exit 1']
-        arr[text] c2 = ['/bin/sh', '-c', 'exit 2']
-        arr[text] c3 = ['/bin/sh', '-c', 'exit 3']
-        arr[text] c4 = ['/bin/sh', '-c', 'exit 4']
-        arr[text] c5 = ['/bin/sh', '-c', 'exit 5']
-        exec(c1, onDone)
-        exec(c2, onDone)
-        exec(c3, onDone)
-        exec(c4, onDone)
-        exec(c5, onDone)
-        log('all 5 dispatched')
-        """)
-        assert result.returncode == 0, result.stdout
-        assert "all 5 dispatched" in result.stdout
-
-    def test_callback_may_be_a_stored_function_value(self, compile_and_run):
-        # Not a bare declared-function name at the call site -- exercises
-        # the runtime, data-carried side of _emit_exec_callback_trampoline
-        # (the callback pointer travels through the payload precisely
-        # because it need not be a compile-time-constant symbol).
-        result = compile_and_run("""
-        void func onDone(code:int) {
-            log(code)
-            close(0)
-        }
-        func[int]:void cb = onDone
-        arr[text] cmd = ['/bin/sh', '-c', 'exit 9']
-        exec(cmd, cb)
-        """)
-        assert result.returncode == 0, result.stdout
-        assert result.stdout == "9\n"
-
-    def test_exec_callback_form_is_rejected_for_wasm(self, cli_mod, tmp_path):
-        src = tmp_path / "main.f"
-        src.write_text("""
+    def test_the_removed_two_argument_callback_form_is_a_clear_error(
+            self, parser, semantic, errors):
+        # claude.md #221: exec(args, callback) -- the non-blocking form
+        # claude.md #177 added -- was removed; exec() now only ever
+        # takes 1 argument.
+        source = """
         void func onDone(code:int) { log(code) }
         arr[text] cmd = ['ls']
         exec(cmd, onDone)
-        """, encoding="utf-8")
-        with pytest.raises(cli_mod.CompileError) as exc_info:
-            cli_mod.compile_file(str(src), str(tmp_path / "out.wasm"),
-                                  cc="clang", target="wasm32-wasi")
-        assert exc_info.value.category == "unsupported platform feature"
-        assert "exec" in str(exc_info.value)
+        """
+        with pytest.raises(errors.CompileError, match="expects 1 argument"):
+            semantic.analyze(parser.parse(source))
 
 
 class TestToInt:
@@ -16062,8 +15959,8 @@ class TestThreads:
             DatabaseURL = '{db}'
             on message(worker:thread, msg:int) {{
                 sqlite('INSERT INTO Hits (n) VALUES (?)', [msg])
-                int total = sqliteInt('SELECT count(*) FROM Hits')
-                postMessage(total)
+                arr[Hits] counted = sqlite('SELECT count(*) AS n FROM Hits')
+                postMessage(counted[0].n)
             }}
         }}
         int cycle = 0
@@ -16582,7 +16479,17 @@ class TestThreadReplyCallback:
     def test_worker_to_main_bare_reply_round_trip(self, compile_and_run):
         # a worker sends to main via the bare form with .callback;
         # main's own top-level on message fires normally, then replies
-        # -- the callback fires back on the WORKER's own OS thread.
+        # -- claude.md #222: the callback now fires back on MAIN's own
+        # OS thread (marshaled through festina_async_io_dispatch), not
+        # the worker's, closing a real cross-thread-isolation hazard.
+        # Festina exposes no OS-thread-identity primitive a test could
+        # check directly; the decisive proof is
+        # tests/stress/thread_reply_callback_churn.f under
+        # scripts/thread_tsan_stress.sh -- routing dispatch through a
+        # genuinely different thread is exactly what surfaced (and let
+        # this fix catch) a real, previously-latent data race in
+        # festina_runtime_async.c's own g_outstanding counter, which
+        # had never been written from any thread but main before.
         source = """
         void func onReply(r:int) {
             log(`worker reply: ${r}`)
@@ -16593,11 +16500,11 @@ class TestThreadReplyCallback:
         on message(worker:thread, msg:int) {
             log(`main got: ${msg}`)
             worker.reply(msg + 1)
-            // claude.md #217: the callback this send registered fires
-            // on the WORKER's own OS thread, asynchronously -- a short
-            // setTimeout (the same pattern this suite's own timer
-            // tests already use to let background work land before
-            // close()) gives it time to log before the process exits.
+            // The callback this send registered fires asynchronously,
+            // via main's own event loop -- a short setTimeout (the
+            // same pattern this suite's own timer tests already use
+            // to let background work land before close()) gives it
+            // time to run before the process exits.
             setTimeout(finish, 200)
         }
         thread worker {
@@ -16835,6 +16742,27 @@ class TestThreadPools:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["false", "true"]
+
+    def test_an_auto_sized_pool_really_has_the_resolved_number_of_instances(
+            self, compile_and_run, codegen, monkeypatch):
+        # claude.md #220: `thread pool[] { }` resolves its own size at
+        # semantic-analysis time (cpu_count minus every other declared
+        # thread, floored at 1) -- codegen.py never sees the "auto"
+        # sentinel at all, so this proves the RESOLVED pool really has
+        # that many live instances, not just that it compiles.
+        monkeypatch.setattr(codegen.semantic_mod.os, "cpu_count", lambda: 3)
+        source = """
+        thread solo { on load() { } }
+        thread pool[] { }
+        log(pool[0].isAlive())
+        log(pool[1].isAlive())
+        log(pool[2].isAlive())
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # 3 cpus - 1 (solo) = 2 instances: pool[0]/pool[1] alive, pool[2] out of range.
+        assert result.stdout.strip().splitlines() == ["true", "true", "false"]
 
 
 class TestThreadPrivateFunctions:

@@ -9,6 +9,109 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.37] - 2026-09-01
+
+### Documentation
+
+- **api.md reorganized.** Three sections that had drifted far from
+  their own topic (an artifact of being documented in whatever order
+  they were built rather than the order a reader looks for them) moved
+  to where they belong: "Single-value queries"/"JSON and full-text
+  search" into `Built-in SQLite`, "Growing arrays"/"Sorting" into
+  `Arrays`, and `Imports` up near the top, right after the compilation
+  pipeline. No headings renamed, so every existing anchor (including
+  external links from this changelog) still resolves. Checked the
+  whole file for stale language left over from this session's earlier
+  removals/fixes -- none found.
+
+See claude.md #229.
+
+## [0.36] - 2026-09-01
+
+### Fixed
+
+- **`toStruct()`/`toArr()`'s partial-parse-failure leak.** A JSON value
+  that failed to parse partway through being built -- a struct's third
+  field turning out to be the wrong type, having already parsed the
+  first two; an array's fourth element failing, having already
+  collected three -- used to leak whatever was already built for that
+  one call. Every generated from-JSON parsing function now installs its
+  own local `try`/`catch` around its own build loop, and the
+  `.toStruct()`/`.toArr()` call site does the same for its own cursor
+  and receiver text. Verified leak-free under Valgrind across a flat
+  struct, a nested struct field, an array, a `map[T]` field, a
+  self-referencing struct, and malformed JSON syntax itself.
+
+### Added
+
+- `scripts/valgrind_stress.sh` + `tests/valgrind_stress/`: a permanent
+  home for stress programs that use `try`/`throw`, which cannot run
+  under the existing AddressSanitizer-based `scripts/leak_stress.sh` in
+  this environment.
+
+See claude.md #223.
+
+## [0.35] - 2026-09-01
+
+### Fixed
+
+- **`.callback(fn)` now fires on MAIN's own OS thread for a send
+  addressed to main.** A worker's own bare `postMessage(x).callback(fn)`
+  (always addressed to main) used to have `fn` fire back on the
+  SENDING worker's own OS thread once main replied -- a real
+  cross-thread-isolation hazard. It's now marshaled onto main, the
+  same mechanism `blob`/`img`/`aud`'s own `.callback()` already uses.
+  A worker messaging ANOTHER worker directly is unaffected -- `fn`
+  still fires on the sending worker's own thread there.
+- **A previously-latent data race in the async-io worker pool's own
+  outstanding-job counter**, exposed by the fix above the first time
+  that path was ever exercised from a thread other than main.
+
+See claude.md #222.
+
+## [0.34] - 2026-09-01
+
+### Removed
+
+- **`exec(args, callback)`** -- the non-blocking form. `exec(args)`
+  (blocking) is unaffected. The callback always ran on main's own OS
+  thread regardless of which thread dispatched it -- a real cross-
+  thread-isolation hazard for a language whose whole thread story is
+  "no shared mutable state to race on" -- so it's gone rather than
+  documented around.
+
+See claude.md #221.
+
+## [0.33] - 2026-09-01
+
+### Added
+
+- **`thread NAME[] { ... }`** -- empty brackets, no literal size --
+  sizes the pool itself: `os.cpu_count()` (read on the machine
+  compiling the program) minus every other thread the program
+  declares, floored at 1. `thread NAME { ... }` (no brackets at all)
+  is unchanged, still a singleton. Two auto-sized pools in the same
+  program each get the full remaining budget rather than splitting it.
+  See [api.md](api.md#thread-pools-thread-namen).
+
+See claude.md #220.
+
+## [0.32] - 2026-09-01
+
+### Removed
+
+- **`sqliteInt()`, `sqliteFloat()`, and `sqliteText()`.** `sqlite()`
+  itself, `table`, and `DatabaseURL` are unaffected. These three
+  existed to read a single value (like a `count(*)`) without declaring
+  a `table` (which creates a real table) just to hold it -- but a
+  `struct` used as a query target creates no real table either, so
+  `arr[SomeStruct] x = sqlite('SELECT count(*) AS n FROM ...')` already
+  gives the identical schema-free round trip through `sqlite()`'s own
+  one path. Calling any of the three now fails with the same
+  "no such function" error any other unrecognized name gets.
+
+See claude.md #219.
+
 ## [0.31] - 2026-09-01
 
 ### Fixed

@@ -1067,21 +1067,12 @@ class CodeGen:
                                                 # wasm32-wasi build outright (there is no SjLj
                                                 # support for that target at all), the same way
                                                 # uses_exec below already does.
-        self._exec_callback_trampoline = None  # claude.md #177: lazily-generated, cached LLVM
-                                                # symbol name for the ONE generic trampoline every
-                                                # exec(args, callback) call site shares -- see
-                                                # _emit_exec_callback_trampoline's own comment on
-                                                # why a single generic trampoline (data-driven via
-                                                # the payload) is right here, unlike
-                                                # _emit_map_value_release_trampoline's own fresh-
-                                                # per-call-site shape.
         self._sort_trampolines = {}            # claude.md #184: types_mod.type_name(element) ->
                                                 # LLVM symbol name for that element type's qsort()
                                                 # comparator trampoline -- one per DISTINCT element
                                                 # type a program calls .sort() on (the trampoline has
-                                                # to decode that type's own raw slot, so unlike
-                                                # _exec_callback_trampoline above it can't be a single
-                                                # shared symbol), cached the same way
+                                                # to decode that type's own raw slot, so it can't be
+                                                # a single shared symbol), cached the same way
                                                 # _array_release_fns below already keys per-type
                                                 # helpers.
         self.uses_exec = False                 # claude.md #150: any exec() call anywhere -- unlike
@@ -1596,7 +1587,11 @@ class CodeGen:
             # message this answers, using the calling thread's own
             # ambient "which message am I currently handling" state.
             "declare i64 @festina_thread_alloc_txn_id()",
-            "declare void @festina_thread_register_callback(ptr, i64, ptr, ptr)",
+            # claude.md #222: the trailing i8 is dispatch_on_main -- see
+            # emit_register_and_send's own call site and
+            # festina_thread_register_callback's doc comment in
+            # runtime/festina_runtime.h.
+            "declare void @festina_thread_register_callback(ptr, i64, ptr, ptr, i8)",
             "declare void @festina_thread_reply(ptr, ptr, ptr, ptr)",
             # claude.md #208: replaces the old per-thread
             # festina_thread_set_out_callback -- ONE handler,
@@ -1689,9 +1684,6 @@ class CodeGen:
             "declare ptr @festina_text_char_at(ptr, i64)",
             "declare ptr @festina_argv_array(i32, ptr)",
             "declare i64 @festina_process_exec(ptr)",
-            # claude.md #177: exec(args, callback) -- the non-blocking
-            # counterpart just above.
-            "declare void @festina_process_exec_dispatch(ptr, ptr, ptr)",
             "declare i64 @strlen(ptr)",
             # claude.md #151: openPort/on request/on upgrade/on message/
             # on socketClose -- see festina_runtime.h's own extensive
@@ -1818,10 +1810,6 @@ class CodeGen:
             "declare void @festina_audio_free(ptr)",
             "declare ptr @festina_image_from_bytes(ptr, i64, ptr)",
             "declare void @festina_sqlite_exec(ptr)",
-            # claude.md #94: single-value queries
-            "declare i64 @festina_sqlite_scalar_int(ptr)",
-            "declare double @festina_sqlite_scalar_float(ptr)",
-            "declare ptr @festina_sqlite_scalar_text(ptr)",
             # claude.md #111: collect_rows takes the declared column
             # NAMES too (result columns are matched by name now), and
             # row.undefined() reads the presence mask it records.
@@ -6495,6 +6483,106 @@ class CodeGen:
         lines.append(f"  {v} = call ptr {fn_name}(ptr {cursor_ref})")
         return v
 
+    def _emit_json_catch_prologue(self, body):
+        """claude.md #223: the local try/catch prologue shared by every
+        generated _from_json_*_fn_for function -- registers a fresh
+        catch frame right after `out` (that function's own fresh
+        struct/array/map header) is allocated, so a throw ANYWHERE in
+        the recursive JSON read that follows (a nested field, element,
+        or entry -- possibly several _from_json_*_fn_for calls deep) is
+        caught HERE rather than skipping straight past this frame the
+        way claude.md #157's own documented "any intermediate frame
+        between the try and the throw leaks" limitation would otherwise
+        apply. Converts each generated from-json function into the one
+        frame shape that's ALREADY leak-free by that same doc comment's
+        own reasoning: one that directly contains its own try. Mirrors
+        _emit_try's own hand-rolled sjlj IR exactly (same llvm.eh.sjlj.
+        setjmp/frameaddress/stacksave shape) -- this is no different
+        structurally, just built directly into a from-json function's
+        own body instead of a user-written `try` statement's.
+
+        Sets self.uses_try = True (this function now genuinely uses
+        sjlj, so it needs the identical wasm32-wasi/macOS compile-time
+        rejection an explicit `try` statement already gets -- see
+        cli.py's own _check_wasm_feature_supported/
+        _check_darwin_try_supported, both gated on this flag). Returns
+        the catch label name; the caller finishes with
+        _emit_json_catch_epilogue once its own loop body is fully
+        emitted."""
+        self.uses_try = True
+        buf = self.tmp()
+        body.append(f"  {buf} = alloca [5 x ptr], align 16")
+        bufp = self.tmp()
+        body.append(f"  {bufp} = getelementptr inbounds [5 x ptr], ptr {buf}, i64 0, i64 0")
+        frame_addr = self.tmp()
+        body.append(f"  {frame_addr} = call ptr @llvm.frameaddress.p0(i32 0)")
+        body.append(f"  store ptr {frame_addr}, ptr {bufp}, align 16")
+        stack_save = self.tmp()
+        body.append(f"  {stack_save} = call ptr @llvm.stacksave.p0()")
+        slot2 = self.tmp()
+        body.append(f"  {slot2} = getelementptr inbounds ptr, ptr {bufp}, i64 2")
+        body.append(f"  store ptr {stack_save}, ptr {slot2}, align 16")
+        rc = self.tmp()
+        body.append(f"  {rc} = call i32 @llvm.eh.sjlj.setjmp(ptr {bufp})")
+        is_catch = self.tmp()
+        body.append(f"  {is_catch} = icmp ne i32 {rc}, 0")
+        try_label = self.label("fromjson.try")
+        catch_label = self.label("fromjson.catch")
+        body.append(f"  br i1 {is_catch}, label %{catch_label}, label %{try_label}")
+        body.append(f"{try_label}:")
+        body.append(f"  call void @festina_try_push(ptr {bufp})")
+        return catch_label
+
+    def _emit_json_catch_epilogue(self, body, out, release_fn, catch_label, extra_free_slots=()):
+        """claude.md #223: closes what _emit_json_catch_prologue opened
+        -- the success tail (pop the frame this function's own try
+        pushed, then return `out` exactly as before) and the catch
+        block itself (retrieve the caught message, release `out` --
+        which correctly frees whatever fields/elements/entries were
+        ALREADY stored in it, since a struct/array/map's own release
+        function walks whatever is actually there regardless of
+        "completeness", the same as it would for any ordinary release
+        -- then re-throw the SAME message outward via an ordinary
+        festina_throw, propagating to whichever try genuinely encloses
+        THIS call, or fail() if none does). Called once, at the very
+        end of a generated from-json function's body, in place of what
+        used to be a bare `ret ptr {out}`.
+
+        `extra_free_slots` -- an `alloca ptr` in the CALLER's own body,
+        one per in-flight temporary (the struct/map builders' own
+        `key_reg`, a JSON key's text buffer read before its value and
+        freed only once the value is fully stored) that would otherwise
+        leak if a throw lands between the temporary being read and its
+        own ordinary free call. `volatile`, on BOTH the caller's own
+        stores into it and the load here -- confirmed necessary, not
+        just cautious: a first version without `volatile` compiled and
+        ran fine unoptimized, but leaked the slot's own value under
+        this project's real `-O2` default (and under `-O1`, and
+        crashed outright with SIGILL under `-fsanitize=address`,
+        confirmed directly). The reason: unlike `out` itself (defined
+        once, in the entry block, on the SAME edge that reaches this
+        catch label in the CFG the optimizer can see), a per-LOOP-
+        iteration store into a plain alloca has no PROVABLE reader on
+        any edge the optimizer's dataflow analysis recognizes --
+        `llvm.eh.sjlj.longjmp`'s own jump into this block is invisible
+        to it, the same class of hazard C's own setjmp/longjmp has
+        always required `volatile` to guard against -- so a plain
+        alloca here is dead-store-eliminated. `free(NULL)` is a
+        defined no-op, so every slot here is freed unconditionally, no
+        branch needed."""
+        body.append("  call void @festina_try_pop()")
+        body.append(f"  ret ptr {out}")
+        body.append(f"{catch_label}:")
+        err_val = self.tmp()
+        body.append(f"  {err_val} = call ptr @festina_try_error()")
+        for slot in extra_free_slots:
+            leftover = self.tmp()
+            body.append(f"  {leftover} = load volatile ptr, ptr {slot}")
+            body.append(f"  call void @free(ptr {leftover})")
+        body.append(f"  call void {release_fn}(ptr {out})")
+        body.append(f"  call void @festina_throw(ptr {err_val})")
+        body.append("  ret ptr null")
+
     def _from_json_struct_fn_for(self, struct_type):
         """claude.md #159: returns (generating on first use, cached by
         struct name) `ptr @__festina_from_json_struct_N(ptr %cursor)` --
@@ -6525,6 +6613,22 @@ class CodeGen:
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         struct_ty = self.struct_llvm_name(struct_type.name)
         out = self._emit_fresh_heap_header(struct_ty, body)
+        # claude.md #223: a local catch frame around the whole field-
+        # reading loop below -- see _emit_json_catch_prologue's own doc
+        # comment for why (an intermediate-frame leak fix). `out` is
+        # already a fully zero-initialized header at this point, so
+        # releasing it in the catch block below correctly frees exactly
+        # whatever fields were already stored before the throw, nothing
+        # more, nothing less.
+        catch_label = self._emit_json_catch_prologue(body)
+        # claude.md #223: `key_slot` names whichever JSON key text
+        # buffer is currently read-but-not-yet-freed -- see
+        # _emit_json_catch_epilogue's own `extra_free_slots` doc
+        # comment for why a plain SSA temp can't be read back from the
+        # catch block below, only a value stored in memory can.
+        key_slot = self.tmp()
+        body.append(f"  {key_slot} = alloca ptr")
+        body.append(f"  store volatile ptr null, ptr {key_slot}")
         body.append("  call void @festina_json_object_start(ptr %cursor)")
         first = self.tmp()
         body.append(f"  {first} = alloca i8")
@@ -6543,6 +6647,7 @@ class CodeGen:
         body.append(f"{readkey_lbl}:")
         key_reg = self.tmp()
         body.append(f"  {key_reg} = call ptr @festina_json_read_key(ptr %cursor)")
+        body.append(f"  store volatile ptr {key_reg}, ptr {key_slot}")
 
         fields = self.struct_fields(struct_type.name)
         for idx, (fname, ftype) in enumerate(fields):
@@ -6587,9 +6692,11 @@ class CodeGen:
         body.append(f"  br label %{keydone_lbl}")
         body.append(f"{keydone_lbl}:")
         body.append(f"  call void @free(ptr {key_reg})")
+        body.append(f"  store volatile ptr null, ptr {key_slot}")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
-        body.append(f"  ret ptr {out}")
+        self._emit_json_catch_epilogue(body, out, self._release_fn_for(struct_type), catch_label,
+                                       extra_free_slots=[key_slot])
         body.append("}")
         body.append("")
         self.func_defs.extend(body)
@@ -6619,6 +6726,12 @@ class CodeGen:
 
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         out = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, body)
+        # claude.md #223: see _from_json_struct_fn_for's own identical
+        # comment -- a local catch frame so a throw partway through
+        # (element N+1 fails, having already pushed elements 0..N)
+        # releases `out`, correctly freeing the elements already
+        # pushed, rather than leaking them.
+        catch_label = self._emit_json_catch_prologue(body)
         body.append("  call void @festina_json_array_start(ptr %cursor)")
         first = self.tmp()
         body.append(f"  {first} = alloca i8")
@@ -6647,7 +6760,8 @@ class CodeGen:
         body.append(f"  call void @festina_array_push(ptr {out}, ptr null, i64 {elem_size}, ptr {slot})")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
-        body.append(f"  ret ptr {out}")
+        self._emit_json_catch_epilogue(
+            body, out, self._release_fn_for(types_mod.ArrayType(elem_type)), catch_label)
         body.append("}")
         body.append("")
         self.func_defs.extend(body)
@@ -6723,6 +6837,17 @@ class CodeGen:
         value_type = map_type.value
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         out = self._emit_fresh_heap_header(FESTINA_MAP_LLVM_TYPE, body)
+        # claude.md #223: see _from_json_struct_fn_for's own identical
+        # comment -- a local catch frame so a throw partway through
+        # (entry N+1's own value fails to parse, having already set N
+        # entries) releases `out`, correctly freeing the entries
+        # already set, rather than leaking them.
+        catch_label = self._emit_json_catch_prologue(body)
+        # claude.md #223: see _from_json_struct_fn_for's own identical
+        # key_slot comment.
+        key_slot = self.tmp()
+        body.append(f"  {key_slot} = alloca ptr")
+        body.append(f"  store volatile ptr null, ptr {key_slot}")
         body.append("  call void @festina_json_object_start(ptr %cursor)")
         first = self.tmp()
         body.append(f"  {first} = alloca i8")
@@ -6740,6 +6865,7 @@ class CodeGen:
         body.append(f"{entry_lbl}:")
         key_reg = self.tmp()
         body.append(f"  {key_reg} = call ptr @festina_json_read_key(ptr %cursor)")
+        body.append(f"  store volatile ptr {key_reg}, ptr {key_slot}")
         v = self._emit_json_read_value(value_type, "%cursor", body)
         self._from_json_map_value(out, value_type, key_reg, v, body)
         # claude.md #97: festina_map_set strdup's its own copy of the
@@ -6747,9 +6873,11 @@ class CodeGen:
         # key_source_expr afterward -- so key_reg (heap-allocated by
         # festina_json_read_key) has no owner left once this returns.
         body.append(f"  call void @free(ptr {key_reg})")
+        body.append(f"  store volatile ptr null, ptr {key_slot}")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
-        body.append(f"  ret ptr {out}")
+        self._emit_json_catch_epilogue(
+            body, out, self._release_fn_for(map_type), catch_label, extra_free_slots=[key_slot])
         body.append("}")
         body.append("")
         self.func_defs.extend(body)
@@ -9417,55 +9545,6 @@ class CodeGen:
         self.func_defs.append("")
         return trampoline_name
 
-    def _emit_exec_callback_trampoline(self):
-        """claude.md #177: bridges festina_async_io_dispatch's fixed
-        `void(*)(void*)` callback ABI to exec(args, callback)'s real
-        `func[int]:void` value -- the one wrinkle blob/img/aud's own
-        `.callback()` never had, since THEIR callback value is already
-        `func[T]:void` for a pointer-shaped T (an img/aud/blob handle),
-        which already IS `void(ptr)`-shaped and needs no adapter at
-        all. exec()'s result is a plain `int` (i64), so calling the
-        real callback needs an actual bridge, not just a cast.
-
-        Unlike _emit_map_value_release_trampoline just above (fresh
-        per call site, hardcoding a fixed release-function SYMBOL known
-        at codegen time), this trampoline cannot hardcode which
-        function to call: exec(args, callback)'s own callback is
-        checked the same permissive, structural way blob/img/aud's
-        `.callback()` already is (semantic.py) -- any func[int]:void-
-        typed EXPRESSION, which may be an ordinary runtime SSA value
-        (a variable, a struct field, ...) that a separately-emitted
-        top-level LLVM function could never reference directly. So
-        instead this trampoline is entirely generic and DATA-driven:
-        it reads both the exit code and the real callback pointer back
-        out of the payload (FestinaExecPayload in runtime/
-        festina_runtime.c -- `{ i64 exit_code; void(*user_callback)
-        (i64); ... }`, a fixed two-field prefix both sides agree on)
-        and makes an indirect call through the pointer it just loaded.
-        That means ONE trampoline correctly serves every exec(args,
-        callback) call site in the whole program, compile-time-
-        constant callback or not -- generated once, lazily, and
-        cached in self._exec_callback_trampoline."""
-        if self._exec_callback_trampoline is not None:
-            return self._exec_callback_trampoline
-        uid = self._unique()
-        trampoline_name = f"@__festina_exec_callback_{uid}"
-        body = [f"define void {trampoline_name}(ptr %payload) {{", "entry:"]
-        exit_code = self.tmp()
-        body.append(f"  {exit_code} = load i64, ptr %payload")
-        cb_slot = self.tmp()
-        body.append(
-            f"  {cb_slot} = getelementptr {{i64, ptr}}, ptr %payload, i32 0, i32 1")
-        cb_val = self.tmp()
-        body.append(f"  {cb_val} = load ptr, ptr {cb_slot}")
-        body.append(f"  call void {cb_val}(i64 {exit_code})")
-        body.append("  ret void")
-        body.append("}")
-        self.func_defs.extend(body)
-        self.func_defs.append("")
-        self._exec_callback_trampoline = trampoline_name
-        return trampoline_name
-
     def _emit_sort_comparator_trampoline(self, elem_type):
         """claude.md #184 (uraikus/festina#76 item 2): bridges
         festina_array_sort's own `int(*)(const void*, const void*,
@@ -9475,22 +9554,20 @@ class CodeGen:
         userdata-less comparator would otherwise force -- to a real
         `func[T,T]:int` Festina value.
 
-        Unlike _emit_exec_callback_trampoline just above, `userdata`
-        IS the callback pointer itself, not a payload struct to read
-        one back out of: .sort()'s comparator argument is evaluated
-        once, at the call site, into an ordinary `ptr` value (first-
-        class function values already ARE bare pointers, claude.md
-        #141), and festina_array_sort hands that same pointer back on
-        every single comparison unchanged, so there's nothing else to
-        carry alongside it.
+        `userdata` IS the callback pointer itself, not a payload struct
+        to read one back out of: .sort()'s comparator argument is
+        evaluated once, at the call site, into an ordinary `ptr` value
+        (first-class function values already ARE bare pointers,
+        claude.md #141), and festina_array_sort hands that same
+        pointer back on every single comparison unchanged, so there's
+        nothing else to carry alongside it.
 
         Cached per element type (types_mod.type_name(elem_type), the
-        same keying _array_release_fns already uses) rather than
-        shared like _exec_callback_trampoline's one symbol, because
-        decoding the two raw comparison slots needs THIS type's own
-        LLVM type -- an i64 slot decodes differently than an i8 or
-        double or ptr one, and the indirect call's own argument types
-        have to match the real comparator's signature exactly."""
+        same keying _array_release_fns already uses), because decoding
+        the two raw comparison slots needs THIS type's own LLVM type --
+        an i64 slot decodes differently than an i8 or double or ptr
+        one, and the indirect call's own argument types have to match
+        the real comparator's signature exactly."""
         key = types_mod.type_name(elem_type)
         if key in self._sort_trampolines:
             return self._sort_trampolines[key]
@@ -10667,8 +10744,6 @@ class CodeGen:
                 sig = ", ".join(f"{ty} {v}" for ty, v in zip(arg_irs, vals))
                 lines.append(f"  call void @{fn}({sig})")
                 return "0", None
-            if name in ("sqliteInt", "sqliteFloat", "sqliteText"):
-                return self._emit_sqlite_scalar(name, expr, env, lines)
             if name == "now":
                 out = self.tmp()
                 lines.append(f"  {out} = call i64 @festina_now_ms()")
@@ -10695,40 +10770,21 @@ class CodeGen:
                 # own single arr[text] argument is exactly that same
                 # case (a refcounted type, not text), not a new one.
                 #
-                # claude.md #177: exec(args, callback) -- the non-
-                # blocking form. Same args handling, dispatched instead
-                # through festina_process_exec_dispatch (releasing args
-                # right after, exactly like the 1-arg form releases it
-                # right after ITS own synchronous call returns -- same
-                # timing, matches festina_process_exec_dispatch's own
-                # doc comment on why it must deep-copy rather than
-                # borrow). The callback value itself needs no cleanup
-                # of its own -- func[T]:void values are never allocated/
-                # freed (see _llvm_type's own FuncType comment), so
-                # there's nothing here to release, same as the ordinary
-                # indirect-call-through-a-func-value site below.
+                # claude.md #177 added a non-blocking exec(args,
+                # callback) form; claude.md #221 removed it (its
+                # callback always ran on main's own OS thread regardless
+                # of which thread dispatched it -- a real cross-thread-
+                # isolation hazard). Only the blocking form remains.
                 self.uses_exec = True
                 arg_expr = expr.args[0]
                 val, vtype = self._emit_expr(arg_expr, env, lines)
-                if len(expr.args) == 1:
-                    out = self.tmp()
-                    lines.append(f"  {out} = call i64 @festina_process_exec(ptr {val})")
-                    if _is_refcounted(vtype) and self._is_owning_refcounted_source(arg_expr):
-                        lines.append(f"  call void {self._release_fn_for(vtype)}(ptr {val})")
-                    else:
-                        self._free_text_temp(arg_expr, val, vtype, lines)
-                    return out, INT
-                self.uses_async_io = True
-                cb_val, _ = self._emit_expr(expr.args[1], env, lines)
-                trampoline_name = self._emit_exec_callback_trampoline()
-                lines.append(
-                    f"  call void @festina_process_exec_dispatch(ptr {val}, "
-                    f"ptr {cb_val}, ptr {trampoline_name})")
+                out = self.tmp()
+                lines.append(f"  {out} = call i64 @festina_process_exec(ptr {val})")
                 if _is_refcounted(vtype) and self._is_owning_refcounted_source(arg_expr):
                     lines.append(f"  call void {self._release_fn_for(vtype)}(ptr {val})")
                 else:
                     self._free_text_temp(arg_expr, val, vtype, lines)
-                return "0", None
+                return out, INT
             if name in ("openPort", "closePort"):
                 # claude.md #151: both take a single plain int -- no
                 # refcounted/text argument-cleanup story at all, unlike
@@ -11094,9 +11150,17 @@ class CodeGen:
                     lines.append(f"  {self_handle} = load ptr, ptr {self._current_thread_ctx[1]}")
                 else:
                     lines.append(f"  {self_handle} = call ptr @festina_thread_get_main_handle()")
+                # claude.md #222: the 5th argument, `dispatch_on_main`,
+                # is `handle is None` (the bare form -- always targets
+                # main) -- compile-time known from this call site's own
+                # AST shape. It makes the eventual reply's own `fn` fire
+                # on MAIN's OS thread rather than the thread that made
+                # THIS send -- see festina_thread_dispatch_reply's own
+                # doc comment in runtime/festina_runtime_thread.c.
+                dispatch_on_main = "1" if handle is None else "0"
                 lines.append(
                     f"  call void @festina_thread_register_callback(ptr {self_handle}, i64 {txn}, "
-                    f"ptr {trampoline}, ptr {fn_val})")
+                    f"ptr {trampoline}, ptr {fn_val}, i8 {dispatch_on_main})")
                 if handle is None:
                     self._emit_bare_postmessage_send(pm_args, env, lines, txn_val=txn)
                 else:
@@ -11104,6 +11168,16 @@ class CodeGen:
                         handle, inbound_type, pm_args, env, lines, txn_val=txn)
 
             if isinstance(pm_callee, ast.Identifier):
+                # claude.md #222: the bare form's own reply is marshaled
+                # onto main via festina_async_io_dispatch when it
+                # arrives (festina_thread_dispatch_reply) -- that only
+                # actually runs on a background thread rather than
+                # falling back to an inline, same-thread call if the
+                # real async-io worker pool is linked and its hooks are
+                # registered, which is exactly what uses_async_io does
+                # (see _emit_main_and_entry's own
+                # festina_register_async_io_hooks() call site).
+                self.uses_async_io = True
                 emit_register_and_send(None, None)
             else:
                 pool_index_expr = None
@@ -11357,9 +11431,33 @@ class CodeGen:
                 else:
                     fn_name = self._from_json_arr_fn_for(target_type)
                     result_type = types_mod.ArrayType(target_type)
+                # claude.md #223: a local catch frame around the call into
+                # the from-json builder -- if IT throws (a partial parse
+                # failure; the builder itself already cleans up whatever
+                # it was building, see _emit_json_catch_prologue), `cursor`
+                # and the receiver's own owning text temp would otherwise
+                # leak right here, the identical "intermediate frame
+                # between the try and the throw" class this whole entry
+                # closes, one level up from the builder itself. `cursor`
+                # and `recv_val` are both plain SSA values defined BEFORE
+                # the setjmp below (unlike the builder's own per-iteration
+                # key_slot), so both dominate the catch block normally --
+                # no `volatile` needed here.
+                catch_label = self._emit_json_catch_prologue(lines)
                 out = self.tmp()
                 lines.append(f"  {out} = call ptr {fn_name}(ptr {cursor})")
                 lines.append(f"  call void @festina_json_expect_end(ptr {cursor})")
+                lines.append("  call void @festina_try_pop()")
+                end_label = self.label("fromjson.callsite.end")
+                lines.append(f"  br label %{end_label}")
+                lines.append(f"{catch_label}:")
+                err_val = self.tmp()
+                lines.append(f"  {err_val} = call ptr @festina_try_error()")
+                lines.append(f"  call void @festina_json_cursor_free(ptr {cursor})")
+                self._free_text_temp(callee.obj, recv_val, recv_type, lines)
+                lines.append(f"  call void @festina_throw(ptr {err_val})")
+                lines.append("  unreachable")
+                self._start_block(end_label, lines)
                 lines.append(f"  call void @festina_json_cursor_free(ptr {cursor})")
                 self._free_text_temp(callee.obj, recv_val, recv_type, lines)
                 return out, result_type
@@ -12486,9 +12584,8 @@ class CodeGen:
 
     def _current_sqlite_db_global(self):
         """claude.md #199 Phase 5: the single dispatch point for "which
-        sqlite3* global should THIS `sqlite()`/`sqliteInt()`/
-        `sqliteFloat()`/`sqliteText()` call site read its handle from"
-        -- `@__festina_db` (the main program's own, unconditionally
+        sqlite3* global should THIS `sqlite()` call site read its handle
+        from" -- `@__festina_db` (the main program's own, unconditionally
         emitted -- see the module-level global list) everywhere except
         while emitting one particular thread's own on_load/on_message/
         on_exit body, where it's that thread's own private
@@ -12629,45 +12726,6 @@ class CodeGen:
                     "sqlite() parameters must be int/float/bool/text/blob/aud/img/null, "
                     f"found {types_mod.type_name(vtype)}",
                     file=self.filename, line=getattr(elem, "line", 0))
-
-    def _emit_sqlite_scalar(self, name, expr, env, lines):
-        """claude.md #94: sqliteInt/sqliteFloat/sqliteText -- one value
-        out of a query, with no `table` declaration to hold it.
-
-        Shares _emit_sqlite_call's own prepare-and-bind path exactly;
-        only the stepping differs, taking the first column of the first
-        row instead of collecting rows into an array. That matters
-        because a `table` declaration CREATES a table (claude.md
-        #28-31), so before this, asking for a `count(*)` meant leaving a
-        throwaway table behind in the database."""
-        self.uses_sqlite = True
-        callee = expr.callee
-        if not expr.args:
-            raise CodegenError(f"{name}() requires a SQL string argument",
-                                file=self.filename, line=callee.line)
-        sql_val, sql_type = self._emit_expr(expr.args[0], env, lines)
-        if sql_type != TEXT:
-            raise CodegenError(
-                f"{name}()'s first argument must be text, found "
-                f"{types_mod.type_name(sql_type)}",
-                file=self.filename, line=callee.line)
-        db_val = self.tmp()
-        lines.append(f"  {db_val} = load ptr, ptr {self._current_sqlite_db_global()}")
-        # claude.md #113: same literal-SQL statement cache the array
-        # query path uses -- sqliteInt('SELECT count(*) ...') in a loop
-        # is exactly the shape that pays for re-preparing.
-        stmt_val = self._emit_sqlite_prepare(expr, sql_val, db_val, lines)
-        self._free_text_temp(expr.args[0], sql_val, sql_type, lines)
-        if len(expr.args) > 1:
-            self._emit_sqlite_bind_params(expr.args[1], stmt_val, env, lines)
-        fn, ret_ir, ret_type = {
-            "sqliteInt": ("festina_sqlite_scalar_int", "i64", INT),
-            "sqliteFloat": ("festina_sqlite_scalar_float", "double", FLOAT),
-            "sqliteText": ("festina_sqlite_scalar_text", "ptr", TEXT),
-        }[name]
-        out = self.tmp()
-        lines.append(f"  {out} = call {ret_ir} @{fn}(ptr {stmt_val})")
-        return out, ret_type
 
     def _emit_sqlite_collect(self, stmt_val, table_type, lines):
         table_name = table_type.name

@@ -222,25 +222,6 @@ void *festina_argv_array(int argc, char **argv);
  * calls. */
 int64_t festina_process_exec(void *args);
 
-/* claude.md #177 (new entry): the non-blocking counterpart --
- * exec(args, callback) -- dispatched onto the exact same background
- * worker pool blob/img/aud's own `.callback()` runs on
- * (festina_async_io_dispatch, below). `user_callback` is the program's
- * real func[int]:void value, carried through as opaque data (it may be
- * an arbitrary runtime value, not just a bare function symbol -- see
- * FestinaExecPayload's own comment); `trampoline` is codegen's own
- * single generated void(ptr) wrapper that reads the exit code and
- * user_callback back out of the payload and calls the latter -- see
- * festina_runtime.c's own FestinaExecPayload/
- * _emit_exec_callback_trampoline doc comments for why a trampoline is
- * needed here at all (an int result, unlike blob/img/aud's own
- * already-ptr-shaped one). Never called with a NULL user_callback/
- * trampoline -- codegen only ever reaches this from the 2-argument
- * exec() form, which always has a real callback; the 1-argument, fully
- * synchronous form still calls festina_process_exec above directly. */
-void festina_process_exec_dispatch(void *args, void *user_callback,
-                                    void (*trampoline)(void *));
-
 /* claude.md #93: math, files and time -- all libc/libm, both already on
  * every link line, so none of this costs a new dependency.
  *
@@ -388,16 +369,6 @@ void *festina_decode_audio_bytes(const void *data, int64_t len, const char *labe
  * any rows (INSERT/UPDATE/DELETE, or a SELECT whose result isn't
  * captured into an arr[Table]). */
 void festina_sqlite_exec(sqlite3_stmt *stmt);
-
-/* claude.md #94: single-value queries -- the first column of the first
- * row, then finalize. Receiving a result used to require declaring a
- * `table`, which CREATES one (claude.md #28-31's schema sync), so a
- * `count(*)` left a throwaway table in the database; these need no
- * schema at all. No rows, or a SQL NULL, answers with Festina's own
- * null for that type rather than failing. */
-int64_t festina_sqlite_scalar_int(sqlite3_stmt *stmt);
-double festina_sqlite_scalar_float(sqlite3_stmt *stmt);
-char *festina_sqlite_scalar_text(sqlite3_stmt *stmt);
 
 /* Steps a prepared statement to completion, collecting each row per the
  * layout above, then finalizes it. col_types has col_count entries,
@@ -1207,11 +1178,21 @@ void festina_thread_post_outbound(FestinaThreadHandle *h, void *payload, int64_t
  * used only to route a reply-to-main through THAT handle's own
  * outbound queue) to `dest` (the original sender), tagged with the
  * calling thread's own ambient "which message am I currently
- * handling" state -- never triggers on_message on the receiving end. */
+ * handling" state -- never triggers on_message on the receiving end.
+ * claude.md #222: `dispatch_on_main` is 1 only for a worker's own
+ * registration of the BARE form (`postMessage(x).callback(fn)`, which
+ * always targets main) -- codegen knows this at compile time from the
+ * call site's own AST shape. It makes `fn` fire on MAIN's own OS
+ * thread when the reply arrives, instead of on whichever thread
+ * originally sent the message (see festina_thread_dispatch_reply's own
+ * doc comment in festina_runtime_thread.c). Always 0 for a named
+ * `NAME.postMessage(x).callback(fn)` send, and for anything main
+ * itself registers (the bare form doesn't exist at main's own top
+ * level, so main's own registrations are never this). */
 int64_t festina_thread_alloc_txn_id(void);
 void festina_thread_register_callback(FestinaThreadHandle *self, int64_t txn_id,
                                       void (*trampoline)(void *payload, void *user_fn),
-                                      void *user_fn);
+                                      void *user_fn, int8_t dispatch_on_main);
 /* claude.md #218: `release` is how to free `payload` if this reply
  * turns out to have nothing to dispatch to -- the receiving side knows
  * only its OWN inbound type, never the sender's reply type, so the
