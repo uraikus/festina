@@ -9,6 +9,22 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.23] - 2026-09-01
+
+### Added
+
+- **Thread-private helper functions.** A `func` declared directly in a
+  `thread { }` body's own top level (a sibling of its state vars/
+  `on load`/`on message`/`on exit`) is now callable from that one
+  thread's own handlers and other private funcs, with direct read/
+  write access to that thread's own state. Two private funcs may call
+  each other regardless of declaration order. An ordinary top-level
+  `func` remains completely uncallable from inside a thread body,
+  unchanged. Each thread pool instance gets its own independent copy
+  of every private func, closing over that one instance's own state.
+
+See claude.md #210 for the full design.
+
 ## [0.22] - 2026-09-01
 
 ### Added
