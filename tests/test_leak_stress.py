@@ -581,4 +581,11 @@ class TestLeakStress:
             # private func closing over THAT instance's own state, not
             # shared with its siblings).
             "thread_private_func_churn.f",
+            # claude.md #211: exec(args)/regex()/mkdir()/ls(), all
+            # newly unblocked inside a thread body -- two threads each
+            # calling these at their OWN call sites concurrently, at
+            # real volume, so a leaked exec()'d child/fd, a leaked
+            # regex compilation, or a leaked directory-listing
+            # accumulator would show up here.
+            "thread_wider_builtins_churn.f",
         }

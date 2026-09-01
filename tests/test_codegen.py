@@ -16702,3 +16702,44 @@ class TestThreadPrivateFunctions:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["3", "200"]
+
+
+class TestThreadWiderBuiltinAccess:
+    """claude.md #211: real, compiled-and-run proof that
+    exec(args)/regex()/mkdir()/ls() all actually work from inside a
+    thread body, not just that semantic.py accepts them."""
+
+    def test_exec_regex_mkdir_ls_all_work_inside_a_thread(
+            self, compile_and_run, tmp_path):
+        source = """
+        on message(worker:thread, msg:text) {
+            log(msg)
+            close(0)
+        }
+        thread worker {
+            on load() {
+                mkdir('subdir')
+                arr[text] entries = ls('.')
+                bool foundDir = false
+                int i = 0
+                while i < entries.length {
+                    if entries[i] == 'subdir' {
+                        foundDir = true
+                    }
+                    i = i + 1
+                }
+                regex r = /^ab/
+                bool matched = r.test('abc')
+                int code = exec(['true'])
+                if foundDir && matched && code == 0 {
+                    postMessage('all good')
+                } else {
+                    postMessage('failed')
+                }
+            }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "all good"
+        assert (tmp_path / "subdir").is_dir()

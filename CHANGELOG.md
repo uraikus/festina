@@ -9,6 +9,27 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.24] - 2026-09-01
+
+### Added
+
+- **Wider builtin access inside a `thread { }` body.** `regex()`,
+  `mkdir()`, and `ls()` are now callable from inside a thread's own
+  handlers and private funcs, alongside the blocking, 1-argument
+  `exec(args)`. Each is safe with zero runtime changes: `regex()`'s
+  memoization slot is a per-call-site codegen global, never shared
+  between threads; `mkdir()`/`ls()` are thin, purely local POSIX
+  wrappers; `exec(args)`'s `fork()`/`execvp()`/`waitpid()` only ever
+  touches the calling thread. The non-blocking, 2-argument
+  `exec(args, callback)` form stays rejected inside a thread body —
+  its callback always runs on the main program's own OS thread
+  regardless of which thread dispatched it, a genuine cross-thread
+  isolation violation if allowed.
+
+See claude.md #211 for the full design, including how this was
+verified against the actual C runtime rather than assumed from names
+alone.
+
 ## [0.23] - 2026-09-01
 
 ### Added

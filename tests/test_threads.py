@@ -142,7 +142,6 @@ class TestThreadIsolation:
         "render()",
         "saveCanvas()",
         "setTimeout(otherFunc, 100)",
-        "exec(['ls'])",
         "openPort(8080)",
     ])
     def test_disallowed_builtins_are_rejected_inside_a_thread(
@@ -917,3 +916,48 @@ class TestThreadPrivateFunctions:
         pool[0].postMessage(1)
         """
         semantic.analyze(parser.parse(source))
+
+
+class TestThreadWiderBuiltinAccess:
+    """claude.md #211: `regex()`/`mkdir()`/`ls()` are unblocked
+    outright inside a thread body -- each confirmed by reading the
+    actual runtime C to touch no shared state at all. `exec` needs an
+    arity split instead of a flat removal: the blocking 1-argument
+    form is equally safe, but the non-blocking 2-argument form's own
+    callback always runs on MAIN's own OS thread regardless of which
+    thread dispatched it, a real cross-thread-isolation violation."""
+
+    def test_regex_is_accepted_inside_a_thread(self, parser, semantic):
+        source = "thread w { on load() { regex r = /^ab/ } }"
+        semantic.analyze(parser.parse(source))
+
+    def test_mkdir_is_accepted_inside_a_thread(self, parser, semantic):
+        source = "thread w { on load() { mkdir('x') } }"
+        semantic.analyze(parser.parse(source))
+
+    def test_ls_is_accepted_inside_a_thread(self, parser, semantic):
+        source = "thread w { on load() { arr[text] r = ls('.') } }"
+        semantic.analyze(parser.parse(source))
+
+    def test_exec_with_one_argument_is_accepted_inside_a_thread(self, parser, semantic):
+        source = "thread w { on load() { int code = exec(['true']) } }"
+        semantic.analyze(parser.parse(source))
+
+    def test_exec_with_a_callback_is_still_rejected_inside_a_thread(
+            self, parser, semantic, errors):
+        source = """
+        void func onDone(code:int) { }
+        thread w { on load() { exec(['true'], onDone) } }
+        """
+        with pytest.raises(errors.CompileError,
+                            match="its callback always runs on the main program's own OS thread"):
+            semantic.analyze(parser.parse(source))
+
+    def test_canvas_and_timer_builtins_are_still_rejected_inside_a_thread(
+            self, parser, semantic, errors):
+        # claude.md #211 is a widening, not a blanket amnesty --
+        # everything still tied to genuinely shared main-thread-only
+        # state stays exactly as rejected as before.
+        source = "thread w { on load() { drawRect(0, 0, 1, 1) } }"
+        with pytest.raises(errors.CompileError, match="cannot be called from inside a thread body"):
+            semantic.analyze(parser.parse(source))

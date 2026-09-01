@@ -3106,15 +3106,25 @@ persists across messages the same way a global would, just scoped to
 this one thread.
 
 **Isolation.** A thread's body may call `log`/`fail`,
-string/array/map/struct/enum operations, `Math`, time functions, and
+string/array/map/struct/enum operations, `Math`, time functions,
 `blankImage()` plus `img`-method drawing/clip/resize/pixel calls (each
-touches only that one private image, never shared state). It may
-**not** call any canvas/window builtin (`drawRect`, `render`,
-`saveCanvas`, ...), `setTimeout`/`setInterval`, `exec()`,
-`mkdir()`/`ls()`, `openPort()`/`openSecurePort()`, or any ordinary
-top-level `func` declared outside the thread. `sqlite()`/`sqliteInt()`/
-`sqliteFloat()`/`sqliteText()` are allowed **only** for a thread that
-declared its own `DatabaseURL` — see below.
+touches only that one private image, never shared state),
+`regex()`/`mkdir()`/`ls()`, and `exec(args)` (the blocking,
+single-argument form — see below). It may **not** call any
+canvas/window builtin (`drawRect`, `render`, `saveCanvas`, ...),
+`setTimeout`/`setInterval`, `openPort()`/`openSecurePort()`, or any
+ordinary top-level `func` declared outside the thread — declare a
+`func` directly inside the thread instead if it only needs to be
+called from there (see [Thread-private functions](#threads) above).
+`sqlite()`/`sqliteInt()`/`sqliteFloat()`/`sqliteText()` are allowed
+**only** for a thread that declared its own `DatabaseURL` — see below.
+
+**`exec(args, callback)` (the non-blocking form) is still rejected
+inside a thread body** — unlike the blocking `exec(args)` form, its
+callback always runs on the *main* program's own OS thread, regardless
+of which thread dispatched it, so a thread handing it a closure over
+its own private state would be a real cross-thread violation. Use the
+blocking form instead.
 
 **Per-thread SQLite.** A thread's own first statement may be
 `DatabaseURL = '<literal>'` — a plain string literal only, unlike the

@@ -840,7 +840,26 @@ def _check_message_handler_params(params, node, filename, structs, tables, enums
 # since the answer depends on THIS thread's own `database_url` (a
 # thread that declared its own `DatabaseURL` may call them; one that
 # didn't may not), a per-thread question this flat, unconditional set
-# has no way to represent.
+# has no way to represent. `exec` is ALSO deliberately not here
+# (claude.md #211) -- the 1-argument (blocking) form's own fork/
+# execvp/waitpid touches no shared state at all (confirmed directly
+# by reading festina_run_argv), but the 2-argument
+# (`exec(args, callback)`, non-blocking) form's own callback is
+# documented to run on MAIN's OS thread regardless of which thread
+# dispatched it (confirmed directly: festina_process_exec_dispatch's
+# own worker only ever computes the exit code; the trampoline that
+# actually invokes the callback runs from festina_async_io_dispatch's
+# own main-thread drain step) -- a real cross-thread-isolation
+# violation the arity alone can't express as a flat name-only set, so
+# `exec` gets its own dedicated arity-aware check instead, mirroring
+# the sqlite one's own shape. `regex`/`mkdir`/`ls` are NOT here either
+# (claude.md #211) -- confirmed safe by reading each: `regex()`'s own
+# memoization slot is a per-CALL-SITE codegen-generated global
+# (`_regex_memo_slots`, keyed by `id(Call node)`), lexically private
+# to whichever one thread's generated code contains that call site,
+# never shared; `mkdir`/`ls` are thin, purely local POSIX wrappers
+# (`mkdir()`/`opendir()`/`readdir()`/`closedir()`) touching no shared
+# global at all.
 _THREAD_DISALLOWED_BUILTINS = frozenset({
     "drawRect", "drawCircle", "drawText", "drawImage", "drawPixel",
     "clearRect", "clearCircle", "clearPixel", "clearCanvas",
@@ -857,8 +876,7 @@ _THREAD_DISALLOWED_BUILTINS = frozenset({
     "setMaxAudioPlayers", "maxAudioPlayers", "stopAudioPlayer",
     "isAudioPlayerPlaying",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
-    "exec", "openPort", "closePort", "openSecurePort", "close",
-    "mkdir", "ls", "regex",
+    "openPort", "closePort", "openSecurePort", "close",
 })
 
 
@@ -2372,6 +2390,29 @@ def analyze(program, filename="<string>"):
                         f"its own database (a thread's first statement may be "
                         f"DatabaseURL = '<path>', giving it a private sqlite "
                         f"handle no other thread or the main program shares)",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                if name == "exec" and len(expr.args) == 2:
+                    # claude.md #211: unlike the flat _THREAD_DISALLOWED_
+                    # BUILTINS set just below, `exec`'s own safety
+                    # depends on ARITY, not just its name -- the
+                    # blocking 1-argument form is fine (see this
+                    # module's own comment above _THREAD_DISALLOWED_
+                    # BUILTINS for the confirmed-by-reading reasoning);
+                    # the non-blocking 2-argument form's own callback
+                    # always runs on MAIN's OS thread regardless of
+                    # which thread dispatched it, a real cross-thread-
+                    # isolation violation. Checked here, ahead of the
+                    # flat set (which no longer even lists `exec`), so
+                    # this gets its own specific reason instead of the
+                    # generic "touches shared state" one.
+                    raise CompileError(
+                        f"'exec(args, callback)' cannot be called from inside a "
+                        f"thread body -- its callback always runs on the main "
+                        f"program's own OS thread, regardless of which thread "
+                        f"dispatched it; 'exec(args)' (the blocking, 1-argument "
+                        f"form) is fine",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
