@@ -17053,6 +17053,80 @@ class TestThreadHttpContext:
         assert "started" in result.stdout
 
 
+class TestThreadDrain:
+    """claude.md #231 (uraikus/festina#91): `NAME.drain()` -- blocks
+    until a thread's own inbound queue is fully processed, so
+    `on close()`/`on exit(code:int)` can fire off a final async job
+    (e.g. a database write on a thread with its own DatabaseURL) and
+    be sure it has actually landed before the process-exit teardown
+    that follows discards anything still in-flight."""
+
+    def test_a_write_on_a_drained_thread_survives_process_exit(
+            self, compile_and_run, tmp_path):
+        # claude.md #231's own decisive proof, and #91's exact repro
+        # shape: without drain(), this same write is silently lost
+        # (confirmed directly -- see claude.md #231's own "Verified"
+        # note). A thread and main can never share one DatabaseURL
+        # (semantic.py's own isolation gate), so the write is checked
+        # the same way every other thread-DB test in this suite does
+        # -- inspecting the thread's own private .sqlite file directly
+        # from Python, once the process has actually exited.
+        source = """
+        table Written { n:int }
+
+        thread writer {
+            DatabaseURL = 'writer_drain.sqlite'
+            on message(caller:thread, msg:int) {
+                sqlite('INSERT INTO Written (n) VALUES (?)', [msg])
+            }
+        }
+
+        writer.postMessage(42)
+        writer.drain()
+        log('drained')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "drained" in result.stdout
+        db = tmp_path / "writer_drain.sqlite"
+        assert db.exists()
+        rows = sqlite3.connect(db).execute("SELECT n FROM Written").fetchall()
+        assert rows == [(42,)]
+
+    def test_drain_on_a_never_started_thread_is_a_safe_no_op(self, compile_and_run):
+        # claude.md #231: a thread with no `on message`/`postMessage`
+        # ever sent to it is never live()'d in the first place --
+        # drain() on it must return immediately rather than hang.
+        source = """
+        thread idle {
+            on load() { }
+        }
+        idle.drain()
+        log('done')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "done" in result.stdout
+
+    def test_drain_on_a_killed_thread_is_a_safe_no_op(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(w:thread, msg:int) { }
+        }
+        worker.postMessage(1)
+        worker.drain()
+        worker.kill()
+        worker.drain()
+        log('done')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "done" in result.stdout
+
+
 class TestGiveRequest:
     """claude.md #213 (Phase 5): real, compiled-and-run proof that
     `NAME.giveRequest(r)` -- live connection hand-off -- genuinely

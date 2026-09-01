@@ -9,6 +9,23 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.39] - 2026-09-01
+
+### Added
+
+- **`NAME.drain()`** blocks until a thread's own inbound queue is
+  fully processed, then returns with the thread still running. The
+  deliberate opposite of `kill()`'s own discard-don't-wait choice --
+  exists specifically so `on close()`/`on exit(code:int)` can fire off
+  a final `postMessage` (e.g. a database write on a thread with its
+  own `DatabaseURL`) and be sure it landed before the teardown that
+  follows a window closing or a graceful shutdown would otherwise
+  discard it, unprocessed, exactly like `kill()` already does. Same
+  main-only shape as `kill()`/`live()`/`isAlive()`, including
+  `pool[i].drain()`. See [api.md](api.md#lifecycle-kill-live-isalive-drain).
+
+See claude.md #231 (uraikus/festina#91).
+
 ## [0.38] - 2026-09-01
 
 ### Fixed

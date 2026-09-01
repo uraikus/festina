@@ -1628,6 +1628,13 @@ class CodeGen:
             "declare void @festina_thread_give_request(ptr, ptr, ptr)",
             "declare void @festina_thread_deliver_given_request(ptr)",
             "declare void @festina_thread_kill(ptr)",
+            # claude.md #231 (uraikus/festina#91): blocks until a
+            # thread's own inbound queue is fully drained -- see
+            # festina_thread_wait_drained's own doc comment in
+            # runtime/festina_runtime_thread.c (named to avoid
+            # colliding with the existing, unrelated
+            # festina_thread_drain(void) declared elsewhere).
+            "declare void @festina_thread_wait_drained(ptr)",
             "declare void @festina_thread_live(ptr, ptr)",
             "declare i8 @festina_thread_is_alive(ptr)",
             "declare void @festina_register_thread_hooks()",
@@ -11286,6 +11293,17 @@ class CodeGen:
                     return "0", None
                 if callee.prop == "kill":
                     lines.append(f"  call void @festina_thread_kill(ptr {handle})")
+                    if end_label is not None:
+                        lines.append(f"  br label %{end_label}")
+                        self._start_block(end_label, lines)
+                    return "0", None
+                if callee.prop == "drain":
+                    # claude.md #231 (uraikus/festina#91): blocks the
+                    # calling (main) thread until `handle`'s own inbound
+                    # queue is fully drained -- see
+                    # festina_thread_wait_drained's own doc comment for
+                    # the actual wait mechanism.
+                    lines.append(f"  call void @festina_thread_wait_drained(ptr {handle})")
                     if end_label is not None:
                         lines.append(f"  br label %{end_label}")
                         self._start_block(end_label, lines)
