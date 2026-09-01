@@ -11,6 +11,7 @@ struct Point { x:int  y:int }
 struct Line { a:Point  b:Point  label:text  tags:arr[text] }
 struct Scores { name:text  values:map[int] }
 struct Node { n:int  next:Node }
+struct Note { msg:text }
 
 int total = 0
 int i = 0
@@ -79,6 +80,17 @@ while i < 150 {
     Point aliasA = ln.a
     free aliasA
     total = total + ln.a.x
+
+
+    // claude.md #206: \u escapes -- a plain BMP codepoint and an
+    // astral-plane surrogate pair, decoded through the same
+    // struct-field path everything else above uses. Proves the
+    // new UTF-8-encode-and-possibly-grow-the-buffer path (a 4-byte
+    // surrogate-pair codepoint can outgrow the buffer sized for
+    // the escape's own source bytes) doesn't leak either.
+    text noteSrc = `{"msg":"caf\\u00e9 note ${i} \\ud83d\\ude00"}`
+    Note note = noteSrc.toStruct(Note)
+    total = total + note.msg.split(' ').length
 
     i = i + 1
 }

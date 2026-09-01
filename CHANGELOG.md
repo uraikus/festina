@@ -9,6 +9,20 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.19] - 2026-09-01
+
+### Fixed
+
+- **`.toStruct(T)`/`.toArr(T)` now decode `\u` unicode escapes** —
+  previously threw `"... not yet supported"` on any JSON string
+  containing a `\uXXXX` escape, including a UTF-16 surrogate pair
+  (astral-plane codepoints); raw, un-escaped UTF-8 bytes were always
+  fine, but a producer that specifically `\u`-escaped non-ASCII text
+  could never be parsed. Now decodes both BMP codepoints and surrogate
+  pairs into their real UTF-8 encoding, with a clear, catchable throw
+  for malformed input (an unpaired surrogate, invalid hex, a truncated
+  escape). See claude.md #206.
+
 ## [0.18] - 2026-09-01
 
 ### Fixed

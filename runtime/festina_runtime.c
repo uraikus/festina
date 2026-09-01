@@ -539,6 +539,28 @@ static int festina_json_try_null(FestinaJsonCursor *c) {
     return 0;
 }
 
+/* claude.md #206: reads exactly 4 hex digits (the payload of a JSON
+ * `\uXXXX` escape) and returns the 16-bit value they encode; throws on
+ * anything else (running past the end of input, or a non-hex
+ * character) -- the same "malformed input is a real error, never
+ * silently guessed at" convention every other JSON parsing helper here
+ * already follows. */
+static int festina_json_read_hex4(FestinaJsonCursor *c) {
+    int value = 0;
+    for (int i = 0; i < 4; i++) {
+        if (c->pos >= c->len) festina_json_throwf("unterminated \\u escape");
+        char ch = c->s[c->pos];
+        int digit;
+        if (ch >= '0' && ch <= '9') digit = ch - '0';
+        else if (ch >= 'a' && ch <= 'f') digit = ch - 'a' + 10;
+        else if (ch >= 'A' && ch <= 'F') digit = ch - 'A' + 10;
+        else { festina_json_throwf("invalid \\u escape at position %lld", (long long)c->pos); return 0; }
+        value = (value << 4) | digit;
+        c->pos++;
+    }
+    return value;
+}
+
 static char *festina_json_parse_string(FestinaJsonCursor *c) {
     festina_json_skip_ws(c);
     if (c->pos >= c->len || c->s[c->pos] != '"') {
@@ -565,16 +587,72 @@ static char *festina_json_parse_string(FestinaJsonCursor *c) {
                 case 'n': decoded = '\n'; break;
                 case 'r': decoded = '\r'; break;
                 case 't': decoded = '\t'; break;
+                case 'u': {
+                    /* claude.md #206: closes the gap claude.md #159
+                     * left documented ("\u unicode escapes are not yet
+                     * supported") -- decodes the escape to a Unicode
+                     * codepoint (combining a UTF-16 surrogate pair into
+                     * one codepoint outside the Basic Multilingual
+                     * Plane when the input calls for it, exactly as
+                     * JSON's own \u encoding requires) and UTF-8
+                     * encodes it directly into `out`, growing capacity
+                     * for however many bytes that codepoint needs (1-4)
+                     * -- a genuinely variable-width write the single
+                     * shared `decoded`-then-append path below can't
+                     * express, so this case writes `out` itself and
+                     * `continue`s the outer loop rather than falling
+                     * through to that path. */
+                    int cp = festina_json_read_hex4(c);
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        if (c->pos + 1 >= c->len || c->s[c->pos] != '\\' || c->s[c->pos + 1] != 'u') {
+                            free(out);
+                            festina_json_throwf("unpaired UTF-16 surrogate \\u%04x", cp);
+                        }
+                        c->pos += 2;
+                        int low = festina_json_read_hex4(c);
+                        if (low < 0xDC00 || low > 0xDFFF) {
+                            free(out);
+                            festina_json_throwf("expected a low surrogate after \\u%04x, found \\u%04x", cp, low);
+                        }
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        free(out);
+                        festina_json_throwf("unpaired UTF-16 surrogate \\u%04x", cp);
+                    }
+                    unsigned char utf8[4];
+                    int n;
+                    if (cp < 0x80) {
+                        utf8[0] = (unsigned char)cp;
+                        n = 1;
+                    } else if (cp < 0x800) {
+                        utf8[0] = (unsigned char)(0xC0 | (cp >> 6));
+                        utf8[1] = (unsigned char)(0x80 | (cp & 0x3F));
+                        n = 2;
+                    } else if (cp < 0x10000) {
+                        utf8[0] = (unsigned char)(0xE0 | (cp >> 12));
+                        utf8[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+                        utf8[2] = (unsigned char)(0x80 | (cp & 0x3F));
+                        n = 3;
+                    } else {
+                        utf8[0] = (unsigned char)(0xF0 | (cp >> 18));
+                        utf8[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+                        utf8[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+                        utf8[3] = (unsigned char)(0x80 | (cp & 0x3F));
+                        n = 4;
+                    }
+                    if (len + n + 1 > cap) {
+                        while (len + n + 1 > cap) cap *= 2;
+                        char *grown = realloc(out, cap);
+                        if (!grown) { free(out); festina_json_throwf("out of memory parsing a JSON string"); }
+                        out = grown;
+                    }
+                    memcpy(out + len, utf8, n);
+                    len += n;
+                    continue;
+                }
                 default:
                     free(out);
-                    /* claude.md #159: \u unicode escapes are a
-                     * documented v1 scope cut, not silently mishandled
-                     * -- raw (unescaped) non-ASCII UTF-8 bytes in a
-                     * string are unaffected and parse completely
-                     * normally; this only affects a producer that
-                     * specifically chooses to \u-escape. */
-                    if (esc == 'u') festina_json_throwf("\\u unicode escapes are not yet supported");
-                    else festina_json_throwf("invalid escape sequence '\\%c'", esc);
+                    festina_json_throwf("invalid escape sequence '\\%c'", esc);
                     return NULL; /* unreachable */
             }
         } else if (ch < 0x20) {

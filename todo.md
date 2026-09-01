@@ -34,10 +34,6 @@ and AddressSanitizer/LeakSanitizer coverage for the target.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately: each new
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
-- **`.toStruct(T)`/`.toArr(T)` don't support `\u` unicode string
-  escapes** — raw, un-escaped UTF-8 bytes in a JSON string are
-  unaffected and parse normally; this only affects a producer that
-  specifically chooses to `\u`-escape.
 - **`thread` declarations are singletons** — declared once by name,
   with no way to spawn more than one instance of the same `thread`
   block (a worker pool, say). See [api.md](api.md#threads).
