@@ -16569,6 +16569,41 @@ class TestThreadReplyCallback:
         lines = sorted(result.stdout.strip().splitlines())
         assert lines == ["A: 100", "B: 200"]
 
+    def test_a_second_sequential_reply_still_delivers(self, compile_and_run):
+        # claude.md #230 (uraikus/festina#89): a SEQUENTIAL round trip
+        # (register, send, reply, dispatch, callback fires -- THEN a
+        # second, completely separate round trip begins) used to
+        # corrupt the sender's own pending_callbacks list: dispatching
+        # the first reply removed the only (and therefore TAIL) node
+        # without updating pending_callbacks_tail, so the next
+        # registration wrote into already-freed memory via the stale
+        # tail and never linked itself into the list `pending_callbacks`
+        # itself still pointed at -- the second reply had nothing left
+        # to be found by and was silently dropped. onA triggers onB's
+        # own send only once its own reply has actually arrived, which
+        # is exactly what makes this deterministic (no timer needed)
+        # and exactly the shape #89's own report called "the second
+        # reply ever emitted by a given thread instance."
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg * 10)
+            }
+        }
+        void func onB(r:int) {
+            log(`B: ${r}`)
+            close(0)
+        }
+        void func onA(r:int) {
+            log(`A: ${r}`)
+            worker.postMessage(2).callback(onB)
+        }
+        worker.postMessage(1).callback(onA)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip().splitlines() == ["A: 10", "B: 20"]
+
     def test_an_out_of_range_pool_index_registers_no_callback(self, compile_and_run):
         # claude.md #218: the registration used to be emitted BEFORE
         # the pool's own bounds check, so an out-of-range index left a

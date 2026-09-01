@@ -477,11 +477,22 @@ static void festina_pending_callback_marshal_free(void *payload) {
  * false) is unaffected -- it already runs on the right thread, whichever
  * called this function, so it stays a direct, unmarshaled call. */
 static int festina_thread_dispatch_reply(FestinaThreadHandle *h, int64_t txn_id, void *payload) {
-    FestinaPendingCallback **link = &h->pending_callbacks;
-    while (*link) {
-        if ((*link)->txn_id == txn_id) {
-            FestinaPendingCallback *cb = *link;
-            *link = cb->next;
+    FestinaPendingCallback *prev = NULL;
+    FestinaPendingCallback *cb = h->pending_callbacks;
+    while (cb) {
+        if (cb->txn_id == txn_id) {
+            /* claude.md #230: unlink via prev/cur, not just a head-
+             * relative **link, specifically so removing the TAIL node
+             * can correct pending_callbacks_tail too -- see this
+             * function's own doc comment above for the bug this fixes
+             * (a stale tail pointer left dangling after freeing `cb`
+             * corrupts the very next registration: it writes into
+             * already-freed memory via the stale tail and never links
+             * the new node into the list `pending_callbacks` itself
+             * still points at, so every reply after that is silently
+             * unfindable). */
+            if (prev) prev->next = cb->next; else h->pending_callbacks = cb->next;
+            if (cb == h->pending_callbacks_tail) h->pending_callbacks_tail = prev;
             if (cb->dispatch_on_main) {
                 FestinaPendingCallbackMarshal *m = malloc(sizeof(*m));
                 if (!m) festina_fail("out of memory marshaling a reply callback onto main");
@@ -497,7 +508,8 @@ static int festina_thread_dispatch_reply(FestinaThreadHandle *h, int64_t txn_id,
             free(cb);
             return 1;
         }
-        link = &(*link)->next;
+        prev = cb;
+        cb = cb->next;
     }
     return 0;
 }

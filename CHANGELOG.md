@@ -9,6 +9,25 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.38] - 2026-09-01
+
+### Fixed
+
+- **A thread's second-ever `.reply()` was silently dropped.** A worker's
+  reply/`.callback()` mechanism delivered successfully only the first
+  time, for that handle's entire process lifetime -- every reply after
+  that from the same sender was silently discarded, no error. Root
+  cause: removing the last entry from a sender's own pending-callback
+  list left its tail pointer dangling, corrupting the very next
+  registration (a real use-after-free write) so it became unreachable
+  from the list's own head. Fixed by tracking the previous node
+  explicitly during removal and correcting the tail pointer whenever
+  the removed node was it. api.md's own "reply at most once per
+  message" documentation needed no change -- it already described the
+  intended behavior; the runtime just wasn't providing it.
+
+See claude.md #230 (uraikus/festina#89, #90).
+
 ## [0.37] - 2026-09-01
 
 ### Documentation
