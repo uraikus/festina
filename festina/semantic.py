@@ -125,9 +125,6 @@ BUILTIN_FUNCTIONS = {
     # claude.md #182: showCursor()/hideCursor() -- toggles the mouse
     # cursor's visibility over the canvas.
     "showCursor", "hideCursor",
-    # claude.md #94: single-value queries, so a scalar result needs no
-    # throwaway `table` declaration (which would create a real table).
-    "sqliteInt", "sqliteFloat", "sqliteText",
     # claude.md #131: exits the program with `code`, running a declared
     # `on exit(code:int)` handler first (see _EVENT_SIGNATURES below) --
     # works with or without a window, unlike mouseDown/.../close's on-
@@ -207,10 +204,6 @@ _BUILTIN_RETURN_TYPES = {
     # claude.md #135: saveCanvas's return type now depends on its own
     # arity (bool with a path, img without) -- handled by its own
     # dedicated branch in _infer_call, not this fixed-per-name table.
-    # claude.md #94
-    "sqliteInt": types_mod.PrimitiveType("int"),
-    "sqliteFloat": types_mod.PrimitiveType("float"),
-    "sqliteText": types_mod.PrimitiveType("text"),
     # claude.md #132
     "mkdir": types_mod.PrimitiveType("bool"),
     "ls": types_mod.ArrayType(types_mod.PrimitiveType("text")),
@@ -428,11 +421,16 @@ _BUILTIN_SIGNATURES = {
 _COLOR = types_mod.ColorType()
 _FONT = types_mod.FontType()
 
-# claude.md #33/#94: every builtin taking (sql, [params]) -- the bound
-# parameter list is a literal array that is explicitly allowed to mix
-# types, so all of them need the same carve-out from the ordinary
-# same-element-type array rule.
-_SQLITE_BUILTINS = frozenset({"sqlite", "sqliteInt", "sqliteFloat", "sqliteText"})
+# claude.md #33/#94/#219: every builtin taking (sql, [params]) -- the
+# bound parameter list is a literal array that is explicitly allowed to
+# mix types, so it needs a carve-out from the ordinary same-element-type
+# array rule. `sqliteInt`/`sqliteFloat`/`sqliteText` (claude.md #94's
+# own single-value-query convenience wrappers) were removed in claude.md
+# #219 -- `sqlite()` itself is the only member left, but this stays a
+# named set (not an inline `name == "sqlite"` check) since every call
+# site below reads as "one of the sql-taking builtins", which is still
+# the real question being asked even with one member.
+_SQLITE_BUILTINS = frozenset({"sqlite"})
 
 _BUILTIN_SIGNATURE_ALTERNATES = {
     # claude.md #91: the one-argument form takes a `color` value, not a
@@ -863,12 +861,11 @@ def _check_message_handler_params(params, node, filename, structs, tables, enums
 # that one private Cairo surface, confirmed safe for concurrent use of
 # DIFFERENT surfaces on different threads. `blankImage` is deliberately
 # NOT here for the identical reason -- it only ever creates a fresh,
-# private surface, nothing shared. `sqlite`/`sqliteInt`/`sqliteFloat`/
-# `sqliteText` are deliberately NOT here (claude.md #199 Phase 5) --
-# each is gated by its own dedicated check in _infer_call instead,
-# since the answer depends on THIS thread's own `database_url` (a
-# thread that declared its own `DatabaseURL` may call them; one that
-# didn't may not), a per-thread question this flat, unconditional set
+# private surface, nothing shared. `sqlite` is deliberately NOT here
+# (claude.md #199 Phase 5) -- it's gated by its own dedicated check in
+# _infer_call instead, since the answer depends on THIS thread's own
+# `database_url` (a thread that declared its own `DatabaseURL` may call
+# it; one that didn't may not), a per-thread question this flat, unconditional set
 # has no way to represent. `exec` is ALSO deliberately not here
 # (claude.md #211) -- the 1-argument (blocking) form's own fork/
 # execvp/waitpid touches no shared state at all (confirmed directly
@@ -1094,8 +1091,8 @@ class _ThreadInfo:
         # claude.md #199 Phase 5: this thread's own resolved
         # `DatabaseURL = '<literal>'` first statement (None if it
         # never declared one) -- a thread with one gets its own
-        # private sqlite handle and may call sqlite()/sqliteInt()/
-        # sqliteFloat()/sqliteText(); one without one may not.
+        # private sqlite handle and may call sqlite(); one without
+        # one may not.
         # `database_url_node` is kept only for the whole-program
         # conflict check's own error reporting.
         self.database_url = None
@@ -1113,8 +1110,7 @@ class _ThreadInfo:
         # _THREAD_HTTP_HANDLER_NAMES) -- gates openPort()/closePort()/
         # openSecurePort() for this thread (see _infer_call), the same
         # "gate the builtin on a per-thread capability" shape
-        # `database_url` already gives sqlite()/sqliteInt()/
-        # sqliteFloat()/sqliteText().
+        # `database_url` already gives sqlite().
         self.has_http_handler = False
         # claude.md #213 (Phase 5 -- giveRequest): WHICH of the four
         # this thread declared, by name -- has_http_handler alone
@@ -2549,8 +2545,7 @@ def analyze(program, filename="<string>"):
                 if name in _SQLITE_BUILTINS and _current_thread[0].database_url is None:
                     # claude.md #199 Phase 5: unlike every OTHER
                     # disallowed builtin (a flat, unconditional "never
-                    # from a thread body"), sqlite()/sqliteInt()/
-                    # sqliteFloat()/sqliteText() are allowed for a
+                    # from a thread body"), sqlite() is allowed for a
                     # thread that declared its own private database --
                     # its own separate sqlite3* handle, never crossing
                     # threads, is exactly what makes this safe (see

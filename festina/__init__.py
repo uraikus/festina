@@ -7,4 +7,4 @@ api.md for the language/standard library reference, and
 tests/CONTRACT.md's "Status" section for what's done vs. not yet.
 """
 
-__version__ = "0.31"
+__version__ = "0.32"

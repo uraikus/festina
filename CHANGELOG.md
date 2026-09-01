@@ -9,6 +9,22 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.32] - 2026-09-01
+
+### Removed
+
+- **`sqliteInt()`, `sqliteFloat()`, and `sqliteText()`.** `sqlite()`
+  itself, `table`, and `DatabaseURL` are unaffected. These three
+  existed to read a single value (like a `count(*)`) without declaring
+  a `table` (which creates a real table) just to hold it -- but a
+  `struct` used as a query target creates no real table either, so
+  `arr[SomeStruct] x = sqlite('SELECT count(*) AS n FROM ...')` already
+  gives the identical schema-free round trip through `sqlite()`'s own
+  one path. Calling any of the three now fails with the same
+  "no such function" error any other unrecognized name gets.
+
+See claude.md #219.
+
 ## [0.31] - 2026-09-01
 
 ### Fixed

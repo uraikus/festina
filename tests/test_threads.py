@@ -546,10 +546,10 @@ class TestThreadLifecycleMethods:
 class TestThreadDatabaseUrl:
     """claude.md #199 Phase 5: `DatabaseURL = '<literal>'` as a thread's
     own first statement -- its own private sqlite handle (gating
-    sqlite()/sqliteInt()/sqliteFloat()/sqliteText() is covered by
-    TestThreadIsolation's own test above, since it's really an
-    isolation question), plus the whole-program compile-time conflict
-    check (main included). Every test here declares an obviously
+    sqlite() is covered by TestThreadIsolation's own test above, since
+    it's really an isolation question), plus the whole-program
+    compile-time conflict check (main included). Every test here
+    declares an obviously
     thread-specific literal path (never 'festina.sqlite') -- a bare
     parser.parse()/semantic.analyze() pair, unlike festina.imports.
     build_program, never sets Program.database_url at all, so the

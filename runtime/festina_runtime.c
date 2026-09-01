@@ -3097,53 +3097,6 @@ void festina_sqlite_bind_null(sqlite3_stmt *stmt, int32_t idx) {
     sqlite3_bind_null(stmt, idx);
 }
 
-/* claude.md #94: single-value queries.
- *
- * Receiving a result previously meant declaring a `table` to hold the
- * row shape -- and a table declaration CREATES a real table (claude.md
- * #28-31's automatic schema sync), so asking for `count(*)` or one
- * json_extract() left a throwaway table sitting in the database
- * forever. These three take the first column of the first row and
- * finalize, so a scalar query costs no schema at all.
- *
- * A query returning no rows answers with Festina's own null for that
- * type, rather than failing: "no rows matched" is an ordinary result a
- * program should be able to test for, the same reasoning claude.md #57
- * applies to division by zero. */
-int64_t festina_sqlite_scalar_int(sqlite3_stmt *stmt) {
-    int64_t out = festina_null_int();
-    if (sqlite3_step(stmt) == SQLITE_ROW
-            && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
-        out = sqlite3_column_int64(stmt, 0);
-    }
-    festina_sqlite_finish(stmt);
-    return out;
-}
-
-double festina_sqlite_scalar_float(sqlite3_stmt *stmt) {
-    double out = festina_null_float();
-    if (sqlite3_step(stmt) == SQLITE_ROW
-            && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
-        out = sqlite3_column_double(stmt, 0);
-    }
-    festina_sqlite_finish(stmt);
-    return out;
-}
-
-char *festina_sqlite_scalar_text(sqlite3_stmt *stmt) {
-    char *out = NULL;
-    if (sqlite3_step(stmt) == SQLITE_ROW
-            && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
-        const unsigned char *txt = sqlite3_column_text(stmt, 0);
-        /* Copied: sqlite owns that buffer only until the next step or
-         * finalize, and Festina text is always an owned buffer
-         * (claude.md #83). */
-        if (txt) out = strdup((const char *)txt);
-    }
-    festina_sqlite_finish(stmt);
-    return out;
-}
-
 void festina_sqlite_exec(sqlite3_stmt *stmt) {
     int rc;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {

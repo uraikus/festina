@@ -1818,10 +1818,6 @@ class CodeGen:
             "declare void @festina_audio_free(ptr)",
             "declare ptr @festina_image_from_bytes(ptr, i64, ptr)",
             "declare void @festina_sqlite_exec(ptr)",
-            # claude.md #94: single-value queries
-            "declare i64 @festina_sqlite_scalar_int(ptr)",
-            "declare double @festina_sqlite_scalar_float(ptr)",
-            "declare ptr @festina_sqlite_scalar_text(ptr)",
             # claude.md #111: collect_rows takes the declared column
             # NAMES too (result columns are matched by name now), and
             # row.undefined() reads the presence mask it records.
@@ -10667,8 +10663,6 @@ class CodeGen:
                 sig = ", ".join(f"{ty} {v}" for ty, v in zip(arg_irs, vals))
                 lines.append(f"  call void @{fn}({sig})")
                 return "0", None
-            if name in ("sqliteInt", "sqliteFloat", "sqliteText"):
-                return self._emit_sqlite_scalar(name, expr, env, lines)
             if name == "now":
                 out = self.tmp()
                 lines.append(f"  {out} = call i64 @festina_now_ms()")
@@ -12486,9 +12480,8 @@ class CodeGen:
 
     def _current_sqlite_db_global(self):
         """claude.md #199 Phase 5: the single dispatch point for "which
-        sqlite3* global should THIS `sqlite()`/`sqliteInt()`/
-        `sqliteFloat()`/`sqliteText()` call site read its handle from"
-        -- `@__festina_db` (the main program's own, unconditionally
+        sqlite3* global should THIS `sqlite()` call site read its handle
+        from" -- `@__festina_db` (the main program's own, unconditionally
         emitted -- see the module-level global list) everywhere except
         while emitting one particular thread's own on_load/on_message/
         on_exit body, where it's that thread's own private
@@ -12629,45 +12622,6 @@ class CodeGen:
                     "sqlite() parameters must be int/float/bool/text/blob/aud/img/null, "
                     f"found {types_mod.type_name(vtype)}",
                     file=self.filename, line=getattr(elem, "line", 0))
-
-    def _emit_sqlite_scalar(self, name, expr, env, lines):
-        """claude.md #94: sqliteInt/sqliteFloat/sqliteText -- one value
-        out of a query, with no `table` declaration to hold it.
-
-        Shares _emit_sqlite_call's own prepare-and-bind path exactly;
-        only the stepping differs, taking the first column of the first
-        row instead of collecting rows into an array. That matters
-        because a `table` declaration CREATES a table (claude.md
-        #28-31), so before this, asking for a `count(*)` meant leaving a
-        throwaway table behind in the database."""
-        self.uses_sqlite = True
-        callee = expr.callee
-        if not expr.args:
-            raise CodegenError(f"{name}() requires a SQL string argument",
-                                file=self.filename, line=callee.line)
-        sql_val, sql_type = self._emit_expr(expr.args[0], env, lines)
-        if sql_type != TEXT:
-            raise CodegenError(
-                f"{name}()'s first argument must be text, found "
-                f"{types_mod.type_name(sql_type)}",
-                file=self.filename, line=callee.line)
-        db_val = self.tmp()
-        lines.append(f"  {db_val} = load ptr, ptr {self._current_sqlite_db_global()}")
-        # claude.md #113: same literal-SQL statement cache the array
-        # query path uses -- sqliteInt('SELECT count(*) ...') in a loop
-        # is exactly the shape that pays for re-preparing.
-        stmt_val = self._emit_sqlite_prepare(expr, sql_val, db_val, lines)
-        self._free_text_temp(expr.args[0], sql_val, sql_type, lines)
-        if len(expr.args) > 1:
-            self._emit_sqlite_bind_params(expr.args[1], stmt_val, env, lines)
-        fn, ret_ir, ret_type = {
-            "sqliteInt": ("festina_sqlite_scalar_int", "i64", INT),
-            "sqliteFloat": ("festina_sqlite_scalar_float", "double", FLOAT),
-            "sqliteText": ("festina_sqlite_scalar_text", "ptr", TEXT),
-        }[name]
-        out = self.tmp()
-        lines.append(f"  {out} = call {ret_ir} @{fn}(ptr {stmt_val})")
-        return out, ret_type
 
     def _emit_sqlite_collect(self, stmt_val, table_type, lines):
         table_name = table_type.name

@@ -8744,7 +8744,8 @@ class TestStatementCache:
             total = total + rows[0].v
         }}
         log(total)
-        log(sqliteInt('SELECT count(*) FROM T'))
+        arr[T] counted = sqlite('SELECT count(*) AS id FROM T')
+        log(counted[0].id)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
@@ -13914,58 +13915,38 @@ class TestDrawRectAndCircleBorderColorOverride:
                 semantic.analyze(program, filename="main.f")
 
 
-class TestScalarQueries:
-    """claude.md #94: sqliteInt/sqliteFloat/sqliteText take one value out
-    of a query without a `table` declaration to hold it.
+class TestStructTargetScalarQueries:
+    """claude.md #219: sqliteInt()/sqliteFloat()/sqliteText() (claude.md
+    #94's own single-value-query convenience wrappers) were removed --
+    the schema-free scalar round trip they existed for was already
+    reachable through `sqlite()`'s own general path. A `struct` (unlike
+    a `table`) creates no real table when used as a query target, so
+    `arr[SomeStruct] x = sqlite('SELECT ... AS field FROM ...')` gives
+    the same no-extra-table round trip these wrappers offered, through
+    the one mechanism instead of four."""
 
-    That declaration isn't free: a `table` CREATES a real table
-    (claude.md #28-31's automatic schema sync), so before this, asking
-    for a `count(*)` or a single `json_extract` meant leaving a
-    throwaway table behind in the database forever. These share the
-    prepare-and-bind path `sqlite()` already uses; only the stepping
-    differs.
-
-    A query matching no rows, or whose value is SQL NULL, answers with
-    Festina's own null for that type -- an ordinary result to test for,
-    the same treatment claude.md #57 gives division by zero."""
-
-    def test_scalars_read_values_without_a_result_table(self, compile_and_run):
+    def test_a_struct_target_reads_values_without_a_result_table(
+            self, compile_and_run, tmp_path):
         source = """
         table Post { id:int  title:text  score:float }
+        struct Count { n:int }
+        struct Title { title:text }
+        struct Total { total:float }
         sqlite(`DELETE FROM Post`)
         sqlite(`INSERT INTO Post (id, title, score) VALUES (?, ?, ?)`, [1, 'alpha', 1.5])
         sqlite(`INSERT INTO Post (id, title, score) VALUES (?, ?, ?)`, [2, 'beta', 2.5])
-        log(sqliteInt(`SELECT count(*) FROM Post`))
-        log(sqliteText(`SELECT title FROM Post WHERE id = ?`, [2]))
-        log(sqliteFloat(`SELECT sum(score) FROM Post`))
+        arr[Count] c = sqlite(`SELECT count(*) AS n FROM Post`)
+        log(c[0].n)
+        arr[Title] t = sqlite(`SELECT title FROM Post WHERE id = ?`, [2])
+        log(t[0].title)
+        arr[Total] s = sqlite(`SELECT sum(score) AS total FROM Post`)
+        log(s[0].total)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout == "2\nbeta\n4\n"
-
-    def test_no_matching_row_is_null(self, compile_and_run):
-        source = """
-        table Post { id:int  title:text }
-        sqlite(`DELETE FROM Post`)
-        log(sqliteText(`SELECT title FROM Post WHERE id = ?`, [99]) == null)
-        log(sqliteInt(`SELECT id FROM Post WHERE id = ?`, [99]) == null)
-        """
-        result = compile_and_run(source)
-        assert result.returncode == 0
-        assert result.stdout == "true\ntrue\n"
-
-    def test_a_scalar_query_creates_no_extra_table(self, compile_and_run, tmp_path):
-        # The gap this exists to close: the only table in the database
-        # afterwards should be the one actually declared.
-        source = """
-        table Post { id:int }
-        sqlite(`DELETE FROM Post`)
-        sqlite(`INSERT INTO Post (id) VALUES (?)`, [1])
-        log(sqliteInt(`SELECT count(*) FROM Post`))
-        """
-        result = compile_and_run(source)
-        assert result.returncode == 0
-        assert result.stdout == "1\n"
+        # The gap the removed wrappers existed to close: the only table
+        # in the database afterwards should be the one actually declared.
         import sqlite3
         db = sqlite3.connect(str(tmp_path / "festina.sqlite"))
         names = sorted(r[0] for r in db.execute(
@@ -13974,13 +13955,30 @@ class TestScalarQueries:
         db.close()
         assert names == ["Post"]
 
-    def test_json1_works_through_scalar_queries(self, compile_and_run):
+    def test_no_matching_row_is_an_empty_array(self, compile_and_run):
+        source = """
+        table Post { id:int  title:text }
+        struct Title { title:text }
+        sqlite(`DELETE FROM Post`)
+        arr[Title] t = sqlite(`SELECT title FROM Post WHERE id = ?`, [99])
+        log(t.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_json1_works_through_a_struct_target(self, compile_and_run):
         # SQLite's JSON1 needs no compiler feature at all -- it is
         # ordinary SQL. This locks in that it stays reachable.
         source = """
-        log(sqliteInt(`SELECT json_extract('{"n":42}','$.n')`))
-        log(sqliteText(`SELECT json_extract('{"name":"ada"}','$.name')`))
-        log(sqliteInt(`SELECT json_array_length('[1,2,3]')`))
+        struct Num { n:int }
+        struct Str { s:text }
+        arr[Num] a = sqlite(`SELECT json_extract('{"n":42}','$.n') AS n`)
+        log(a[0].n)
+        arr[Str] b = sqlite(`SELECT json_extract('{"name":"ada"}','$.name') AS s`)
+        log(b[0].s)
+        arr[Num] c = sqlite(`SELECT json_array_length('[1,2,3]') AS n`)
+        log(c[0].n)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
@@ -13992,6 +13990,8 @@ class TestScalarQueries:
         # through untouched.
         source = """
         table Post { id:int  title:text  body:text }
+        struct Count { n:int }
+        struct Title { title:text }
         sqlite(`DELETE FROM Post`)
         sqlite(`INSERT INTO Post (id, title, body) VALUES (?, ?, ?)`,
                [1, 'Compilers', 'a compiler turns source into machine code'])
@@ -14002,8 +14002,10 @@ class TestScalarQueries:
         sqlite(`DROP TABLE IF EXISTS PostSearch`)
         sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
         sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
-        log(sqliteInt(`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`, ['machine']))
-        log(sqliteText(`SELECT title FROM PostSearch WHERE PostSearch MATCH ? ORDER BY rank`, ['tomatoes']))
+        arr[Count] c = sqlite(`SELECT count(*) AS n FROM PostSearch WHERE PostSearch MATCH ?`, ['machine'])
+        log(c[0].n)
+        arr[Title] t = sqlite(`SELECT title FROM PostSearch WHERE PostSearch MATCH ? ORDER BY rank`, ['tomatoes'])
+        log(t[0].title)
         """
         result = compile_and_run(source)
         assert result.returncode == 0
@@ -16062,8 +16064,8 @@ class TestThreads:
             DatabaseURL = '{db}'
             on message(worker:thread, msg:int) {{
                 sqlite('INSERT INTO Hits (n) VALUES (?)', [msg])
-                int total = sqliteInt('SELECT count(*) FROM Hits')
-                postMessage(total)
+                arr[Hits] counted = sqlite('SELECT count(*) AS n FROM Hits')
+                postMessage(counted[0].n)
             }}
         }}
         int cycle = 0

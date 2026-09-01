@@ -389,16 +389,6 @@ void *festina_decode_audio_bytes(const void *data, int64_t len, const char *labe
  * captured into an arr[Table]). */
 void festina_sqlite_exec(sqlite3_stmt *stmt);
 
-/* claude.md #94: single-value queries -- the first column of the first
- * row, then finalize. Receiving a result used to require declaring a
- * `table`, which CREATES one (claude.md #28-31's schema sync), so a
- * `count(*)` left a throwaway table in the database; these need no
- * schema at all. No rows, or a SQL NULL, answers with Festina's own
- * null for that type rather than failing. */
-int64_t festina_sqlite_scalar_int(sqlite3_stmt *stmt);
-double festina_sqlite_scalar_float(sqlite3_stmt *stmt);
-char *festina_sqlite_scalar_text(sqlite3_stmt *stmt);
-
 /* Steps a prepared statement to completion, collecting each row per the
  * layout above, then finalizes it. col_types has col_count entries,
  * one per declared table field in order ("int"/"float"/"bool"/"text"). */

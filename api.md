@@ -2861,19 +2861,30 @@ log(`took ${now() - started}ms`)
 
 ### Single-value queries
 
+A `struct` — unlike a `table` — declares only a shape, not a real
+table, so it costs nothing to use as a one-off landing spot for a
+value that would otherwise need a throwaway `table` sitting in your
+database forever just to receive a `count(*)`:
+
 ```festina
-int total  = sqliteInt(`SELECT count(*) FROM Post`)
-text name  = sqliteText(`SELECT title FROM Post WHERE id = ?`, [2])
-float mean = sqliteFloat(`SELECT avg(score) FROM Post`)
+struct Total { total:int }
+struct Name  { name:text }
+struct Mean  { mean:float }
+
+arr[Total] t = sqlite(`SELECT count(*) AS total FROM Post`)
+int total = t[0].total
+
+arr[Name] n = sqlite(`SELECT title AS name FROM Post WHERE id = ?`, [2])
+text name = n[0].name
+
+arr[Mean] m = sqlite(`SELECT avg(score) AS mean FROM Post`)
+float mean = m[0].mean
 ```
 
-The first column of the first row. Use these instead of declaring a
-`table` just to receive a scalar — a `table` declaration *creates* a
-real table, so a throwaway one for a `count(*)` would sit in your
-database permanently.
-
-A query matching no rows (or whose value is SQL NULL) returns `null`,
-so it's something to test for rather than something that stops you.
+Alias the column to match the struct's field name (`AS total`, `AS
+name`, ...) the same way any `sqlite()` query does. A query matching no
+rows comes back as an empty array (`arr.length == 0`) rather than a
+value — check that before indexing `[0]`.
 
 ### JSON and full-text search
 
@@ -2881,11 +2892,15 @@ Both are ordinary SQL, and `sqlite()` passes SQL through untouched — so
 SQLite's JSON1 and FTS5 work today with no extra language feature:
 
 ```festina
-log(sqliteText(`SELECT json_extract(data, '$.name') FROM Doc WHERE id = ?`, [1]))
+struct Name { name:text }
+arr[Name] n = sqlite(`SELECT json_extract(data, '$.name') AS name FROM Doc WHERE id = ?`, [1])
+log(n[0].name)
 
 sqlite(`CREATE VIRTUAL TABLE PostSearch USING fts5(title, body, content='Post', content_rowid='id')`)
 sqlite(`INSERT INTO PostSearch(PostSearch) VALUES('rebuild')`)
-log(sqliteInt(`SELECT count(*) FROM PostSearch WHERE PostSearch MATCH ?`, ['machine']))
+struct Total { total:int }
+arr[Total] t = sqlite(`SELECT count(*) AS total FROM PostSearch WHERE PostSearch MATCH ?`, ['machine'])
+log(t[0].total)
 ```
 
 ## Growing arrays
@@ -3248,9 +3263,9 @@ any ordinary top-level `func` declared outside the thread — declare a
 
 Two builtins are allowed conditionally:
 
-- `sqlite()`/`sqliteInt()`/`sqliteFloat()`/`sqliteText()` — only for a
-  thread that declared its own `DatabaseURL`, see
-  [A thread's own database](#a-threads-own-database-databaseurl) below.
+- `sqlite()` — only for a thread that declared its own `DatabaseURL`,
+  see [A thread's own database](#a-threads-own-database-databaseurl)
+  below.
 - `openPort()`/`closePort()`/`openSecurePort()` — only for a thread
   that has already declared its own `on request`/`on upgrade`/
   `on socketMessage`/`on socketClose`, see
@@ -3285,11 +3300,11 @@ logger.postMessage('started up')
 
 A thread with its own `DatabaseURL` gets its own private sqlite handle
 — never shared with the main program or any other thread — and may
-call `sqlite()`/`sqliteInt()`/`sqliteFloat()`/`sqliteText()`; every
-`table` declared anywhere in the program is synced against it, the
-same as the main program's own database. A thread that did **not**
-declare its own `DatabaseURL` may not call any of the four at all — a
-clear compile error naming the fix. **Two contexts (a thread and the
+call `sqlite()`; every `table` declared anywhere in the program is
+synced against it, the same as the main program's own database. A
+thread that did **not** declare its own `DatabaseURL` may not call
+`sqlite()` at all — a clear compile error naming the fix. **Two
+contexts (a thread and the
 main program, or two threads) may never resolve to the same literal
 database file** — checked at compile time across the whole program,
 including the main program's own default (`'festina.sqlite'`, when it
