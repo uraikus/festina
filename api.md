@@ -2113,7 +2113,7 @@ Every connection is serviced from a **single thread**, the same "one
 thread total" model `setTimeout`/`setInterval` and graphics event
 handlers already use — connections are multiplexed, not run in
 parallel, so ordinary globals need no locking to read/write safely
-across requests. The tradeoff: a slow `on request`/`on message` handler
+across requests. The tradeoff: a slow `on request`/`on socketMessage` handler
 delays every *other* connection's own turn. This is built for the kind
 of small, script-shaped server this language already targets, not as a
 general-purpose production server replacement.
@@ -2235,7 +2235,7 @@ on upgrade(s:socket) {
     log('client connected')
 }
 
-on message(s:socket, msg:blob) {
+on socketMessage(s:socket, msg:blob) {
     s.send(`you said: ${msg.toText()}`)
 }
 
@@ -2253,16 +2253,16 @@ actually a valid WebSocket handshake (missing/mismatched headers),
 normal "no response sent" default (`200`, empty body) — never a crash.
 
 Once upgraded, `on upgrade(s:socket)` fires once for that connection,
-then `on message(s:socket, msg:blob)` fires once per message received
+then `on socketMessage(s:socket, msg:blob)` fires once per message received
 — **always as a `blob`**, whether the peer sent a text or binary frame
 (call `.toText()` if you know it's always text). `on socketClose(s)`
 fires exactly once when the connection ends, however it ends (the peer
 closed it, sent a close frame, or the read failed) — never for a plain
 HTTP connection that never upgraded.
 
-**Fragmentation is invisible to `on message`.** A peer
+**Fragmentation is invisible to `on socketMessage`.** A peer
 may split one logical message across several WebSocket frames (RFC 6455
-§5.4) — this runtime reassembles them itself, so `on message` fires
+§5.4) — this runtime reassembles them itself, so `on socketMessage` fires
 exactly once per MESSAGE either way, with the full, already-concatenated
 `blob`; there's no way to observe the individual fragments, and no
 reason to want to. A ping/pong or close frame arriving in the middle of
@@ -2532,7 +2532,7 @@ openSecurePort(8443, key)
 
 The TLS counterpart to `openPort()` — same listener/connection table,
 same single-threaded event loop, and the exact same `on request`/
-`on upgrade`/`on message`/`on socketClose` handler surface (a program
+`on upgrade`/`on socketMessage`/`on socketClose` handler surface (a program
 can mix plain `openPort()` and TLS `openSecurePort()` listeners
 freely; a connection's own `req`/`s` behaves identically either way —
 nothing about *reading* a request or *sending* a response differs
@@ -2690,19 +2690,19 @@ alias within one thread does. Both directions work the same way:
 ```festina
 struct Circle { x:int y:int }
 
+Circle? c
+on message(worker:thread, msg:Circle?) {
+    log(msg.x)                     // 99
+    log(c.x)                       // 99 -- c itself changed, proving no clone happened
+}
+
 thread Worker {
-    on message(p:Circle?) {
-        p.x = 99                   // mutates the SAME value the sender holds
-        postMessage(p)              // echoes the same reference back, no clone
+    on message(worker:thread, msg:Circle?) {
+        msg.x = 99                 // mutates the SAME value the sender holds
+        postMessage(msg)           // echoes the same reference back, no clone
     }
 }
 
-Circle? c
-void func onReply(x:Circle?) {
-    log(x.x)                       // 99
-    log(c.x)                       // 99 -- c itself changed, proving no clone happened
-}
-Worker.onMessage(void (x:Circle?) => onReply(x))
 c.x = 1
 Worker.postMessage(c)
 ```
@@ -3000,20 +3000,19 @@ deadlines together so neither blocks the other.
 ## Threads
 
 ```festina
+on message(worker:thread, msg:int) {
+    log(`main got: ${msg}`)
+}
+
 thread worker {
     on load() {
         log('worker: ready')
     }
-    on message(p:int) {
-        postMessage(p * 2)
+    on message(worker:thread, msg:int) {
+        postMessage(msg * 2)
     }
 }
 
-void func onReply(x:int) {
-    log(`main got: ${x}`)
-}
-
-worker.onMessage(void (x:int) => onReply(x))
 worker.postMessage(21)
 ```
 
@@ -3026,20 +3025,29 @@ function names, and type names — never a global variable or constant,
 and it cannot call an ordinary top-level function** (see "Isolation"
 below).
 
-**Sending and receiving.** `on message(p:T)` declares the type a
-thread accepts (a thread with no `on message` accepts no messages at
-all, and `NAME.postMessage(x)` anywhere is a compile error). From the
-main program, `NAME.postMessage(x)` sends `x` to the thread; from
-inside the thread's own body, the bare `postMessage(x)` sends `x` back
-out to the main program. The main program registers
-`NAME.onMessage(callback)` to receive those: `callback` is checked
-against whatever type the thread's own `postMessage(x)` call sites
-actually send, which must be a single, consistent type — sending more
-than one shape from the same thread is a compile error that says to
-pre-declare a named `enum` covering both (the same convention `on
-message` itself already uses for multiple inbound types). A thread
-that never calls `postMessage` needs no `NAME.onMessage(...)`
-registration at all.
+**Sending and receiving.** Every message receiver — the main program,
+or a specific `thread` — declares its own inbound type directly with
+one `on message(worker:thread, msg:T)` handler, the *same* shape in
+both places: `worker` identifies who sent the message (`null` when it
+was sent by the main program), and `msg:T` is the receiver's own
+choice of type. There is exactly **one** `on message` at the top
+level for the whole program — it's what a bare `postMessage(x)`
+(inside any thread's own body) sends to. `NAME.postMessage(x)` sends
+`x` to a specific thread `NAME`, checked against *that thread's own*
+declared `on message`; this works both from the main program and from
+inside another thread's own body — **threads may message each other
+directly**, not just the main program. Sending anywhere with no
+matching `on message` declared is a compile error naming what's
+missing.
+
+Since each side's `msg` type is declared, not inferred, sending more
+than one shape to the same receiver needs a pre-declared `enum`
+covering all of them, exactly like an ordinary function parameter
+would.
+
+`kill()`/`live()`/`isAlive()` (below) stay callable **only** from the
+main program — a thread may message another thread, but may not
+control its lifecycle.
 
 **Every message is a deep, independent copy** — two threads (or a
 thread and the main program) never share a mutable value, which is
@@ -3084,8 +3092,8 @@ process.
 ```festina
 thread counter {
     int total = 0
-    on message(p:int) {
-        total = total + p
+    on message(worker:thread, msg:int) {
+        total = total + msg
         postMessage(total)
     }
 }
@@ -3116,8 +3124,8 @@ main program's own `DatabaseURL` (which may be any `text` expression):
 thread logger {
     DatabaseURL = './logs.sqlite'
     table LogEntry { message:text }
-    on message(p:text) {
-        sqlite('INSERT INTO LogEntry (message) VALUES (?)', [p])
+    on message(worker:thread, msg:text) {
+        sqlite('INSERT INTO LogEntry (message) VALUES (?)', [msg])
     }
 }
 logger.postMessage('started up')
