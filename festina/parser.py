@@ -696,21 +696,44 @@ class Parser:
         return ast.EnumDecl(name_tok.value, members, t.line, t.column)
 
     def parse_thread_decl(self):
-        # claude.md #195: `thread NAME { ... }` -- no parens, ever
+        # claude.md #195/#208: `thread NAME { ... }` -- no parens, ever
         # (unlike func/on, which always carry a signature). A thread
         # declaration has no signature of its own: its inbound message
-        # type is whatever an `on message(p:T)` nested inside its own
-        # body declares (found by semantic analysis, not here), and its
-        # outbound type is inferred from that same body's own
-        # `postMessage(x)` call sites. The body is an ordinary block --
-        # nested `on load()`/`on message(p:T)`/`on exit(code:int)`
-        # handlers and thread-private state VarDecls all parse for free
-        # through parse_block()/parse_statement(), the same reuse
+        # type is whatever an `on message(worker:thread, msg:T)` nested
+        # inside its own body declares (found by semantic analysis, not
+        # here). The body is an ordinary block -- nested
+        # `on load()`/`on message(...)`/`on exit(code:int)` handlers and
+        # thread-private state VarDecls all parse for free through
+        # parse_block()/parse_statement(), the same reuse
         # parse_func_decl's own body already gets.
+        #
+        # claude.md #209 (thread pools): `thread NAME[N] { ... }` --
+        # `N` is a bare, compile-time-literal integer, never a general
+        # expression, matching `DatabaseURL`'s own "must be a literal"
+        # precedent (its own conflict/naming machinery needs to reason
+        # about every instance without running the program). `NAME[i]`
+        # at a USE site (`pool[i].postMessage(...)`) needs no grammar
+        # of its own at all -- it already parses as an ordinary
+        # computed `Member` through parse_call_member's own generic
+        # `LBRACK` branch above, identical to indexing an `arr[T]`.
         t = self.eat("thread")
         name_tok = self.eat("IDENT")
+        pool_size = None
+        if self.at("LBRACK"):
+            self.eat("LBRACK")
+            size_tok = self.eat("NUMBER")
+            if not isinstance(size_tok.value, int):
+                raise self.err(size_tok, "invalid syntax",
+                                "a thread pool's size must be a plain integer literal, "
+                                f"found '{size_tok.value}'")
+            pool_size = size_tok.value
+            if pool_size <= 0:
+                raise self.err(size_tok, "invalid syntax",
+                                f"a thread pool's size must be a positive integer, "
+                                f"found {pool_size}")
+            self.eat("RBRACK")
         body = self.parse_block()
-        return ast.ThreadDecl(name_tok.value, body, t.line, t.column)
+        return ast.ThreadDecl(name_tok.value, body, t.line, t.column, pool_size=pool_size)
 
     def parse_event_handler(self):
         t = self.eat("on")

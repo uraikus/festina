@@ -1035,6 +1035,13 @@ class _ThreadInfo:
         # conflict check's own error reporting.
         self.database_url = None
         self.database_url_node = None
+        # claude.md #209: `thread NAME[N] { ... }` -- None for an
+        # ordinary singleton thread, or N (a positive int) for a pool.
+        # ONE _ThreadInfo is shared by every index of a pool -- every
+        # instance runs the identical body, so there is exactly one
+        # `inbound_type`/`database_url` to reason about regardless of
+        # which index a particular send targets.
+        self.pool_size = node.pool_size
 
 
 class AnalyzedProgram:
@@ -2697,9 +2704,52 @@ def analyze(program, filename="<string>"):
             # of everything else in this branch, since ThreadType is its
             # own closed namespace no other check here could ever match
             # anyway.
-            if isinstance(callee.obj, ast.Identifier) and callee.obj.name in threads:
-                thread_name = callee.obj.name
+            # claude.md #209: `pool[i].postMessage(...)` -- `pool[i]`
+            # itself is an ordinary computed `Member` (`callee.obj`),
+            # not a bare Identifier, needing no grammar of its own (see
+            # parse_thread_decl's own comment); recognized here by
+            # peeling that one extra layer off before the identical
+            # by-name lookup below, so every check underneath (method
+            # name, main-only lifecycle methods, postMessage's own
+            # inbound-type check) runs completely unchanged for a pool
+            # instance -- `thread_name`/`info` name the POOL as a
+            # whole (one `_ThreadInfo` shared by every index, since
+            # every index runs the identical body), the index itself
+            # only ever matters at codegen's own runtime select.
+            pool_index_expr = None
+            pool_receiver = callee.obj
+            if (isinstance(callee.obj, ast.Member) and callee.obj.computed
+                    and isinstance(callee.obj.obj, ast.Identifier)
+                    and callee.obj.obj.name in threads):
+                if threads[callee.obj.obj.name].pool_size is None:
+                    raise CompileError(
+                        f"'{callee.obj.obj.name}' is an ordinary thread, not a pool -- "
+                        f"'{callee.obj.obj.name}[i]' is only valid for a "
+                        f"'thread {callee.obj.obj.name}[N] {{ ... }}' pool declaration",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid method receiver",
+                    )
+                pool_index_expr = callee.obj.prop
+                pool_receiver = callee.obj.obj
+            if isinstance(pool_receiver, ast.Identifier) and pool_receiver.name in threads:
+                thread_name = pool_receiver.name
                 info = threads[thread_name]
+                if info.pool_size is not None and pool_index_expr is None:
+                    raise CompileError(
+                        f"thread pool '{thread_name}' must be indexed to call a "
+                        f"method -- e.g. '{thread_name}[0].{callee.prop}(...)'",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid method receiver",
+                    )
+                if pool_index_expr is not None:
+                    idx_type = infer(pool_index_expr, scope)
+                    if idx_type != _INT:
+                        raise CompileError(
+                            f"thread pool index must be int, found "
+                            f"{types_mod.type_name(idx_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
                 if callee.prop not in ("postMessage", "kill", "live", "isAlive"):
                     raise CompileError(
                         f"thread '{thread_name}' has no method '{callee.prop}' -- only "

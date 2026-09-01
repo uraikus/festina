@@ -655,3 +655,94 @@ class TestThreadReservedName:
         program = parser.parse("void func postMessage() { }")
         with pytest.raises(errors.CompileError, match="builtin function name"):
             semantic.analyze(program)
+
+
+class TestThreadPools:
+    """claude.md #209: `thread NAME[N] { ... }` -- N independent
+    instances of one body, addressed at a use site via `NAME[i]` --
+    `NAME[i]` itself needs no grammar of its own (it already parses as
+    an ordinary computed `Member`, identical to indexing an `arr[T]`);
+    only the DECLARATION's own optional `[N]` is new grammar. Real
+    per-instance independence (private state, correct message routing)
+    is a compile-and-run question -- see `TestThreads` in
+    `tests/test_codegen.py`."""
+
+    def test_a_pool_declaration_parses_and_analyzes(self, parser, semantic):
+        semantic.analyze(parser.parse("thread pool[4] { }"))
+
+    def test_pool_size_must_be_a_plain_integer_literal(self, parser, semantic, errors):
+        with pytest.raises(errors.CompileError, match="plain integer literal"):
+            semantic.analyze(parser.parse("thread pool[4.5] { }"))
+
+    def test_pool_size_must_be_positive(self, parser, semantic, errors):
+        with pytest.raises(errors.CompileError, match="positive integer"):
+            semantic.analyze(parser.parse("thread pool[0] { }"))
+
+    def test_indexed_postmessage_to_a_pool_is_accepted(self, parser, semantic):
+        source = """
+        thread pool[4] { on message(worker:thread, msg:int) { } }
+        pool[0].postMessage(1)
+        pool[3].postMessage(2)
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_pool_index_can_be_a_runtime_expression(self, parser, semantic):
+        source = """
+        thread pool[4] { on message(worker:thread, msg:int) { } }
+        int i = 2
+        pool[i].postMessage(1)
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_pool_index_must_be_int(self, parser, semantic, errors):
+        source = """
+        thread pool[4] { on message(worker:thread, msg:int) { } }
+        pool['x'].postMessage(1)
+        """
+        with pytest.raises(errors.CompileError, match="thread pool index must be int"):
+            semantic.analyze(parser.parse(source))
+
+    def test_the_bare_pool_name_must_be_indexed_to_call_a_method(self, parser, semantic, errors):
+        source = """
+        thread pool[4] { on load() { } }
+        pool.kill()
+        """
+        with pytest.raises(errors.CompileError, match="must be indexed"):
+            semantic.analyze(parser.parse(source))
+
+    def test_indexing_an_ordinary_non_pool_thread_is_rejected(self, parser, semantic, errors):
+        source = """
+        thread worker { on load() { } }
+        worker[0].kill()
+        """
+        with pytest.raises(errors.CompileError, match="is an ordinary thread, not a pool"):
+            semantic.analyze(parser.parse(source))
+
+    def test_pool_isalive_kill_live_are_accepted_when_indexed(self, parser, semantic):
+        source = """
+        thread pool[2] { on load() { } }
+        bool alive = pool[0].isAlive()
+        pool[1].kill()
+        pool[0].live(void (ok:bool) => log(ok))
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_pool_lifecycle_methods_are_still_rejected_from_inside_a_thread_body(
+            self, parser, semantic, errors):
+        source = """
+        thread pool[2] { on load() { } }
+        thread other { on load() { pool[0].kill() } }
+        """
+        with pytest.raises(errors.CompileError, match="cannot be called from inside a thread body"):
+            semantic.analyze(parser.parse(source))
+
+    def test_a_thread_may_postmessage_a_specific_pool_instance_from_inside_its_own_body(
+            self, parser, semantic):
+        # claude.md #208's "messaging only" inter-thread capability
+        # applies to a pool instance exactly the same as an ordinary
+        # thread.
+        source = """
+        thread pool[2] { on message(worker:thread, msg:int) { } }
+        thread other { on load() { pool[0].postMessage(1) } }
+        """
+        semantic.analyze(parser.parse(source))

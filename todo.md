@@ -34,9 +34,6 @@ and AddressSanitizer/LeakSanitizer coverage for the target.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately: each new
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
-- **`thread` declarations are singletons** — declared once by name,
-  with no way to spawn more than one instance of the same `thread`
-  block (a worker pool, say). See [api.md](api.md#threads).
 - **A thread-private helper function** (an ordinary `func` callable
   only from inside one thread's own body, closing over that thread's
   own state) **isn't supported** — every top-level `func` is checked

@@ -1018,6 +1018,22 @@ class CodeGen:
                                                 # bare `postMessage(x)`
                                                 # dispatch (the only thing that needs to know "am
                                                 # I inside a thread body right now") consults.
+        self.thread_pools = {}                 # claude.md #209: pool thread NAME -> dict of
+                                                # {"pool_size", "inbound_type",
+                                                # "handle_globals" (a list of N handle_global
+                                                # names, index-order)}. Kept PARALLEL to
+                                                # self.threads rather than making that dict
+                                                # polymorphic -- a pool's own N instances are each
+                                                # emitted through the ordinary, unchanged
+                                                # _emit_thread_decl/_emit_thread_on_load/etc. path,
+                                                # one per mangled instance name (`NAME$0`...
+                                                # `NAME$N-1`), each getting its own real entry in
+                                                # self.threads (so the existing startup
+                                                # registration loop, which just iterates
+                                                # self.threads.items(), needs no changes at all).
+                                                # This dict exists only so a USE site
+                                                # (`pool[i].postMessage(...)`) can find the N
+                                                # handle globals to runtime-select among.
         self._struct_clone_fns = {}            # claude.md #197 Phase 3: struct name -> LLVM
                                                 # function name of its own lazily-generated
                                                 # deep-clone wrapper -- see _clone_fn_for_struct's
@@ -2192,7 +2208,10 @@ class CodeGen:
                 self._emit_event_handler(stmt)
             return
         if isinstance(stmt, ast.ThreadDecl):
-            self._emit_thread_decl(stmt)
+            if stmt.pool_size is not None:
+                self._emit_thread_pool_decl(stmt)
+            else:
+                self._emit_thread_decl(stmt)
             return
         if isinstance(stmt, ast.VarDecl):
             # claude.md #202: `type_` here is deliberately the BARE
@@ -3629,6 +3648,64 @@ class CodeGen:
         self.threads[decl.name]["on_load_symbol"] = on_load_symbol
         self.threads[decl.name]["on_message_symbol"] = on_message_symbol
         self.threads[decl.name]["on_exit_symbol"] = on_exit_symbol
+
+    def _emit_thread_pool_decl(self, decl):
+        """claude.md #209: `thread NAME[N] { ... }` -- N fully
+        independent instances of the identical body, each with its own
+        real OS thread, private state, and message queues, exactly like
+        N separate ordinary `thread` declarations would have (nothing
+        about the runtime registry itself -- confirmed by a full read
+        of runtime/festina_runtime_thread.c -- stores a name or index
+        anywhere, so N independent registrations already work today).
+
+        Implemented as a compile-time-unrolled loop calling the
+        ordinary, completely unchanged `_emit_thread_decl` once per
+        index, over a synthesized per-instance ThreadDecl whose own
+        `.name` is mangled (`NAME$0`...`NAME$N-1`, `$` being a valid
+        unquoted LLVM identifier character) -- every global/symbol
+        `_emit_thread_decl` and its own on_load/on_message/on_exit
+        helpers derive from `decl.name` comes out already, correctly,
+        namespaced per instance, with zero changes needed to any of
+        that machinery. The one thing those functions read OUTSIDE
+        `decl.name` itself is `self.analyzed.threads[thread_name]`
+        (`_emit_thread_decl`'s own `info` lookup, and
+        `_emit_thread_on_load`'s own `database_url` read) -- aliased
+        here, once, so every mangled name resolves to the SAME shared
+        `_ThreadInfo` semantic.py already built for the pool as a whole
+        (one declared `on message`/`DatabaseURL` applies identically to
+        every instance).
+        """
+        info = self.analyzed.threads[decl.name]
+        handle_globals = []
+        for i in range(decl.pool_size):
+            instance_name = f"{decl.name}${i}"
+            self.analyzed.threads[instance_name] = info
+            instance_decl = ast.ThreadDecl(instance_name, decl.body, decl.line, decl.column)
+            self._emit_thread_decl(instance_decl)
+            handle_globals.append(self.threads[instance_name]["handle_global"])
+        # claude.md #209: one extra global -- a genuinely CONSTANT
+        # `[N x ptr]` array whose own N elements are each the compile-
+        # time ADDRESS of one instance's own `handle_global` (each of
+        # those is itself an ordinary `global ptr null`, populated at
+        # runtime by the startup registration loop below, completely
+        # unaware anything pool-shaped is going on). A use site
+        # (`pool[i].postMessage(...)`) GEPs into this array at a
+        # RUNTIME index to pick the right slot, loads it to recover
+        # WHICH handle_global that index names, then loads THAT to get
+        # the actual FestinaThreadHandle* -- one extra indirection
+        # versus a singleton's own direct `load ptr, ptr {handle_
+        # global}`, in exchange for never needing an emitted N-way
+        # switch/chain of branches at every call site.
+        handles_array_global = f"@__festina_thread_pool_{decl.name}_handles"
+        elems = ", ".join(f"ptr {g}" for g in handle_globals)
+        self.extra_globals.append(
+            f"{handles_array_global} = global [{decl.pool_size} x ptr] [{elems}]")
+        self.thread_pools[decl.name] = {
+            "pool_size": decl.pool_size,
+            "inbound_type": info.inbound_type,
+            "handle_globals": handle_globals,
+            "handles_array_global": handles_array_global,
+        }
 
     def _emit_thread_on_load(self, thread_name, state_inits, on_load_decl, state_env, thread_ctx):
         symbol = f"@__festina_thread_{thread_name}_on_load"
@@ -10563,17 +10640,76 @@ class CodeGen:
                 return out, ret_type
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
         if isinstance(callee, ast.Member) and not callee.computed:
-            # claude.md #195 Phase 2: NAME.postMessage/onMessage/kill/
-            # live/isAlive -- checked first, ahead of everything else in
-            # this branch, since a declared thread's own name is its
-            # own closed namespace (semantic.py already proved
-            # callee.prop is one of these five and that this call site
-            # is NOT itself inside any thread body -- these five are
-            # main-program-only operations).
-            if isinstance(callee.obj, ast.Identifier) and callee.obj.name in self.threads:
-                thread_name = callee.obj.name
-                tinfo = self.threads[thread_name]
-                handle_global = tinfo["handle_global"]
+            # claude.md #195 Phase 2 (widened by #209): NAME.postMessage/
+            # kill/live/isAlive, and now ALSO pool[i].<same four> --
+            # checked first, ahead of everything else in this branch,
+            # since a declared thread's (or thread pool's) own name is
+            # its own closed namespace (semantic.py already proved
+            # callee.prop is one of these four, that this call site is
+            # NOT itself inside any thread body for kill/live/isAlive,
+            # and -- for a pool -- that the index expression is int).
+            #
+            # claude.md #209: `pool[i]` is peeled off here into
+            # `pool_index_expr` (an ordinary expression, evaluated
+            # below) plus `receiver` (the bare pool NAME) -- mirroring
+            # semantic.py's own identical peel in `_infer_call`.
+            pool_index_expr = None
+            receiver = callee.obj
+            if (isinstance(callee.obj, ast.Member) and callee.obj.computed
+                    and isinstance(callee.obj.obj, ast.Identifier)
+                    and callee.obj.obj.name in self.thread_pools):
+                pool_index_expr = callee.obj.prop
+                receiver = callee.obj.obj
+            if isinstance(receiver, ast.Identifier) and (
+                    receiver.name in self.threads or receiver.name in self.thread_pools):
+                # claude.md #209: an out-of-range pool index is a
+                # SILENT NO-OP (this language's own established "test,
+                # don't fail" convention -- claude.md #195's own
+                # `NAME.isAlive()` already returns a plain bool rather
+                # than ever raising) -- `handle` is only ever loaded,
+                # and the real op only ever runs, inside a bounds-
+                # checked block; `end_label`/`oob_pred` are None for an
+                # ordinary (non-pool) receiver, where none of this
+                # applies and the op runs completely unconditionally,
+                # exactly as before.
+                end_label = None
+                oob_pred = None
+                if pool_index_expr is not None:
+                    pinfo = self.thread_pools[receiver.name]
+                    inbound_type = pinfo["inbound_type"]
+                    n = pinfo["pool_size"]
+                    idx_val, _ = self._emit_expr(pool_index_expr, env, lines)
+                    in_range = self.tmp()
+                    lines.append(f"  {in_range} = icmp ult i64 {idx_val}, {n}")
+                    oob_pred = self.cur_block
+                    in_range_label = self.label("pool.inrange")
+                    end_label = self.label("pool.end")
+                    lines.append(f"  br i1 {in_range}, label %{in_range_label}, label %{end_label}")
+                    self._start_block(in_range_label, lines)
+                    # claude.md #209: double indirection -- the pool's
+                    # own `[N x ptr]` global holds N compile-time-
+                    # constant handle-global ADDRESSES (one per
+                    # instance, built once in _emit_thread_pool_decl);
+                    # GEP selects the SLOT at the runtime index, the
+                    # first load reads which handle global that slot
+                    # names, the second reads that instance's own
+                    # actual (runtime-registered) FestinaThreadHandle*
+                    # -- the same value a singleton's own single `load
+                    # ptr, ptr {handle_global}` reads directly below.
+                    slot = self.tmp()
+                    lines.append(
+                        f"  {slot} = getelementptr inbounds [{n} x ptr], ptr "
+                        f"{pinfo['handles_array_global']}, i64 0, i64 {idx_val}")
+                    handle_global_addr = self.tmp()
+                    lines.append(f"  {handle_global_addr} = load ptr, ptr {slot}")
+                    handle = self.tmp()
+                    lines.append(f"  {handle} = load ptr, ptr {handle_global_addr}")
+                else:
+                    tinfo = self.threads[receiver.name]
+                    inbound_type = tinfo["inbound_type"]
+                    handle_global = tinfo["handle_global"]
+                    handle = self.tmp()
+                    lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                 if callee.prop == "postMessage":
                     # claude.md #208: legal from main OR from inside
                     # ANOTHER thread's own body now -- the sender
@@ -10584,11 +10720,8 @@ class CodeGen:
                     # on_exit body -- see _emit_call's bare postMessage
                     # branch for the identical pattern) when this call
                     # site is itself inside another thread's body.
-                    inbound_type = tinfo["inbound_type"]
                     val, vtype = self._emit_expr(expr.args[0], env, lines)
                     val = self._coerce(val, vtype, inbound_type, lines, source_expr=expr.args[0])
-                    handle = self.tmp()
-                    lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                     box = self._emit_thread_box(val, inbound_type, lines)
                     if self._current_thread_ctx is not None:
                         sender = self.tmp()
@@ -10597,11 +10730,15 @@ class CodeGen:
                         sender = "null"
                     lines.append(f"  call void @festina_thread_post(ptr {handle}, ptr {sender}, ptr {box})")
                     self._emit_thread_postmessage_cleanup(expr.args[0], val, vtype, inbound_type, lines)
+                    if end_label is not None:
+                        lines.append(f"  br label %{end_label}")
+                        self._start_block(end_label, lines)
                     return "0", None
                 if callee.prop == "kill":
-                    handle = self.tmp()
-                    lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                     lines.append(f"  call void @festina_thread_kill(ptr {handle})")
+                    if end_label is not None:
+                        lines.append(f"  br label %{end_label}")
+                        self._start_block(end_label, lines)
                     return "0", None
                 if callee.prop == "live":
                     # claude.md #195 Phase 2: the callback's own real
@@ -10613,15 +10750,23 @@ class CodeGen:
                     # thread-queue payload, not a real, already-typed
                     # Festina bool).
                     cb_val, _ = self._emit_expr(expr.args[0], env, lines)
-                    handle = self.tmp()
-                    lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                     lines.append(f"  call void @festina_thread_live(ptr {handle}, ptr {cb_val})")
+                    if end_label is not None:
+                        lines.append(f"  br label %{end_label}")
+                        self._start_block(end_label, lines)
                     return "0", None
                 # callee.prop == "isAlive"
-                handle = self.tmp()
-                lines.append(f"  {handle} = load ptr, ptr {handle_global}")
                 out = self.tmp()
                 lines.append(f"  {out} = call i8 @festina_thread_is_alive(ptr {handle})")
+                if end_label is not None:
+                    in_range_pred = self.cur_block
+                    lines.append(f"  br label %{end_label}")
+                    self._start_block(end_label, lines)
+                    phi_out = self.tmp()
+                    lines.append(
+                        f"  {phi_out} = phi i8 [ {out}, %{in_range_pred} ], "
+                        f"[ 0, %{oob_pred} ]")
+                    return phi_out, BOOL
                 return out, BOOL
             # claude.md #188 (uraikus/festina#76 item 1):
             # Math.floorDiv(a:int, b:int) -> int

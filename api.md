@@ -3145,12 +3145,38 @@ declares no `DatabaseURL` of its own); a non-literal main `DatabaseURL`
 (an expression the compiler can't prove anything about) skips this
 check rather than guessing.
 
-**Limitations.** Threads are singletons, declared once by name — there
-is no way to spawn more than one instance of the same `thread` block
-(a worker pool, say). There is also no way to declare a thread-private
-*helper function* — every top-level `func` is either callable from
-every thread (if it never touches a global or an impure builtin) or
-from none at all; a `func` scoped to one particular thread's own body,
+**Thread pools.** `thread NAME[N] { ... }` declares `N` fully
+independent instances of the same body — each its own OS thread, its
+own private state, its own inbound queue:
+
+```festina
+thread pool[4] {
+    on message(worker:thread, msg:int) {
+        postMessage(msg * 2)
+    }
+}
+pool[0].postMessage(1)
+pool[3].postMessage(2)
+```
+
+A pool instance is addressed with `NAME[i]` (`i` any `int`
+expression, not just a literal) everywhere a singleton thread's own
+bare `NAME` would be used — `pool[i].postMessage(x)`/`.kill()`/
+`.live(callback)`/`.isAlive()` all work identically to the singleton
+form, just per-instance. **An out-of-range index is a silent no-op**
+(this language's own established "test, don't fail" convention, the
+same one `NAME.isAlive()` itself already follows) — `pool[99].kill()`
+neither crashes nor raises, it simply does nothing, and
+`pool[99].isAlive()` reads `false`. The bare pool name on its own
+(`pool.kill()`, with no index) is a compile error naming the fix — a
+pool must always be indexed. There is no `pool.length` — the size is
+whatever `N` the declaration itself used, known at every call site
+already.
+
+**Limitations.** There is no way to declare a thread-private *helper
+function* — every top-level `func` is either callable from every
+thread (if it never touches a global or an impure builtin) or from
+none at all; a `func` scoped to one particular thread's own body,
 closing over that thread's own state, isn't supported.
 
 ## Audio

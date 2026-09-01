@@ -16499,3 +16499,92 @@ class TestThreads:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "main done"
+
+
+class TestThreadPools:
+    """claude.md #209: `thread NAME[N] { ... }` -- real, compiled-and-
+    run proof that N pool instances are genuinely independent (private
+    state, correct per-instance message routing) and that an out-of-
+    range index is a real, silent no-op at runtime, not just a
+    semantic-analysis-time claim."""
+
+    def test_two_pool_instances_have_genuinely_independent_private_state(self, compile_and_run):
+        # Each instance accumulates its OWN total -- if state were
+        # accidentally shared (e.g. both instances aliasing the same
+        # global), pool[0]'s own total would include pool[1]'s posts
+        # too, and vice versa.
+        source = """
+        int seenA = 0
+        int seenB = 0
+        void func checkDone() {
+            if seenA != 0 && seenB != 0 {
+                log(seenA)
+                log(seenB)
+                close(0)
+            }
+        }
+        on message(worker:thread, msg:int) {
+            if msg < 100 {
+                seenA = msg
+            } else {
+                seenB = msg
+            }
+            checkDone()
+        }
+        thread pool[2] {
+            int total = 0
+            on message(worker:thread, msg:int) {
+                total = total + msg
+                postMessage(total)
+            }
+        }
+        pool[0].postMessage(1)
+        pool[0].postMessage(2)
+        pool[1].postMessage(200)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        # pool[0]'s own total after two posts (1, then 1+2=3) --
+        # checkDone only fires once BOTH seenA/seenB are non-zero, so
+        # the observed seenA is whichever reply arrived MOST recently
+        # before pool[1]'s own reply also landed; either 1 or 3 proves
+        # independence (pool[1]'s reply is always >= 200, so it can
+        # never leak into seenA).
+        lines = result.stdout.strip().splitlines()
+        assert lines[0] in ("1", "3")
+        assert lines[1] == "200"
+
+    def test_an_out_of_range_pool_index_is_a_real_silent_noop(self, compile_and_run):
+        source = """
+        thread pool[2] {
+            on message(worker:thread, msg:int) {
+                log('should never run')
+            }
+        }
+        log(pool[0].isAlive())
+        log(pool[99].isAlive())
+        int negIdx = -1
+        log(pool[negIdx].isAlive())
+        pool[99].postMessage(1)
+        pool[99].kill()
+        log('still alive')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == [
+            "true", "false", "false", "still alive",
+        ]
+
+    def test_killing_one_pool_instance_does_not_affect_another(self, compile_and_run):
+        source = """
+        thread pool[2] {
+        }
+        pool[0].kill()
+        log(pool[0].isAlive())
+        log(pool[1].isAlive())
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["false", "true"]
