@@ -838,8 +838,14 @@ def _check_message_handler_params(params, node, filename, structs, tables, enums
     if not _is_thread_sendable_type(msg_type, structs, enums):
         raise CompileError(
             f"'on message(worker:thread, msg:{types_mod.type_name(msg_type)})': "
+            # claude.md #218: `thread` belongs in this list too -- it
+            # became a real, holdable value type in claude.md #208/#216
+            # and is genuinely one of the types someone can try to send
+            # (directly, or nested in a struct), so leaving it out made
+            # the error name every unsendable type EXCEPT the one the
+            # reader was actually holding.
             f"{types_mod.type_name(msg_type)} cannot cross a thread boundary -- "
-            f"func/http/socket/regex/table values are not sendable (see "
+            f"func/http/socket/regex/table/thread values are not sendable (see "
             f"claude.md #195's own list)",
             file=filename, line=node.line, column=node.column,
             category="invalid function argument type",
@@ -2431,9 +2437,19 @@ def analyze(program, filename="<string>"):
             # above all split fields vs. methods the identical way).
             if expr.prop == "main":
                 return _BOOL
+            # claude.md #218: the old wording here suggested
+            # `.postMessage()` as the fix, which is wrong for exactly
+            # the case that reaches this branch -- `.postMessage()` is
+            # not a method on a `thread` VALUE at all, it's a method on
+            # a declared thread's own NAME (a different receiver
+            # entirely, dispatched by name). Someone writing
+            # `w.postMessage(x)` inside a handler was being pointed
+            # straight back at the thing that just failed.
             raise CompileError(
-                f"thread has no field '{expr.prop}' (thread has .main; "
-                f"messaging is done with .postMessage()/.reply())",
+                f"thread has no field '{expr.prop}' -- a thread value has "
+                f"'.main' and '.reply(x)' (reply to the message being "
+                f"handled); to send a NEW message, name the target thread, "
+                f"e.g. 'someThread.postMessage(x)'",
                 file=filename, line=expr.line, column=expr.column,
                 category="invalid field access",
             )

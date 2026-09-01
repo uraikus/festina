@@ -398,4 +398,14 @@ def type_name(t):
         params = ",".join(type_name(p) for p in t.param_types)
         ret = "void" if t.return_type is None else type_name(t.return_type)
         return f"func[{params}]:{ret}"
+    if isinstance(t, ThreadType):
+        # claude.md #218: without this, every user-facing message about
+        # a thread value (`cannot assign value of type X to int`, an
+        # argument-type mismatch, ...) fell through to `str(t)` below
+        # and printed this class's own Python repr -- `ThreadType(None)`
+        # -- rather than the type as the language actually spells it.
+        # The generic variant IS spelled `thread`; a specific declared
+        # thread's own type is only ever reachable through its name, so
+        # naming it that way is what a reader can act on.
+        return "thread" if t.name is None else f"thread '{t.name}'"
     return str(t)

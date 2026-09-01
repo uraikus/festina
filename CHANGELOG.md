@@ -9,6 +9,45 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.31] - 2026-09-01
+
+### Fixed
+
+- **An out-of-range thread-pool index no longer registers a dead
+  callback.** `pool[99].postMessage(x).callback(fn)` registered `fn`
+  before the bounds check, so it could never fire and its slot was
+  never reclaimed. The whole expression is a clean no-op now.
+- **`.reply()` with no message in flight** (a second reply to one
+  message, or a `thread` value stashed in a struct/array/map and
+  replied to later) silently dropped the reply and leaked its payload.
+  It now releases the payload and delivers nothing. Every other path
+  that can drop a reply -- including one still queued when its target
+  is killed -- releases it correctly too.
+- **Error messages naming a thread type** printed the compiler's own
+  internal repr (`ThreadType(None)`) instead of `thread`. `log()` and
+  template interpolation of a thread value now give the same specific
+  "has no text form" error `img`/`aud` already did, and the "thread has
+  no field X" error no longer suggests a method that doesn't exist on a
+  thread value.
+- A broken intra-document link in api.md (`#http--websocket-servers`).
+
+### Changed
+
+- **Thread messaging is faster.** The pending-callback list appends
+  instead of prepending, turning the ordinary in-order reply case from
+  O(N^2) into an O(1) lookup (measured on the identical program built
+  both ways: 0.06s -> 0.04s at 5,000 in-flight sends, 0.92s -> 0.47s at
+  20,000), and a worker now takes its inbound mutex once per message
+  instead of twice.
+- **api.md's Threads section reorganized** into ten subsections with
+  working cross-references, plus newly documented behavior: reply at
+  most once per message, `kill()` drops pending callbacks, a thread
+  value has no text form, and a pool compiles its body once per
+  instance (a compiled-size cost worth knowing before picking a large
+  `N`).
+
+See claude.md #218.
+
 ## [0.30] - 2026-09-01
 
 ### Added

@@ -1212,7 +1212,15 @@ int64_t festina_thread_alloc_txn_id(void);
 void festina_thread_register_callback(FestinaThreadHandle *self, int64_t txn_id,
                                       void (*trampoline)(void *payload, void *user_fn),
                                       void *user_fn);
-void festina_thread_reply(FestinaThreadHandle *self, FestinaThreadHandle *dest, void *payload);
+/* claude.md #218: `release` is how to free `payload` if this reply
+ * turns out to have nothing to dispatch to -- the receiving side knows
+ * only its OWN inbound type, never the sender's reply type, so the
+ * sender records the right function here. Also used when a reply is
+ * still queued at kill() time. `festina_thread_reply` releases the
+ * payload and delivers nothing at all if no message is currently being
+ * dispatched on the calling thread (nothing could ever answer it). */
+void festina_thread_reply(FestinaThreadHandle *self, FestinaThreadHandle *dest, void *payload,
+                          void (*release)(void *payload));
 /* claude.md #208: registers the ONE handler for everything sent to
  * main, from any thread -- replaces the old per-thread
  * festina_thread_set_out_callback (one dynamic `NAME.onMessage(...)`

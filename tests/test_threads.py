@@ -763,6 +763,36 @@ class TestReplyCallback:
         with pytest.raises(errors.CompileError, match="must chain '.callback\\(fn\\)'"):
             semantic.analyze(parser.parse(source))
 
+    def test_errors_name_the_type_as_thread_not_the_internal_repr(
+            self, parser, semantic, errors, types_mod):
+        # claude.md #218: types.type_name had no ThreadType case at all,
+        # so every user-facing message about a thread value printed this
+        # compiler's own Python repr ("ThreadType(None)").
+        assert types_mod.type_name(types_mod.ThreadType(None)) == "thread"
+        assert types_mod.type_name(types_mod.ThreadType("w")) == "thread 'w'"
+        source = """
+        thread worker { on message(w:thread, msg:int) { log(msg) } }
+        on message(w:thread, msg:int) { int x = w }
+        thread other { on load() { postMessage(1) } }
+        """
+        with pytest.raises(errors.CompileError, match="of type thread to int"):
+            semantic.analyze(parser.parse(source))
+
+    def test_the_no_such_field_error_does_not_suggest_postmessage(
+            self, parser, semantic, errors):
+        # claude.md #218: `.postMessage()` is a method on a declared
+        # thread's NAME, never on a thread VALUE -- the old message
+        # pointed someone writing `w.postMessage(x)` straight back at
+        # the thing that had just failed.
+        source = """
+        thread other { on message(w:thread, msg:int) { log(msg) } }
+        thread worker { on message(w:thread, msg:int) { w.postMessage(msg) } }
+        worker.postMessage(1)
+        """
+        with pytest.raises(errors.CompileError, match=r"\.reply\(x\)") as excinfo:
+            semantic.analyze(parser.parse(source))
+        assert "someThread.postMessage(x)" in str(excinfo.value)
+
     def test_reply_is_legal_only_on_the_generic_thread_type(self, parser, semantic, errors):
         # `.reply` is only recognized on a value of the GENERIC `thread`
         # type (a `worker`/`t` parameter) -- calling it as a plain

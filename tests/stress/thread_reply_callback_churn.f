@@ -49,6 +49,13 @@ void func onBareReply(r:int) {
 
 on message(worker:thread, msg:int) {
     worker.reply(msg + 1)
+    // claude.md #218: a SECOND reply to the same message, every single
+    // time -- the first one consumed the only pending callback slot,
+    // so this one has nothing to dispatch to and must be released
+    // rather than leaked (it used to be enqueued, dropped on arrival,
+    // and its payload leaked with it). 5,000 of these per run, so a
+    // regression is unmissable under scripts/leak_stress.sh.
+    worker.reply(msg + 2)
 }
 
 thread worker2 {

@@ -16662,6 +16662,91 @@ class TestThreadReplyCallback:
         lines = sorted(result.stdout.strip().splitlines())
         assert lines == ["A: 100", "B: 200"]
 
+    def test_an_out_of_range_pool_index_registers_no_callback(self, compile_and_run):
+        # claude.md #218: the registration used to be emitted BEFORE
+        # the pool's own bounds check, so an out-of-range index left a
+        # pending callback that could never fire (its send never
+        # happened) sitting on the sender's list forever. The whole
+        # expression must be a no-op -- and the in-range send right
+        # after it must still work, proving the fix didn't just disable
+        # the feature.
+        source = """
+        void func onReply(r:int) { log(`cb ${r}`) }
+        void func done() { log('done') close(0) }
+        thread pool[2] {
+            on message(w:thread, msg:int) { w.reply(msg * 10) }
+        }
+        pool[5].postMessage(1).callback(onReply)
+        pool[0].postMessage(7).callback(onReply)
+        setTimeout(done, 300)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["cb 70", "done"]
+
+    def test_replying_twice_to_one_message_delivers_only_the_first(self, compile_and_run):
+        # claude.md #218: the first reply consumes the only pending
+        # callback slot; the second has nothing to answer. It must be
+        # discarded cleanly (and its payload released -- the leak side
+        # of this is covered at volume by
+        # tests/stress/thread_reply_callback_churn.f).
+        source = """
+        void func onReply(r:int) { log(`cb ${r}`) }
+        void func done() { log('done') close(0) }
+        thread worker {
+            on message(w:thread, msg:int) { w.reply(msg) w.reply(msg + 100) }
+        }
+        worker.postMessage(1).callback(onReply)
+        setTimeout(done, 300)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip().splitlines() == ["cb 1", "done"]
+
+    def test_replying_from_a_thread_value_that_outlived_its_dispatch_is_a_no_op(
+            self, compile_and_run):
+        # claude.md #218: a `thread` value stashed in a struct field
+        # (also legal in an arr[thread]/map[thread]) can be replied to
+        # long after the message it identifies was finished -- there is
+        # no pending callback left to answer, so this must deliver
+        # nothing and release the payload rather than enqueuing a
+        # message that gets silently dropped on arrival (which is what
+        # it did before, leaking the payload with it).
+        source = """
+        struct Holder { t:thread }
+        Holder h
+        void func onReply(r:text) { log(`cb ${r}`) }
+        void func ignore(r:int) { }
+        void func later() {
+            h.t.reply(999)
+            log('stale reply was a no-op')
+            close(0)
+        }
+        thread worker { on message(w:thread, msg:text) { w.reply(`echo:${msg}`) } }
+        on message(w:thread, msg:int) { h.t = w  log(`main got ${msg}`) }
+        thread pinger { on load() { postMessage(5).callback(ignore) } }
+        worker.postMessage('hi').callback(onReply)
+        setTimeout(later, 300)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert "stale reply was a no-op" in result.stdout
+        assert "cb echo:hi" in result.stdout
+
+    def test_a_thread_value_has_no_text_form(self, parser, semantic, codegen, errors):
+        # claude.md #218: these used to fall through to codegen's own
+        # generic fallbacks ("only supports primitive values", and a
+        # template error that didn't even name the file) -- a thread
+        # value now gets img/aud's own specific message.
+        for src in ("thread worker { on message(w:thread, msg:int) { log(w) } }\n"
+                    "worker.postMessage(1)\n",
+                    "thread worker { on message(w:thread, msg:int) { log(`${w}`) } }\n"
+                    "worker.postMessage(1)\n"):
+            program = parser.parse(src)
+            analyzed = semantic.analyze(program)
+            with pytest.raises(codegen.CodegenError, match="no text form"):
+                codegen.CodeGen(analyzed, filename="main.f").generate(program)
+
 
 class TestThreadPools:
     """claude.md #209: `thread NAME[N] { ... }` -- real, compiled-and-

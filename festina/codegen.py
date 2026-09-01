@@ -1597,7 +1597,7 @@ class CodeGen:
             # ambient "which message am I currently handling" state.
             "declare i64 @festina_thread_alloc_txn_id()",
             "declare void @festina_thread_register_callback(ptr, i64, ptr, ptr)",
-            "declare void @festina_thread_reply(ptr, ptr, ptr)",
+            "declare void @festina_thread_reply(ptr, ptr, ptr, ptr)",
             # claude.md #208: replaces the old per-thread
             # festina_thread_set_out_callback -- ONE handler,
             # registered once, receives every thread's own outbound
@@ -5998,13 +5998,26 @@ class CodeGen:
             # bytes up to the first NUL -- which is exactly what its
             # explicit toText() does, and the two must not disagree.
             lines.append(f"  {out} = call ptr @festina_blob_to_text(ptr {val})")
-        elif isinstance(type_, (types_mod.ImageType, types_mod.AudioType)):
+        elif isinstance(type_, (types_mod.ImageType, types_mod.AudioType,
+                                types_mod.ThreadType)):
+            # claude.md #218: `thread` joins img/aud here rather than
+            # falling through to the generic "cannot interpolate"
+            # message below -- a thread value is an opaque identity
+            # token (see ThreadType's own doc comment), so rendering it
+            # could only ever print a raw pointer, and the specific
+            # message is the one that tells a reader what to do instead
+            # (`worker.main`, or an ordinary value the thread sent).
             raise CodegenError(
                 f"a value of type {types_mod.type_name(type_)} has no text "
                 f"form and cannot appear in log() or a template",
                 file=self.filename)
         else:
-            raise CodegenError(f"cannot interpolate a value of type {types_mod.type_name(type_)}")
+            # claude.md #218: `file=` here too -- without it this
+            # fallback reported `<string>:0:0`, naming neither the file
+            # nor anything else a reader could act on.
+            raise CodegenError(
+                f"cannot interpolate a value of type {types_mod.type_name(type_)}",
+                file=self.filename)
         return out
 
     def _emit_sendable_body(self, val, vtype, lines):
@@ -10500,7 +10513,12 @@ class CodeGen:
                     lines.append(f"  call void @free(ptr {rendered})")
                     self._release_owned_receiver(expr.args[0], val, vtype, lines)
                     return "0", None
-                if isinstance(vtype, (types_mod.ImageType, types_mod.AudioType)):
+                if isinstance(vtype, (types_mod.ImageType, types_mod.AudioType,
+                                      types_mod.ThreadType)):
+                    # claude.md #218: `thread` gets img/aud's own
+                    # specific "no text form" message rather than the
+                    # generic "only primitives right now" fallback just
+                    # below -- see _to_text's matching branch.
                     raise CodegenError(
                         f"log() cannot print a value of type "
                         f"{types_mod.type_name(vtype)} -- it has no text form",
@@ -11020,7 +11038,17 @@ class CodeGen:
                     lines.append(f"  {self_handle} = load ptr, ptr {self._current_thread_ctx[1]}")
                 else:
                     lines.append(f"  {self_handle} = call ptr @festina_thread_get_main_handle()")
-                lines.append(f"  call void @festina_thread_reply(ptr {self_handle}, ptr {dest_val}, ptr {box})")
+                # claude.md #218: the 4th argument is how to release
+                # THIS reply's own payload if it ever turns out to have
+                # nothing to dispatch to (replied twice for one
+                # message, or still queued when its target is kill()'d)
+                # -- the receiving side can't name the sender's own
+                # reply_type, so the sender records it here. See
+                # FestinaThreadMsg's own `release` field.
+                reply_release = self._thread_payload_release_fn(reply_type)
+                lines.append(
+                    f"  call void @festina_thread_reply(ptr {self_handle}, ptr {dest_val}, "
+                    f"ptr {box}, ptr {reply_release})")
                 self._emit_thread_postmessage_cleanup(expr.args[0], val, vtype, reply_type, lines)
                 return "0", None
         if (isinstance(callee, ast.Member) and not callee.computed and callee.prop == "callback"
@@ -11043,19 +11071,40 @@ class CodeGen:
             pm_args = callee.obj.args
             reply_type = self._postmessage_reply_type(pm_callee)
             trampoline = self._emit_reply_callback_trampoline(reply_type)
-            fn_val, _fn_type = self._emit_expr(expr.args[0], env, lines)
-            txn = self.tmp()
-            lines.append(f"  {txn} = call i64 @festina_thread_alloc_txn_id()")
-            self_handle = self.tmp()
-            if self._current_thread_ctx is not None:
-                lines.append(f"  {self_handle} = load ptr, ptr {self._current_thread_ctx[1]}")
-            else:
-                lines.append(f"  {self_handle} = call ptr @festina_thread_get_main_handle()")
-            lines.append(
-                f"  call void @festina_thread_register_callback(ptr {self_handle}, i64 {txn}, "
-                f"ptr {trampoline}, ptr {fn_val})")
+
+            def emit_register_and_send(handle, inbound_type):
+                """claude.md #218: registration and send, emitted
+                TOGETHER at whatever point the caller has established
+                is actually reached. For a pool receiver that means
+                INSIDE the bounds-checked block -- registering ahead of
+                it (which this originally did) meant an out-of-range
+                `pool[i].postMessage(x).callback(fn)` registered a
+                pending callback whose send never happened, so `fn`
+                could never fire and its slot sat on the sender's own
+                list forever. An out-of-range pool index is a silent
+                no-op for the whole expression now, callback included,
+                matching what `pool[i].postMessage(x)` alone already
+                does with its own argument (also only evaluated
+                in-range)."""
+                fn_val, _fn_type = self._emit_expr(expr.args[0], env, lines)
+                txn = self.tmp()
+                lines.append(f"  {txn} = call i64 @festina_thread_alloc_txn_id()")
+                self_handle = self.tmp()
+                if self._current_thread_ctx is not None:
+                    lines.append(f"  {self_handle} = load ptr, ptr {self._current_thread_ctx[1]}")
+                else:
+                    lines.append(f"  {self_handle} = call ptr @festina_thread_get_main_handle()")
+                lines.append(
+                    f"  call void @festina_thread_register_callback(ptr {self_handle}, i64 {txn}, "
+                    f"ptr {trampoline}, ptr {fn_val})")
+                if handle is None:
+                    self._emit_bare_postmessage_send(pm_args, env, lines, txn_val=txn)
+                else:
+                    self._emit_named_postmessage_send(
+                        handle, inbound_type, pm_args, env, lines, txn_val=txn)
+
             if isinstance(pm_callee, ast.Identifier):
-                self._emit_bare_postmessage_send(pm_args, env, lines, txn_val=txn)
+                emit_register_and_send(None, None)
             else:
                 pool_index_expr = None
                 receiver = pm_callee.obj
@@ -11066,7 +11115,7 @@ class CodeGen:
                     receiver = receiver.obj
                 handle, inbound_type, end_label, _oob_pred = self._emit_thread_target_handle(
                     receiver, pool_index_expr, env, lines)
-                self._emit_named_postmessage_send(handle, inbound_type, pm_args, env, lines, txn_val=txn)
+                emit_register_and_send(handle, inbound_type)
                 if end_label is not None:
                     lines.append(f"  br label %{end_label}")
                     self._start_block(end_label, lines)
