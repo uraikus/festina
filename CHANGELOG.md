@@ -9,6 +9,31 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.36] - 2026-09-01
+
+### Fixed
+
+- **`toStruct()`/`toArr()`'s partial-parse-failure leak.** A JSON value
+  that failed to parse partway through being built -- a struct's third
+  field turning out to be the wrong type, having already parsed the
+  first two; an array's fourth element failing, having already
+  collected three -- used to leak whatever was already built for that
+  one call. Every generated from-JSON parsing function now installs its
+  own local `try`/`catch` around its own build loop, and the
+  `.toStruct()`/`.toArr()` call site does the same for its own cursor
+  and receiver text. Verified leak-free under Valgrind across a flat
+  struct, a nested struct field, an array, a `map[T]` field, a
+  self-referencing struct, and malformed JSON syntax itself.
+
+### Added
+
+- `scripts/valgrind_stress.sh` + `tests/valgrind_stress/`: a permanent
+  home for stress programs that use `try`/`throw`, which cannot run
+  under the existing AddressSanitizer-based `scripts/leak_stress.sh` in
+  this environment.
+
+See claude.md #223.
+
 ## [0.35] - 2026-09-01
 
 ### Fixed

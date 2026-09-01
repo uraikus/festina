@@ -3907,16 +3907,33 @@ supported (raw, un-escaped non-ASCII UTF-8 bytes in a JSON string are
 unaffected and parse completely normally — this only affects a
 producer that specifically chooses to `\u`-escape).
 
-**One real, honest limitation, the same structural class `throw`'s own
-limitation above already is.** A JSON value that fails to parse
-*partway through* being built — a struct whose third field turns out
-to be the wrong type, having already parsed the first two; an array
-whose fourth element fails, having already collected three — leaks
-whatever was already built for that one call. A **successful** parse
+**The partial-parse-failure leak above is fixed (claude.md #223).** A
+JSON value that fails to parse *partway through* being built — a
+struct whose third field turns out to be the wrong type, having
+already parsed the first two; an array whose fourth element fails,
+having already collected three — used to leak whatever was already
+built for that one call, the same structural class as `throw`'s own
+intermediate-frame limitation above. It no longer does: every generated
+`toStruct`/`toArr`/map-field parsing function now installs its own
+local `try`/`catch` around its own build loop, so a throw anywhere
+inside it — including several levels of nesting deep, and including the
+in-flight JSON key text a struct/map field read before its value threw
+— is caught and released right there before re-throwing outward, and
+the `.toStruct()`/`.toArr()` call site itself does the same for its own
+`cursor` and the receiver's own text. A **successful** parse still
 leaks nothing (measured directly under Valgrind, including 30 repeated
-calls in a loop) — this is strictly an
-error-path leak, bounded to at most one partially-built value per
-failed call, never unbounded or accumulating across successful ones.
+calls in a loop), and a **failed** one now leaks nothing either —
+verified under Valgrind across a flat struct, a nested struct field, an
+array, a `map[T]` field, a self-referencing struct, and malformed JSON
+syntax itself, 400 iterations of each (`tests/stress/
+json_parse_fail_churn.f`). Not verified under `scripts/leak_stress.sh`
+(AddressSanitizer) — this project's `try`/`throw` is built on
+`llvm.eh.sjlj.setjmp`/`longjmp`, which ASan cannot instrument through in
+this environment (confirmed: even a plain, pre-existing `try`/`catch`
+program with no JSON involved crashes with SIGILL under
+`-fsanitize=address`), which is exactly why `try`/`throw`'s own
+leak-freedom above was already stated as Valgrind-measured rather than
+ASan-measured.
 
 ## Error format
 

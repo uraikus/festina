@@ -6483,6 +6483,106 @@ class CodeGen:
         lines.append(f"  {v} = call ptr {fn_name}(ptr {cursor_ref})")
         return v
 
+    def _emit_json_catch_prologue(self, body):
+        """claude.md #223: the local try/catch prologue shared by every
+        generated _from_json_*_fn_for function -- registers a fresh
+        catch frame right after `out` (that function's own fresh
+        struct/array/map header) is allocated, so a throw ANYWHERE in
+        the recursive JSON read that follows (a nested field, element,
+        or entry -- possibly several _from_json_*_fn_for calls deep) is
+        caught HERE rather than skipping straight past this frame the
+        way claude.md #157's own documented "any intermediate frame
+        between the try and the throw leaks" limitation would otherwise
+        apply. Converts each generated from-json function into the one
+        frame shape that's ALREADY leak-free by that same doc comment's
+        own reasoning: one that directly contains its own try. Mirrors
+        _emit_try's own hand-rolled sjlj IR exactly (same llvm.eh.sjlj.
+        setjmp/frameaddress/stacksave shape) -- this is no different
+        structurally, just built directly into a from-json function's
+        own body instead of a user-written `try` statement's.
+
+        Sets self.uses_try = True (this function now genuinely uses
+        sjlj, so it needs the identical wasm32-wasi/macOS compile-time
+        rejection an explicit `try` statement already gets -- see
+        cli.py's own _check_wasm_feature_supported/
+        _check_darwin_try_supported, both gated on this flag). Returns
+        the catch label name; the caller finishes with
+        _emit_json_catch_epilogue once its own loop body is fully
+        emitted."""
+        self.uses_try = True
+        buf = self.tmp()
+        body.append(f"  {buf} = alloca [5 x ptr], align 16")
+        bufp = self.tmp()
+        body.append(f"  {bufp} = getelementptr inbounds [5 x ptr], ptr {buf}, i64 0, i64 0")
+        frame_addr = self.tmp()
+        body.append(f"  {frame_addr} = call ptr @llvm.frameaddress.p0(i32 0)")
+        body.append(f"  store ptr {frame_addr}, ptr {bufp}, align 16")
+        stack_save = self.tmp()
+        body.append(f"  {stack_save} = call ptr @llvm.stacksave.p0()")
+        slot2 = self.tmp()
+        body.append(f"  {slot2} = getelementptr inbounds ptr, ptr {bufp}, i64 2")
+        body.append(f"  store ptr {stack_save}, ptr {slot2}, align 16")
+        rc = self.tmp()
+        body.append(f"  {rc} = call i32 @llvm.eh.sjlj.setjmp(ptr {bufp})")
+        is_catch = self.tmp()
+        body.append(f"  {is_catch} = icmp ne i32 {rc}, 0")
+        try_label = self.label("fromjson.try")
+        catch_label = self.label("fromjson.catch")
+        body.append(f"  br i1 {is_catch}, label %{catch_label}, label %{try_label}")
+        body.append(f"{try_label}:")
+        body.append(f"  call void @festina_try_push(ptr {bufp})")
+        return catch_label
+
+    def _emit_json_catch_epilogue(self, body, out, release_fn, catch_label, extra_free_slots=()):
+        """claude.md #223: closes what _emit_json_catch_prologue opened
+        -- the success tail (pop the frame this function's own try
+        pushed, then return `out` exactly as before) and the catch
+        block itself (retrieve the caught message, release `out` --
+        which correctly frees whatever fields/elements/entries were
+        ALREADY stored in it, since a struct/array/map's own release
+        function walks whatever is actually there regardless of
+        "completeness", the same as it would for any ordinary release
+        -- then re-throw the SAME message outward via an ordinary
+        festina_throw, propagating to whichever try genuinely encloses
+        THIS call, or fail() if none does). Called once, at the very
+        end of a generated from-json function's body, in place of what
+        used to be a bare `ret ptr {out}`.
+
+        `extra_free_slots` -- an `alloca ptr` in the CALLER's own body,
+        one per in-flight temporary (the struct/map builders' own
+        `key_reg`, a JSON key's text buffer read before its value and
+        freed only once the value is fully stored) that would otherwise
+        leak if a throw lands between the temporary being read and its
+        own ordinary free call. `volatile`, on BOTH the caller's own
+        stores into it and the load here -- confirmed necessary, not
+        just cautious: a first version without `volatile` compiled and
+        ran fine unoptimized, but leaked the slot's own value under
+        this project's real `-O2` default (and under `-O1`, and
+        crashed outright with SIGILL under `-fsanitize=address`,
+        confirmed directly). The reason: unlike `out` itself (defined
+        once, in the entry block, on the SAME edge that reaches this
+        catch label in the CFG the optimizer can see), a per-LOOP-
+        iteration store into a plain alloca has no PROVABLE reader on
+        any edge the optimizer's dataflow analysis recognizes --
+        `llvm.eh.sjlj.longjmp`'s own jump into this block is invisible
+        to it, the same class of hazard C's own setjmp/longjmp has
+        always required `volatile` to guard against -- so a plain
+        alloca here is dead-store-eliminated. `free(NULL)` is a
+        defined no-op, so every slot here is freed unconditionally, no
+        branch needed."""
+        body.append("  call void @festina_try_pop()")
+        body.append(f"  ret ptr {out}")
+        body.append(f"{catch_label}:")
+        err_val = self.tmp()
+        body.append(f"  {err_val} = call ptr @festina_try_error()")
+        for slot in extra_free_slots:
+            leftover = self.tmp()
+            body.append(f"  {leftover} = load volatile ptr, ptr {slot}")
+            body.append(f"  call void @free(ptr {leftover})")
+        body.append(f"  call void {release_fn}(ptr {out})")
+        body.append(f"  call void @festina_throw(ptr {err_val})")
+        body.append("  ret ptr null")
+
     def _from_json_struct_fn_for(self, struct_type):
         """claude.md #159: returns (generating on first use, cached by
         struct name) `ptr @__festina_from_json_struct_N(ptr %cursor)` --
@@ -6513,6 +6613,22 @@ class CodeGen:
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         struct_ty = self.struct_llvm_name(struct_type.name)
         out = self._emit_fresh_heap_header(struct_ty, body)
+        # claude.md #223: a local catch frame around the whole field-
+        # reading loop below -- see _emit_json_catch_prologue's own doc
+        # comment for why (an intermediate-frame leak fix). `out` is
+        # already a fully zero-initialized header at this point, so
+        # releasing it in the catch block below correctly frees exactly
+        # whatever fields were already stored before the throw, nothing
+        # more, nothing less.
+        catch_label = self._emit_json_catch_prologue(body)
+        # claude.md #223: `key_slot` names whichever JSON key text
+        # buffer is currently read-but-not-yet-freed -- see
+        # _emit_json_catch_epilogue's own `extra_free_slots` doc
+        # comment for why a plain SSA temp can't be read back from the
+        # catch block below, only a value stored in memory can.
+        key_slot = self.tmp()
+        body.append(f"  {key_slot} = alloca ptr")
+        body.append(f"  store volatile ptr null, ptr {key_slot}")
         body.append("  call void @festina_json_object_start(ptr %cursor)")
         first = self.tmp()
         body.append(f"  {first} = alloca i8")
@@ -6531,6 +6647,7 @@ class CodeGen:
         body.append(f"{readkey_lbl}:")
         key_reg = self.tmp()
         body.append(f"  {key_reg} = call ptr @festina_json_read_key(ptr %cursor)")
+        body.append(f"  store volatile ptr {key_reg}, ptr {key_slot}")
 
         fields = self.struct_fields(struct_type.name)
         for idx, (fname, ftype) in enumerate(fields):
@@ -6575,9 +6692,11 @@ class CodeGen:
         body.append(f"  br label %{keydone_lbl}")
         body.append(f"{keydone_lbl}:")
         body.append(f"  call void @free(ptr {key_reg})")
+        body.append(f"  store volatile ptr null, ptr {key_slot}")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
-        body.append(f"  ret ptr {out}")
+        self._emit_json_catch_epilogue(body, out, self._release_fn_for(struct_type), catch_label,
+                                       extra_free_slots=[key_slot])
         body.append("}")
         body.append("")
         self.func_defs.extend(body)
@@ -6607,6 +6726,12 @@ class CodeGen:
 
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         out = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, body)
+        # claude.md #223: see _from_json_struct_fn_for's own identical
+        # comment -- a local catch frame so a throw partway through
+        # (element N+1 fails, having already pushed elements 0..N)
+        # releases `out`, correctly freeing the elements already
+        # pushed, rather than leaking them.
+        catch_label = self._emit_json_catch_prologue(body)
         body.append("  call void @festina_json_array_start(ptr %cursor)")
         first = self.tmp()
         body.append(f"  {first} = alloca i8")
@@ -6635,7 +6760,8 @@ class CodeGen:
         body.append(f"  call void @festina_array_push(ptr {out}, ptr null, i64 {elem_size}, ptr {slot})")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
-        body.append(f"  ret ptr {out}")
+        self._emit_json_catch_epilogue(
+            body, out, self._release_fn_for(types_mod.ArrayType(elem_type)), catch_label)
         body.append("}")
         body.append("")
         self.func_defs.extend(body)
@@ -6711,6 +6837,17 @@ class CodeGen:
         value_type = map_type.value
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         out = self._emit_fresh_heap_header(FESTINA_MAP_LLVM_TYPE, body)
+        # claude.md #223: see _from_json_struct_fn_for's own identical
+        # comment -- a local catch frame so a throw partway through
+        # (entry N+1's own value fails to parse, having already set N
+        # entries) releases `out`, correctly freeing the entries
+        # already set, rather than leaking them.
+        catch_label = self._emit_json_catch_prologue(body)
+        # claude.md #223: see _from_json_struct_fn_for's own identical
+        # key_slot comment.
+        key_slot = self.tmp()
+        body.append(f"  {key_slot} = alloca ptr")
+        body.append(f"  store volatile ptr null, ptr {key_slot}")
         body.append("  call void @festina_json_object_start(ptr %cursor)")
         first = self.tmp()
         body.append(f"  {first} = alloca i8")
@@ -6728,6 +6865,7 @@ class CodeGen:
         body.append(f"{entry_lbl}:")
         key_reg = self.tmp()
         body.append(f"  {key_reg} = call ptr @festina_json_read_key(ptr %cursor)")
+        body.append(f"  store volatile ptr {key_reg}, ptr {key_slot}")
         v = self._emit_json_read_value(value_type, "%cursor", body)
         self._from_json_map_value(out, value_type, key_reg, v, body)
         # claude.md #97: festina_map_set strdup's its own copy of the
@@ -6735,9 +6873,11 @@ class CodeGen:
         # key_source_expr afterward -- so key_reg (heap-allocated by
         # festina_json_read_key) has no owner left once this returns.
         body.append(f"  call void @free(ptr {key_reg})")
+        body.append(f"  store volatile ptr null, ptr {key_slot}")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
-        body.append(f"  ret ptr {out}")
+        self._emit_json_catch_epilogue(
+            body, out, self._release_fn_for(map_type), catch_label, extra_free_slots=[key_slot])
         body.append("}")
         body.append("")
         self.func_defs.extend(body)
@@ -11291,9 +11431,33 @@ class CodeGen:
                 else:
                     fn_name = self._from_json_arr_fn_for(target_type)
                     result_type = types_mod.ArrayType(target_type)
+                # claude.md #223: a local catch frame around the call into
+                # the from-json builder -- if IT throws (a partial parse
+                # failure; the builder itself already cleans up whatever
+                # it was building, see _emit_json_catch_prologue), `cursor`
+                # and the receiver's own owning text temp would otherwise
+                # leak right here, the identical "intermediate frame
+                # between the try and the throw" class this whole entry
+                # closes, one level up from the builder itself. `cursor`
+                # and `recv_val` are both plain SSA values defined BEFORE
+                # the setjmp below (unlike the builder's own per-iteration
+                # key_slot), so both dominate the catch block normally --
+                # no `volatile` needed here.
+                catch_label = self._emit_json_catch_prologue(lines)
                 out = self.tmp()
                 lines.append(f"  {out} = call ptr {fn_name}(ptr {cursor})")
                 lines.append(f"  call void @festina_json_expect_end(ptr {cursor})")
+                lines.append("  call void @festina_try_pop()")
+                end_label = self.label("fromjson.callsite.end")
+                lines.append(f"  br label %{end_label}")
+                lines.append(f"{catch_label}:")
+                err_val = self.tmp()
+                lines.append(f"  {err_val} = call ptr @festina_try_error()")
+                lines.append(f"  call void @festina_json_cursor_free(ptr {cursor})")
+                self._free_text_temp(callee.obj, recv_val, recv_type, lines)
+                lines.append(f"  call void @festina_throw(ptr {err_val})")
+                lines.append("  unreachable")
+                self._start_block(end_label, lines)
                 lines.append(f"  call void @festina_json_cursor_free(ptr {cursor})")
                 self._free_text_temp(callee.obj, recv_val, recv_type, lines)
                 return out, result_type
