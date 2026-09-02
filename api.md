@@ -3929,36 +3929,44 @@ normally from inside either a `try` or a `catch` body, and a caught
 `catch` body can itself `throw` again (a rethrow, or a different error
 entirely) to propagate out to whatever `try` encloses *that*.
 
-**One real, honest limitation.** `throw` unwinds by jumping directly to
-the catching `try` (not by returning normally through every call frame
-in between), so a local declared in the function that *directly*
-contains the `throw` is always freed correctly — no different from an
-early `return` from that same function. But a function that merely
-*calls* something which eventually throws, without itself containing a
-`throw` or a `try`, never gets the chance to run any of its own
-cleanup: whatever `struct`/`arr`/`map`/`text`/etc. locals it declared
-leak. This is a leak, never a crash or corrupted state — measured
-directly under Valgrind: 0 bytes leaked
-throwing from the function a `try` calls directly, and 0 bytes leaked
-one level deeper still; a real, reproducible leak, one allocation per
-call, the moment a genuine *intermediate* frame sits between the `try`
-and the actual `throw`. Keep whatever a `try`-adjacent call chain
-allocates minimal, or accept the same class of leak this language
-already accepts elsewhere (e.g. the one documented row-array chain
-shape in [security.md](security.md)).
+**A throw leaks nothing on its way out (0.43, claude.md #236).**
+`throw` unwinds by jumping directly to the catching `try` (not by
+returning normally through every call frame in between), which used to
+mean that a function which merely *called* something that eventually
+threw — no `throw` or `try` of its own — never ran its scope-exit
+cleanup, and its `struct`/`arr`/`map`/`text`/etc. locals leaked. Not
+any more: in a program that contains a `try` anywhere, every managed
+local is registered on a per-thread *cleanup stack* in the runtime as
+it is bound (the same stack `.toStruct()`/`.toArr()` already use for
+their half-built values), and a `throw` releases every entry above the
+catching `try`, newest first — the throwing function's own locals,
+every intermediate frame's, the argument temporaries each call site on
+the chain was holding for its callee (a literal `[1, 2, 3]`, a template
+text, a call result), and a catch variable of a frame that rethrows.
+Measured under AddressSanitizer and Valgrind
+(`tests/stress/throw_unwind_churn.f`): 0 bytes leaked across every
+kind of local, through three frames, a loop-body local, an escaping
+parameter, a rethrow and a JSON parse failure two frames down. A
+program with no `try` pays nothing (its generated code is unchanged:
+a `throw` there is `fail()`); one with a `try` pays one runtime call
+per managed local binding plus one per scope exit — about 8 ns per
+binding, measured as roughly a third more on a function that binds a
+text, two arrays and a struct and does nothing else (2 million calls:
+0.25 s to 0.33 s), and lost in the noise on anything that does real
+work with them.
 
-**Not available under `--target=wasm32-wasi`, or on macOS.** WASI has
-no setjmp/longjmp support at all — rejected at compile time; see
-[wasm.md](wasm.md). macOS is the same story for a different reason:
-LLVM's AArch64 backend (Apple Silicon, what every current Mac runs on)
-has no SjLj lowering either, so `try`/`catch`/`throw` anywhere in a program
-is rejected outright at compile time there too, no override. A program
-that never writes `try`/`catch`/`throw` is completely unaffected on
-macOS (a `.toStruct()`/`.toArr()` parse failure, for example, still
-behaves exactly like the documented "no enclosing try" case above —
-prints and exits(1) — since that was always the fallback for an
-uncaught throw anyway); what's actually unavailable there is catching
-one.
+**Not available under `--target=wasm32-wasi`.** wasi-libc has no
+setjmp/longjmp support at all — rejected at compile time; see
+[wasm.md](wasm.md). A program that never writes `try`/`catch`/`throw`
+is completely unaffected there (a `.toStruct()`/`.toArr()` parse
+failure, for example, still behaves exactly like the documented "no
+enclosing try" case above — prints and exits(1) — since that was
+always the fallback for an uncaught throw anyway); what's actually
+unavailable is catching one. Every native target — Linux, macOS and
+Windows — has it: a `try` is a direct call to libc's own `setjmp` and
+a `throw` is libc's `longjmp` (0.43, claude.md #235; earlier versions
+used LLVM's SjLj intrinsics, which have no AArch64 lowering — so macOS
+rejected `try` outright — and a broken x86_64 Windows one).
 
 ## `.toStruct()` / `.toArr()` — parsing JSON
 
@@ -4039,10 +4047,10 @@ runtime, and the `.toStruct()`/`.toArr()` call site registers its own
 cursor, the receiver's temporary text and the finished value; a `throw`
 releases every one of them, newest first, on its way to the catching
 `try`. This is plain runtime C — no `setjmp` of its own — which is why
-JSON parsing works under `--target=wasm32-wasi` and on macOS even though
+JSON parsing works under `--target=wasm32-wasi` even though
 `try`/`catch` itself does not (an uncaught parse failure there simply
 ends the program the way any uncaught `throw` does). The same stack
-bounds how deep a self-referencing struct may nest (1024 builder
+bounds how deep a self-referencing struct may nest (1000 builder
 levels); input deeper than that *throws* `JSON nested too deeply`
 instead of exhausting the C stack, the same protection an unknown
 field's skipped value already had. Verified under Valgrind across a
@@ -4051,12 +4059,11 @@ self-referencing struct, malformed syntax, a duplicate `text` key whose
 second value fails, trailing data after a complete value, and
 2000-level nesting — 0 bytes lost and 0 invalid frees
 (`tests/valgrind_stress/json_parse_fail_churn.f`, run by
-`scripts/valgrind_stress.sh`). Valgrind rather than
-`scripts/leak_stress.sh` (AddressSanitizer) only because the *test
-program's* own `try`/`catch` is built on `llvm.eh.sjlj.setjmp`, which
-ASan cannot instrument through in this environment (confirmed: even a
-plain `try`/`catch` program with no JSON involved crashes with SIGILL
-under `-fsanitize=address`).
+`scripts/valgrind_stress.sh`; since 0.43 the same program also runs
+clean under `scripts/leak_stress.sh`'s AddressSanitizer build — the
+Valgrind tier originally existed only because ASan could not
+instrument through the LLVM SjLj intrinsics `try` used to be built on,
+which claude.md #235 replaced with libc's own `setjmp`/`longjmp`).
 
 ## Error format
 

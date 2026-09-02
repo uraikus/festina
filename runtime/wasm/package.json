@@ -1,0 +1,6 @@
+{
+  "name": "festina-wasm-runtime",
+  "private": true,
+  "type": "module",
+  "description": "claude.md #237: makes Node treat this directory's .js files as ES modules, so the browser WASI host (festina_wasi_browser.js) can be imported and tested under Node exactly as a browser loads it. run_wasi.mjs is unaffected (.mjs is always a module)."
+}

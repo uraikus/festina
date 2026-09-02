@@ -243,9 +243,9 @@ class ForStmt(Node):
 class TryStmt(Node):
     """claude.md #157: try { ... } catch (name:text) { ... }. try_body
     runs normally; if a throw anywhere inside it (directly, or via a
-    called function -- see festina_throw's own runtime comment for the
-    real, documented leak caveat that second case carries) reaches this
-    try before any nested try of its own catches it first, catch_body
+    called function -- every frame in between releases its own locals
+    on the way, claude.md #236) reaches this try before any nested try
+    of its own catches it first, catch_body
     runs instead, with catch_var bound to the thrown message as text.
     Falling off the end of either body (no return/break/continue)
     continues normally after the whole statement -- this is a plain

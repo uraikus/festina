@@ -3203,6 +3203,57 @@ depend on `xwd`/`xprop`, `/proc`, or POSIX signal delivery now skip
 where those don't exist (and the Linux job installs the two X11 tools
 it had been missing), and the Windows HTTP runtime compiles again.
 
+**claude.md #235** (the Windows CI job's own findings): `try`/`catch`
+is a direct call to libc's `setjmp`/`longjmp` (the LLVM SjLj
+intrinsics had no AArch64 lowering and a broken Windows one), so it
+works on macOS now -- `tests/test_platform.py::TestOnMacOS::
+test_try_catch_works` runs a real caught throw on the macos-14 job, and
+`::TestSetjmpSymbol` pins the per-platform symbol and the null SEH
+frame Windows gets; every existing `tests/test_try_catch.py` test
+passes unchanged on the new mechanism, and ASan can instrument through
+it (the Valgrind tier stays as a second tool, no longer the only one).
+Windows-specific runtime fixes -- an empty `WSAPoll` (a thread-only
+listener kept main alive) and an atomic `blob.append()`
+(`FILE_APPEND_DATA`) -- are verified by the existing
+`TestThreadHttpContext`/`TestThreadDrain` tests on the windows job
+itself; `TestExec` and `TestDoctorFix` no longer assume `/bin/sh`,
+`/bin/echo` or `apt`.
+
+**claude.md #236** (a throw releases every intermediate frame's
+locals): in a program with a `try`, every managed local and every
+call site's owning argument temporaries are registered on the
+runtime's cleanup stack, and `festina_throw` releases everything above
+the catching frame. Leak-freedom is measured by
+`tests/stress/throw_unwind_churn.f` under ASan (`scripts/leak_stress.sh`,
+29 programs now) and Valgrind -- every kind of local through three
+frames, a rethrow, a JSON failure two frames down, 400 balanced
+non-throwing calls; behaviour and IR shape by `tests/test_try_catch.py::
+TestThrowUnwindsIntermediateFrames` (8 tests, including that a program
+with no `try` generates byte-identical code and that a worker thread
+unwinds on its own stack). The JSON depth cap moved onto the parser's
+cursor (`tests/test_json_parse.py`'s deep-nesting test pins the new
+1000-level message).
+
+**claude.md #237** (a compiled `.wasm` in a browser): the project's own
+WASI Preview 1 host (`runtime/wasm/festina_wasi_browser.js`) is verified
+by `tests/test_wasm_browser.py` (10 tests) two ways -- under Node via
+`run_wasi_js.mjs` (hello, exit codes and stderr, files/directories/
+`ls`/`exists`/`delete` round-tripping to the real sandbox directory,
+SQLite rows, timers through `poll_oneoff`, `argv`) and in headless
+Chromium through Playwright against `browser.html` itself (output
+rendered, files handed back to the page as bytes, an uncaught error's
+exit 1). Skips cleanly without the wasm toolchain, Node, Playwright or
+a Chromium; the linux CI job installs all four so FESTINA_STRICT_DEPS
+makes every one a hard requirement there.
+
+**claude.md #238** (windowed input on the Windows CI job):
+`tests/test_platform.py::TestOnWindowsWindow` opens a real Win32 window
+and posts `WM_LBUTTONDOWN`/`UP`, `WM_KEYDOWN`/`UP`, a `MoveWindow`
+resize and `WM_CLOSE` to it, asserting `mouseDown`/`mouseUp` (with
+coordinates and button), `keyDown`/`keyUp` (with the key name),
+`resize` (with the new client size) and `close` against the program's
+own output -- the Windows counterpart of the Xvfb/xdotool tier.
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left

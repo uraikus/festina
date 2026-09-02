@@ -45,6 +45,7 @@
  */
 #include <stddef.h>  /* offsetof -- claude.md #162's FestinaHttpValue accessors */
 #include <stdint.h>
+#include <setjmp.h>  /* jmp_buf/_setjmp -- the async worker's own catch frame, claude.md #163/#235 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,7 +79,24 @@
    typedef WSAPOLLFD FestinaPollFd;
 #  define FESTINA_INVALID_SOCKET INVALID_SOCKET
 #  define festina_close_fd(fd) closesocket(fd)
-#  define festina_poll(fds, n, timeout) WSAPoll((fds), (n), (timeout))
+/* claude.md #235: WSAPoll rejects an EMPTY fd set outright
+ * (SOCKET_ERROR/WSAEINVAL) where POSIX poll(2) simply sleeps out the
+ * timeout -- and both loops in this file lean on that sleep: main's own
+ * festina_run_http_loop when it has nothing of its own to poll but a
+ * `thread` (serving its own private port) to stay alive for, and a
+ * thread's festina_thread_http_service_pass before its first
+ * openPort() (see its own comment). Found by the windows CI job: a
+ * program whose ONLY listener lived on a thread exited 0 the instant
+ * main's loop first polled nothing. Sleeping here keeps poll(2)'s
+ * semantics exactly, including a negative timeout meaning "forever"
+ * (neither loop ever passes one with nothing to wait for). */
+static int festina_poll(WSAPOLLFD *fds, size_t n, int timeout_ms) {
+    if (n == 0) {
+        Sleep(timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms);
+        return 0;
+    }
+    return WSAPoll(fds, (ULONG)n, timeout_ms);
+}
 static int festina_socket_would_block(void) { return WSAGetLastError() == WSAEWOULDBLOCK; }
 static int festina_socket_was_interrupted(void) { return WSAGetLastError() == WSAEINTR; }
 #else
@@ -3571,12 +3589,13 @@ void festina_http_send_client(void *payload) {
  *
  * A network failure inside festina_http_send_client throws
  * (claude.md #162) -- caught HERE, on the worker's own thread, via a
- * hand-written __builtin_setjmp frame (verified directly, with a
- * standalone two-thread harness, to interoperate correctly with
- * festina_throw's own __builtin_longjmp before this went anywhere
- * near the real runtime -- see festina_runtime.c's own
- * g_festina_catch_top doc comment for why that state had to become
- * __thread-local first) rather than letting it escape across threads.
+ * hand-written _setjmp frame (verified directly, with a standalone
+ * two-thread harness, to interoperate correctly with festina_throw's
+ * own longjmp before this went anywhere near the real runtime -- see
+ * festina_runtime.c's own g_festina_catch_top doc comment for why that
+ * state had to become __thread-local first; claude.md #235 moved both
+ * sides from the LLVM SjLj builtins to libc's own pair) rather than
+ * letting it escape across threads.
  * A failed request still fires the callback -- there's no `try` frame
  * left to deliver a throw TO by the time a background result comes
  * back later -- leaving `.code` `null` (explicitly reset here, in
@@ -3613,8 +3632,8 @@ static void *festina_async_worker(void *unused) {
         pthread_mutex_unlock(&g_async_lock);
         job->next = NULL;
 
-        void *catch_buf[5];
-        if (__builtin_setjmp(catch_buf) == 0) {
+        jmp_buf catch_buf;
+        if (_setjmp(catch_buf) == 0) {
             festina_try_push(catch_buf);
             festina_http_send_client(job->payload);
             festina_try_pop();

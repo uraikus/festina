@@ -25,3 +25,22 @@ exact flags this project builds it with).
 Only linked into the `wasm32-wasi` build (`festina/cli.py`'s own
 target-specific runtime-object selection) -- every native target is
 completely unaffected and keeps using the system's `libsqlite3`.
+
+# The WASI hosts
+
+The rest of this directory is how a compiled `.wasm` gets *run*
+(claude.md #148, #237 -- see `wasm.md`):
+
+- `run_wasi.mjs` -- runs a program under Node's built-in `node:wasi`
+  host; what `festina run --target=wasm32-wasi` uses.
+- `festina_wasi_browser.js` -- this project's own WASI Preview 1 host,
+  a dependency-free ES module with an in-memory filesystem, for the
+  browser (and anywhere else with `WebAssembly`).
+- `festina_wasi_worker.js` -- runs a program on that host inside a Web
+  Worker; `browser.html` is the page that uses it
+  (`browser.html?wasm=program.wasm`, served over HTTP).
+- `run_wasi_js.mjs` -- the browser host under Node, the preopened
+  directory loaded into its filesystem and written back afterwards; how
+  the host is tested without a browser.
+- `package.json` -- `{"type": "module"}`, so Node imports the `.js`
+  host as an ES module exactly as a browser does.

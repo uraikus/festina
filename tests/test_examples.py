@@ -120,9 +120,17 @@ class TestIndividualExamples:
         result = _run_example(cli_mod, tmp_path, "timers.f")
         lines = result.stdout.splitlines()
         assert lines[0] == "scheduling a one-shot timeout and a repeating interval..."
-        assert lines[1:6] == [f"tick {i}" for i in range(1, 6)]
-        assert lines[6] == "stopping the interval"
-        assert lines[7] == "one second has passed"
+        # claude.md #235: the interval reschedules from *now* (see
+        # festina_fire_expired_timers), so on a loaded runner five 100ms
+        # ticks can drift past the 1000ms one-shot -- the macos job saw
+        # "one second has passed" land before "tick 5". The ticks' own
+        # order and the stop right after the fifth are what the example
+        # promises; where the one-shot lands relative to them is not.
+        ticks = [l for l in lines[1:] if l.startswith("tick ")]
+        assert ticks == [f"tick {i}" for i in range(1, 6)]
+        assert lines[lines.index("tick 5") + 1] == "stopping the interval"
+        assert lines.count("one second has passed") == 1
+        assert len(lines) == 8
 
     def test_audio_demo_plays_through_the_null_alsa_device(self, cli_mod, tmp_path, audio_null_env):
         result = _run_example(cli_mod, tmp_path, "audio.f", env=audio_null_env)

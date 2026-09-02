@@ -629,4 +629,12 @@ class TestLeakStress:
             # have on the global fill/border state is what this exists
             # to keep fixed (TSan, via scripts/thread_tsan_stress.sh).
             "thread_image_layer_churn.f",
+            # claude.md #236: a throw reached through intermediate
+            # frames releases every local those frames hold (text,
+            # stack arr/map buffers, heap and stack structs, arr of
+            # structs, blob, loop-body locals, an escaping parameter, a
+            # rethrowing catch, a JSON failure two frames down) -- the
+            # leak claude.md #157 documented. Only runnable under ASan
+            # at all since claude.md #235 (libc setjmp/longjmp).
+            "throw_unwind_churn.f",
         }

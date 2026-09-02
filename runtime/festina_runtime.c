@@ -39,6 +39,9 @@
 #include <float.h>   /* DBL_MAX -- claude.md #192's JSON float render bound */
 #include <regex.h>
 #if !defined(__wasi__)
+#include <setjmp.h>  /* longjmp -- claude.md #157/#235's throw. wasi-libc has
+                       * no setjmp/longjmp at all; festina_throw is a stub
+                       * for that target (see its own comment). */
 #include <signal.h>  /* sig_atomic_t/signal/SIGINT/SIGTERM -- claude.md #161's
                        * graceful shutdown. wasi-libc's own <signal.h> is an
                        * unconditional #error unless compiled with
@@ -69,6 +72,10 @@
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h> /* CreateFileA/WriteFile -- claude.md #235's atomic
+                       * append in festina_put_file */
 #include <direct.h> /* _mkdir -- claude.md #132's mkdir(), MSVCRT/UCRT's
                       * own single-argument spelling (no mode bits -- NTFS
                       * permissions aren't POSIX mode bits, so there is
@@ -238,20 +245,30 @@ void festina_fail_structured(const char *msg, const char *fields_json) {
  *
  * The fix: the actual setjmp call happens directly in the FESTINA
  * FUNCTION THAT CONTAINS THE try STATEMENT -- codegen's own _emit_try
- * emits it as raw LLVM IR (the llvm.eh.sjlj.setjmp/llvm.eh.sjlj.longjmp
- * intrinsics, the same portable, fixed-size-buffer mechanism clang
- * itself lowers __builtin_setjmp/__builtin_longjmp to -- chosen over
- * calling libc's own setjmp/longjmp symbols directly from hand-written
- * IR specifically because THEIR symbol names and jmp_buf layout are
- * platform/libc-specific in exactly the way an intrinsic isn't). That
- * frame is exactly as long-lived as the try statement needs it to be:
- * it can't return before hitting one of the exit paths codegen's own
+ * emits it as raw LLVM IR, a direct call to libc's own setjmp entry
+ * point (`_setjmp` on every POSIX libc, `setjmp` with an explicit null
+ * frame argument on Windows -- see codegen.py's _setjmp_symbol_for)
+ * into a 1KB buffer generated code never interprets itself. That frame
+ * is exactly as long-lived as the try statement needs it to be: it
+ * can't return before hitting one of the exit paths codegen's own
  * _TryFrameMarker mechanism already instruments.
+ *
+ * claude.md #235: libc's setjmp/longjmp, not the llvm.eh.sjlj.setjmp/
+ * longjmp intrinsics the first version used (chosen then as "portable,
+ * fixed-size buffer, no libc struct layout to know"). Those intrinsics
+ * have no lowering at all for wasm32 or AArch64 -- which is why
+ * try/catch was rejected outright on macOS from claude.md #170 until
+ * now -- and a broken one on x86_64 Windows, where the catch ran but
+ * every local read afterwards was garbage (three 0xC0000005 crashes,
+ * found by the windows CI job). libc's pair saves and restores the
+ * platform's full callee-saved register set and is what every C
+ * program's own setjmp/longjmp already relies on, so the only platform
+ * split left is wasm32-wasi (see festina_throw).
  *
  * longjmp itself has NO equivalent placement constraint -- only the
  * ORIGINATING setjmp call cares where it's made, so festina_throw
- * below is free to be an ordinary runtime C function using
- * __builtin_longjmp on whatever buffer festina_try_push registered.
+ * below is free to be an ordinary runtime C function calling longjmp
+ * on whatever buffer festina_try_push registered.
  *
  * The catch-frame stack is `__thread`-local (claude.md #163), not a
  * plain global -- generated Festina code itself still only ever runs
@@ -259,7 +276,7 @@ void festina_fail_structured(const char *msg, const char *fields_json) {
  * globals, refcounts -- is exactly as unsynchronized as it always
  * was, and stays that way), but claude.md #163's background http
  * worker pool calls this SAME festina_throw/try_push/try_error
- * machinery -- via a hand-written __builtin_setjmp catch frame, not
+ * machinery -- via a hand-written _setjmp catch frame, not
  * generated IR -- from its own worker threads, to convert a network
  * failure into a queued callback result rather than let it escape
  * across threads. A plain, shared g_festina_catch_top would let a
@@ -274,33 +291,31 @@ void festina_fail_structured(const char *msg, const char *fields_json) {
  * own independent try/catch) before this went anywhere near the real
  * runtime.
  *
- * THE ONE REAL, DOCUMENTED LIMITATION (see api.md and claude.md #157):
- * longjmp unwinds the C stack directly, bypassing every LLVM-generated
- * cleanup instruction in every frame between the throw and the
- * catching try -- EXCEPT the one frame that matters most, which
- * codegen's own ThrowStmt handling covers explicitly (a plain, direct
- * _emit_free_active_locals call, right before the festina_throw call
- * itself -- unlike every other frame's cleanup, this one is emitted
- * BEFORE, not after, so it isn't dead code the longjmp skips). So: a
- * throw is leak-free for every local active in the FUNCTION THAT
- * DIRECTLY CONTAINS the throw statement, whether that's the try's own
- * body or a function it calls (or a function THAT calls, arbitrarily
- * deep) -- exactly like Return already is for that same function. The
- * real gap is narrower than "any called function": any INTERMEDIATE
- * frame on the call chain between the try and the actual throw -- a
- * function that merely CALLS something which eventually throws,
- * without itself containing a throw or try -- never runs any of its
- * own cleanup at all, because longjmp skips past its remaining code
- * entirely, the same way it skips a frame with no cleanup story of its
- * own. Confirmed empirically, not just reasoned about: a direct
- * Valgrind run showed 0 leaked bytes throwing from the SAME function a
- * try calls, and from a function THAT function calls in turn -- and a
- * real, reproducible "N bytes in N blocks definitely lost" (N = call
- * count) the moment a genuine intermediate frame sat between them.
- * This is a leak, never a use-after-free or corruption (nothing is
- * freed that shouldn't be, only some things that should be freed
- * eventually aren't) -- the same correctness class this runtime already accepts
- * for the one documented row-array chain shape in security.md. */
+ * WHAT A THROW RELEASES (claude.md #157, closed by #236): longjmp
+ * unwinds the C stack directly, bypassing every LLVM-generated cleanup
+ * instruction in every frame between the throw and the catching try.
+ * #157 covered the one frame that generated code CAN reach -- the
+ * function directly containing the throw statement freed its own
+ * locals right before calling festina_throw -- and documented the
+ * rest as this mechanism's one real leak: any INTERMEDIATE frame on
+ * the call chain, a function that merely calls something which
+ * eventually throws, never ran its cleanup at all (a direct Valgrind
+ * run: 0 bytes lost throwing from the function a try calls, "N bytes
+ * in N blocks definitely lost", N = call count, the moment a genuine
+ * intermediate frame sat between them). #236 closed it with the
+ * cleanup stack below: in a program containing a try, generated code
+ * registers every managed local as it is bound, and every call site's
+ * owning argument temporaries for the duration of the call, so
+ * festina_throw itself releases everything above the catching frame --
+ * newest first, exactly what those frames' own scope exits would have
+ * done -- and the throw statement no longer frees anything inline
+ * (doing both would be a double free). Measured under ASan and
+ * Valgrind (tests/stress/throw_unwind_churn.f): 0 bytes lost through
+ * three frames, every kind of local, a rethrow, a JSON failure. What
+ * remains is only what a runtime C frame in the middle of the chain
+ * held for itself (a throw out of a .sort() comparator leaves qsort's
+ * own scratch behind) -- error-path-only, bounded per throw, listed in
+ * todo.md. */
 
 /* ---- The cleanup stack (claude.md #233) ----
  *
@@ -330,41 +345,44 @@ void festina_fail_structured(const char *msg, const char *fields_json) {
  * parse failure still ends the program exactly as any uncaught throw
  * does, and nothing here is ever reached.
  *
- * A fixed-size `__thread` array rather than a malloc'd one, on purpose:
- * a worker thread exits with no hook that could free a grown buffer (a
- * per-thread leak the thread churn stress programs would rightly flag
- * under LeakSanitizer), and the bound doubles as the one depth cap the
- * JSON builders' own recursion never had -- a self-referencing struct
- * fed `{"next":{"next":{"next":...` a few hundred thousand levels deep
- * used to recurse straight off the end of the C stack (SIGSEGV,
- * reachable through req.toStruct() on a network body; confirmed
- * directly), the identical hostile-input hole claude.md #192 already
- * closed for an UNKNOWN field's skipped value. Overflowing this stack
- * now throws the same catchable error instead. Two entries per builder
- * level (the value being built plus one in-flight key), so this allows
- * more nesting than FESTINA_JSON_MAX_DEPTH does for skipped values,
- * and its ~32KB of thread-local storage is nothing next to the 8MB
- * stack every thread already has. */
-#define FESTINA_CLEANUP_STACK_MAX 2048
-
+ * claude.md #236: the same stack carries every managed LOCAL of every
+ * function and handler too, whenever the program contains a `try` at
+ * all -- generated code registers (slot, release-through-slot) the
+ * moment a local is bound and pops it wherever its ordinary scope-exit
+ * release runs (codegen.py's _track_local / _emit_free_active_locals),
+ * so a throw reached through any number of intermediate frames -- a
+ * function that merely CALLS something which eventually throws --
+ * releases those frames' locals on its way to the catching try, the
+ * leak this file's own top comment documented since claude.md #157.
+ * That made the stack's size a function of call depth rather than JSON
+ * depth, so it is a malloc'd, doubling buffer now (64 entries to
+ * start; a worker thread frees its own on the way out --
+ * festina_cleanup_stack_free, called from festina_thread_main -- and
+ * main's is reachable until exit), and the JSON nesting cap it used to
+ * double as moved to where it belongs: festina_json_object_start/
+ * _array_start count nesting on the cursor and throw past
+ * FESTINA_JSON_MAX_DEPTH, the identical cap claude.md #192 already
+ * gave an UNKNOWN field's skipped value (a self-referencing struct fed
+ * `{"next":{"next":...` a few hundred thousand levels deep used to
+ * recurse straight off the C stack; #233 first closed that with the
+ * fixed array's own bound). */
 typedef struct FestinaCleanupEntry {
     void *ptr;
     void (*release)(void *);
 } FestinaCleanupEntry;
 
-static __thread FestinaCleanupEntry g_festina_cleanup_stack[FESTINA_CLEANUP_STACK_MAX];
+static __thread FestinaCleanupEntry *g_festina_cleanup_stack = NULL;
 static __thread size_t g_festina_cleanup_len = 0;
+static __thread size_t g_festina_cleanup_cap = 0;
 
 void festina_cleanup_push(void *ptr, void (*release)(void *)) {
-    if (g_festina_cleanup_len >= FESTINA_CLEANUP_STACK_MAX) {
-        /* The value being registered is the one thing nothing owns yet
-         * -- release it here so the throw below strands nothing. */
-        release(ptr);
-        char msg[96];
-        snprintf(msg, sizeof(msg), "JSON nested too deeply (more than %d levels)",
-                 FESTINA_CLEANUP_STACK_MAX / 2);
-        festina_throw(strdup(msg));
-        return; /* unreachable -- festina_throw never returns */
+    if (g_festina_cleanup_len == g_festina_cleanup_cap) {
+        size_t new_cap = g_festina_cleanup_cap ? g_festina_cleanup_cap * 2 : 64;
+        FestinaCleanupEntry *grown = realloc(g_festina_cleanup_stack,
+                                             new_cap * sizeof(FestinaCleanupEntry));
+        if (!grown) festina_fail("out of memory growing the cleanup stack");
+        g_festina_cleanup_stack = grown;
+        g_festina_cleanup_cap = new_cap;
     }
     g_festina_cleanup_stack[g_festina_cleanup_len].ptr = ptr;
     g_festina_cleanup_stack[g_festina_cleanup_len].release = release;
@@ -375,8 +393,31 @@ void festina_cleanup_pop(void) {
     if (g_festina_cleanup_len) g_festina_cleanup_len--;
 }
 
+/* claude.md #236: a scope exit releases several tracked locals in a
+ * row -- one call for all of their entries, not one per local (the
+ * push is unavoidably per binding; this halves the calls a function
+ * with a try in the program pays). */
+void festina_cleanup_pop_n(int64_t n) {
+    if (n <= 0) return;
+    g_festina_cleanup_len = ((size_t)n >= g_festina_cleanup_len) ? 0 : g_festina_cleanup_len - (size_t)n;
+}
+
+/* claude.md #236: a worker thread's own buffer, freed as that thread
+ * ends (festina_thread_main) -- nothing else ever could, and a grown
+ * buffer left behind in a dead thread's TLS is exactly the per-thread
+ * leak LeakSanitizer would flag in the thread churn stress programs.
+ * Safe to call with nothing allocated; the stack is empty by then on
+ * every path (every push has its pop, and a throw that unwinds past
+ * a frame's entries pops them as it releases them). */
+void festina_cleanup_stack_free(void) {
+    free(g_festina_cleanup_stack);
+    g_festina_cleanup_stack = NULL;
+    g_festina_cleanup_len = 0;
+    g_festina_cleanup_cap = 0;
+}
+
 typedef struct FestinaCatchFrame {
-    void *buf;  /* codegen's own [5 x ptr] alloca -- see _emit_try */
+    void *buf;  /* a jmp_buf: codegen's own 1KB alloca -- see _emit_try */
     size_t cleanup_depth;  /* g_festina_cleanup_len when this frame was pushed */
     struct FestinaCatchFrame *prev;
 } FestinaCatchFrame;
@@ -390,11 +431,11 @@ static __thread FestinaCatchFrame *g_festina_catch_top = NULL;
  * collected. */
 static __thread char *g_festina_error_message = NULL;
 
-/* Registers buf (codegen's own alloca'd sjlj buffer, already populated
- * by ITS direct llvm.eh.sjlj.setjmp call, which returned 0 -- the
- * normal, first-arrival path) as the new top catch frame. Called by
- * generated code once, right after that setjmp -- never on the
- * "returned via a longjmp" (nonzero) path. */
+/* Registers buf (codegen's own alloca'd jmp_buf, already populated by
+ * ITS direct setjmp call, which returned 0 -- the normal, first-arrival
+ * path) as the new top catch frame. Called by generated code once,
+ * right after that setjmp -- never on the "returned via a longjmp"
+ * (nonzero) path. */
 void festina_try_push(void *buf) {
     FestinaCatchFrame *frame = malloc(sizeof(FestinaCatchFrame));
     if (!frame) { fprintf(stderr, "festina: out of memory (try)\n"); exit(1); }
@@ -441,35 +482,31 @@ char *festina_try_error(void) {
  * unwinding TO (not any frame still open between here and there --
  * those are simply never visited, which is this mechanism's one
  * documented leak -- see this file's own top comment), and jumps via
- * __builtin_longjmp -- safe to call from here (an ordinary, nested
+ * libc's longjmp -- safe to call from here (an ordinary, nested
  * runtime function) even though the matching setjmp is not, since only
  * setjmp cares about its own call site's frame lifetime; longjmp has
- * no equivalent restriction.
+ * no equivalent restriction. On Windows the generated setjmp call
+ * passed a null frame, so this longjmp is a plain register restore
+ * with no SEH unwind through the frames in between (which have no
+ * handlers to run anyway) -- see codegen.py's _setjmp_symbol_for.
  *
- * wasm32-wasi AND macOS both get a stub, the identical shape
+ * wasm32-wasi gets a stub instead, the identical shape
  * festina_process_exec's own wasm32-wasi branch already uses just
- * below (see this file's own top-of-file comment on why):
- * __builtin_longjmp is flatly rejected by clang for both targets
- * ("not supported for the current target", confirmed directly for
- * each -- LLVM's wasm32 backend has no SjLj lowering at all outside
- * emscripten's own EH pass, which this project doesn't use; LLVM's
- * AArch64 backend (claude.md #170, found via a real macos-14 CI run --
- * Apple Silicon, what every current Mac and every GitHub macOS runner
- * actually is -- compiling this file unconditionally, try/throw or
- * not) has no SjLj lowering either, even though the identical builtin
- * compiles fine for x86_64-apple-macos, an architecture this project
- * doesn't target), so this whole file would fail to compile for EVERY
- * program on either platform, try/throw or not, without this split --
- * this translation unit is still compiled UNCONDITIONALLY on both.
- * try/throw is rejected outright at compile time instead (festina/
- * cli.py's _check_wasm_feature_supported for wasm32-wasi, gated on
- * codegen's own uses_try; _check_darwin_try_supported for macOS, same
- * gate, same reasoning) -- this stub degrading every throw to fail()'s
- * own behavior instead of a hard compile error would be surprising,
- * silently platform-dependent semantics rather than a clear, honest
- * "not supported here"; it exists purely so this file compiles, never
- * to be reached by a real program on either platform. */
-#if !defined(__wasi__) && !defined(__APPLE__)
+ * below (see this file's own top-of-file comment on why): wasi-libc
+ * has no setjmp/longjmp at all (they need WebAssembly exception
+ * handling, which this project's plain wasm32-wasi build doesn't use),
+ * and this translation unit is compiled UNCONDITIONALLY for every wasm
+ * build, try/throw or not. try/throw is rejected outright at compile
+ * time there instead (festina/cli.py's _check_wasm_feature_supported,
+ * gated on codegen's own uses_try) -- this stub degrading every throw
+ * to fail()'s own behavior instead of a hard compile error would be
+ * surprising, silently platform-dependent semantics rather than a
+ * clear, honest "not supported here"; it exists purely so this file
+ * compiles, never to be reached by a real program on that target.
+ * (claude.md #170 had macOS on the same stub, because the LLVM SjLj
+ * intrinsics generated code used until claude.md #235 have no AArch64
+ * lowering; libc's longjmp has no such gap, so that split is gone.) */
+#if !defined(__wasi__)
 void festina_throw(const char *msg) {
     if (g_festina_catch_top == NULL) {
         festina_fail(msg);
@@ -493,7 +530,7 @@ void festina_throw(const char *msg) {
         FestinaCleanupEntry entry = g_festina_cleanup_stack[--g_festina_cleanup_len];
         entry.release(entry.ptr);
     }
-    __builtin_longjmp(buf, 1);
+    longjmp(*(jmp_buf *)buf, 1);
 }
 #else
 void festina_throw(const char *msg) {
@@ -884,8 +921,30 @@ void festina_json_expect_end(void *cursor) {
     }
 }
 
-void festina_json_object_start(void *cursor) { festina_json_expect((FestinaJsonCursor *)cursor, '{'); }
-void festina_json_array_start(void *cursor) { festina_json_expect((FestinaJsonCursor *)cursor, '['); }
+/* claude.md #236: the generated builders count nesting on the cursor
+ * exactly as festina_json_skip_value does (the same c->depth, so a
+ * skipped value nested inside a built one counts once, as total depth)
+ * and throw past FESTINA_JSON_MAX_DEPTH -- each builder level is one C
+ * frame of recursion, and this is what keeps hostile input a catchable
+ * throw rather than a stack overflow now that the cleanup stack no
+ * longer has a fixed bound to trip first (see its comment). */
+static void festina_json_enter(FestinaJsonCursor *c) {
+    if (++c->depth > FESTINA_JSON_MAX_DEPTH) {
+        festina_json_throwf("JSON nested too deeply (more than %d levels)", FESTINA_JSON_MAX_DEPTH);
+    }
+}
+
+void festina_json_object_start(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    festina_json_expect(c, '{');
+    festina_json_enter(c);
+}
+
+void festina_json_array_start(void *cursor) {
+    FestinaJsonCursor *c = cursor;
+    festina_json_expect(c, '[');
+    festina_json_enter(c);
+}
 
 /* Called at the START of each object-field loop iteration -- returns 1
  * (and consumes the closing '}') once the object has ended, 0
@@ -894,7 +953,7 @@ void festina_json_array_start(void *cursor) { festina_json_expect((FestinaJsonCu
  * whether a leading ',' needs consuming first. */
 int8_t festina_json_object_next(void *cursor, int8_t *first) {
     FestinaJsonCursor *c = cursor;
-    if (festina_json_try_eat(c, '}')) return 1;
+    if (festina_json_try_eat(c, '}')) { c->depth--; return 1; }
     if (!*first) festina_json_expect(c, ',');
     *first = 0;
     return 0;
@@ -903,7 +962,7 @@ int8_t festina_json_object_next(void *cursor, int8_t *first) {
 /* The array counterpart -- identical shape, closing ']'. */
 int8_t festina_json_array_next(void *cursor, int8_t *first) {
     FestinaJsonCursor *c = cursor;
-    if (festina_json_try_eat(c, ']')) return 1;
+    if (festina_json_try_eat(c, ']')) { c->depth--; return 1; }
     if (!*first) festina_json_expect(c, ',');
     *first = 0;
     return 0;
@@ -2090,6 +2149,35 @@ char *festina_read_file(const char *path) {
 static int8_t festina_put_file(const char *path, const char *content, const char *mode) {
     if (!path) return 0;
     if (!content) content = "";
+#ifdef _WIN32
+    /* claude.md #235: the C runtime's "a" mode is NOT an atomic append
+     * on Windows -- UCRT/MSVCRT implement O_APPEND as a seek to the end
+     * followed by a separate write, so two threads appending to the
+     * same file at once (each `thread` in a pool with its own blob on
+     * one shared log file -- TestThreadDrain's own pool test, which
+     * lost one of two appended bytes on the windows CI job) can land on
+     * the same offset and one overwrites the other. A handle opened
+     * with FILE_APPEND_DATA alone makes the kernel position every write
+     * at end-of-file atomically -- the same guarantee POSIX O_APPEND
+     * already gives every other target. */
+    if (mode[0] == 'a') {
+        HANDLE h = CreateFileA(path, FILE_APPEND_DATA,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) return 0;
+        size_t len = strlen(content);
+        size_t done = 0;
+        int ok = 1;
+        while (done < len) {
+            DWORD chunk = (len - done > 0x7fffffffu) ? 0x7fffffffu : (DWORD)(len - done);
+            DWORD wrote = 0;
+            if (!WriteFile(h, content + done, chunk, &wrote, NULL) || wrote == 0) { ok = 0; break; }
+            done += wrote;
+        }
+        if (!CloseHandle(h)) ok = 0;
+        return (int8_t)ok;
+    }
+#endif
     FILE *f = fopen(path, mode);
     if (!f) return 0;
     size_t len = strlen(content);

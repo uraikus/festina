@@ -13,9 +13,9 @@ compiled `.wasm` example on every push (`.github/workflows/ci.yml`).
 
 **What's out of scope, on purpose:** graphics and audio (WASI has no
 display server or audio device model at all — not "not yet", genuinely
-absent), and getting a `.wasm` running outside a WASI host (a browser
-tab, for instance) — see [Limitations](#limitations) below for the full
-accounting.
+absent) — see [Limitations](#limitations) below for the full
+accounting. A compiled `.wasm` runs in a browser tab too, on this
+project's own WASI host — see [In a browser](#in-a-browser).
 
 This file is the design writeup, implementation record, and benchmark
 results, kept current as a reference.
@@ -179,6 +179,46 @@ festina run --target=wasm32-wasi program.f
 with a clear error) — only clang can target `wasm32-wasi` at all; the
 gcc/cc fallback native builds have doesn't apply here.
 
+## In a browser
+
+A browser has no built-in WASI host, so `runtime/wasm/` ships one
+(claude.md #237): `festina_wasi_browser.js`, a dependency-free ES
+module implementing WASI Preview 1 — every import a compiled Festina
+program names — over an in-memory filesystem, with `/` preopened
+exactly as `run_wasi.mjs` preopens a real directory. `browser.html` is
+the smallest page that uses it: serve the directory over HTTP (module
+workers can't load from `file://`) and open
+
+```
+browser.html?wasm=program.wasm
+```
+
+The program runs in a Web Worker (`festina_wasi_worker.js`), so a
+Festina program's synchronous `main()` and its timer loop never block
+the page; stdout/stderr stream into the page as they are written, and
+when the program exits `window.festinaResult` holds `{code, stdout,
+stderr, files}` — `files` being every file the program left in its
+sandbox, as bytes. `window.festinaRun(url, {files: {...}})` runs
+another program on demand, seeding its filesystem. Timers
+(`poll_oneoff`) sleep with `Atomics.wait` when the page is
+cross-origin isolated (COOP/COEP headers) and otherwise spin inside
+the worker.
+
+The same host runs under Node without a browser —
+`node runtime/wasm/run_wasi_js.mjs program.wasm <preopen-dir>`, the
+directory loaded into the in-memory filesystem first and written back
+afterwards — which is how the host itself is tested independently of
+any browser. `tests/test_wasm_browser.py` covers both: files,
+directories, SQLite's own database file, timers, `argv`, exit codes and
+stderr through the host under Node, and the page itself in headless
+Chromium through Playwright (the `linux` CI job installs it; the tests
+skip cleanly where it is absent).
+
+Not covered by the host, because WASI itself has none: anything in
+[Limitations](#limitations) below. And it is a host for *this
+project's* programs, not a general WASI polyfill — a `.wasm` that
+imports something no Festina program does gets `ENOSYS` back.
+
 ## Limitations
 
 WASI genuinely has no answer for either of these — not a "not yet",
@@ -200,14 +240,14 @@ fail at compile time, before any of the real work
   any kind.
 - **`openSecurePort()`** — needs everything `openPort()` needs plus
   mbedTLS, so it's rejected for the identical reason.
-- **`try`/`catch`/`throw`** — LLVM's wasm32 backend has no
-  setjmp/longjmp (SjLj) lowering at all outside emscripten's own
-  exception-handling pass, which this project doesn't use (`clang`
-  rejects `__builtin_longjmp` outright for this target). `.toStruct()`/
-  `.toArr()` are *not* affected (claude.md #233 — their cleanup is
-  plain runtime C, not a catch frame): they compile and run here, and a
-  parse failure ends the program the way any uncaught `throw` does,
-  since there is no `try` to catch it.
+- **`try`/`catch`/`throw`** — wasi-libc has no setjmp/longjmp at all
+  (they need WebAssembly exception handling, which this project's plain
+  wasm32-wasi build doesn't use), and a `try` is a direct call to
+  libc's `setjmp` (claude.md #235). `.toStruct()`/`.toArr()` are *not*
+  affected (claude.md #233 — their cleanup is plain runtime C, not a
+  catch frame): they compile and run here, and a parse failure ends
+  the program the way any uncaught `throw` does, since there is no
+  `try` to catch it.
 
 A few more things worth knowing, that aren't compile-time errors:
 
@@ -237,11 +277,13 @@ A few more things worth knowing, that aren't compile-time errors:
 - **Static linking is the only linking there is.** There's no
   dynamic-vs-static sqlite3 choice to make for wasm — the vendored
   amalgamation is always compiled in.
-- **No browser support claimed.** Every test and benchmark here runs a
-  compiled `.wasm` through Node's `node:wasi` module. A browser has no
-  built-in WASI host — running one there needs a JS-side WASI
-  polyfill (e.g. `@wasmer/wasi`) that this project has neither
-  vendored nor tested against.
+- **Two WASI hosts, one contract.** Every benchmark here runs a
+  compiled `.wasm` through Node's `node:wasi` module; the browser host
+  ([In a browser](#in-a-browser)) is this project's own JavaScript and
+  is tested to the same behaviour (files, timers, exit codes) under
+  Node and in headless Chromium. Its filesystem is in memory: nothing a
+  program writes in a tab touches the real disk unless the page saves
+  `festinaResult.files` somewhere itself.
 
 ## Benchmarks
 

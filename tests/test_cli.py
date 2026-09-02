@@ -234,8 +234,14 @@ class TestDoctorFix:
         assert ran == []
         out = capsys.readouterr().out
         # sqlite3 + pkg-config, deduplicated and combined into one command,
-        # not two separate installs.
-        assert "About to run:" in out and "apt install -y" in out
+        # not two separate installs. `install -y`, not `apt install -y`:
+        # _doctor_fix_install_command spells the tool `apt` when one is
+        # on PATH and `apt-get` otherwise, and this test stubs the
+        # MANAGER, not the machine -- on the Windows CI job there is no
+        # `apt` binary at all, so the command reads `apt-get install -y
+        # ...` there (claude.md #235; it failed on that job for exactly
+        # this reason).
+        assert "About to run:" in out and "install -y" in out
         assert "libsqlite3-dev" in out
         assert "pkg-config" in out
 
