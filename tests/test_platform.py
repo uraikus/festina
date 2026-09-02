@@ -681,26 +681,35 @@ class TestAudioFeatureConfig:
         assert pkgs == ["libjpeg", "cairo"]
         assert flags == ["-lgdi32", "-luser32"]
 
-    def test_linux_http_has_no_pkgs_or_flags(self, cli_mod):
+    def test_linux_http_has_no_pkgs_and_links_only_pthread(self, cli_mod):
         # claude.md #151: plain POSIX sockets -- never had a third-
-        # party library dependency on any platform.
+        # party library dependency on any platform. claude.md #233:
+        # -pthread, the same flag audio/async_io/threads already link
+        # -- festina_runtime_http.c has called pthread_* unconditionally
+        # since claude.md #212's connection-id mutex (glibc 2.34+ folds
+        # libpthread into libc, which is why nothing failed here before).
         pkgs, flags = cli_mod._feature_pkgs_and_flags("http", "linux")
         assert pkgs == []
-        assert flags == []
+        assert flags == ["-pthread"]
 
-    def test_darwin_http_has_no_pkgs_or_flags(self, cli_mod):
-        # Same POSIX sockets as Linux -- darwin needs nothing extra.
+    def test_darwin_http_has_no_pkgs_and_links_only_pthread(self, cli_mod):
+        # Same POSIX sockets as Linux -- darwin needs nothing beyond the
+        # same -pthread (a no-op there: pthreads live in libSystem).
         pkgs, flags = cli_mod._feature_pkgs_and_flags("http", "darwin")
         assert pkgs == []
-        assert flags == []
+        assert flags == ["-pthread"]
 
-    def test_windows_http_links_ws2_32(self, cli_mod):
+    def test_windows_http_links_pthread_and_ws2_32(self, cli_mod):
         # claude.md #151 (Windows round): winsock2 lives in ws2_32.dll
         # -- a system DLL with an import library but no pkg-config
         # file, the same shape winmm/gdi32/user32 already are above.
+        # claude.md #233: plus -pthread -- MSYS2's winpthreads is a
+        # separate library, and its absence (with the header include it
+        # goes with) was why every http test failed to build on the
+        # windows CI job.
         pkgs, flags = cli_mod._feature_pkgs_and_flags("http", "win32")
         assert pkgs == []
-        assert flags == ["-lws2_32"]
+        assert flags == ["-pthread", "-lws2_32"]
 
     def test_windows_graphics_extra_object_is_the_win32_companion(self, cli_mod, monkeypatch):
         # windows.md Phase 2: the win32 counterpart to
@@ -1041,6 +1050,27 @@ class TestOnMacOS:
         with pytest.raises(errors.CompileError) as excinfo:
             cli_mod.compile_file(str(src), str(tmp_path / "out"))
         assert excinfo.value.category == "unsupported platform feature"
+
+    def test_to_struct_is_not_rejected(self, cli_mod, tmp_path):
+        # claude.md #233: the darwin counterpart of test_wasm.py's own
+        # test_to_struct_and_to_arr_work_under_wasm. claude.md #223's
+        # sjlj frame inside every JSON builder made .toStruct()/
+        # .toArr() trip the darwin try gate just above -- and because
+        # conftest's compile_file_or_skip turns that category into a
+        # skip, every JSON parsing test on this job quietly became a
+        # skip (21 more skips than the run before it) rather than a
+        # failure anyone would notice. This goes through compile_file
+        # directly, with no skip translation, so a repeat is a real
+        # failure here.
+        src = tmp_path / "main.f"
+        src.write_text(
+            "struct Person { id:int  name:text }\n"
+            "Person p = '{\"id\": 7, \"name\": \"mac\"}'.toStruct(Person)\n"
+            "log(`${p.name} ${p.id}`)\n", encoding="utf-8")
+        out = cli_mod.compile_file(str(src), str(tmp_path / "out"))
+        result = subprocess.run([out], capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "mac 7"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="runs on the Windows CI job")

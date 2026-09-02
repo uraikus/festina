@@ -107,6 +107,19 @@ void festina_try_push(void *buf);
 void festina_try_pop(void);
 char *festina_try_error(void);
 void festina_throw(const char *msg);
+/* claude.md #233: the cleanup stack -- generated code registers a value
+ * it is holding mid-expression (a .toStruct()/.toArr() builder's own
+ * half-built result, an in-flight JSON key, the call site's cursor)
+ * together with the function that releases it; festina_throw releases
+ * every entry pushed since the catching try frame, newest first, before
+ * jumping to it. Strictly LIFO: every push has exactly one matching pop
+ * on every non-throwing path. Plain portable C (no sjlj of its own), so
+ * unlike a `try` statement this never makes a program "use try" -- it
+ * compiles for wasm32-wasi and macOS too, where festina_throw is the
+ * fail() stub and none of this is ever reached. See the runtime's own
+ * comment on FESTINA_CLEANUP_STACK_MAX for the depth cap. */
+void festina_cleanup_push(void *ptr, void (*release)(void *));
+void festina_cleanup_pop(void);
 
 /* claude.md #131: close(code) -- runs a declared `on exit(code:int)`
  * handler (if any), then exits with `code`. Lives in the core runtime

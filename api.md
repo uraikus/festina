@@ -2878,6 +2878,15 @@ and a freed binding that scope-exit cleanup later visits is already
 `null`, which every release treats as nothing-to-do. Constants and
 parameters can't be freed (a parameter borrows its caller's value).
 
+What `free` promises is that the *binding* reads `null` afterwards —
+`c == null` is `true`. It does not make a field read *through* that
+binding safe: `c.x` on a freed (or otherwise `null`) struct binding is
+a read through a null pointer, undefined in exactly the way an
+out-of-range index is (see [Indexing is not
+bounds-checked](#indexing-is-not-bounds-checked)) — it happened to
+print `0` on Linux and a stray heap address on macOS and Windows. Check
+`c == null` first, or don't read a struct you've freed.
+
 ### `delete`
 
 ```festina
@@ -3031,7 +3040,8 @@ matters throughout this section:
 
 - **the thread's own name** (`worker`) — what you send *to*, and what
   the main program controls: `worker.postMessage(x)`, `worker.kill()`,
-  `worker.live(cb)`, `worker.isAlive()`, `worker.giveRequest(r)`.
+  `worker.live(cb)`, `worker.isAlive()`, `worker.drain()`,
+  `worker.giveRequest(r)`.
 - **a `thread` *value*** — what an `on message` handler receives as its
   first parameter, identifying whoever sent that message. It has
   exactly two operations: the field `.main` (was this sent by the main
@@ -3265,6 +3275,17 @@ both already run to completion before any teardown begins, so a
 `postMessage(x)` immediately followed by `drain()` there is a reliable
 "fire this off and be sure it landed before we exit" pattern.
 
+`drain()` is about the thread's own side effects, not round-trip
+completion. It returns once the thread has *processed* everything —
+including any `.reply()` it made along the way — but a reply is
+delivered to your `.callback(fn)` by the main program's own event
+loop, which only runs once top-level code returns. So after
+`worker.postMessage(x).callback(fn); worker.drain()`, the next line
+always runs *before* `fn` does, never after. It also works on a thread
+with its own [HTTP context](#a-threads-own-http-context), whose worker
+loop polls rather than blocks — a drain there can take up to one poll
+interval (~20ms) longer to notice an idle queue.
+
 All four of these are callable **only** from the main program — a
 thread may message another thread, but may not control its lifecycle.
 
@@ -3360,7 +3381,7 @@ pool[3].postMessage(2)
 A pool instance is addressed with `NAME[i]` (`i` any `int`
 expression, not just a literal) everywhere a singleton thread's own
 bare `NAME` would be used — `pool[i].postMessage(x)`/`.kill()`/
-`.live(callback)`/`.isAlive()`/`.giveRequest(r)` all work identically
+`.live(callback)`/`.isAlive()`/`.drain()`/`.giveRequest(r)` all work identically
 to the singleton form, just per-instance. **An out-of-range index is a
 silent no-op** (this language's own established "test, don't fail"
 convention, the same one `NAME.isAlive()` itself already follows) —
@@ -3940,33 +3961,38 @@ supported (raw, un-escaped non-ASCII UTF-8 bytes in a JSON string are
 unaffected and parse completely normally — this only affects a
 producer that specifically chooses to `\u`-escape).
 
-**The partial-parse-failure leak above is fixed (claude.md #223).** A
-JSON value that fails to parse *partway through* being built — a
-struct whose third field turns out to be the wrong type, having
-already parsed the first two; an array whose fourth element fails,
-having already collected three — used to leak whatever was already
-built for that one call, the same structural class as `throw`'s own
+**A parse that fails partway through leaks nothing (claude.md #223,
+redone in #233).** A JSON value that fails to parse *partway through*
+being built — a struct whose third field turns out to be the wrong
+type, having already parsed the first two; an array whose fourth
+element fails, having already collected three; a complete value
+followed by trailing data — used to leak whatever was already built for
+that one call, the same structural class as `throw`'s own
 intermediate-frame limitation above. It no longer does: every generated
-`toStruct`/`toArr`/map-field parsing function now installs its own
-local `try`/`catch` around its own build loop, so a throw anywhere
-inside it — including several levels of nesting deep, and including the
-in-flight JSON key text a struct/map field read before its value threw
-— is caught and released right there before re-throwing outward, and
-the `.toStruct()`/`.toArr()` call site itself does the same for its own
-`cursor` and the receiver's own text. A **successful** parse still
-leaks nothing (measured directly under Valgrind, including 30 repeated
-calls in a loop), and a **failed** one now leaks nothing either —
-verified under Valgrind across a flat struct, a nested struct field, an
-array, a `map[T]` field, a self-referencing struct, and malformed JSON
-syntax itself, 400 iterations of each (`tests/stress/
-json_parse_fail_churn.f`). Not verified under `scripts/leak_stress.sh`
-(AddressSanitizer) — this project's `try`/`throw` is built on
-`llvm.eh.sjlj.setjmp`/`longjmp`, which ASan cannot instrument through in
-this environment (confirmed: even a plain, pre-existing `try`/`catch`
-program with no JSON involved crashes with SIGILL under
-`-fsanitize=address`), which is exactly why `try`/`throw`'s own
-leak-freedom above was already stated as Valgrind-measured rather than
-ASan-measured.
+parsing function registers the value it is building (and each JSON key
+it has read but not yet freed) on a per-thread *cleanup stack* in the
+runtime, and the `.toStruct()`/`.toArr()` call site registers its own
+cursor, the receiver's temporary text and the finished value; a `throw`
+releases every one of them, newest first, on its way to the catching
+`try`. This is plain runtime C — no `setjmp` of its own — which is why
+JSON parsing works under `--target=wasm32-wasi` and on macOS even though
+`try`/`catch` itself does not (an uncaught parse failure there simply
+ends the program the way any uncaught `throw` does). The same stack
+bounds how deep a self-referencing struct may nest (1024 builder
+levels); input deeper than that *throws* `JSON nested too deeply`
+instead of exhausting the C stack, the same protection an unknown
+field's skipped value already had. Verified under Valgrind across a
+flat struct, a nested struct field, an array, a `map[T]` field, a
+self-referencing struct, malformed syntax, a duplicate `text` key whose
+second value fails, trailing data after a complete value, and
+2000-level nesting — 0 bytes lost and 0 invalid frees
+(`tests/valgrind_stress/json_parse_fail_churn.f`, run by
+`scripts/valgrind_stress.sh`). Valgrind rather than
+`scripts/leak_stress.sh` (AddressSanitizer) only because the *test
+program's* own `try`/`catch` is built on `llvm.eh.sjlj.setjmp`, which
+ASan cannot instrument through in this environment (confirmed: even a
+plain `try`/`catch` program with no JSON involved crashes with SIGILL
+under `-fsanitize=address`).
 
 ## Error format
 

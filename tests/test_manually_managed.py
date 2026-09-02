@@ -412,6 +412,14 @@ class TestRuntime:
         assert result.stdout.strip() == "1"
 
     def test_manually_managed_struct_free_then_read_is_null(self, compile_and_run):
+        # claude.md #233: this used to `log(c.x)` after `free c` and
+        # expect "0". What `free` promises (api.md's own `free` section)
+        # is that the BINDING reads null -- `c == null` -- not that a
+        # field can still be read THROUGH it: `c.x` on a null struct
+        # binding is a load through a null pointer, and LLVM treats that
+        # as undefined. It happened to print 0 on Linux and a stray
+        # heap pointer on macOS and Windows (both CI jobs, every push),
+        # so the old assertion was pinning luck, not a contract.
         source = """
         struct Circle { x:int y:int }
         void func f() {
@@ -422,13 +430,13 @@ class TestRuntime:
             c.x = 99
             log(c.x)
             free c
-            log(c.x)
+            log(c == null)
         }
         f()
         """
         result = compile_and_run(source)
         assert result.returncode == 0
-        assert result.stdout.splitlines() == ["1", "99", "0"]
+        assert result.stdout.splitlines() == ["1", "99", "true"]
 
     def test_manually_managed_array_and_map_free_correctly(self, compile_and_run):
         source = """

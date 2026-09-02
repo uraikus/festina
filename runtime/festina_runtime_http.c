@@ -51,6 +51,18 @@
 #include <ctype.h>
 #include "festina_runtime.h"
 #include "festina_runtime_internal.h"
+/* claude.md #233: <pthread.h> on EVERY platform, not just the POSIX
+ * branch below where it used to live -- claude.md #212's
+ * g_next_conn_id_lock (a plain mutex, further down) is unconditional,
+ * so the Windows build had been failing to compile this file at all
+ * ("unknown type name 'pthread_mutex_t'", every http test on the
+ * windows CI job) ever since. MSYS2 UCRT64's winpthreads provides the
+ * header and library; festina_runtime_thread.c and
+ * festina_runtime_audio.c already include it unconditionally for the
+ * same reason, and cli.py's "http" feature now links -pthread the same
+ * way "audio"/"threads" already do. The async-callback worker pool
+ * (claude.md #163) stays POSIX-only behind its own #if further down. */
+#include <pthread.h>
 
 /* claude.md #151 (Windows round): named festina_close_fd, not
  * festina_socket_close -- a real naming collision found by an actual
@@ -82,12 +94,10 @@ static int festina_socket_was_interrupted(void) { return WSAGetLastError() == WS
 #  include <netinet/tcp.h>
 #  include <arpa/inet.h>
 #  include <netdb.h>      /* getaddrinfo -- claude.md #162's client fetch */
-#  include <pthread.h>    /* claude.md #163: the async-callback worker pool below --
-                            * POSIX only for now, the same staged-platform-rollout
-                            * shape every other http feature here already uses (see
-                            * "http -- async client" further down). Already an
-                            * accepted dependency in this runtime -- festina_runtime_audio.c
-                            * links it too, whenever audio is used. */
+   /* <pthread.h> itself is included unconditionally above (claude.md
+    * #233); claude.md #163's async-callback worker pool that first
+    * needed it here stays POSIX-only (see "http -- async client"
+    * further down). */
    typedef int FestinaSocket;
    typedef struct pollfd FestinaPollFd;
 #  define FESTINA_INVALID_SOCKET (-1)

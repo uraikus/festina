@@ -167,13 +167,23 @@ struct FestinaThreadHandle {
      * drained (called from main) reads/waits on both, and a condvar's own
      * correctness requires its predicate be read and waited on under
      * the SAME lock that guards every write to it. `dispatching` is 1
-     * from the moment a message is dequeued until its own on_message/
-     * in_release (or GIVE_REQUEST/REPLY dispatch) has fully finished --
-     * "the queue is empty" alone is not enough to mean "drained": a
-     * message could be dequeued (in_head already NULL) but still being
-     * processed when drain() checks. */
+     * from the moment a message is dequeued until the worker next
+     * takes in_lock looking for another (claude.md #232: which is the
+     * instant after that message's own on_message/in_release, or
+     * GIVE_REQUEST/REPLY dispatch, returns -- see
+     * festina_thread_note_dispatch_finished_locked). "The queue is
+     * empty" alone is not enough to mean "drained": a message could be
+     * dequeued (in_head already NULL) but still being processed when
+     * drain() checks. */
     volatile int dispatching;
     pthread_cond_t drained_cond;
+    /* claude.md #232: how many festina_thread_wait_drained callers are
+     * currently blocked on drained_cond (in practice 0 or 1 -- only
+     * main ever calls it). Guarded by in_lock. Read by the worker on
+     * every dequeue so it can SKIP the broadcast entirely when nobody
+     * is waiting, which is every message in a program that never
+     * calls drain() at all -- see festina_thread_try_dispatch_one. */
+    int drain_waiters;
 
     pthread_mutex_t out_lock;
     FestinaThreadMsg *out_head;
@@ -528,25 +538,30 @@ static int festina_thread_dispatch_reply(FestinaThreadHandle *h, int64_t txn_id,
     return 0;
 }
 
-/* claude.md #231 (uraikus/festina#91): the other half of the
- * `dispatching` flag festina_thread_try_dispatch_one sets under
- * in_lock right after dequeuing a message -- called once, after that
- * message's own dispatch (on_message/in_release, or the GIVE_REQUEST/
- * REPLY equivalent) has fully finished, from every one of that
- * function's own "processed one message" exit paths. Re-acquires
- * in_lock (the message's own real work always runs OUTSIDE the lock,
- * so this is a second, short acquisition, not held-across-dispatch),
- * clears `dispatching`, and broadcasts `drained_cond` -- a spurious
- * wake for festina_thread_wait_drained's own waiters is harmless (they just
- * recheck the real predicate and, finding the queue non-empty or
- * dispatching still set for whatever message came after, wait again),
- * so this is unconditional rather than only firing when in_head also
- * happens to be NULL right now. */
-static void festina_thread_mark_drained(FestinaThreadHandle *h) {
-    pthread_mutex_lock(&h->in_lock);
-    h->dispatching = 0;
-    pthread_mutex_unlock(&h->in_lock);
-    pthread_cond_broadcast(&h->drained_cond);
+/* claude.md #232: the other half of the `dispatching` flag
+ * festina_thread_try_dispatch_one sets under in_lock right after
+ * dequeuing a message -- cleared at the START of the NEXT call, under
+ * the lock that call already takes, rather than by a separate
+ * lock/clear/unlock/broadcast round trip after every message (which is
+ * how claude.md #231 first shipped it). The worker loop calls this
+ * function again the instant a dispatch returns, so "the next call's
+ * own lock acquisition" IS "right after this message finished" --
+ * there is no window a drain() waiter can observe between the two
+ * where the flag is stale in a way that matters: it only ever stays
+ * set for the few instructions between one dispatch returning and the
+ * next lock being taken, during which the worker is provably not idle
+ * anyway. This restores the exact one-acquisition-per-message shape
+ * claude.md #218 established for this path, with the broadcast
+ * skipped outright unless someone is actually waiting (drain_waiters,
+ * also under this lock) -- a program that never calls drain() pays
+ * one predictable `if` per message and nothing else. Also runs on the
+ * kill path (kill_requested seen) so a waiter is never left holding a
+ * stale flag on a thread that's about to stop. */
+static inline void festina_thread_note_dispatch_finished_locked(FestinaThreadHandle *h) {
+    if (h->dispatching) {
+        h->dispatching = 0;
+        if (h->drain_waiters) pthread_cond_broadcast(&h->drained_cond);
+    }
 }
 
 static int festina_thread_try_dispatch_one(FestinaThreadHandle *h, int *killed_out, int blocking) {
@@ -564,6 +579,11 @@ static int festina_thread_try_dispatch_one(FestinaThreadHandle *h, int *killed_o
      * -- it must never block here, since its own listener needs
      * servicing on the same loop. */
     pthread_mutex_lock(&h->in_lock);
+    /* claude.md #232: BEFORE the blocking wait below -- once this
+     * worker goes idle on its own condvar, a drain() waiter must
+     * already have been released, not left waiting on a flag nobody
+     * will clear until the next message arrives. */
+    festina_thread_note_dispatch_finished_locked(h);
     if (blocking) {
         while (!h->in_head && !h->kill_requested) {
             pthread_cond_wait(&h->in_cond, &h->in_lock);
@@ -605,7 +625,6 @@ static int festina_thread_try_dispatch_one(FestinaThreadHandle *h, int *killed_o
          * festina_thread_deliver_given_request, festina_runtime_http.c). */
         if (h->give_request_deliver) h->give_request_deliver(msg->payload);
         free(msg);
-        festina_thread_mark_drained(h);
         return 1;
     }
     if (msg->kind == FESTINA_THREAD_MSG_REPLY) {
@@ -620,7 +639,6 @@ static int festina_thread_try_dispatch_one(FestinaThreadHandle *h, int *killed_o
             if (msg->release) msg->release(msg->payload);
         }
         free(msg);
-        festina_thread_mark_drained(h);
         return 1;
     }
     g_current_reply_txn = msg->txn_id;
@@ -628,7 +646,6 @@ static int festina_thread_try_dispatch_one(FestinaThreadHandle *h, int *killed_o
     g_current_reply_txn = 0;
     h->in_release(msg->payload);
     free(msg);
-    festina_thread_mark_drained(h);
     return 1;
 }
 
@@ -712,6 +729,12 @@ static void *festina_thread_main(void *arg) {
     if (h->http_teardown) h->http_teardown();
     pthread_mutex_lock(&h->in_lock);
     h->alive = 0;
+    /* claude.md #232: release any drain() waiter -- its predicate
+     * includes `alive`, so this is what stops it sleeping forever on
+     * a thread that will never dispatch again. See
+     * festina_thread_wait_drained. */
+    h->dispatching = 0;
+    if (h->drain_waiters) pthread_cond_broadcast(&h->drained_cond);
     pthread_mutex_unlock(&h->in_lock);
     return NULL;
 }
@@ -892,13 +915,20 @@ void festina_thread_kill(FestinaThreadHandle *h) {
  * discard already has, just waiting instead of discarding. */
 void festina_thread_wait_drained(FestinaThreadHandle *h) {
     pthread_mutex_lock(&h->in_lock);
-    if (!h->alive) {
-        pthread_mutex_unlock(&h->in_lock);
-        return;
-    }
-    while (h->in_head != NULL || h->dispatching) {
+    /* claude.md #232: `alive` is part of the predicate, not just an
+     * up-front check -- if the thread stops while a waiter is blocked
+     * here (impossible today, since only main calls both this and
+     * kill(), and kill() joins synchronously; kept correct anyway
+     * rather than relied on), the waiter must wake and return rather
+     * than sleep forever on a condvar a dead thread will never signal
+     * again. festina_thread_main broadcasts on its way out for exactly
+     * this. drain_waiters is what lets the worker skip the broadcast
+     * on every message when nobody is here. */
+    h->drain_waiters++;
+    while (h->alive && (h->in_head != NULL || h->dispatching)) {
         pthread_cond_wait(&h->drained_cond, &h->in_lock);
     }
+    h->drain_waiters--;
     pthread_mutex_unlock(&h->in_lock);
 }
 

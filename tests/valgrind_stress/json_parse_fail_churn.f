@@ -7,13 +7,16 @@
 // whatever was already built for that one call, the same structural
 // class throw's own "any intermediate frame between the try and the
 // throw leaks" limitation already documented. Every generated
-// _from_json_*_fn_for function now installs its OWN local catch frame
-// around its own build loop specifically to close this gap (see
-// codegen.py's _emit_json_catch_prologue/_epilogue) -- this file
-// deliberately fails PARTWAY THROUGH at every shape that gap could
-// apply to (a struct, an array, a map, a nested struct field, a
-// self-referencing struct one level deep), every single pass, so a
-// regression shows up as a real, reported leak, not a maybe.
+// _from_json_*_fn_for function now registers what it is building on
+// the runtime's cleanup stack (claude.md #233, which replaced #223's
+// per-builder sjlj catch frames -- see codegen.py's
+// _emit_json_cleanup_push), and festina_throw releases it on the way
+// to the catching try -- this file deliberately fails PARTWAY THROUGH
+// at every shape that gap could apply to (a struct, an array, a map, a
+// nested struct field, a self-referencing struct one level deep, plus
+// #233's own three shapes at the end), every single pass, so a
+// regression shows up as a real, reported leak or invalid free, not a
+// maybe.
 
 struct Person { id:int  name:text  active:bool  score:float }
 struct Line { a:Person  label:text }
@@ -87,6 +90,61 @@ while i < 400 {
         caught = caught + 1
     }
 
+    // claude.md #233: a duplicate TEXT key whose SECOND value fails to
+    // parse. The builder used to free the first value BEFORE reading
+    // the second; the read throws, and the throw-time release of the
+    // half-built struct then freed that same (already freed) buffer
+    // again -- an "Invalid free()" per iteration under Valgrind, not a
+    // leak. Load-old / read-new / store / free-old now.
+    try {
+        Person dup = `{"id":${i},"name":"first","name":5}`.toStruct(Person)
+        log('unreachable')
+    } catch (e:text) {
+        caught = caught + 1
+    }
+
+    // claude.md #233: trailing data after a COMPLETE value. The
+    // builder had already returned the finished struct when
+    // festina_json_expect_end threw, and nothing owned it yet -- one
+    // definitely-lost block per iteration under #223's design. The
+    // call site now keeps the finished value registered across that
+    // final check.
+    try {
+        Person whole = `{"id":${i},"name":"whole"} trailing`.toStruct(Person)
+        log('unreachable')
+    } catch (e:text) {
+        caught = caught + 1
+    }
+
     i = i + 1
+}
+
+// claude.md #233: a self-referencing struct nested far deeper than the
+// cleanup stack allows (1024 builder levels) -- this used to recurse
+// straight off the C stack (SIGSEGV) with no cap at all; now it throws
+// from festina_cleanup_push, and the release cascade of the ~1024
+// levels already built must leave nothing behind. Built once (not per
+// pass -- the text alone is ~40KB) and parsed 20 times.
+text deep = ''
+int d = 0
+while d < 2000 {
+    deep = deep + '{"n":1,"next":'
+    d = d + 1
+}
+deep = deep + '{"n":2}'
+d = 0
+while d < 2000 {
+    deep = deep + '}'
+    d = d + 1
+}
+int pass = 0
+while pass < 20 {
+    try {
+        Node chain = deep.toStruct(Node)
+        log('unreachable')
+    } catch (e:text) {
+        caught = caught + 1
+    }
+    pass = pass + 1
 }
 log(caught)
