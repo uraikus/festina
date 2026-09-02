@@ -57,7 +57,15 @@ jobs:
             libasound2-dev libmpg123-dev \
             libmbedtls-dev \
             wasi-libc libclang-rt-18-dev-wasm32 \
-            xvfb xdotool openbox fonts-dejavu-core
+            xvfb xdotool openbox fonts-dejavu-core \
+            x11-apps x11-utils
+          # claude.md #233: x11-apps (xwd) and x11-utils (xprop) are what
+          # the real-pixel canvas tests and the window-manager decoration
+          # test read the screen through; four of them were hard-failing
+          # on every push (FileNotFoundError: 'xwd'/'xprop') with neither
+          # installed here. The tests now also skip cleanly when the tool
+          # is genuinely absent -- but FESTINA_STRICT_DEPS=1 above exists
+          # precisely so that this job never relies on a skip.
           pip install -r requirements-dev.txt -r requirements-build.txt
       - name: Run the test suite
         run: python -m pytest tests/ -q

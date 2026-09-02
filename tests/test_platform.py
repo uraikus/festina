@@ -1042,6 +1042,27 @@ class TestOnMacOS:
             cli_mod.compile_file(str(src), str(tmp_path / "out"))
         assert excinfo.value.category == "unsupported platform feature"
 
+    def test_to_struct_is_not_rejected(self, cli_mod, tmp_path):
+        # claude.md #233: the darwin counterpart of test_wasm.py's own
+        # test_to_struct_and_to_arr_work_under_wasm. claude.md #223's
+        # sjlj frame inside every JSON builder made .toStruct()/
+        # .toArr() trip the darwin try gate just above -- and because
+        # conftest's compile_file_or_skip turns that category into a
+        # skip, every JSON parsing test on this job quietly became a
+        # skip (21 more skips than the run before it) rather than a
+        # failure anyone would notice. This goes through compile_file
+        # directly, with no skip translation, so a repeat is a real
+        # failure here.
+        src = tmp_path / "main.f"
+        src.write_text(
+            "struct Person { id:int  name:text }\n"
+            "Person p = '{\"id\": 7, \"name\": \"mac\"}'.toStruct(Person)\n"
+            "log(`${p.name} ${p.id}`)\n", encoding="utf-8")
+        out = cli_mod.compile_file(str(src), str(tmp_path / "out"))
+        result = subprocess.run([out], capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "mac 7"
+
 
 @pytest.mark.skipif(sys.platform != "win32", reason="runs on the Windows CI job")
 class TestOnWindows:

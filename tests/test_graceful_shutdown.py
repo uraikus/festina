@@ -15,9 +15,24 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
 
 import pytest
+
+# claude.md #233: every test here delivers a real POSIX signal and reads
+# the conventional 128+N exit code back (143 for SIGTERM, 130 for
+# SIGINT). Windows has neither: Python's send_signal(SIGTERM) there is
+# TerminateProcess -- the process dies with exit code 1 and no `on exit`
+# handler ever runs -- so on win32 these were failing for what the
+# platform is, not for anything the runtime got wrong (found by the
+# windows CI job). Graceful shutdown on Windows is api.md's own
+# documented gap for that platform; skipped as a platform gap, the same
+# way the audio tier sheds there.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX signal delivery -- send_signal(SIGTERM) is TerminateProcess on Windows",
+)
 
 
 class TestHttpGracefulShutdown:
@@ -360,7 +375,15 @@ class TestThreadGracefulShutdown:
         # handler saw the real signal code, not a stale 0.
         assert rows == [(243,)]
 
+    @pytest.mark.skipif(not sys.platform.startswith("linux"),
+                        reason="reads /proc/<pid>/task, a Linux-only view of a process's threads")
     def test_no_orphaned_thread_survives_after_the_parent_exits(self, tmp_path, cli_mod):
+        # claude.md #233: Linux-only by construction -- /proc is the
+        # whole point of this test (see below), and macOS has no /proc
+        # at all, so there the listdir() raised, the loop broke with
+        # thread_count still 1, and the "never showed up as a real OS
+        # thread" assertion fired for what the platform is rather than
+        # for anything the runtime did (found by the macos CI job).
         # A declared `thread` is an OS thread INSIDE the same process,
         # not a separate one -- the only way it could "survive" the
         # parent is if festina_thread_kill_all()'s own pthread_join

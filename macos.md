@@ -17,6 +17,13 @@ is rejected outright at compile time on darwin (`festina/cli.py`'s
 gate like audio/graphics below; the backend genuinely doesn't support
 it. See [api.md](api.md#try--catch--throw)'s own Limitations note.
 
+`.toStruct()`/`.toArr()` are *not* caught by that gate (claude.md #233
+— their partial-parse cleanup is plain runtime C, not a catch frame;
+claude.md #223 had briefly made them trip it, which showed up on the
+macos CI job only as 21 extra silent skips): they compile and run
+here, and a parse failure ends the program the way any uncaught
+`throw` does.
+
 ## What's gated on real hardware
 
 Audio playback, windowed mouse/keyboard/window behavior, and

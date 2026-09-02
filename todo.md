@@ -68,10 +68,13 @@ as the manual override. What remains open:
   exit-time busywork.
 - **A `throw` reached from a called function leaks that function's own
   locals**, structurally the same issue `.toStruct()`/`.toArr()` used
-  to have when a parse failed partway through (claude.md #223 fixed
-  that one specifically: every generated from-JSON function, and the
-  `.toStruct()`/`.toArr()` call site itself, now install their own
-  local `try`/`catch`). The general case remains open: an ARBITRARY
+  to have when a parse failed partway through (claude.md #223/#233
+  fixed that one specifically: every generated from-JSON function, and
+  the `.toStruct()`/`.toArr()` call site itself, register what they
+  hold on the runtime's per-thread cleanup stack, which `throw` unwinds
+  on its way to the catching `try` -- the same mechanism could in
+  principle carry an ordinary function's locals too, which is the
+  obvious shape for the general fix). The general case remains open: an ARBITRARY
   function that merely calls something which eventually throws, with
   no `try`/`catch` of its own to wrap, never gets the chance to run its
   own cleanup, because neither the intermediate C stack frames a

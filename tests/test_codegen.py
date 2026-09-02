@@ -5172,6 +5172,23 @@ def _find_window(display, timeout=20):
     raise AssertionError("the Festina canvas window never appeared")
 
 
+def _require_x11_tool(name, purpose):
+    """claude.md #233: skip (or, under FESTINA_STRICT_DEPS, fail loudly)
+    when an X11 helper binary this test reads the screen through isn't
+    installed -- `xwd` (x11-apps) and `xprop` (x11-utils) are optional
+    tooling in setup.md's sense, exactly like xdotool/openbox, and a
+    missing one used to surface as a raw FileNotFoundError from
+    subprocess (four tests, every push, on the linux CI job before
+    ci.yml installed them) instead of the clean skip every other
+    optional tier already gets."""
+    if shutil.which(name):
+        return
+    missing = f"{name} isn't installed -- needed to {purpose}"
+    if os.environ.get("FESTINA_STRICT_DEPS"):
+        pytest.fail(missing)
+    pytest.skip(missing)
+
+
 def _xwd_pixels(display, wid, points):
     """Capture a window with `xwd` and return the RGB at each (x, y).
 
@@ -5186,6 +5203,7 @@ def _xwd_pixels(display, wid, points):
     header say where each channel sits inside a pixel.
     """
     import struct
+    _require_x11_tool("xwd", "read real canvas pixels")
     dump = subprocess.run(["xwd", "-id", wid], env=dict(os.environ, DISPLAY=display),
                           capture_output=True, check=True).stdout
     hdr = struct.unpack(">25I", dump[:100])
@@ -5919,7 +5937,10 @@ class TestFullscreenAndDecorations:
         # many pixels of chrome (title bar, border) it drew around the
         # window -- (0, 0, 0, 0) or absent entirely means "no decoration
         # was drawn", the exact claude.md #95 look this entry retires.
-        # xprop is already a dependency of x_display_with_wm itself.
+        # x_display_with_wm only PREFERS xprop (it falls back to a fixed
+        # wait without it); this test genuinely needs it -- claude.md
+        # #233: skip cleanly rather than FileNotFoundError.
+        _require_x11_tool("xprop", "read the window manager's _NET_FRAME_EXTENTS")
         source = "drawRect(0, 0, 10, 10)\nrender()"
         proc, stdout_path = run_graphics_program(source, display=x_display_with_wm)
         try:

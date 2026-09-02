@@ -9,6 +9,57 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.41] - 2026-09-02
+
+### Fixed
+
+- **`.toStruct()`/`.toArr()` work again under `--target=wasm32-wasi`
+  and on macOS, and their error path works again on Windows.** 0.36's
+  partial-parse leak fix put a `setjmp` catch frame inside every
+  generated JSON parsing function, which made any program that parses
+  JSON a "uses `try`" program -- rejected outright on the two targets
+  with no SjLj lowering, and silently broken on Windows (the catch
+  never ran). The parsing functions now register what they are
+  building on a per-thread *cleanup stack* in the runtime, which
+  `throw` unwinds on its way to the catching `try`: plain portable C,
+  no `setjmp`, and the per-call overhead 0.36 added is essentially
+  gone (100k-object parse benchmark: median 233 -> 225 ms; 223 ms
+  before 0.36).
+- A duplicate `text` key whose second value fails to parse
+  (`{"name":"a","name":5}` inside a `try`) no longer double-frees the
+  first value.
+- Trailing data after a complete JSON value (`'{"id":1} extra'`
+  inside a `try`) no longer leaks the parsed value.
+- A self-referencing struct nested pathologically deep (hundreds of
+  thousands of `{"next":` levels -- reachable through `req.toStruct()`
+  on a network body) now throws `JSON nested too deeply` instead of
+  overflowing the C stack.
+- **Windows: the HTTP runtime compiles again.** `<pthread.h>` was only
+  included on POSIX while a mutex added in 0.25 used it on every
+  platform; every `openPort()` program failed to build on Windows.
+- Windows: `festina compile --target=wasm32-wasi tool.wasm.f` no
+  longer names its output `tool.wasm.exe`.
+
+### Changed
+
+- CI on `main` had been failing on all three platforms; besides the
+  fixes above, the Linux job now installs `x11-apps`/`x11-utils`
+  (four real-pixel tests needed `xwd`/`xprop`), the Linux-only
+  `/proc` check and the POSIX-signal tests skip cleanly on the
+  platforms that lack them, and one test that asserted the value of a
+  field read through a freed struct (undefined behavior) now asserts
+  the documented contract, `c == null`.
+
+### Documentation
+
+- api.md: what `free` promises (the binding reads `null`) versus what
+  it does not (a field read through the freed binding), the JSON
+  cleanup-stack design and its Valgrind coverage, `drain()` in every
+  Threads method list; wasm.md/macos.md: JSON parsing is unaffected by
+  the `try` gate; stale runtime/todo/contract wording refreshed.
+
+See claude.md #233.
+
 ## [0.40] - 2026-09-01
 
 ### Changed

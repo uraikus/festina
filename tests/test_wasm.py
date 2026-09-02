@@ -30,6 +30,16 @@ class TestDefaultOutputNameWasm:
     def test_wasm_target_does_not_double_an_existing_wasm_suffix(self, cli_mod):
         assert cli_mod._default_output_name("tool.wasm.f", target="wasm32-wasi") == "tool.wasm"
 
+    def test_existing_wasm_suffix_on_a_win32_host_does_not_gain_exe(self, cli_mod):
+        # claude.md #233: the one above only exercised the live
+        # platform, so this combination -- a base ALREADY ending in
+        # .wasm, on a Windows host -- was covered nowhere but the
+        # windows CI job, where it failed: the wasm branch was skipped
+        # (nothing to append) and the win32 branch then appended .exe,
+        # giving "tool.wasm.exe". Pinned with an explicit platform_name
+        # so every platform's run covers it.
+        assert cli_mod._default_output_name("tool.wasm.f", "win32", target="wasm32-wasi") == "tool.wasm"
+
     def test_native_target_is_unaffected(self, cli_mod):
         assert cli_mod._default_output_name("game.f", "linux", target="native") == "game"
         assert cli_mod._default_output_name("game.f", "win32", target="native") == "game.exe"
@@ -185,6 +195,24 @@ class TestWasmRun:
         )
         assert result.returncode == 0
         assert result.stdout.strip().splitlines() == ["42", "true", "e", "true"]
+
+    def test_to_struct_and_to_arr_work_under_wasm(self, compile_and_run_wasm):
+        # claude.md #233: the regression this pins. claude.md #223 put a
+        # real sjlj catch frame inside every generated JSON builder,
+        # which made any program using .toStruct()/.toArr() a "uses
+        # try" program -- and so rejected outright for this target
+        # ("try/catch/throw is not supported when compiling to WASM"),
+        # a working feature silently removed from a CI-verified
+        # platform. The builders' cleanup is plain runtime C now (the
+        # cleanup stack), so this must compile AND run here.
+        result = compile_and_run_wasm(
+            "struct Person { id:int  name:text }\n"
+            "Person p = '{\"id\": 7, \"name\": \"wasm\"}'.toStruct(Person)\n"
+            "arr[int] xs = '[1,2,3]'.toArr(int)\n"
+            "log(`${p.name} ${p.id} ${xs.length}`)\n"
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "wasm 7 3"
 
 
 class TestWasmGraphicsAudioRejection:

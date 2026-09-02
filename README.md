@@ -9,7 +9,7 @@ compiles through LLVM to a real, standalone executable — with SQLite,
 graphics, audio, timers, threads, and an HTTP/WebSocket server built
 directly into the language, not bolted on as libraries.
 
-Version 0.40 — see [CHANGELOG.md](CHANGELOG.md).
+Version 0.41 — see [CHANGELOG.md](CHANGELOG.md).
 
 [![Tests](https://img.shields.io/badge/tests-2224%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)

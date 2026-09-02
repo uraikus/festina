@@ -124,6 +124,45 @@ class TestSemanticErrors:
         semantic.analyze(program)
 
 
+class TestJsonParsingNeedsNoSjlj:
+    """claude.md #233: .toStruct()/.toArr() must never make a program a
+    "uses try" one. claude.md #223 put a real llvm.eh.sjlj.setjmp frame
+    inside every generated JSON builder and set CodeGen.uses_try for
+    it -- which is the one flag cli.py's wasm32-wasi and macOS gates
+    key off, so JSON parsing was silently rejected on both (and the
+    builder-side catch never ran on Windows). The builders' cleanup is
+    the runtime's cleanup stack now (plain C, no setjmp), so the flag
+    stays exactly what the program's own source says."""
+
+    def _flag(self, parser, semantic, codegen, source):
+        program = parser.parse(source)
+        analyzed = semantic.analyze(program)
+        gen = codegen.CodeGen(analyzed)
+        ir = gen.generate(program)
+        return gen.uses_try, ir
+
+    def test_to_struct_and_to_arr_leave_uses_try_unset(self, parser, semantic, codegen):
+        uses_try, ir = self._flag(parser, semantic, codegen, """
+        struct Person { id:int  name:text  tags:arr[text]  scores:map[int] }
+        Person p = '{"id":1,"name":"a","tags":["x"],"scores":{"q":2}}'.toStruct(Person)
+        arr[Person] ps = '[]'.toArr(Person)
+        log(p.id + ps.length)
+        """)
+        assert uses_try is False
+        # The intrinsic is always DECLARED (the runtime prelude is
+        # fixed); what must be absent is any actual call to it.
+        assert "call i32 @llvm.eh.sjlj.setjmp" not in ir
+        # and the cleanup stack is what replaced it
+        assert "call void @festina_cleanup_push" in ir
+        assert "call void @festina_cleanup_pop" in ir
+
+    def test_an_explicit_try_still_sets_it(self, parser, semantic, codegen):
+        uses_try, ir = self._flag(parser, semantic, codegen,
+                                  "try { log('x') } catch (e:text) { log(e) }\n")
+        assert uses_try is True
+        assert "call i32 @llvm.eh.sjlj.setjmp" in ir
+
+
 class TestRuntimeBehavior:
     def test_to_struct_parses_every_scalar_field_type(self, compile_and_run):
         source = """
@@ -272,6 +311,92 @@ class TestRuntimeBehavior:
         """
         result = compile_and_run(source)
         assert "trailing" in result.stdout
+
+    def test_duplicate_text_key_whose_second_value_fails_does_not_double_free(
+            self, compile_and_run):
+        # claude.md #233: the builder used to free the first "name"
+        # BEFORE reading the second value; that read throws, and the
+        # throw-time release of the half-built struct then freed the
+        # same buffer again (an "Invalid free()" under Valgrind; glibc
+        # aborts the process outright on the double free it detects).
+        # 200 rounds so a detected double free cannot hide behind
+        # allocator luck.
+        source = """
+        struct Person { id:int  name:text }
+        int caught = 0
+        int i = 0
+        while i < 200 {
+            try {
+                Person p = `{"id":${i},"name":"first","name":5}`.toStruct(Person)
+                log('unreachable')
+            } catch (e:text) {
+                caught = caught + 1
+            }
+            i = i + 1
+        }
+        log(caught)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "200"
+
+    def test_trailing_data_after_a_complete_value_is_caught_and_the_program_continues(
+            self, compile_and_run):
+        # claude.md #233: the finished value is registered on the
+        # cleanup stack across festina_json_expect_end's own trailing-
+        # data check (it used to leak there -- see
+        # tests/valgrind_stress/json_parse_fail_churn.f, which measures
+        # that under Valgrind; this test pins the visible contract: a
+        # catchable throw, then the program carries on).
+        source = """
+        struct Person { id:int  name:text }
+        int caught = 0
+        int i = 0
+        while i < 100 {
+            try {
+                Person p = `{"id":${i},"name":"whole"} trailing`.toStruct(Person)
+                log('unreachable')
+            } catch (e:text) {
+                if i == 0 { log(e) }
+                caught = caught + 1
+            }
+            i = i + 1
+        }
+        log(caught)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stderr
+        lines = result.stdout.splitlines()
+        assert "trailing" in lines[0]
+        assert lines[1] == "100"
+
+    def test_pathologically_deep_self_referencing_nesting_throws_instead_of_crashing(
+            self, compile_and_run):
+        # claude.md #233: a self-referencing struct's own builder
+        # recursion had no depth cap at all (claude.md #192's cap only
+        # covered an UNKNOWN field's skipped value) -- 300k levels of
+        # `{"next":` recursed straight off the C stack (SIGSEGV,
+        # confirmed). The cleanup stack's bound now converts that into
+        # the same catchable throw, and the ~1000 levels already built
+        # are released on the way out (Valgrind-measured in
+        # tests/valgrind_stress/json_parse_fail_churn.f).
+        deep = '{"n":1,"next":' * 5000 + '{"n":2}' + "}" * 5000
+        source = '''
+        struct Node { n:int  next:Node }
+        try {
+            Node chain = '%s'.toStruct(Node)
+            log('unreachable')
+        } catch (e:text) {
+            log(`caught: ${e}`)
+        }
+        log('still running')
+        ''' % deep
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            "caught: JSON nested too deeply (more than 1024 levels)",
+            "still running",
+        ]
 
     def test_uncaught_parse_error_behaves_like_fail(self, compile_and_run):
         result = compile_and_run("""
