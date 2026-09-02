@@ -203,7 +203,11 @@ fail at compile time, before any of the real work
 - **`try`/`catch`/`throw`** — LLVM's wasm32 backend has no
   setjmp/longjmp (SjLj) lowering at all outside emscripten's own
   exception-handling pass, which this project doesn't use (`clang`
-  rejects `__builtin_longjmp` outright for this target).
+  rejects `__builtin_longjmp` outright for this target). `.toStruct()`/
+  `.toArr()` are *not* affected (claude.md #233 — their cleanup is
+  plain runtime C, not a catch frame): they compile and run here, and a
+  parse failure ends the program the way any uncaught `throw` does,
+  since there is no `try` to catch it.
 
 A few more things worth knowing, that aren't compile-time errors:
 

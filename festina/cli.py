@@ -150,8 +150,15 @@ def _default_output_name(entry_path, platform_name=None, target="native"):
     if base.endswith(".f"):
         base = base[:-2]
     base = base or "a.out"
-    if target == "wasm32-wasi" and not base.lower().endswith(".wasm"):
-        base += ".wasm"
+    if target == "wasm32-wasi":
+        # claude.md #233: decided BEFORE the host check, whatever the
+        # base already ends in -- an entry named `tool.wasm.f` used to
+        # skip this branch (its base already had the suffix) and fall
+        # through to the win32 one, coming out as `tool.wasm.exe` on a
+        # Windows host (tests/test_wasm.py's own suffix test, failing
+        # on the windows CI job).
+        if not base.lower().endswith(".wasm"):
+            base += ".wasm"
     elif platform_name == "win32" and not base.lower().endswith(".exe"):
         base += ".exe"
     return base
@@ -542,14 +549,22 @@ _RUNTIME_FEATURES = {
     },
     # claude.md #151: openPort/on request/on upgrade/on message/on
     # socketClose -- plain POSIX sockets + poll(), no external library
-    # at all (unlike graphics/audio), so no pkgs and no extra link
-    # flags on Linux or macOS -- see _feature_pkgs_and_flags for the
-    # win32 branch (there is none: http has no Windows backend at
-    # all, gated out at _check_feature_supported instead).
+    # at all (unlike graphics/audio), so no pkgs; see
+    # _feature_pkgs_and_flags for the win32 branch (Winsock's own
+    # import library). claude.md #233: -pthread, the identical flag
+    # "audio"/"async_io"/"threads" below already link -- this
+    # translation unit has called pthread_* unconditionally since
+    # claude.md #212's connection-id mutex (and, on POSIX, since
+    # claude.md #163's async worker pool). Linux (glibc 2.34+) and
+    # macOS fold libpthread into libc, which is why the omission never
+    # failed a link there; MSYS2's winpthreads is a separate library,
+    # and its absence was one half of why every http test failed on
+    # the windows CI job (the other half: the header include, see
+    # festina_runtime_http.c's own top-of-file note).
     "http": {
         "source": _RUNTIME_HTTP_C,
         "pkgs": [],
-        "extra_link_flags": [],
+        "extra_link_flags": ["-pthread"],
     },
     # claude.md #160: openSecurePort() -- linked ON TOP of "http" above
     # (uses_https always implies uses_http, see codegen.py's own

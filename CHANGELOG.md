@@ -9,6 +9,168 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.42] - 2026-09-02
+
+### Added
+
+- **An `img` is now a self-contained drawing target** (uraikus/festina#93)
+  -- three groups of methods mirroring the canvas calls name-for-name,
+  each touching only the image it is called on (so they work from a
+  worker thread too):
+  - **A per-image transform and state stack:** `img.translate(dx, dy)`,
+    `img.rotate(degrees)`, `img.scale(sx, sy)`, `img.resetTransform()`,
+    `img.saveState()`, `img.restoreState()`. Identity from creation,
+    independent of the canvas's transform, applied to everything drawn,
+    cleared or composited onto that image. The stack holds the image's
+    transform only; style state stays with the canvas's `saveState()`.
+  - **Clearing to transparent:** `img.clear()`, `img.clearRect(x, y, w,
+    h)`, `img.clearCircle(x, y, r)`, `img.clearPixel(x, y)` -- alpha 0,
+    so a later draw underneath shows through. `clear()` ignores the
+    transform like `clearCanvas()`; the region forms honour it.
+  - **Compositing:** `img.drawImage(src, x, y)` and `img.drawImage(src,
+    x, y, w, h)` -- through the destination's transform, honouring
+    `fillAlpha`; drawing an image onto itself copies it first.
+
+  A layer can now be painted in place -- a rotated brush stroke, an
+  eraser, a tiled background, a swayed sprite stamp -- instead of being
+  bounced through the canvas (`clearCanvas`, `drawImage` in, draw,
+  `saveCanvas`, `clip`) at two window-sized copies per stamp.
+
+### Fixed
+
+- The per-call colour forms (`drawRect(..., color[, border])`,
+  `drawCircle(..., color[, border])`, `drawPixel(..., color)`, canvas
+  and `img` alike) no longer write the global fill/border state around
+  each call -- a data race when a worker thread painted its own layer
+  with them while main drew anything with a colour of its own. Same
+  results, computed locally.
+
+### Documentation
+
+- api.md's Images table lists every `img` method (including the
+  `getPixelColor` row it was missing and `drawCircle`'s colour forms),
+  with a new "An image as a layer" section; `examples/layers.f` uses
+  `.clear()` and a per-image transform for its HUD layer.
+
+See claude.md #234.
+
+## [0.41] - 2026-09-02
+
+### Fixed
+
+- **`.toStruct()`/`.toArr()` work again under `--target=wasm32-wasi`
+  and on macOS, and their error path works again on Windows.** 0.36's
+  partial-parse leak fix put a `setjmp` catch frame inside every
+  generated JSON parsing function, which made any program that parses
+  JSON a "uses `try`" program -- rejected outright on the two targets
+  with no SjLj lowering, and silently broken on Windows (the catch
+  never ran). The parsing functions now register what they are
+  building on a per-thread *cleanup stack* in the runtime, which
+  `throw` unwinds on its way to the catching `try`: plain portable C,
+  no `setjmp`, and the per-call overhead 0.36 added is essentially
+  gone (100k-object parse benchmark: median 233 -> 225 ms; 223 ms
+  before 0.36).
+- A duplicate `text` key whose second value fails to parse
+  (`{"name":"a","name":5}` inside a `try`) no longer double-frees the
+  first value.
+- Trailing data after a complete JSON value (`'{"id":1} extra'`
+  inside a `try`) no longer leaks the parsed value.
+- A self-referencing struct nested pathologically deep (hundreds of
+  thousands of `{"next":` levels -- reachable through `req.toStruct()`
+  on a network body) now throws `JSON nested too deeply` instead of
+  overflowing the C stack.
+- **Windows: the HTTP runtime compiles again.** `<pthread.h>` was only
+  included on POSIX while a mutex added in 0.25 used it on every
+  platform; every `openPort()` program failed to build on Windows.
+- Windows: `festina compile --target=wasm32-wasi tool.wasm.f` no
+  longer names its output `tool.wasm.exe`.
+
+### Changed
+
+- CI on `main` had been failing on all three platforms; besides the
+  fixes above, the Linux job now installs `x11-apps`/`x11-utils`
+  (four real-pixel tests needed `xwd`/`xprop`), the Linux-only
+  `/proc` check and the POSIX-signal tests skip cleanly on the
+  platforms that lack them, and one test that asserted the value of a
+  field read through a freed struct (undefined behavior) now asserts
+  the documented contract, `c == null`.
+
+### Documentation
+
+- api.md: what `free` promises (the binding reads `null`) versus what
+  it does not (a field read through the freed binding), the JSON
+  cleanup-stack design and its Valgrind coverage, `drain()` in every
+  Threads method list; wasm.md/macos.md: JSON parsing is unaffected by
+  the `try` gate; stale runtime/todo/contract wording refreshed.
+
+See claude.md #233.
+
+## [0.40] - 2026-09-01
+
+### Changed
+
+- **`NAME.drain()`'s bookkeeping no longer costs the worker an extra
+  mutex round trip per message.** The "finished dispatching" flag is
+  now cleared inside the lock acquisition the worker already makes
+  when it looks for its next message, and the wake-up broadcast is
+  skipped entirely unless a `drain()` is actually waiting -- a
+  program that never calls `drain()` pays one predictable branch per
+  message and nothing else. Measured on a 400,000-message
+  fire-and-forget program: min 208 -> 171 ms, median 300 -> 225 ms.
+
+### Fixed
+
+- `drain()` on a thread that stops while the call is blocked can no
+  longer sleep forever -- `alive` is part of the wait predicate and a
+  stopping thread wakes any waiter on its way out. (Not reachable
+  from Festina code today, where only the main program can call
+  either `drain()` or `kill()` and never concurrently; kept correct
+  rather than relied on.)
+
+### Documentation
+
+- `drain()` waits for the thread's own side effects, not for a
+  reply's `.callback(fn)` to run on main -- spelled out in api.md,
+  with a test pinning the order.
+
+See claude.md #232.
+
+## [0.39] - 2026-09-01
+
+### Added
+
+- **`NAME.drain()`** blocks until a thread's own inbound queue is
+  fully processed, then returns with the thread still running. The
+  deliberate opposite of `kill()`'s own discard-don't-wait choice --
+  exists specifically so `on close()`/`on exit(code:int)` can fire off
+  a final `postMessage` (e.g. a database write on a thread with its
+  own `DatabaseURL`) and be sure it landed before the teardown that
+  follows a window closing or a graceful shutdown would otherwise
+  discard it, unprocessed, exactly like `kill()` already does. Same
+  main-only shape as `kill()`/`live()`/`isAlive()`, including
+  `pool[i].drain()`. See [api.md](api.md#lifecycle-kill-live-isalive-drain).
+
+See claude.md #231 (uraikus/festina#91).
+
+## [0.38] - 2026-09-01
+
+### Fixed
+
+- **A thread's second-ever `.reply()` was silently dropped.** A worker's
+  reply/`.callback()` mechanism delivered successfully only the first
+  time, for that handle's entire process lifetime -- every reply after
+  that from the same sender was silently discarded, no error. Root
+  cause: removing the last entry from a sender's own pending-callback
+  list left its tail pointer dangling, corrupting the very next
+  registration (a real use-after-free write) so it became unreachable
+  from the list's own head. Fixed by tracking the previous node
+  explicitly during removal and correcting the tail pointer whenever
+  the removed node was it. api.md's own "reply at most once per
+  message" documentation needed no change -- it already described the
+  intended behavior; the runtime just wasn't providing it.
+
+See claude.md #230 (uraikus/festina#89, #90).
+
 ## [0.37] - 2026-09-01
 
 ### Documentation

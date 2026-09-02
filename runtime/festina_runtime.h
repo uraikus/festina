@@ -107,6 +107,19 @@ void festina_try_push(void *buf);
 void festina_try_pop(void);
 char *festina_try_error(void);
 void festina_throw(const char *msg);
+/* claude.md #233: the cleanup stack -- generated code registers a value
+ * it is holding mid-expression (a .toStruct()/.toArr() builder's own
+ * half-built result, an in-flight JSON key, the call site's cursor)
+ * together with the function that releases it; festina_throw releases
+ * every entry pushed since the catching try frame, newest first, before
+ * jumping to it. Strictly LIFO: every push has exactly one matching pop
+ * on every non-throwing path. Plain portable C (no sjlj of its own), so
+ * unlike a `try` statement this never makes a program "use try" -- it
+ * compiles for wasm32-wasi and macOS too, where festina_throw is the
+ * fail() stub and none of this is ever reached. See the runtime's own
+ * comment on FESTINA_CLEANUP_STACK_MAX for the depth cap. */
+void festina_cleanup_push(void *ptr, void (*release)(void *));
+void festina_cleanup_pop(void);
 
 /* claude.md #131: close(code) -- runs a declared `on exit(code:int)`
  * handler (if any), then exits with `code`. Lives in the core runtime
@@ -771,6 +784,28 @@ void festina_image_draw_circle_color(void *img, int64_t x, int64_t y, int64_t r,
 void festina_image_draw_circle_colors(void *img, int64_t x, int64_t y, int64_t r,
                                        int64_t fill_color, int64_t border_color);
 void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y);
+/* claude.md #234 (uraikus/festina#93): an img as a self-contained
+ * drawing target. Its OWN transform and transform stack (independent
+ * of the canvas's; style state stays global), clears to transparent
+ * (img.clear() ignores the transform like clearCanvas(); the three
+ * region forms honour it like clearRect()/clearCircle()/clearPixel()),
+ * and compositing one image onto another through the destination's
+ * transform, honouring fillAlpha (an image drawn onto itself is
+ * snapshotted first). Every one of the drawing calls above goes
+ * through the image's transform too. */
+void festina_image_translate(void *img, int64_t x, int64_t y);
+void festina_image_rotate(void *img, double degrees);
+void festina_image_scale(void *img, double sx, double sy);
+void festina_image_reset_transform(void *img);
+void festina_image_save_state(void *img);
+void festina_image_restore_state(void *img);
+void festina_image_clear(void *img);
+void festina_image_clear_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+void festina_image_clear_circle(void *img, int64_t x, int64_t y, int64_t r);
+void festina_image_clear_pixel(void *img, int64_t x, int64_t y);
+void festina_image_draw_image(void *dst, void *src, int64_t x, int64_t y);
+void festina_image_draw_image_scaled(void *dst, void *src, int64_t x, int64_t y,
+                                     int64_t w, int64_t h);
 void festina_image_free(void *img);
 /* claude.md #198 Phase 4: `thread`'s own deep-clone of an img message/
  * field -- round-trips through festina_image_bytes/_from_bytes rather
@@ -1285,6 +1320,27 @@ void festina_thread_give_request(FestinaThreadHandle *h, void *conn, void *http_
  * is already not alive. isAlive() is guaranteed false the moment this
  * returns. */
 void festina_thread_kill(FestinaThreadHandle *h);
+/* claude.md #231 (uraikus/festina#91): `NAME.drain()` -- blocking, the
+ * DELIBERATE opposite of kill()'s own "discard, don't wait" choice:
+ * blocks the calling (main) thread until h's own inbound queue is
+ * fully processed -- everything queued at the moment this call is
+ * made, no new arrivals meanwhile changes that. Unlike kill(), this
+ * does NOT stop the thread or discard anything; h keeps running (and
+ * accepting new messages) once this returns, exactly as before. A
+ * thread that is not currently alive (never live()'d, or already
+ * kill()'d) has nothing to drain and this returns immediately. Exists
+ * specifically so `on close()`/`on exit(code:int)` can fire off a
+ * final async job (e.g. a database write on a thread with its own
+ * DatabaseURL) and then wait for it to actually land before the
+ * process-exit teardown that follows discards anything still
+ * in-flight -- see festina_thread_kill_all's own doc comment for that
+ * teardown. Named festina_thread_wait_drained (not festina_thread_
+ * drain) to avoid colliding with the existing, unrelated
+ * festina_thread_drain(void) further below -- that one drains every
+ * declared thread's own OUTBOUND queue into main's own dispatch, part
+ * of the existing hook triple main's event loops already poll; this
+ * one waits on ONE thread's own INBOUND queue instead. */
+void festina_thread_wait_drained(FestinaThreadHandle *h);
 /* `NAME.live(callback)`: respawns a killed thread (running on_load()
  * again) and calls callback(true) once the new OS thread has actually
  * been created. If h is already alive, this is a no-op that still

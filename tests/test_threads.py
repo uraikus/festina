@@ -524,7 +524,24 @@ class TestThreadLifecycleMethods:
         """
         semantic.analyze(parser.parse(source))
 
-    @pytest.mark.parametrize("call", ["kill()", "isAlive()", "live(void (ok:bool) => log(ok))"])
+    def test_drain_is_accepted_with_no_arguments(self, parser, semantic):
+        # claude.md #231 (uraikus/festina#91)
+        source = """
+        thread myWorker { on load() { } }
+        myWorker.drain()
+        """
+        semantic.analyze(parser.parse(source))
+
+    def test_drain_takes_no_arguments(self, parser, semantic, errors):
+        source = """
+        thread myWorker { on load() { } }
+        myWorker.drain(1)
+        """
+        with pytest.raises(errors.CompileError, match="drain\\(\\) expects no arguments"):
+            semantic.analyze(parser.parse(source))
+
+    @pytest.mark.parametrize("call", ["kill()", "isAlive()", "live(void (ok:bool) => log(ok))",
+                                       "drain()"])
     def test_lifecycle_methods_are_rejected_from_inside_any_thread_body(
             self, parser, semantic, errors, call):
         source = f"""
@@ -946,6 +963,7 @@ class TestThreadPools:
         bool alive = pool[0].isAlive()
         pool[1].kill()
         pool[0].live(void (ok:bool) => log(ok))
+        pool[0].drain()
         """
         semantic.analyze(parser.parse(source))
 

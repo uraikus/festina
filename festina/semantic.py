@@ -482,6 +482,32 @@ _IMAGE = types_mod.ImageType()
 _HTTP = types_mod.HttpType()
 _SOCKET = types_mod.SocketType()
 
+# claude.md #234 (uraikus/festina#93): an img as a self-contained
+# drawing target -- its own transform and state stack, clears, and
+# drawing one image onto another. Method forms on img mirroring the
+# canvas builtins name-for-name, with the SAME argument shapes
+# _BUILTIN_SIGNATURES/_BUILTIN_SIGNATURE_ALTERNATES give the canvas
+# versions above (translate takes ints, rotate/scale floats, drawImage's
+# 3- and 5-argument forms), so there is nothing new to learn. `clear()`
+# is the one rename: the canvas's own clearCanvas() has no "canvas" to
+# name once it's a method on an image. Every one touches only the
+# receiver image, so -- like every other img method -- they're all
+# allowed inside a thread body (see _THREAD_DISALLOWED_BUILTINS' own
+# comment on why img-METHOD calls are never in that set).
+_IMAGE_LAYER_METHODS = {
+    "translate": [(_INT, _INT)],
+    "rotate": [(_FLOAT,)],
+    "scale": [(_FLOAT, _FLOAT)],
+    "resetTransform": [()],
+    "saveState": [()],
+    "restoreState": [()],
+    "clear": [()],
+    "clearRect": [(_INT, _INT, _INT, _INT)],
+    "clearCircle": [(_INT, _INT, _INT)],
+    "clearPixel": [(_INT, _INT)],
+    "drawImage": [(_IMAGE, _INT, _INT), (_IMAGE, _INT, _INT, _INT, _INT)],
+}
+
 # claude.md #151: http's fixed-arity, fixed-argument-type methods --
 # same (arg types, return type) shape as _BLOB_METHODS above, and for
 # the identical reason (arity/argument types enforced by name here
@@ -2329,7 +2355,11 @@ def analyze(program, filename="<string>"):
             # silently accepted every typo.
             if expr.prop in ("width", "height"):
                 return types_mod.PrimitiveType("int")
-            if expr.prop in ("clip", "resize", "save", "saveCopy"):
+            if expr.prop in ("clip", "resize", "save", "saveCopy", "getPixelColor",
+                             "drawRect", "drawPixel", "drawCircle", "drawText",
+                             "drawImage", "translate", "rotate", "scale",
+                             "resetTransform", "saveState", "restoreState",
+                             "clear", "clearRect", "clearCircle", "clearPixel"):
                 raise CompileError(
                     f"'{expr.prop}' is a method on img -- call it, "
                     f"e.g. `sheet.{expr.prop}(...)`",
@@ -3050,10 +3080,11 @@ def analyze(program, filename="<string>"):
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
-                if callee.prop not in ("postMessage", "kill", "live", "isAlive", "giveRequest"):
+                if callee.prop not in ("postMessage", "kill", "live", "isAlive", "giveRequest",
+                                        "drain"):
                     raise CompileError(
                         f"thread '{thread_name}' has no method '{callee.prop}' -- only "
-                        f"postMessage/kill/live/isAlive/giveRequest are supported",
+                        f"postMessage/kill/live/isAlive/giveRequest/drain are supported",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid method receiver",
                     )
@@ -3072,7 +3103,7 @@ def analyze(program, filename="<string>"):
                         f"inside a thread body -- only the main program controls a "
                         f"thread's own lifecycle and hands off live connections "
                         f"(threads may message each other via postMessage, but not "
-                        f"kill/live/isAlive/giveRequest each other)",
+                        f"kill/live/isAlive/giveRequest/drain each other)",
                         file=filename, line=callee.line, column=callee.column,
                         category="invalid function argument type",
                     )
@@ -3164,6 +3195,26 @@ def analyze(program, filename="<string>"):
                     if expr.args:
                         raise CompileError(
                             f"kill() expects no arguments, got {len(expr.args)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    return None
+                if callee.prop == "drain":
+                    # claude.md #231 (uraikus/festina#91): blocks until
+                    # `thread_name`'s own inbound queue is fully
+                    # processed -- everything already queued at the
+                    # moment this call runs, no new messages accepted
+                    # meanwhile changes that -- distinct from kill(),
+                    # which explicitly does NOT wait and discards
+                    # anything still queued. Same main-only,
+                    # no-arguments shape as kill(); a dead (never
+                    # live()'d, or already kill()'d) thread's own drain
+                    # is a safe no-op at the runtime level, not rejected
+                    # here -- draining nothing is a valid thing to ask
+                    # for.
+                    if expr.args:
+                        raise CompileError(
+                            f"drain() expects no arguments, got {len(expr.args)}",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",
                         )
@@ -3978,6 +4029,34 @@ def analyze(program, filename="<string>"):
                     if arg_type is not None and arg_type is not NULL and arg_type != expected:
                         raise CompileError(
                             f"{callee.prop}()'s argument {i + 1} expects "
+                            f"{types_mod.type_name(expected)}, found {types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return None
+            # claude.md #234 (uraikus/festina#93): the img-method forms of
+            # translate/rotate/scale/resetTransform/saveState/restoreState,
+            # clear/clearRect/clearCircle/clearPixel, and drawImage -- see
+            # _IMAGE_LAYER_METHODS. Checked exactly like the drawRect/...
+            # block just above: pick the alternate by arity, then each
+            # argument against its expected type.
+            if (callee.prop in _IMAGE_LAYER_METHODS
+                    and isinstance(infer(callee.obj, scope), types_mod.ImageType)):
+                alternates = _IMAGE_LAYER_METHODS[callee.prop]
+                sig = next((a for a in alternates if len(a) == len(expr.args)), None)
+                if sig is None:
+                    shapes = " or ".join(str(len(a)) for a in alternates)
+                    raise CompileError(
+                        f"img.{callee.prop}() expects {shapes} argument(s), "
+                        f"got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for i, (arg, expected) in enumerate(zip(expr.args, sig)):
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != expected:
+                        raise CompileError(
+                            f"img.{callee.prop}()'s argument {i + 1} expects "
                             f"{types_mod.type_name(expected)}, found {types_mod.type_name(arg_type)}",
                             file=filename, line=callee.line, column=callee.column,
                             category="invalid function argument type",

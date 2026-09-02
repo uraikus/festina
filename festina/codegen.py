@@ -1499,6 +1499,10 @@ class CodeGen:
             "declare void @festina_try_push(ptr)",
             "declare void @festina_try_pop()",
             "declare ptr @festina_try_error()",
+            # claude.md #233: the cleanup stack -- see
+            # _emit_json_cleanup_push. (ptr value, ptr release-function)
+            "declare void @festina_cleanup_push(ptr, ptr)",
+            "declare void @festina_cleanup_pop()",
             "declare void @festina_throw(ptr)",
             "declare void @festina_log_text(ptr)",
             "declare void @festina_fail(ptr)",
@@ -1628,6 +1632,13 @@ class CodeGen:
             "declare void @festina_thread_give_request(ptr, ptr, ptr)",
             "declare void @festina_thread_deliver_given_request(ptr)",
             "declare void @festina_thread_kill(ptr)",
+            # claude.md #231 (uraikus/festina#91): blocks until a
+            # thread's own inbound queue is fully drained -- see
+            # festina_thread_wait_drained's own doc comment in
+            # runtime/festina_runtime_thread.c (named to avoid
+            # colliding with the existing, unrelated
+            # festina_thread_drain(void) declared elsewhere).
+            "declare void @festina_thread_wait_drained(ptr)",
             "declare void @festina_thread_live(ptr, ptr)",
             "declare i8 @festina_thread_is_alive(ptr)",
             "declare void @festina_register_thread_hooks()",
@@ -1906,6 +1917,20 @@ class CodeGen:
             "declare void @festina_image_draw_circle_color(ptr, i64, i64, i64, i64)",
             "declare void @festina_image_draw_circle_colors(ptr, i64, i64, i64, i64, i64)",
             "declare void @festina_image_draw_text(ptr, ptr, i64, i64)",
+            # claude.md #234 (uraikus/festina#93): an img's own transform/
+            # state stack, clears, and img.drawImage.
+            "declare void @festina_image_translate(ptr, i64, i64)",
+            "declare void @festina_image_rotate(ptr, double)",
+            "declare void @festina_image_scale(ptr, double, double)",
+            "declare void @festina_image_reset_transform(ptr)",
+            "declare void @festina_image_save_state(ptr)",
+            "declare void @festina_image_restore_state(ptr)",
+            "declare void @festina_image_clear(ptr)",
+            "declare void @festina_image_clear_rect(ptr, i64, i64, i64, i64)",
+            "declare void @festina_image_clear_circle(ptr, i64, i64, i64)",
+            "declare void @festina_image_clear_pixel(ptr, i64, i64)",
+            "declare void @festina_image_draw_image(ptr, ptr, i64, i64)",
+            "declare void @festina_image_draw_image_scaled(ptr, ptr, i64, i64, i64, i64)",
             "declare void @festina_image_free(ptr)",
             "declare i8 @festina_image_save(ptr, ptr)",
             "declare i8 @festina_image_save_copy(ptr, ptr)",
@@ -6483,105 +6508,49 @@ class CodeGen:
         lines.append(f"  {v} = call ptr {fn_name}(ptr {cursor_ref})")
         return v
 
-    def _emit_json_catch_prologue(self, body):
-        """claude.md #223: the local try/catch prologue shared by every
-        generated _from_json_*_fn_for function -- registers a fresh
-        catch frame right after `out` (that function's own fresh
-        struct/array/map header) is allocated, so a throw ANYWHERE in
-        the recursive JSON read that follows (a nested field, element,
-        or entry -- possibly several _from_json_*_fn_for calls deep) is
-        caught HERE rather than skipping straight past this frame the
-        way claude.md #157's own documented "any intermediate frame
-        between the try and the throw leaks" limitation would otherwise
-        apply. Converts each generated from-json function into the one
-        frame shape that's ALREADY leak-free by that same doc comment's
-        own reasoning: one that directly contains its own try. Mirrors
-        _emit_try's own hand-rolled sjlj IR exactly (same llvm.eh.sjlj.
-        setjmp/frameaddress/stacksave shape) -- this is no different
-        structurally, just built directly into a from-json function's
-        own body instead of a user-written `try` statement's.
+    def _emit_json_cleanup_push(self, body, ptr, release_fn):
+        """claude.md #233 (replacing claude.md #223's per-builder sjlj
+        catch frames): registers `ptr` -- together with `release_fn`,
+        the LLVM function (`@free`, `@festina_json_cursor_free`, or one
+        of this class's own per-type release functions) that reclaims
+        it -- on the runtime's per-thread cleanup stack, so a throw
+        anywhere before the matching _emit_json_cleanup_pop releases it
+        on the way to the catching try: festina_throw walks the stack
+        back down to the depth the catching frame recorded when it was
+        pushed (see the runtime's own "cleanup stack" comment).
 
-        Sets self.uses_try = True (this function now genuinely uses
-        sjlj, so it needs the identical wasm32-wasi/macOS compile-time
-        rejection an explicit `try` statement already gets -- see
-        cli.py's own _check_wasm_feature_supported/
-        _check_darwin_try_supported, both gated on this flag). Returns
-        the catch label name; the caller finishes with
-        _emit_json_catch_epilogue once its own loop body is fully
-        emitted."""
-        self.uses_try = True
-        buf = self.tmp()
-        body.append(f"  {buf} = alloca [5 x ptr], align 16")
-        bufp = self.tmp()
-        body.append(f"  {bufp} = getelementptr inbounds [5 x ptr], ptr {buf}, i64 0, i64 0")
-        frame_addr = self.tmp()
-        body.append(f"  {frame_addr} = call ptr @llvm.frameaddress.p0(i32 0)")
-        body.append(f"  store ptr {frame_addr}, ptr {bufp}, align 16")
-        stack_save = self.tmp()
-        body.append(f"  {stack_save} = call ptr @llvm.stacksave.p0()")
-        slot2 = self.tmp()
-        body.append(f"  {slot2} = getelementptr inbounds ptr, ptr {bufp}, i64 2")
-        body.append(f"  store ptr {stack_save}, ptr {slot2}, align 16")
-        rc = self.tmp()
-        body.append(f"  {rc} = call i32 @llvm.eh.sjlj.setjmp(ptr {bufp})")
-        is_catch = self.tmp()
-        body.append(f"  {is_catch} = icmp ne i32 {rc}, 0")
-        try_label = self.label("fromjson.try")
-        catch_label = self.label("fromjson.catch")
-        body.append(f"  br i1 {is_catch}, label %{catch_label}, label %{try_label}")
-        body.append(f"{try_label}:")
-        body.append(f"  call void @festina_try_push(ptr {bufp})")
-        return catch_label
+        Every generated _from_json_*_fn_for function is hand-written IR
+        outside _emit_block's _active_free_locals tracking, so nothing
+        else could ever free what it holds mid-build: the header it is
+        filling in (registered right after it is allocated, popped
+        right before it is returned) and, in the struct/map builders,
+        each JSON key text read before its value (registered from the
+        read until its own free). Nested builders push and pop above
+        their caller's entries, so the stack is strictly LIFO -- which
+        is also what makes the release order on a throw right: an inner
+        half-built value is released before the outer one it would have
+        been stored into. The .toStruct()/.toArr() call site itself
+        registers its cursor, its temporary receiver text, and the
+        finished value across festina_json_expect_end (see _emit_call).
 
-    def _emit_json_catch_epilogue(self, body, out, release_fn, catch_label, extra_free_slots=()):
-        """claude.md #223: closes what _emit_json_catch_prologue opened
-        -- the success tail (pop the frame this function's own try
-        pushed, then return `out` exactly as before) and the catch
-        block itself (retrieve the caught message, release `out` --
-        which correctly frees whatever fields/elements/entries were
-        ALREADY stored in it, since a struct/array/map's own release
-        function walks whatever is actually there regardless of
-        "completeness", the same as it would for any ordinary release
-        -- then re-throw the SAME message outward via an ordinary
-        festina_throw, propagating to whichever try genuinely encloses
-        THIS call, or fail() if none does). Called once, at the very
-        end of a generated from-json function's body, in place of what
-        used to be a bare `ret ptr {out}`.
+        Why this replaced #223's design, which installed a real
+        llvm.eh.sjlj.setjmp frame inside every builder: that made any
+        program using .toStruct()/.toArr() a "uses try" program (see
+        self.uses_try) -- rejected outright under --target=wasm32-wasi
+        and on macOS, where there is no SjLj lowering at all, and
+        broken on Windows (the builder's own catch never ran: every
+        JSON throw test on the windows CI job) -- and cost a setjmp, a
+        malloc'd frame and `volatile` slot traffic per builder call on
+        the success path. This is two plain calls per value, no setjmp,
+        no volatile, portable everywhere the runtime compiles, and
+        uses_try stays untouched."""
+        body.append(f"  call void @festina_cleanup_push(ptr {ptr}, ptr {release_fn})")
 
-        `extra_free_slots` -- an `alloca ptr` in the CALLER's own body,
-        one per in-flight temporary (the struct/map builders' own
-        `key_reg`, a JSON key's text buffer read before its value and
-        freed only once the value is fully stored) that would otherwise
-        leak if a throw lands between the temporary being read and its
-        own ordinary free call. `volatile`, on BOTH the caller's own
-        stores into it and the load here -- confirmed necessary, not
-        just cautious: a first version without `volatile` compiled and
-        ran fine unoptimized, but leaked the slot's own value under
-        this project's real `-O2` default (and under `-O1`, and
-        crashed outright with SIGILL under `-fsanitize=address`,
-        confirmed directly). The reason: unlike `out` itself (defined
-        once, in the entry block, on the SAME edge that reaches this
-        catch label in the CFG the optimizer can see), a per-LOOP-
-        iteration store into a plain alloca has no PROVABLE reader on
-        any edge the optimizer's dataflow analysis recognizes --
-        `llvm.eh.sjlj.longjmp`'s own jump into this block is invisible
-        to it, the same class of hazard C's own setjmp/longjmp has
-        always required `volatile` to guard against -- so a plain
-        alloca here is dead-store-eliminated. `free(NULL)` is a
-        defined no-op, so every slot here is freed unconditionally, no
-        branch needed."""
-        body.append("  call void @festina_try_pop()")
-        body.append(f"  ret ptr {out}")
-        body.append(f"{catch_label}:")
-        err_val = self.tmp()
-        body.append(f"  {err_val} = call ptr @festina_try_error()")
-        for slot in extra_free_slots:
-            leftover = self.tmp()
-            body.append(f"  {leftover} = load volatile ptr, ptr {slot}")
-            body.append(f"  call void @free(ptr {leftover})")
-        body.append(f"  call void {release_fn}(ptr {out})")
-        body.append(f"  call void @festina_throw(ptr {err_val})")
-        body.append("  ret ptr null")
+    def _emit_json_cleanup_pop(self, body):
+        """The matching pop -- see _emit_json_cleanup_push. Emitted on
+        the ordinary (non-throwing) path only; a throw unwinds the
+        stack itself inside festina_throw."""
+        body.append("  call void @festina_cleanup_pop()")
 
     def _from_json_struct_fn_for(self, struct_type):
         """claude.md #159: returns (generating on first use, cached by
@@ -6613,22 +6582,12 @@ class CodeGen:
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         struct_ty = self.struct_llvm_name(struct_type.name)
         out = self._emit_fresh_heap_header(struct_ty, body)
-        # claude.md #223: a local catch frame around the whole field-
-        # reading loop below -- see _emit_json_catch_prologue's own doc
-        # comment for why (an intermediate-frame leak fix). `out` is
-        # already a fully zero-initialized header at this point, so
-        # releasing it in the catch block below correctly frees exactly
-        # whatever fields were already stored before the throw, nothing
-        # more, nothing less.
-        catch_label = self._emit_json_catch_prologue(body)
-        # claude.md #223: `key_slot` names whichever JSON key text
-        # buffer is currently read-but-not-yet-freed -- see
-        # _emit_json_catch_epilogue's own `extra_free_slots` doc
-        # comment for why a plain SSA temp can't be read back from the
-        # catch block below, only a value stored in memory can.
-        key_slot = self.tmp()
-        body.append(f"  {key_slot} = alloca ptr")
-        body.append(f"  store volatile ptr null, ptr {key_slot}")
+        # claude.md #233: `out` sits on the cleanup stack for the whole
+        # field-reading loop below (see _emit_json_cleanup_push). It is
+        # a fully zero-initialized header at this point, so a throw's
+        # release of it frees exactly whatever fields were stored before
+        # the throw, nothing more, nothing less.
+        self._emit_json_cleanup_push(body, out, self._release_fn_for(struct_type))
         body.append("  call void @festina_json_object_start(ptr %cursor)")
         first = self.tmp()
         body.append(f"  {first} = alloca i8")
@@ -6647,7 +6606,10 @@ class CodeGen:
         body.append(f"{readkey_lbl}:")
         key_reg = self.tmp()
         body.append(f"  {key_reg} = call ptr @festina_json_read_key(ptr %cursor)")
-        body.append(f"  store volatile ptr {key_reg}, ptr {key_slot}")
+        # claude.md #233: the key is live (read, not yet freed) across
+        # the value read below, which may throw -- registered for
+        # exactly that window, popped again right before its own free.
+        self._emit_json_cleanup_push(body, key_reg, "@free")
 
         fields = self.struct_fields(struct_type.name)
         for idx, (fname, ftype) in enumerate(fields):
@@ -6663,40 +6625,49 @@ class CodeGen:
             slot = self.tmp()
             body.append(f"  {slot} = getelementptr {struct_ty}, ptr {out}, i32 0, i32 {idx}")
             # claude.md #173: a duplicate JSON key overwriting an
-            # already-set nested struct/arr[T]/map[T] field must not
-            # leak whatever it already parsed into that field -- the
-            # same "last one wins, and doesn't leak the value it
-            # replaces" contract a map literal's repeated key already
-            # follows. Store-then-release (not release-then-store), the
-            # same ordering claude.md #120's own cycle-trial-safety
-            # comment on _emit_assign requires: a trial deletion
-            # triggered by the release must never see this slot still
-            # pointing at the value whose count it just dropped.
-            old_refcounted = None
-            if ftype == TEXT:
-                old = self.tmp()
-                body.append(f"  {old} = load ptr, ptr {slot}")
-                body.append(f"  call void @free(ptr {old})")
-            elif _is_refcounted(ftype):
-                old_refcounted = self.tmp()
-                body.append(f"  {old_refcounted} = load ptr, ptr {slot}")
+            # already-set field must not leak whatever it already
+            # parsed into that field -- the same "last one wins, and
+            # doesn't leak the value it replaces" contract a map
+            # literal's repeated key already follows. Store-then-release
+            # (not release-then-store), the same ordering claude.md
+            # #120's own cycle-trial-safety comment on _emit_assign
+            # requires: a trial deletion triggered by the release must
+            # never see this slot still pointing at the value whose
+            # count it just dropped.
+            #
+            # claude.md #233: the SAME order for a text field too. It
+            # used to free the old text BEFORE reading the new value --
+            # and that read can throw, after which festina_throw's
+            # release of `out` found this slot still pointing at the
+            # already-freed buffer: a real double free (`{"name":"a",
+            # "name":5}` inside a try, confirmed under Valgrind as an
+            # invalid free per iteration). Load old, read new, store
+            # new, THEN free old -- so a throw mid-read leaves the slot
+            # holding a value that is still valid.
+            old_val = None
+            if ftype == TEXT or _is_refcounted(ftype):
+                old_val = self.tmp()
+                body.append(f"  {old_val} = load ptr, ptr {slot}")
             v = self._emit_json_read_value(ftype, "%cursor", body)
             ir_ty = _llvm_type(ftype)
             body.append(f"  store {ir_ty} {v}, ptr {slot}")
-            if old_refcounted is not None:
-                body.append(f"  call void {self._release_fn_for(ftype)}(ptr {old_refcounted})")
+            if old_val is not None:
+                if ftype == TEXT:
+                    body.append(f"  call void @free(ptr {old_val})")
+                else:
+                    body.append(f"  call void {self._release_fn_for(ftype)}(ptr {old_val})")
             body.append(f"  br label %{keydone_lbl}")
             body.append(f"{next_check_lbl}:")
         # No field matched -- an unrecognized key, skipped whole.
         body.append("  call void @festina_json_skip_field_value(ptr %cursor)")
         body.append(f"  br label %{keydone_lbl}")
         body.append(f"{keydone_lbl}:")
+        self._emit_json_cleanup_pop(body)
         body.append(f"  call void @free(ptr {key_reg})")
-        body.append(f"  store volatile ptr null, ptr {key_slot}")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
-        self._emit_json_catch_epilogue(body, out, self._release_fn_for(struct_type), catch_label,
-                                       extra_free_slots=[key_slot])
+        self._emit_json_cleanup_pop(body)
+        body.append(f"  ret ptr {out}")
         body.append("}")
         body.append("")
         self.func_defs.extend(body)
@@ -6726,16 +6697,27 @@ class CodeGen:
 
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         out = self._emit_fresh_heap_header(FESTINA_ARRAY_LLVM_TYPE, body)
-        # claude.md #223: see _from_json_struct_fn_for's own identical
-        # comment -- a local catch frame so a throw partway through
-        # (element N+1 fails, having already pushed elements 0..N)
-        # releases `out`, correctly freeing the elements already
-        # pushed, rather than leaking them.
-        catch_label = self._emit_json_catch_prologue(body)
+        # claude.md #233: see _from_json_struct_fn_for's own identical
+        # comment -- `out` registered for the whole element loop, so a
+        # throw partway through (element N+1 fails, elements 0..N
+        # already pushed) releases the elements already pushed rather
+        # than leaking them.
+        self._emit_json_cleanup_push(
+            body, out, self._release_fn_for(types_mod.ArrayType(elem_type)))
         body.append("  call void @festina_json_array_start(ptr %cursor)")
         first = self.tmp()
         body.append(f"  {first} = alloca i8")
         body.append(f"  store i8 1, ptr {first}")
+        elem_ir = _llvm_type(elem_type)
+        elem_size = _elem_size(elem_type)
+        # One element slot, allocated once here in the entry block
+        # rather than inside the loop body below (claude.md #233): a
+        # non-entry alloca is a fresh stack allocation per iteration as
+        # far as the IR is concerned, and only the optimizer's own
+        # hoisting kept a multi-million-element array from growing the
+        # stack by one slot per element.
+        slot = self.tmp()
+        body.append(f"  {slot} = alloca {elem_ir}")
         loop_lbl = self.label("fromjson.aloop")
         end_lbl = self.label("fromjson.aend")
         elem_lbl = self.label("fromjson.aelem")
@@ -6748,10 +6730,6 @@ class CodeGen:
         body.append(f"  br i1 {done_b}, label %{end_lbl}, label %{elem_lbl}")
         body.append(f"{elem_lbl}:")
         v = self._emit_json_read_value(elem_type, "%cursor", body)
-        elem_ir = _llvm_type(elem_type)
-        elem_size = _elem_size(elem_type)
-        slot = self.tmp()
-        body.append(f"  {slot} = alloca {elem_ir}")
         body.append(f"  store {elem_ir} {v}, ptr {slot}")
         # claude.md #174: `null` capacity -- a JSON-parsed array is
         # always plain (there is no `.toArr(amor T)` syntax to request
@@ -6760,8 +6738,8 @@ class CodeGen:
         body.append(f"  call void @festina_array_push(ptr {out}, ptr null, i64 {elem_size}, ptr {slot})")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
-        self._emit_json_catch_epilogue(
-            body, out, self._release_fn_for(types_mod.ArrayType(elem_type)), catch_label)
+        self._emit_json_cleanup_pop(body)
+        body.append(f"  ret ptr {out}")
         body.append("}")
         body.append("")
         self.func_defs.extend(body)
@@ -6837,17 +6815,12 @@ class CodeGen:
         value_type = map_type.value
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         out = self._emit_fresh_heap_header(FESTINA_MAP_LLVM_TYPE, body)
-        # claude.md #223: see _from_json_struct_fn_for's own identical
-        # comment -- a local catch frame so a throw partway through
-        # (entry N+1's own value fails to parse, having already set N
-        # entries) releases `out`, correctly freeing the entries
-        # already set, rather than leaking them.
-        catch_label = self._emit_json_catch_prologue(body)
-        # claude.md #223: see _from_json_struct_fn_for's own identical
-        # key_slot comment.
-        key_slot = self.tmp()
-        body.append(f"  {key_slot} = alloca ptr")
-        body.append(f"  store volatile ptr null, ptr {key_slot}")
+        # claude.md #233: see _from_json_struct_fn_for's own identical
+        # comment -- `out` registered for the whole entry loop, so a
+        # throw partway through (entry N+1's own value fails to parse,
+        # N entries already set) releases the entries already set
+        # rather than leaking them.
+        self._emit_json_cleanup_push(body, out, self._release_fn_for(map_type))
         body.append("  call void @festina_json_object_start(ptr %cursor)")
         first = self.tmp()
         body.append(f"  {first} = alloca i8")
@@ -6865,19 +6838,21 @@ class CodeGen:
         body.append(f"{entry_lbl}:")
         key_reg = self.tmp()
         body.append(f"  {key_reg} = call ptr @festina_json_read_key(ptr %cursor)")
-        body.append(f"  store volatile ptr {key_reg}, ptr {key_slot}")
+        # claude.md #233: see _from_json_struct_fn_for's identical
+        # comment -- the key is live across the value read below.
+        self._emit_json_cleanup_push(body, key_reg, "@free")
         v = self._emit_json_read_value(value_type, "%cursor", body)
         self._from_json_map_value(out, value_type, key_reg, v, body)
         # claude.md #97: festina_map_set strdup's its own copy of the
         # key -- the same reason _emit_map_set frees its own
         # key_source_expr afterward -- so key_reg (heap-allocated by
         # festina_json_read_key) has no owner left once this returns.
+        self._emit_json_cleanup_pop(body)
         body.append(f"  call void @free(ptr {key_reg})")
-        body.append(f"  store volatile ptr null, ptr {key_slot}")
         body.append(f"  br label %{loop_lbl}")
         body.append(f"{end_lbl}:")
-        self._emit_json_catch_epilogue(
-            body, out, self._release_fn_for(map_type), catch_label, extra_free_slots=[key_slot])
+        self._emit_json_cleanup_pop(body)
+        body.append(f"  ret ptr {out}")
         body.append("}")
         body.append("")
         self.func_defs.extend(body)
@@ -11290,6 +11265,17 @@ class CodeGen:
                         lines.append(f"  br label %{end_label}")
                         self._start_block(end_label, lines)
                     return "0", None
+                if callee.prop == "drain":
+                    # claude.md #231 (uraikus/festina#91): blocks the
+                    # calling (main) thread until `handle`'s own inbound
+                    # queue is fully drained -- see
+                    # festina_thread_wait_drained's own doc comment for
+                    # the actual wait mechanism.
+                    lines.append(f"  call void @festina_thread_wait_drained(ptr {handle})")
+                    if end_label is not None:
+                        lines.append(f"  br label %{end_label}")
+                        self._start_block(end_label, lines)
+                    return "0", None
                 if callee.prop == "live":
                     # claude.md #195 Phase 2: the callback's own real
                     # LLVM signature is already `void(i8)` -- exactly
@@ -11422,8 +11408,24 @@ class CodeGen:
             if callee.prop in ("toStruct", "toArr") and len(expr.args) == 1 \
                     and isinstance(expr.args[0], ast.TypeArg):
                 recv_val, recv_type = self._emit_expr(callee.obj, env, lines)
+                # claude.md #233: everything this call site holds while
+                # the parse can still throw goes on the cleanup stack
+                # (see _emit_json_cleanup_push): a temporary receiver
+                # text (a call result or template literal -- exactly what
+                # _free_text_temp below frees on the ordinary path), the
+                # cursor, and -- once the builder has returned it -- the
+                # finished value itself, which festina_json_expect_end
+                # can still reject for trailing data. That last one used
+                # to leak under #223's design: by then the value was
+                # already off the builder's own frame and nothing else
+                # owned it yet (confirmed under Valgrind -- one lost
+                # block per `'{...} trailing'.toStruct(T)` inside a try).
+                owning_recv = recv_type == TEXT and self._is_owning_text_source(callee.obj)
+                if owning_recv:
+                    self._emit_json_cleanup_push(lines, recv_val, "@free")
                 cursor = self.tmp()
                 lines.append(f"  {cursor} = call ptr @festina_json_cursor_new(ptr {recv_val})")
+                self._emit_json_cleanup_push(lines, cursor, "@festina_json_cursor_free")
                 target_type = self._resolve(expr.args[0].type_expr, expr.args[0])
                 if callee.prop == "toStruct":
                     fn_name = self._from_json_struct_fn_for(target_type)
@@ -11431,33 +11433,14 @@ class CodeGen:
                 else:
                     fn_name = self._from_json_arr_fn_for(target_type)
                     result_type = types_mod.ArrayType(target_type)
-                # claude.md #223: a local catch frame around the call into
-                # the from-json builder -- if IT throws (a partial parse
-                # failure; the builder itself already cleans up whatever
-                # it was building, see _emit_json_catch_prologue), `cursor`
-                # and the receiver's own owning text temp would otherwise
-                # leak right here, the identical "intermediate frame
-                # between the try and the throw" class this whole entry
-                # closes, one level up from the builder itself. `cursor`
-                # and `recv_val` are both plain SSA values defined BEFORE
-                # the setjmp below (unlike the builder's own per-iteration
-                # key_slot), so both dominate the catch block normally --
-                # no `volatile` needed here.
-                catch_label = self._emit_json_catch_prologue(lines)
                 out = self.tmp()
                 lines.append(f"  {out} = call ptr {fn_name}(ptr {cursor})")
+                self._emit_json_cleanup_push(lines, out, self._release_fn_for(result_type))
                 lines.append(f"  call void @festina_json_expect_end(ptr {cursor})")
-                lines.append("  call void @festina_try_pop()")
-                end_label = self.label("fromjson.callsite.end")
-                lines.append(f"  br label %{end_label}")
-                lines.append(f"{catch_label}:")
-                err_val = self.tmp()
-                lines.append(f"  {err_val} = call ptr @festina_try_error()")
-                lines.append(f"  call void @festina_json_cursor_free(ptr {cursor})")
-                self._free_text_temp(callee.obj, recv_val, recv_type, lines)
-                lines.append(f"  call void @festina_throw(ptr {err_val})")
-                lines.append("  unreachable")
-                self._start_block(end_label, lines)
+                self._emit_json_cleanup_pop(lines)   # the finished value
+                self._emit_json_cleanup_pop(lines)   # the cursor
+                if owning_recv:
+                    self._emit_json_cleanup_pop(lines)   # the receiver text
                 lines.append(f"  call void @festina_json_cursor_free(ptr {cursor})")
                 self._free_text_temp(callee.obj, recv_val, recv_type, lines)
                 return out, result_type
@@ -11668,6 +11651,41 @@ class CodeGen:
                             f"  call void @festina_image_draw_text(ptr {obj_val}, "
                             f"ptr {text}, i64 {x}, i64 {y})")
                         self._free_text_temp(expr.args[0], text, emitted[0][1], lines)
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return "0", None
+            # claude.md #234 (uraikus/festina#93): an img's own transform/
+            # state stack, clears, and img.drawImage -- see semantic.py's
+            # _IMAGE_LAYER_METHODS, which has already checked arity and
+            # types. Dispatched by arity exactly like the drawRect/...
+            # branch just above; each runtime entry point is the img-
+            # method counterpart of the same-named _CANVAS_OPS entry, and
+            # takes the receiver image first.
+            _IMAGE_LAYER_OPS = {
+                "translate": {2: ("festina_image_translate", ["i64", "i64"])},
+                "rotate": {1: ("festina_image_rotate", ["double"])},
+                "scale": {2: ("festina_image_scale", ["double", "double"])},
+                "resetTransform": {0: ("festina_image_reset_transform", [])},
+                "saveState": {0: ("festina_image_save_state", [])},
+                "restoreState": {0: ("festina_image_restore_state", [])},
+                "clear": {0: ("festina_image_clear", [])},
+                "clearRect": {4: ("festina_image_clear_rect", ["i64"] * 4)},
+                "clearCircle": {3: ("festina_image_clear_circle", ["i64"] * 3)},
+                "clearPixel": {2: ("festina_image_clear_pixel", ["i64"] * 2)},
+                "drawImage": {3: ("festina_image_draw_image", ["ptr", "i64", "i64"]),
+                              5: ("festina_image_draw_image_scaled", ["ptr"] + ["i64"] * 4)},
+            }
+            if callee.prop in _IMAGE_LAYER_OPS:
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ImageType):
+                    emitted = [self._emit_expr(a, env, lines) for a in expr.args]
+                    fn, arg_irs = _IMAGE_LAYER_OPS[callee.prop][len(expr.args)]
+                    sig = "".join(f", {ty} {v}" for ty, (v, _) in zip(arg_irs, emitted))
+                    lines.append(f"  call void @{fn}(ptr {obj_val}{sig})")
+                    if callee.prop == "drawImage":
+                        # An owning SOURCE (a clip()/blankImage() result
+                        # passed straight in) is done with once painted --
+                        # the same release an owning receiver gets.
+                        self._release_owned_receiver(expr.args[0], emitted[0][0], emitted[0][1], lines)
                     self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return "0", None
             # claude.md #38: music.play() / music.stop() / music.isPlaying()

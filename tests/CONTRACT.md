@@ -3174,6 +3174,35 @@ key for a full second and asserts exactly one keyUp),
 `tests/test_graphics.py` (5 more, including that bare `on key` no longer
 marks a program as using graphics).
 
+**claude.md #220-#233** (the threads-and-messaging consolidation, the
+review rounds after it, and the review of those): `exec(args,
+callback)` is gone (#221); a reply's `.callback(fn)` runs on the thread
+that sent the request, main's own event loop included (#222); a
+`.toStruct()`/`.toArr()` parse that fails partway through strands
+nothing -- first via a `setjmp` frame inside every generated builder
+(#223), then redone as the runtime's per-thread *cleanup stack* once
+that frame turned out to make JSON parsing a "uses `try`" program,
+rejected on wasm32-wasi/macOS and broken on Windows (#233, which also
+fixed a double free on a duplicate `text` key, a leak on trailing data,
+and turned a deep-nesting stack overflow into a catchable throw);
+`giveRequest` and the pool's shared body were scoped and pinned (#225,
+#226); a thread's `.reply()` delivers more than once per lifetime (#230,
+the dangling tail pointer); `NAME.drain()` blocks until a thread's queue
+is fully processed (#231, hardened in #232). Where the coverage lives:
+`tests/test_threads.py` (semantic), `tests/test_codegen.py::
+TestThreadReplyCallback`/`::TestThreadDrain`/`::TestGiveRequest`
+(compile-and-run), `tests/test_json_parse.py` (every parse-failure
+shape, plus `TestJsonParsingNeedsNoSjlj` pinning `uses_try` untouched),
+`tests/test_wasm.py` (JSON parsing under wasm32-wasi), and three
+sanitizer tiers: `scripts/leak_stress.sh` (ASan/LSan, 26 programs),
+`scripts/thread_tsan_stress.sh` (TSan, 11) and `scripts/
+valgrind_stress.sh` (Valgrind, for programs whose own `try`/`catch`
+ASan cannot instrument through -- `tests/valgrind_stress/`). #233 also
+made CI on `main` honest again on all three platforms: the tests that
+depend on `xwd`/`xprop`, `/proc`, or POSIX signal delivery now skip
+where those don't exist (and the Linux job installs the two X11 tools
+it had been missing), and the Windows HTTP runtime compiles again.
+
 See api.md for the current language/standard library reference and this
 file's own "Status" section above for the implemented-vs-not matrix; the
 short version: nothing is left

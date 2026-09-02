@@ -5172,6 +5172,23 @@ def _find_window(display, timeout=20):
     raise AssertionError("the Festina canvas window never appeared")
 
 
+def _require_x11_tool(name, purpose):
+    """claude.md #233: skip (or, under FESTINA_STRICT_DEPS, fail loudly)
+    when an X11 helper binary this test reads the screen through isn't
+    installed -- `xwd` (x11-apps) and `xprop` (x11-utils) are optional
+    tooling in setup.md's sense, exactly like xdotool/openbox, and a
+    missing one used to surface as a raw FileNotFoundError from
+    subprocess (four tests, every push, on the linux CI job before
+    ci.yml installed them) instead of the clean skip every other
+    optional tier already gets."""
+    if shutil.which(name):
+        return
+    missing = f"{name} isn't installed -- needed to {purpose}"
+    if os.environ.get("FESTINA_STRICT_DEPS"):
+        pytest.fail(missing)
+    pytest.skip(missing)
+
+
 def _xwd_pixels(display, wid, points):
     """Capture a window with `xwd` and return the RGB at each (x, y).
 
@@ -5186,6 +5203,7 @@ def _xwd_pixels(display, wid, points):
     header say where each channel sits inside a pixel.
     """
     import struct
+    _require_x11_tool("xwd", "read real canvas pixels")
     dump = subprocess.run(["xwd", "-id", wid], env=dict(os.environ, DISPLAY=display),
                           capture_output=True, check=True).stdout
     hdr = struct.unpack(">25I", dump[:100])
@@ -5919,7 +5937,10 @@ class TestFullscreenAndDecorations:
         # many pixels of chrome (title bar, border) it drew around the
         # window -- (0, 0, 0, 0) or absent entirely means "no decoration
         # was drawn", the exact claude.md #95 look this entry retires.
-        # xprop is already a dependency of x_display_with_wm itself.
+        # x_display_with_wm only PREFERS xprop (it falls back to a fixed
+        # wait without it); this test genuinely needs it -- claude.md
+        # #233: skip cleanly rather than FileNotFoundError.
+        _require_x11_tool("xprop", "read the window manager's _NET_FRAME_EXTENTS")
         source = "drawRect(0, 0, 10, 10)\nrender()"
         proc, stdout_path = run_graphics_program(source, display=x_display_with_wm)
         try:
@@ -13162,6 +13183,223 @@ class TestImageDrawMethods:
                 semantic.analyze(program, filename="main.f")
 
 
+class TestImageLayerOps:
+    """claude.md #234 (uraikus/festina#93): an img as a self-contained
+    drawing target -- its own translate/rotate/scale/resetTransform
+    and saveState/restoreState stack, clear/clearRect/clearCircle/
+    clearPixel to transparent, and img.drawImage(src, x, y[, w, h]).
+    Every one of these needs no display (same as the four drawing
+    methods TestImageDrawMethods covers), so every pixel here is read
+    back headlessly through img.getPixelColor (claude.md #189) with
+    DISPLAY explicitly unset."""
+
+    def _run(self, compile_and_run, body):
+        source = "color red = 'red'\ncolor blue = 'blue'\n" + body
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0, result.stderr
+        return result.stdout.split()
+
+    def test_translate_moves_the_images_own_drawing(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img a = blankImage(40, 40)
+        a.translate(10, 10)
+        a.drawRect(0, 0, 5, 5, blue)
+        log(a.getPixelColor(12, 12) == blue)
+        log(a.getPixelColor(2, 2) == null)
+        """) == ["true", "true"]
+
+    def test_rotate_is_in_degrees_about_the_translated_origin(self, compile_and_run):
+        # A 10x2 bar at the origin, after translate(20, 20) + rotate(90),
+        # stands vertically just left of x=20 from y=20 down to y=30.
+        assert self._run(compile_and_run, """
+        img b = blankImage(40, 40)
+        b.translate(20, 20)
+        b.rotate(90.0)
+        b.drawRect(0, 0, 10, 2, blue)
+        log(b.getPixelColor(19, 25) == blue)
+        log(b.getPixelColor(25, 21) == null)
+        """) == ["true", "true"]
+
+    def test_scale_grows_the_drawing(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img c = blankImage(40, 40)
+        c.scale(2.0, 2.0)
+        c.drawRect(0, 0, 5, 5, blue)
+        log(c.getPixelColor(8, 8) == blue)
+        log(c.getPixelColor(12, 12) == null)
+        """) == ["true", "true"]
+
+    def test_save_restore_and_reset_transform(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img d = blankImage(40, 40)
+        d.saveState()
+        d.translate(20, 20)
+        d.restoreState()
+        d.drawRect(0, 0, 3, 3, blue)          // back at identity
+        d.translate(30, 30)
+        d.resetTransform()
+        d.drawRect(10, 10, 3, 3, red)         // identity again
+        log(d.getPixelColor(1, 1) == blue)
+        log(d.getPixelColor(11, 11) == red)
+        log(d.getPixelColor(31, 31) == null)
+        """) == ["true", "true", "true"]
+
+    def test_the_image_transform_and_the_canvas_transform_are_independent(
+            self, compile_and_run):
+        # The canvas's own transform is never applied to image draws
+        # (unchanged from claude.md #134), and an image's transform never
+        # touches the canvas.
+        assert self._run(compile_and_run, """
+        translate(100, 100)
+        img e = blankImage(40, 40)
+        e.drawRect(0, 0, 3, 3, blue)
+        e.translate(15, 15)
+        fillStyle(red)
+        drawRect(0, 0, 3, 3)
+        log(e.getPixelColor(1, 1) == blue)
+        log(getPixelColor(101, 101) == red)
+        log(getPixelColor(1, 1) == null)
+        """) == ["true", "true", "true"]
+
+    def test_clears_erase_to_transparent(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img f = blankImage(40, 40)
+        f.drawRect(0, 0, 40, 40, blue)
+        f.clearRect(0, 0, 10, 10)
+        f.clearCircle(30, 30, 5)
+        f.clearPixel(20, 5)
+        log(f.getPixelColor(5, 5) == null)
+        log(f.getPixelColor(30, 30) == null)
+        log(f.getPixelColor(20, 5) == null)
+        log(f.getPixelColor(15, 15) == blue)
+        """) == ["true"] * 4
+
+    def test_region_clears_honour_the_transform_but_clear_does_not(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img f = blankImage(40, 40)
+        f.drawRect(0, 0, 40, 40, blue)
+        f.translate(20, 20)
+        f.clearRect(0, 0, 5, 5)
+        log(f.getPixelColor(22, 22) == null)
+        log(f.getPixelColor(15, 15) == blue)
+        f.clear()
+        log(f.getPixelColor(15, 15) == null)
+        log(f.getPixelColor(1, 1) == null)
+        """) == ["true"] * 4
+
+    def test_a_cleared_region_lets_a_later_draw_underneath_show(self, compile_and_run):
+        # The whole point of clearing to alpha 0 rather than painting
+        # transparent black: what is drawn UNDER the layer afterwards
+        # shows through where it was cleared.
+        assert self._run(compile_and_run, """
+        img layer = blankImage(20, 20)
+        layer.drawRect(0, 0, 20, 20, blue)
+        layer.clearCircle(10, 10, 4)
+        img under = blankImage(20, 20)
+        under.drawRect(0, 0, 20, 20, red)
+        under.drawImage(layer, 0, 0)
+        log(under.getPixelColor(10, 10) == red)
+        log(under.getPixelColor(1, 1) == blue)
+        """) == ["true", "true"]
+
+    def test_draw_image_plain_scaled_and_through_the_transform(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img src = blankImage(10, 10)
+        src.drawRect(0, 0, 10, 10, red)
+        img g = blankImage(40, 40)
+        g.drawImage(src, 5, 5)
+        g.drawImage(src, 20, 20, 20, 20)
+        log(g.getPixelColor(7, 7) == red)
+        log(g.getPixelColor(2, 2) == null)
+        log(g.getPixelColor(35, 35) == red)
+        img h = blankImage(40, 40)
+        h.translate(20, 20)
+        h.drawImage(src, 0, 0)
+        log(h.getPixelColor(22, 22) == red)
+        log(h.getPixelColor(2, 2) == null)
+        """) == ["true"] * 5
+
+    def test_draw_image_honours_fill_alpha(self, compile_and_run):
+        # 50% red over opaque blue is neither pure colour -- a real
+        # blend, the same fillAlpha contract the canvas drawImage has
+        # (claude.md #183).
+        assert self._run(compile_and_run, """
+        img src = blankImage(10, 10)
+        src.drawRect(0, 0, 10, 10, red)
+        img k = blankImage(10, 10)
+        k.drawRect(0, 0, 10, 10, blue)
+        fillAlpha(0.5)
+        k.drawImage(src, 0, 0)
+        fillAlpha(1.0)
+        color blended = k.getPixelColor(5, 5)
+        log(blended != red)
+        log(blended != blue)
+        log(blended != null)
+        """) == ["true"] * 3
+
+    def test_drawing_an_image_onto_itself_copies_first(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img m = blankImage(20, 20)
+        m.drawRect(0, 0, 10, 20, red)
+        m.drawImage(m, 10, 0)
+        log(m.getPixelColor(15, 5) == red)
+        log(m.getPixelColor(5, 5) == red)
+        """) == ["true", "true"]
+
+    def test_an_owning_clip_source_is_released_after_the_blit(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img sheet = blankImage(32, 32)
+        sheet.drawRect(0, 0, 32, 32, blue)
+        img n = blankImage(32, 32)
+        n.drawImage(sheet.clip(0, 0, 8, 8), 4, 4)
+        log(n.getPixelColor(6, 6) == blue)
+        log(n.getPixelColor(20, 20) == null)
+        """) == ["true", "true"]
+
+    def test_a_layer_in_an_array_is_edited_in_place(self, compile_and_run):
+        # The festina-game shape: layers held in an arr[img], each
+        # stamped through its own transform with no canvas round trip.
+        assert self._run(compile_and_run, """
+        arr[img] chunks = [blankImage(16, 16), blankImage(16, 16)]
+        chunks[1].saveState()
+        chunks[1].translate(8, 8)
+        chunks[1].rotate(45.0)
+        chunks[1].drawRect(-2, -2, 4, 4, red)
+        chunks[1].restoreState()
+        log(chunks[1].getPixelColor(8, 8) == red)
+        log(chunks[0].getPixelColor(8, 8) == null)
+        """) == ["true", "true"]
+
+    def test_restore_with_nothing_saved_fails_clearly(self, compile_and_run):
+        result = compile_and_run("img a = blankImage(4, 4)\na.restoreState()\nlog('unreachable')",
+                                 env={"DISPLAY": ""})
+        assert result.returncode != 0
+        assert "img.restoreState(): nothing was saved" in result.stdout + result.stderr
+
+    def test_nesting_past_64_saves_fails_clearly(self, compile_and_run):
+        result = compile_and_run(
+            "img a = blankImage(4, 4)\nint i = 0\nwhile i < 65 { a.saveState()\n i = i + 1 }\n"
+            "log('unreachable')", env={"DISPLAY": ""})
+        assert result.returncode != 0
+        assert "img.saveState(): nested too deeply" in result.stdout + result.stderr
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in [
+            "img s = blankImage(4, 4)\ns.rotate(45)",            # float, like the canvas's
+            "img s = blankImage(4, 4)\ns.translate(1.0, 2)",
+            "img s = blankImage(4, 4)\ns.scale(2.0)",
+            "img s = blankImage(4, 4)\ns.drawImage(1, 2, 3)",
+            "img s = blankImage(4, 4)\nimg t = blankImage(2, 2)\ns.drawImage(t, 2, 3, 4)",
+            "img s = blankImage(4, 4)\ns.restoreState(1)",
+            "img s = blankImage(4, 4)\ns.clearRect(0, 0, 1)",
+            "img s = blankImage(4, 4)\ns.clear(1)",
+            "text s = 'x'\ns.translate(1, 2)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestImageClipRendersRealPixels:
     """claude.md #92, the tier the rest can't reach: that clip() lifts
     the region it was actually asked for. Asserting the runtime call was
@@ -16569,6 +16807,122 @@ class TestThreadReplyCallback:
         lines = sorted(result.stdout.strip().splitlines())
         assert lines == ["A: 100", "B: 200"]
 
+    def test_a_second_sequential_reply_still_delivers(self, compile_and_run):
+        # claude.md #230 (uraikus/festina#89): a SEQUENTIAL round trip
+        # (register, send, reply, dispatch, callback fires -- THEN a
+        # second, completely separate round trip begins) used to
+        # corrupt the sender's own pending_callbacks list: dispatching
+        # the first reply removed the only (and therefore TAIL) node
+        # without updating pending_callbacks_tail, so the next
+        # registration wrote into already-freed memory via the stale
+        # tail and never linked itself into the list `pending_callbacks`
+        # itself still pointed at -- the second reply had nothing left
+        # to be found by and was silently dropped. onA triggers onB's
+        # own send only once its own reply has actually arrived, which
+        # is exactly what makes this deterministic (no timer needed)
+        # and exactly the shape #89's own report called "the second
+        # reply ever emitted by a given thread instance."
+        source = """
+        thread worker {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg * 10)
+            }
+        }
+        void func onB(r:int) {
+            log(`B: ${r}`)
+            close(0)
+        }
+        void func onA(r:int) {
+            log(`A: ${r}`)
+            worker.postMessage(2).callback(onB)
+        }
+        worker.postMessage(1).callback(onA)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip().splitlines() == ["A: 10", "B: 20"]
+
+    def test_replies_arriving_out_of_registration_order_keep_the_list_intact(
+            self, compile_and_run):
+        # claude.md #232: the one removal shape claude.md #230's own
+        # fix has that neither of its tests exercised -- removing the
+        # TAIL of a list that is NOT thereby emptied. Main registers
+        # cbSlow (to a thread that stalls ~200ms before replying) then
+        # cbFast; the fast reply arrives first, removing the tail
+        # node while the head survives, so pending_callbacks_tail must
+        # be walked back to the head node, not left dangling or set
+        # to NULL. Then the slow reply empties the list, and a THIRD
+        # send proves the list is still perfectly usable after both
+        # removal shapes in a row. Output order is therefore forced,
+        # not racy: fast, slow, third.
+        source = """
+        int seen = 0
+        void func finish() {
+            seen = seen + 1
+            if seen == 3 { close(0) }
+        }
+        void func onSlow(r:int) { log(`slow ${r}`) finish() }
+        void func onFast(r:int) { log(`fast ${r}`) finish() }
+        void func onThird(r:int) { log(`third ${r}`) finish() }
+        thread slow {
+            on message(w:thread, msg:int) {
+                int s = now()
+                while now() - s < 200 { }
+                w.reply(msg)
+            }
+        }
+        thread fast {
+            on message(w:thread, msg:int) { w.reply(msg) }
+        }
+        slow.postMessage(1).callback(onSlow)
+        fast.postMessage(2).callback(onFast)
+        fast.postMessage(3).callback(onThird)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip().splitlines() == ["fast 2", "third 3", "slow 1"]
+
+    def test_many_outstanding_replies_across_a_pool_all_resolve(self, compile_and_run):
+        # claude.md #232: dynamic coverage of the pending-callback list
+        # under a removal order NOTHING controls -- four real OS
+        # threads racing to reply, so main's single list has entries
+        # removed from the head, the middle and the tail in whatever
+        # interleaving the scheduler produces this run, while new
+        # registrations keep appending at the tail throughout (each
+        # callback fires a fresh send until its own chain is done).
+        # Every one of the 4 x 30 chained round trips must resolve to
+        # its own callback exactly once: the count and the checksum
+        # both pin that, whatever order it happened in.
+        source = """
+        int done = 0
+        int sum = 0
+        int DEPTH = 30
+        thread pool[4] {
+            on message(w:thread, msg:int) { w.reply(msg) }
+        }
+        void func onReply(r:int) {
+            done = done + 1
+            sum = sum + r
+            int lane = r % 4
+            int step = Math.floorDiv(r, 4)
+            if step + 1 < DEPTH {
+                pool[lane].postMessage(r + 4).callback(onReply)
+            }
+            if done == 4 * DEPTH {
+                log(`${done} ${sum}`)
+                close(0)
+            }
+        }
+        pool[0].postMessage(0).callback(onReply)
+        pool[1].postMessage(1).callback(onReply)
+        pool[2].postMessage(2).callback(onReply)
+        pool[3].postMessage(3).callback(onReply)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        # values 0..119 each exactly once: 120 callbacks, sum 119*120/2
+        assert result.stdout.strip() == "120 7140"
+
     def test_an_out_of_range_pool_index_registers_no_callback(self, compile_and_run):
         # claude.md #218: the registration used to be emitted BEFORE
         # the pool's own bounds check, so an out-of-range index left a
@@ -17016,6 +17370,229 @@ class TestThreadHttpContext:
         result = compile_and_run(source)
         assert result.returncode == 0, result.stdout + result.stderr
         assert "started" in result.stdout
+
+
+class TestThreadDrain:
+    """claude.md #231 (uraikus/festina#91): `NAME.drain()` -- blocks
+    until a thread's own inbound queue is fully processed, so
+    `on close()`/`on exit(code:int)` can fire off a final async job
+    (e.g. a database write on a thread with its own DatabaseURL) and
+    be sure it has actually landed before the process-exit teardown
+    that follows discards anything still in-flight."""
+
+    def test_a_write_on_a_drained_thread_survives_process_exit(
+            self, compile_and_run, tmp_path):
+        # claude.md #231's own decisive proof, and #91's exact repro
+        # shape: without drain(), this same write is silently lost
+        # (confirmed directly -- see claude.md #231's own "Verified"
+        # note). A thread and main can never share one DatabaseURL
+        # (semantic.py's own isolation gate), so the write is checked
+        # the same way every other thread-DB test in this suite does
+        # -- inspecting the thread's own private .sqlite file directly
+        # from Python, once the process has actually exited.
+        source = """
+        table Written { n:int }
+
+        thread writer {
+            DatabaseURL = 'writer_drain.sqlite'
+            on message(caller:thread, msg:int) {
+                sqlite('INSERT INTO Written (n) VALUES (?)', [msg])
+            }
+        }
+
+        writer.postMessage(42)
+        writer.drain()
+        log('drained')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "drained" in result.stdout
+        db = tmp_path / "writer_drain.sqlite"
+        assert db.exists()
+        rows = sqlite3.connect(db).execute("SELECT n FROM Written").fetchall()
+        assert rows == [(42,)]
+
+    def test_drain_blocks_until_every_queued_message_has_run(self, compile_and_run, tmp_path):
+        # claude.md #232: the blocking guarantee itself, checked from
+        # INSIDE the program rather than after it exits, across
+        # deliberately uneven batch sizes (1, then a burst, then 1
+        # again -- the list draining fully to empty and refilling is
+        # exactly the shape that matters). The worker appends one byte
+        # per message to a file; after each drain() main re-reads the
+        # file and the byte count must equal everything sent so far,
+        # every single time. A drain() that returned early -- while a
+        # message was dequeued but still mid-append, or still queued --
+        # shows up as a short count at that exact batch.
+        source = """
+        thread worker {
+            blob out = 'progress.txt'
+            on message(w:thread, msg:int) {
+                out.append('x')
+            }
+        }
+        arr[int] batches = [1, 7, 3, 25, 1, 60, 12, 100, 2]
+        int sent = 0
+        int b = 0
+        while b < batches.length {
+            int k = 0
+            while k < batches[b] {
+                worker.postMessage(k)
+                k = k + 1
+            }
+            sent = sent + batches[b]
+            worker.drain()
+            blob check = 'progress.txt'
+            int have = check.toText().split('').length
+            if have != sent {
+                log(`short at batch ${b}: have ${have}, sent ${sent}`)
+                close(1)
+            }
+            b = b + 1
+        }
+        log(`all ${sent} landed`)
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "all 211 landed"
+
+    def test_drain_works_on_a_thread_with_its_own_http_context(self, compile_and_run):
+        # claude.md #232: a thread that declared an HTTP-shaped handler
+        # runs the OTHER worker-loop shape (the bounded 20ms poll of
+        # festina_thread_main's http branch, never blocking on its own
+        # condvar). drain() must work identically there -- the
+        # dispatching flag and its condvar live in the shared
+        # try_dispatch_one path both loop shapes call, so this pins
+        # that the polling shape clears/broadcasts too, not just the
+        # blocking one every other test here happens to use.
+        source = """
+        thread worker {
+            blob out = 'polled.txt'
+            on request(req:http) { }
+            on message(w:thread, msg:int) {
+                out.append('x')
+            }
+        }
+        int i = 0
+        while i < 40 {
+            worker.postMessage(i)
+            i = i + 1
+        }
+        worker.drain()
+        blob check = 'polled.txt'
+        log(check.toText().split('').length)
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "40"
+
+    def test_drain_from_on_exit_makes_a_final_write_durable(self, compile_and_run, tmp_path):
+        # claude.md #232: the headline use case from uraikus/festina#91
+        # verbatim -- the exit handler itself fires the last write and
+        # drains, and it must land even though process teardown (which
+        # discards a thread's queue, like kill()) follows immediately.
+        source = """
+        table Written { n:int }
+        thread writer {
+            DatabaseURL = 'exit_drain.sqlite'
+            on message(caller:thread, msg:int) {
+                sqlite('INSERT INTO Written (n) VALUES (?)', [msg])
+            }
+        }
+        on exit(code:int) {
+            writer.postMessage(99)
+            writer.drain()
+            log('drained in on exit')
+        }
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "drained in on exit" in result.stdout
+        rows = sqlite3.connect(tmp_path / "exit_drain.sqlite").execute(
+            "SELECT n FROM Written").fetchall()
+        assert rows == [(99,)]
+
+    def test_drain_returns_before_pending_replies_reach_main(self, compile_and_run):
+        # claude.md #232: pins a semantic that is easy to assume the
+        # other way. drain() waits for the WORKER to finish processing
+        # -- including its own .reply() call -- but a reply is
+        # delivered to main's callback by main's own event loop, which
+        # only runs once top-level code has returned. So the line
+        # after drain() always runs BEFORE the callback, never after.
+        # (drain() is about durability of the worker's own side
+        # effects, not about round-trip completion; api.md says so.)
+        source = """
+        void func onReply(r:int) {
+            log(`reply ${r}`)
+            close(0)
+        }
+        thread worker {
+            on message(w:thread, msg:int) { w.reply(msg * 2) }
+        }
+        worker.postMessage(21).callback(onReply)
+        worker.drain()
+        log('drained')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip().splitlines() == ["drained", "reply 42"]
+
+    def test_an_out_of_range_pool_drain_is_a_silent_no_op(self, compile_and_run):
+        # claude.md #232: same "test, don't fail" convention every
+        # other pool[i] lifecycle method already has -- and the
+        # in-range drain right after it must still genuinely wait.
+        source = """
+        thread pool[2] {
+            blob out = 'pool.txt'
+            on message(w:thread, msg:int) { out.append('x') }
+        }
+        pool[5].drain()
+        pool[0].postMessage(1)
+        pool[1].postMessage(2)
+        pool[0].drain()
+        pool[1].drain()
+        blob check = 'pool.txt'
+        log(check.toText().split('').length)
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "2"
+
+    def test_drain_on_a_never_started_thread_is_a_safe_no_op(self, compile_and_run):
+        # claude.md #231: a thread with no `on message`/`postMessage`
+        # ever sent to it is never live()'d in the first place --
+        # drain() on it must return immediately rather than hang.
+        source = """
+        thread idle {
+            on load() { }
+        }
+        idle.drain()
+        log('done')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "done" in result.stdout
+
+    def test_drain_on_a_killed_thread_is_a_safe_no_op(self, compile_and_run):
+        source = """
+        thread worker {
+            on message(w:thread, msg:int) { }
+        }
+        worker.postMessage(1)
+        worker.drain()
+        worker.kill()
+        worker.drain()
+        log('done')
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "done" in result.stdout
 
 
 class TestGiveRequest:

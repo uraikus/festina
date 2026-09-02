@@ -1713,7 +1713,12 @@ clip, resize and `saveCanvas` without an X server.
 | `img.width` / `img.height` | Current size in pixels, as `int`. |
 | `img.clip(x, y, w, h)` | A **new** `img` holding that rectangle. The source is untouched, so one sheet can be clipped as many times as you like. |
 | `img.resize(w, h)` | Scales the image **in place** — it changes the image itself, so every name for it sees the new size. |
-| `img.drawRect(x, y, w, h[, color])` / `img.drawPixel(x, y[, color])` / `img.drawCircle(x, y, r)` / `img.drawText(text, x, y)` | The same four canvas-level drawing calls, painting onto **this image's own surface** instead. |
+| `img.drawRect(x, y, w, h[, color[, border]])` / `img.drawPixel(x, y[, color])` / `img.drawCircle(x, y, r[, color[, border]])` / `img.drawText(text, x, y)` | The same four canvas-level drawing calls, painting onto **this image's own surface** instead. |
+| `img.translate(dx, dy)` / `img.rotate(degrees)` / `img.scale(sx, sy)` / `img.resetTransform()` | **This image's own** transform — identity from creation, independent of the canvas's — applied to everything drawn, cleared or composited onto it afterwards. |
+| `img.saveState()` / `img.restoreState()` | Push/pop **this image's own transform** (style state is global and stays with the canvas's `saveState()`). `restoreState()` with nothing saved is an error, like the canvas's. |
+| `img.clear()` / `img.clearRect(x, y, w, h)` / `img.clearCircle(x, y, r)` / `img.clearPixel(x, y)` | Erase to **transparent** (alpha 0, so whatever is later drawn underneath shows through). `clear()` ignores the image's transform, exactly as `clearCanvas()` ignores the canvas's; the three region forms honour it. |
+| `img.drawImage(src, x, y)` / `img.drawImage(src, x, y, w, h)` | Composite `src` onto **this image** at `(x, y)` in this image's coordinates, through this image's transform, honouring `fillAlpha`; the five-argument form scales `src` to fit `w`×`h`. Drawing an image onto itself copies it first. |
+| `img.getPixelColor(x, y)` | One pixel read back off this image's surface (`null` when transparent or out of bounds) — the `img` form of `getPixelColor` above. |
 
 `clip` is the spritesheet operation: one PNG holding a grid of frames,
 sliced into the individual images you draw.
@@ -1733,13 +1738,13 @@ height *is* an error, since it could only ever produce an image nothing
 can draw.
 
 **Drawing onto an image** uses the same style state as the canvas
-(`fillStyle`, `borderColor`, `lineWidth`, `changeFont`) and the same
-optional trailing `color` on `drawRect`/`drawPixel` — but nothing else
-about the canvas. No window is needed (an image's surface already
-exists in full the moment the image does), and the canvas's own
-`translate`/`rotate`/`scale` transform is never applied — an image is a
-portable asset with its own local pixel coordinates, independent of
-whatever the canvas's transform happens to be set to:
+(`fillStyle`, `borderColor`, `lineWidth`, `fillAlpha`, `changeFont`) and
+the same optional trailing colours on `drawRect`/`drawPixel`/`drawCircle`
+— but nothing else about the canvas. No window is needed (an image's
+surface already exists in full the moment the image does), and the
+canvas's own `translate`/`rotate`/`scale` transform is never applied —
+an image is a portable asset with its own local pixel coordinates,
+independent of whatever the canvas's transform happens to be set to:
 
 ```festina
 color red = 'red'
@@ -1750,6 +1755,57 @@ icon.drawRect(0, 0, 16, 16)
 icon.drawPixel(24, 8, blue)      // this pixel only -- fillStyle stays red after
 icon.save('icon-with-border.png')
 ```
+
+**An image as a layer.** What an image *does* have is a transform of
+its own, a way to erase part of itself, and a way to take another image
+— the three things that make it a self-contained drawing target rather
+than something you bounce through the canvas (blit in, draw, `saveCanvas`,
+`clip`) to edit. Every one of these mirrors the canvas call of the same
+name and touches only the image it's called on, so a layer can be
+painted from wherever it lives — a worker thread included:
+
+```festina
+// A rotated brush stroke, painted straight into a chunk layer
+img layer = blankImage(384, 384)
+layer.saveState()
+layer.translate(sx, sy)
+layer.rotate(strokeAngleDeg)                   // degrees, like the canvas
+layer.drawRect(-halfW, -halfH, sw, sh)         // rotated about (sx, sy) ON THE IMAGE
+layer.restoreState()                           // layer back to identity; canvas untouched
+
+// An eraser
+layer.clearCircle(localX, localY, radius)      // to transparent, not "paint black"
+
+// Building a background once from tiles, no canvas involved
+img bg = blankImage(CHUNK_PX, CHUNK_PX)
+for int ty = 0, ty < CHUNK_TILES, ty++ {
+    for int tx = 0, tx < CHUNK_TILES, tx++ {
+        bg.drawImage(grassTile, tx * TILE, ty * TILE)
+    }
+}
+
+// Stamping a sprite into a layer with a sway rotation already applied
+layer.saveState()
+layer.translate(pivotX, pivotY)
+layer.rotate(swayDeg)
+layer.drawImage(sprite, drawX - pivotX, drawTopY - pivotY)
+layer.restoreState()
+```
+
+The image's transform applies to its `drawRect`/`drawPixel`/`drawCircle`/
+`drawText`, to `clearRect`/`clearCircle`/`clearPixel`, and to
+`drawImage` — the same set the canvas's transform applies to on the
+canvas. `img.saveState()`/`img.restoreState()` push and pop only that
+image's transform: style state (`fillStyle`, `borderColor`, `lineWidth`,
+`fillAlpha`, font) is global and stays with the canvas's own
+`saveState()`. `img.clear()` wipes the whole image to transparent
+regardless of its transform (as `clearCanvas()` does for the canvas);
+the region-shaped clears go through it. `img.drawImage` honours
+`fillAlpha` exactly as the canvas `drawImage` does, and drawing an image
+onto itself is fine — the source is copied first, so tiling an image
+with shifted copies of itself just works. A thread that receives an
+image as a message gets its own copy with the same current transform
+and an empty state stack.
 
 Because `resize` changes the image itself, two names for one image stay
 in step:
@@ -1961,6 +2017,11 @@ error rather than a silent no-op.
 Rotation is in **degrees**. `Math.PI` is there if you'd rather work in
 radians.
 
+The canvas's transform never applies to drawing onto an `img`; an image
+carries its own instead — `img.translate()`/`rotate()`/`scale()`/
+`resetTransform()` and `img.saveState()`/`restoreState()`, the same
+calls as methods (see [Images](#images)).
+
 ### Gradients and transparency
 
 ```festina
@@ -1982,7 +2043,8 @@ gradient a program draws, and needs no separate gradient type.
 
 `fillAlpha` applies uniformly to whatever's drawn next — every fill
 (`drawRect`/`drawPixel`/`drawCircle`/`drawText`, whether onto the
-canvas or directly onto an `img`'s own surface) **and** `drawImage`:
+canvas or directly onto an `img`'s own surface) **and** `drawImage`, in
+both its canvas form and its `img.drawImage` form:
 
 ```festina
 fillAlpha(0.4)
@@ -2878,6 +2940,15 @@ and a freed binding that scope-exit cleanup later visits is already
 `null`, which every release treats as nothing-to-do. Constants and
 parameters can't be freed (a parameter borrows its caller's value).
 
+What `free` promises is that the *binding* reads `null` afterwards —
+`c == null` is `true`. It does not make a field read *through* that
+binding safe: `c.x` on a freed (or otherwise `null`) struct binding is
+a read through a null pointer, undefined in exactly the way an
+out-of-range index is (see [Indexing is not
+bounds-checked](#indexing-is-not-bounds-checked)) — it happened to
+print `0` on Linux and a stray heap address on macOS and Windows. Check
+`c == null` first, or don't read a struct you've freed.
+
 ### `delete`
 
 ```festina
@@ -3031,7 +3102,8 @@ matters throughout this section:
 
 - **the thread's own name** (`worker`) — what you send *to*, and what
   the main program controls: `worker.postMessage(x)`, `worker.kill()`,
-  `worker.live(cb)`, `worker.isAlive()`, `worker.giveRequest(r)`.
+  `worker.live(cb)`, `worker.isAlive()`, `worker.drain()`,
+  `worker.giveRequest(r)`.
 - **a `thread` *value*** — what an `on message` handler receives as its
   first parameter, identifying whoever sent that message. It has
   exactly two operations: the field `.main` (was this sent by the main
@@ -3211,7 +3283,7 @@ top-level `func` there. Each pool instance
 every private func, closing over that ONE instance's own state, exactly
 like its handlers already do.
 
-### Lifecycle: `kill()`, `live()`, `isAlive()`
+### Lifecycle: `kill()`, `live()`, `isAlive()`, `drain()`
 
 ```festina
 log(worker.isAlive())        // true
@@ -3231,9 +3303,53 @@ log(worker.isAlive())        // true
 - `NAME.live(callback)` respawns a killed thread and calls
   `callback(true)` once it's running again.
 - `NAME.isAlive()` reads whether the thread is currently running.
+- `NAME.drain()` blocks until the thread has finished processing
+  everything already queued for it — the deliberate opposite of
+  `kill()`'s own discard-don't-wait choice. Unlike `kill()`, the thread
+  keeps running afterward (still alive, still accepting new messages);
+  this only waits, it never stops anything. A thread that isn't
+  currently alive has nothing to drain and this returns immediately.
 
-These three are callable **only** from the main program — a thread may
-message another thread, but may not control its lifecycle.
+```festina
+thread writer {
+    DatabaseURL = 'writes.sqlite'
+    on message(caller:thread, msg:int) {
+        sqlite('INSERT INTO Log (n) VALUES (?)', [msg])
+    }
+}
+
+on close() {
+    writer.postMessage(finalValue)
+    writer.drain()   // blocks until the INSERT above has actually run
+}
+```
+
+This is what makes a thread with its own [`DatabaseURL`](#a-threads-own-database-databaseurl)
+safe to use for work that must survive the program exiting: without an
+explicit `drain()`, a message posted right before `close()` (or a
+window's own close button, or a SIGINT/SIGTERM-driven
+[graceful shutdown](#graceful-shutdown)) races the thread being killed
+during exit's own teardown — the send might land, or the thread might
+be stopped first with that message still sitting unprocessed in its
+queue, discarded exactly like `kill()`'s own documented behavior above.
+`on close()`/`on exit(code:int)` are the natural place to call it:
+both already run to completion before any teardown begins, so a
+`postMessage(x)` immediately followed by `drain()` there is a reliable
+"fire this off and be sure it landed before we exit" pattern.
+
+`drain()` is about the thread's own side effects, not round-trip
+completion. It returns once the thread has *processed* everything —
+including any `.reply()` it made along the way — but a reply is
+delivered to your `.callback(fn)` by the main program's own event
+loop, which only runs once top-level code returns. So after
+`worker.postMessage(x).callback(fn); worker.drain()`, the next line
+always runs *before* `fn` does, never after. It also works on a thread
+with its own [HTTP context](#a-threads-own-http-context), whose worker
+loop polls rather than blocks — a drain there can take up to one poll
+interval (~20ms) longer to notice an idle queue.
+
+All four of these are callable **only** from the main program — a
+thread may message another thread, but may not control its lifecycle.
 
 If the main program exits (including via `close(code)` or a
 SIGINT/SIGTERM-driven [graceful shutdown](#graceful-shutdown)), every
@@ -3246,9 +3362,11 @@ process.
 ### Isolation: what a thread body may and may not do
 
 A thread's body **may** call `log`/`fail`, string/array/map/struct/enum
-operations, `Math`, time functions, `blankImage()` plus `img`-method
-drawing/clip/resize/pixel calls (each touches only that one private
-image, never shared state), `regex()`/`mkdir()`/`ls()`, and `exec()`.
+operations, `Math`, time functions, `blankImage()` plus every
+`img`-method call — drawing, clip/resize, pixel reads, and the
+image's own transform/state stack, clears and `drawImage` (each touches
+only that one private image, never shared state) —
+`regex()`/`mkdir()`/`ls()`, and `exec()`.
 
 It may **not** call any canvas/window builtin (`drawRect`, `render`,
 `saveCanvas`, ...) or `setTimeout`/`setInterval`, and it may not call
@@ -3327,7 +3445,7 @@ pool[3].postMessage(2)
 A pool instance is addressed with `NAME[i]` (`i` any `int`
 expression, not just a literal) everywhere a singleton thread's own
 bare `NAME` would be used — `pool[i].postMessage(x)`/`.kill()`/
-`.live(callback)`/`.isAlive()`/`.giveRequest(r)` all work identically
+`.live(callback)`/`.isAlive()`/`.drain()`/`.giveRequest(r)` all work identically
 to the singleton form, just per-instance. **An out-of-range index is a
 silent no-op** (this language's own established "test, don't fail"
 convention, the same one `NAME.isAlive()` itself already follows) —
@@ -3907,33 +4025,38 @@ supported (raw, un-escaped non-ASCII UTF-8 bytes in a JSON string are
 unaffected and parse completely normally — this only affects a
 producer that specifically chooses to `\u`-escape).
 
-**The partial-parse-failure leak above is fixed (claude.md #223).** A
-JSON value that fails to parse *partway through* being built — a
-struct whose third field turns out to be the wrong type, having
-already parsed the first two; an array whose fourth element fails,
-having already collected three — used to leak whatever was already
-built for that one call, the same structural class as `throw`'s own
+**A parse that fails partway through leaks nothing (claude.md #223,
+redone in #233).** A JSON value that fails to parse *partway through*
+being built — a struct whose third field turns out to be the wrong
+type, having already parsed the first two; an array whose fourth
+element fails, having already collected three; a complete value
+followed by trailing data — used to leak whatever was already built for
+that one call, the same structural class as `throw`'s own
 intermediate-frame limitation above. It no longer does: every generated
-`toStruct`/`toArr`/map-field parsing function now installs its own
-local `try`/`catch` around its own build loop, so a throw anywhere
-inside it — including several levels of nesting deep, and including the
-in-flight JSON key text a struct/map field read before its value threw
-— is caught and released right there before re-throwing outward, and
-the `.toStruct()`/`.toArr()` call site itself does the same for its own
-`cursor` and the receiver's own text. A **successful** parse still
-leaks nothing (measured directly under Valgrind, including 30 repeated
-calls in a loop), and a **failed** one now leaks nothing either —
-verified under Valgrind across a flat struct, a nested struct field, an
-array, a `map[T]` field, a self-referencing struct, and malformed JSON
-syntax itself, 400 iterations of each (`tests/stress/
-json_parse_fail_churn.f`). Not verified under `scripts/leak_stress.sh`
-(AddressSanitizer) — this project's `try`/`throw` is built on
-`llvm.eh.sjlj.setjmp`/`longjmp`, which ASan cannot instrument through in
-this environment (confirmed: even a plain, pre-existing `try`/`catch`
-program with no JSON involved crashes with SIGILL under
-`-fsanitize=address`), which is exactly why `try`/`throw`'s own
-leak-freedom above was already stated as Valgrind-measured rather than
-ASan-measured.
+parsing function registers the value it is building (and each JSON key
+it has read but not yet freed) on a per-thread *cleanup stack* in the
+runtime, and the `.toStruct()`/`.toArr()` call site registers its own
+cursor, the receiver's temporary text and the finished value; a `throw`
+releases every one of them, newest first, on its way to the catching
+`try`. This is plain runtime C — no `setjmp` of its own — which is why
+JSON parsing works under `--target=wasm32-wasi` and on macOS even though
+`try`/`catch` itself does not (an uncaught parse failure there simply
+ends the program the way any uncaught `throw` does). The same stack
+bounds how deep a self-referencing struct may nest (1024 builder
+levels); input deeper than that *throws* `JSON nested too deeply`
+instead of exhausting the C stack, the same protection an unknown
+field's skipped value already had. Verified under Valgrind across a
+flat struct, a nested struct field, an array, a `map[T]` field, a
+self-referencing struct, malformed syntax, a duplicate `text` key whose
+second value fails, trailing data after a complete value, and
+2000-level nesting — 0 bytes lost and 0 invalid frees
+(`tests/valgrind_stress/json_parse_fail_churn.f`, run by
+`scripts/valgrind_stress.sh`). Valgrind rather than
+`scripts/leak_stress.sh` (AddressSanitizer) only because the *test
+program's* own `try`/`catch` is built on `llvm.eh.sjlj.setjmp`, which
+ASan cannot instrument through in this environment (confirmed: even a
+plain `try`/`catch` program with no JSON involved crashes with SIGILL
+under `-fsanitize=address`).
 
 ## Error format
 

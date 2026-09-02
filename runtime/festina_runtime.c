@@ -302,8 +302,82 @@ void festina_fail_structured(const char *msg, const char *fields_json) {
  * eventually aren't) -- the same correctness class this runtime already accepts
  * for the one documented row-array chain shape in security.md. */
 
+/* ---- The cleanup stack (claude.md #233) ----
+ *
+ * A per-thread stack of (pointer, release function) pairs: the values
+ * generated code holds "mid-expression" that a throw would otherwise
+ * strand -- a .toStruct()/.toArr() builder's own half-built struct/
+ * array/map, the JSON key text it has read but not yet freed, the call
+ * site's own cursor and temporary receiver text. Generated code pushes
+ * each one the moment it becomes live and pops it again on the ordinary
+ * path (codegen.py's _emit_json_cleanup_push/_pop and their callers);
+ * festina_throw below releases -- newest first -- every entry pushed
+ * since the catching try frame was registered, BEFORE jumping to it.
+ * Every push has exactly one matching pop on every non-throwing path,
+ * and a nested builder's own pushes are always balanced by the time it
+ * returns, so the entries above a try frame's recorded depth are
+ * precisely the values still in flight at the moment of the throw.
+ *
+ * Why this and not a setjmp catch frame inside each builder (what
+ * claude.md #223 first shipped): a sjlj frame per builder function made
+ * .toStruct()/.toArr() themselves a "uses try" program -- rejected
+ * outright under --target=wasm32-wasi and on macOS (no SjLj lowering on
+ * either, see festina_throw's own comment) and broken on Windows too
+ * (the catch never ran; found by the windows CI job) -- plus a setjmp, a
+ * malloc'd frame and `volatile` slot traffic on every builder call for
+ * a path that, on success, throws nothing. This is plain, portable C
+ * with no longjmp of its own: where festina_throw is the fail() stub a
+ * parse failure still ends the program exactly as any uncaught throw
+ * does, and nothing here is ever reached.
+ *
+ * A fixed-size `__thread` array rather than a malloc'd one, on purpose:
+ * a worker thread exits with no hook that could free a grown buffer (a
+ * per-thread leak the thread churn stress programs would rightly flag
+ * under LeakSanitizer), and the bound doubles as the one depth cap the
+ * JSON builders' own recursion never had -- a self-referencing struct
+ * fed `{"next":{"next":{"next":...` a few hundred thousand levels deep
+ * used to recurse straight off the end of the C stack (SIGSEGV,
+ * reachable through req.toStruct() on a network body; confirmed
+ * directly), the identical hostile-input hole claude.md #192 already
+ * closed for an UNKNOWN field's skipped value. Overflowing this stack
+ * now throws the same catchable error instead. Two entries per builder
+ * level (the value being built plus one in-flight key), so this allows
+ * more nesting than FESTINA_JSON_MAX_DEPTH does for skipped values,
+ * and its ~32KB of thread-local storage is nothing next to the 8MB
+ * stack every thread already has. */
+#define FESTINA_CLEANUP_STACK_MAX 2048
+
+typedef struct FestinaCleanupEntry {
+    void *ptr;
+    void (*release)(void *);
+} FestinaCleanupEntry;
+
+static __thread FestinaCleanupEntry g_festina_cleanup_stack[FESTINA_CLEANUP_STACK_MAX];
+static __thread size_t g_festina_cleanup_len = 0;
+
+void festina_cleanup_push(void *ptr, void (*release)(void *)) {
+    if (g_festina_cleanup_len >= FESTINA_CLEANUP_STACK_MAX) {
+        /* The value being registered is the one thing nothing owns yet
+         * -- release it here so the throw below strands nothing. */
+        release(ptr);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "JSON nested too deeply (more than %d levels)",
+                 FESTINA_CLEANUP_STACK_MAX / 2);
+        festina_throw(strdup(msg));
+        return; /* unreachable -- festina_throw never returns */
+    }
+    g_festina_cleanup_stack[g_festina_cleanup_len].ptr = ptr;
+    g_festina_cleanup_stack[g_festina_cleanup_len].release = release;
+    g_festina_cleanup_len++;
+}
+
+void festina_cleanup_pop(void) {
+    if (g_festina_cleanup_len) g_festina_cleanup_len--;
+}
+
 typedef struct FestinaCatchFrame {
     void *buf;  /* codegen's own [5 x ptr] alloca -- see _emit_try */
+    size_t cleanup_depth;  /* g_festina_cleanup_len when this frame was pushed */
     struct FestinaCatchFrame *prev;
 } FestinaCatchFrame;
 
@@ -325,6 +399,7 @@ void festina_try_push(void *buf) {
     FestinaCatchFrame *frame = malloc(sizeof(FestinaCatchFrame));
     if (!frame) { fprintf(stderr, "festina: out of memory (try)\n"); exit(1); }
     frame->buf = buf;
+    frame->cleanup_depth = g_festina_cleanup_len;
     frame->prev = g_festina_catch_top;
     g_festina_catch_top = frame;
 }
@@ -405,7 +480,19 @@ void festina_throw(const char *msg) {
     FestinaCatchFrame *frame = g_festina_catch_top;
     g_festina_catch_top = frame->prev;
     void *buf = frame->buf;
+    size_t cleanup_depth = frame->cleanup_depth;
     free(frame);
+    /* claude.md #233: release everything generated code registered on
+     * the cleanup stack since the target frame was pushed -- newest
+     * first, so a nested builder's own half-built value goes before the
+     * outer value it would have been stored into (see the cleanup
+     * stack's own comment above). Each entry is popped BEFORE its
+     * release runs, so the stack is consistent even if a release were
+     * ever to end up back here. */
+    while (g_festina_cleanup_len > cleanup_depth) {
+        FestinaCleanupEntry entry = g_festina_cleanup_stack[--g_festina_cleanup_len];
+        entry.release(entry.ptr);
+    }
     __builtin_longjmp(buf, 1);
 }
 #else
@@ -441,25 +528,18 @@ static double festina_null_float(void);     /* defined with the sqlite helpers b
  * can still legally hold arbitrarily nested JSON, and needs to be
  * correctly skipped past either way -- see its own comment).
  *
- * ONE REAL, DOCUMENTED LIMITATION, the SAME structural class claude.md
- * #157 already accepted (see festina_throw's own comment above): a
- * throw from anywhere inside codegen's own generated
- * __festina_from_json_struct_N/__festina_from_json_arr_N leaves
- * whatever that ONE call had already built (the struct's own header,
- * any field text already read, any array elements already pushed)
- * permanently unreclaimed -- that function is HAND-WRITTEN LLVM IR,
- * not a real Festina function body going through _emit_block's own
- * _active_free_locals tracking, so nothing in generated code ever gets
- * the chance to free it on the way out. A SUCCESSFUL parse leaks
- * NOTHING (confirmed directly under Valgrind, including 30 repeated
- * calls in a loop) -- this is strictly an error-path leak, bounded to
- * at most one partially-built struct/array per FAILED call, never
- * unbounded or accumulating across successful ones. Fixing this
- * properly would mean real exception-safe cleanup for values built
- * mid-expression-evaluation generally (this language has no RAII/
- * unwind-table story at all today) -- a substantially larger
- * undertaking than this feature's own reasonable scope, tracked in
- * todo.md rather than attempted here. */
+ * A throw partway through a parse strands nothing (claude.md #223,
+ * redone in #233): the generated __festina_from_json_{struct,arr,map}_N
+ * functions are HAND-WRITTEN LLVM IR, not Festina function bodies going
+ * through _emit_block's own _active_free_locals tracking, so they can't
+ * rely on scope-exit cleanup -- instead each registers the value it is
+ * building (and each in-flight key) on the cleanup stack above, and
+ * the .toStruct()/.toArr() call site registers its cursor, its
+ * temporary receiver text and the finished value while
+ * festina_json_expect_end still has a chance to reject trailing data.
+ * festina_throw releases every one of them on its way to the catching
+ * try. Measured under Valgrind (tests/valgrind_stress/
+ * json_parse_fail_churn.f): 0 bytes lost across every failure shape. */
 
 typedef struct FestinaJsonCursor {
     const char *s;
