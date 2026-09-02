@@ -196,7 +196,11 @@ jobs:
     # still sheds as skips via the conftest mechanism macOS Phase 0
     # built; graphics/http no longer need to.
     runs-on: windows-latest
-    timeout-minutes: 30
+    # claude.md #238: the full suite took 25.5 of these minutes on one
+    # run and blew straight through 30 on the next (every segment ~1.4x
+    # slower on that runner, from the parser-only tests on -- runner
+    # speed, not a test). Head-room for that variance.
+    timeout-minutes: 45
     defaults:
       run:
         shell: msys2 {0}
