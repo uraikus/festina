@@ -99,10 +99,11 @@ void festina_release_url(void *payload);
 void *festina_url_clone(void *payload);
 
 /* claude.md #157: try/catch/throw. See festina_runtime.c's own comment
- * on this whole group for the setjmp/longjmp design and its one
- * documented leak caveat (a throw reached through a called function).
- * The actual setjmp call is emitted directly by codegen (_emit_try) --
- * festina_try_push registers the buffer it produced. */
+ * on this whole group for the setjmp/longjmp design (and claude.md
+ * #236 for how a throw releases every frame's locals on the way out).
+ * The actual setjmp call -- libc's own, claude.md #235 -- is emitted
+ * directly by codegen (_emit_try); festina_try_push registers the
+ * jmp_buf it filled. */
 void festina_try_push(void *buf);
 void festina_try_pop(void);
 char *festina_try_error(void);
@@ -113,13 +114,19 @@ void festina_throw(const char *msg);
  * together with the function that releases it; festina_throw releases
  * every entry pushed since the catching try frame, newest first, before
  * jumping to it. Strictly LIFO: every push has exactly one matching pop
- * on every non-throwing path. Plain portable C (no sjlj of its own), so
- * unlike a `try` statement this never makes a program "use try" -- it
- * compiles for wasm32-wasi and macOS too, where festina_throw is the
- * fail() stub and none of this is ever reached. See the runtime's own
- * comment on FESTINA_CLEANUP_STACK_MAX for the depth cap. */
+ * on every non-throwing path. Plain portable C (no setjmp of its own),
+ * so unlike a `try` statement this never makes a program "use try" --
+ * it compiles for wasm32-wasi too, where festina_throw is the fail()
+ * stub and none of this is ever reached. See the runtime's own comment
+ * on FESTINA_CLEANUP_STACK_MAX for the depth cap. */
 void festina_cleanup_push(void *ptr, void (*release)(void *));
 void festina_cleanup_pop(void);
+void festina_cleanup_pop_n(int64_t n);
+/* claude.md #236: the same stack carries every function's managed
+ * locals when the program has a `try` (a throw through intermediate
+ * frames releases them); it grows on demand, and a worker thread frees
+ * its own as it ends (festina_thread_main). */
+void festina_cleanup_stack_free(void);
 
 /* claude.md #131: close(code) -- runs a declared `on exit(code:int)`
  * handler (if any), then exits with `code`. Lives in the core runtime

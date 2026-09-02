@@ -24,7 +24,7 @@
  * all follow the "test, don't fail" convention -- an unreadable/
  * malformed file yields an empty/unusable value, never festina_throw)
  * -- so this pool needs none of festina_runtime_http.c's own
- * __builtin_setjmp catch-frame machinery at all. Much simpler as a
+ * setjmp catch-frame machinery at all. Much simpler as a
  * result: a job is just (payload, work_fn, callback, release_fn), and
  * the worker's whole body is `work_fn(payload)`.
  */

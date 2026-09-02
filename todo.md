@@ -11,23 +11,20 @@ exist, compile, and type-check against real platform headers in CI —
 see [macos.md](macos.md) and [windows.md](windows.md) for exactly
 what's supported on each. What remains open:
 
-- **Audio playback and windowed mouse/keyboard/window behavior**, on
-  both a real Mac and a real Windows machine. Each stays behind an
-  explicit opt-in env var (`FESTINA_ENABLE_MACOS_AUDIO`/
-  `_GRAPHICS`, `FESTINA_ENABLE_WINDOWS_AUDIO`/`_GRAPHICS`) until
-  confirmed on real hardware.
-- **One exception that needs no hardware at all**: unlike macOS,
-  GitHub's Windows CI runners can create real Win32 windows, so the
-  windowed-graphics gate on Windows could be lifted for a CI run to try
-  it directly — see [windows.md](windows.md). The cheapest open item on
-  either platform.
+- **Audio playback on a real Mac and a real Windows machine, and
+  windowed mouse/keyboard/window behavior on a real Mac.** Each stays
+  behind an explicit opt-in env var (`FESTINA_ENABLE_MACOS_AUDIO`/
+  `_GRAPHICS`, `FESTINA_ENABLE_WINDOWS_AUDIO`) until confirmed on real
+  hardware. Windows windowing needs no hardware: the CI job opens a
+  real Win32 window and drives its mouse, keyboard, resize and close
+  handlers itself (claude.md #238, [windows.md](windows.md)).
 
 Compiling to `wasm32-wasi` is supported and CI-verified — see
-[wasm.md](wasm.md). Graphics/audio are out of scope there permanently
-(WASI has no backend for either), and two things remain open, neither
-blocking: running a compiled `.wasm` in a browser (every test/benchmark
-here uses Node's own `node:wasi` host, not a browser's WASI polyfill),
-and AddressSanitizer/LeakSanitizer coverage for the target.
+[wasm.md](wasm.md) — and a compiled `.wasm` runs in a browser tab on
+this project's own WASI host (`runtime/wasm/browser.html`, verified in
+headless Chromium on every push). Graphics/audio are out of scope there
+permanently (WASI has no backend for either); what remains open, not
+blocking: AddressSanitizer/LeakSanitizer coverage for the target.
 
 ## Language & standard library
 
@@ -66,25 +63,13 @@ as the manual override. What remains open:
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.
-- **A `throw` reached from a called function leaks that function's own
-  locals**, structurally the same issue `.toStruct()`/`.toArr()` used
-  to have when a parse failed partway through (claude.md #223/#233
-  fixed that one specifically: every generated from-JSON function, and
-  the `.toStruct()`/`.toArr()` call site itself, register what they
-  hold on the runtime's per-thread cleanup stack, which `throw` unwinds
-  on its way to the catching `try` -- the same mechanism could in
-  principle carry an ordinary function's locals too, which is the
-  obvious shape for the general fix). The general case remains open: an ARBITRARY
-  function that merely calls something which eventually throws, with
-  no `try`/`catch` of its own to wrap, never gets the chance to run its
-  own cleanup, because neither the intermediate C stack frames a
-  `longjmp` skips nor an ordinary Festina function's own generated body
-  ever go through scope-exit tracking on that path. Error-path-only (a
-  normal return leaks nothing) and bounded per throw, never unbounded
-  or accumulating. A real fix would mean exception-safe cleanup for
-  every function's own locals generally — this language has no
-  RAII/unwind-table story at all today, and building one is a
-  genuinely large undertaking.
+- **A `throw` out of a runtime-driven callback** (`.forEach(fn)`,
+  `.sort(cmp)`, a timer) crosses the runtime's own C frame on the way
+  to the catching `try`. Festina-side locals are released (claude.md
+  #236); whatever that C frame itself held mid-operation — `qsort`'s
+  scratch buffer, an iteration cursor — is not. Error-path-only,
+  bounded per throw. (The general "intermediate frame" leak that used
+  to be listed here is closed: claude.md #236.)
 
 ## Deliberate behavior (documented, not planned work)
 

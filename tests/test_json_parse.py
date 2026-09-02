@@ -137,7 +137,9 @@ class TestJsonParsingNeedsNoSjlj:
     def _flag(self, parser, semantic, codegen, source):
         program = parser.parse(source)
         analyzed = semantic.analyze(program)
-        gen = codegen.CodeGen(analyzed)
+        # host_platform pinned: the symbol is `setjmp` on Windows
+        # (claude.md #235, test_platform.py's TestSetjmpSymbol).
+        gen = codegen.CodeGen(analyzed, host_platform="linux")
         ir = gen.generate(program)
         return gen.uses_try, ir
 
@@ -149,9 +151,9 @@ class TestJsonParsingNeedsNoSjlj:
         log(p.id + ps.length)
         """)
         assert uses_try is False
-        # The intrinsic is always DECLARED (the runtime prelude is
+        # libc's setjmp is always DECLARED (the runtime prelude is
         # fixed); what must be absent is any actual call to it.
-        assert "call i32 @llvm.eh.sjlj.setjmp" not in ir
+        assert "call i32 @_setjmp" not in ir
         # and the cleanup stack is what replaced it
         assert "call void @festina_cleanup_push" in ir
         assert "call void @festina_cleanup_pop" in ir
@@ -160,7 +162,7 @@ class TestJsonParsingNeedsNoSjlj:
         uses_try, ir = self._flag(parser, semantic, codegen,
                                   "try { log('x') } catch (e:text) { log(e) }\n")
         assert uses_try is True
-        assert "call i32 @llvm.eh.sjlj.setjmp" in ir
+        assert "call i32 @_setjmp" in ir
 
 
 class TestRuntimeBehavior:
@@ -376,10 +378,12 @@ class TestRuntimeBehavior:
         # recursion had no depth cap at all (claude.md #192's cap only
         # covered an UNKNOWN field's skipped value) -- 300k levels of
         # `{"next":` recursed straight off the C stack (SIGSEGV,
-        # confirmed). The cleanup stack's bound now converts that into
-        # the same catchable throw, and the ~1000 levels already built
-        # are released on the way out (Valgrind-measured in
-        # tests/valgrind_stress/json_parse_fail_churn.f).
+        # confirmed). #233 converted that into a catchable throw via the
+        # cleanup stack's fixed bound; claude.md #236 (which made that
+        # stack growable) moved the cap onto the parser's own cursor,
+        # the same FESTINA_JSON_MAX_DEPTH #192 uses. The ~1000 levels
+        # already built are released on the way out (Valgrind-measured
+        # in tests/valgrind_stress/json_parse_fail_churn.f).
         deep = '{"n":1,"next":' * 5000 + '{"n":2}' + "}" * 5000
         source = '''
         struct Node { n:int  next:Node }
@@ -394,7 +398,7 @@ class TestRuntimeBehavior:
         result = compile_and_run(source)
         assert result.returncode == 0, result.stderr
         assert result.stdout.splitlines() == [
-            "caught: JSON nested too deeply (more than 1024 levels)",
+            "caught: JSON nested too deeply (more than 1000 levels)",
             "still running",
         ]
 

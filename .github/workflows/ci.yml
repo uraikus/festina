@@ -67,6 +67,13 @@ jobs:
           # is genuinely absent -- but FESTINA_STRICT_DEPS=1 above exists
           # precisely so that this job never relies on a skip.
           pip install -r requirements-dev.txt -r requirements-build.txt
+          # claude.md #237: a compiled .wasm runs in a real browser tab
+          # on this project's own WASI host (runtime/wasm/browser.html);
+          # tests/test_wasm_browser.py opens it in headless Chromium
+          # through Playwright. --with-deps installs Chromium's own
+          # shared-library dependencies via apt.
+          pip install playwright
+          python -m playwright install --with-deps chromium
       - name: Run the test suite
         run: python -m pytest tests/ -q
       - name: Compile and run a WASM example

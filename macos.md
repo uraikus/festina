@@ -6,23 +6,17 @@ GitHub Actions, on every push). What's gated on real-hardware
 confirmation, and what's a genuine, permanent limitation, are covered
 below.
 
-## `try`/`catch`/`throw` is unavailable
+## `try`/`catch`/`throw` works (since 0.43)
 
-`__builtin_longjmp` (which `festina_throw` uses) is rejected by clang
-for `arm64-apple-macos14` — the architecture every current Mac and
-every macOS CI runner is. LLVM's AArch64 backend has no SjLj lowering
-at all, the same gap `wasm32-wasi`'s backend has. `try`/`catch`/`throw`
-is rejected outright at compile time on darwin (`festina/cli.py`'s
-`_check_darwin_try_supported`) — this is not a hardware-verification
-gate like audio/graphics below; the backend genuinely doesn't support
-it. See [api.md](api.md#try--catch--throw)'s own Limitations note.
-
-`.toStruct()`/`.toArr()` are *not* caught by that gate (claude.md #233
-— their partial-parse cleanup is plain runtime C, not a catch frame;
-claude.md #223 had briefly made them trip it, which showed up on the
-macos CI job only as 21 extra silent skips): they compile and run
-here, and a parse failure ends the program the way any uncaught
-`throw` does.
+Earlier versions rejected `try`/`catch`/`throw` outright on darwin:
+generated code called LLVM's SjLj intrinsics, which have no lowering
+for AArch64 (`arm64-apple-macos14` — every current Mac and every macOS
+CI runner). A `try` is a direct call to libc's own `_setjmp` now, and a
+`throw` is libc's `longjmp` (claude.md #235), which Darwin has always
+had — the CI job runs a real caught throw
+(`tests/test_platform.py::TestOnMacOS::test_try_catch_works`). Nothing
+about `try`/`catch` is gated or macOS-specific any more; see
+[api.md](api.md#try--catch--throw) for the feature itself.
 
 ## What's gated on real hardware
 

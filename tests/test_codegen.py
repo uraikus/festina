@@ -15523,9 +15523,22 @@ class TestExec:
     to avoid colliding with the pre-existing internal SQL-DDL helper of
     that name."""
 
+    # claude.md #235: `/bin/sh` and `/bin/echo` are MSYS2 virtual paths
+    # on Windows -- the shell resolves them, but festina_process_exec's
+    # own _spawnvp (a plain CRT call, PATH-searched) cannot, so both
+    # exec tests came back -1/empty on the windows CI job. `cmd /c` is
+    # the Windows spelling of the same two programs; the runtime's own
+    # contract (real exit code, inherited stdio) is what's under test,
+    # not a particular shell.
+    _SHELL_EXIT_3 = (["cmd", "/c", "exit 3"] if sys.platform == "win32"
+                     else ["/bin/sh", "-c", "exit 3"])
+    _ECHO_FROM_CHILD = (["cmd", "/c", "echo from-child"] if sys.platform == "win32"
+                        else ["/bin/echo", "from-child"])
+
     def test_successful_exec_returns_the_real_exit_code(self, compile_and_run):
-        source = """
-        arr[text] cmd = ['/bin/sh', '-c', 'exit 3']
+        cmd = ", ".join(f"'{part}'" for part in self._SHELL_EXIT_3)
+        source = f"""
+        arr[text] cmd = [{cmd}]
         log(exec(cmd))
         """
         result = compile_and_run(source)
@@ -15547,8 +15560,9 @@ class TestExec:
     def test_stdio_is_inherited(self, compile_and_run):
         # exec() inherits stdout rather than capturing it -- the child's
         # own output lands directly in the parent's stdout stream.
-        source = """
-        arr[text] cmd = ['/bin/echo', 'from-child']
+        cmd = ", ".join(f"'{part}'" for part in self._ECHO_FROM_CHILD)
+        source = f"""
+        arr[text] cmd = [{cmd}]
         exec(cmd)
         """
         result = compile_and_run(source)

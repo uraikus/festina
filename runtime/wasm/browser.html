@@ -1,0 +1,78 @@
+<!doctype html>
+<!-- claude.md #237: the smallest page that runs a compiled Festina
+     .wasm in a browser tab. Serve this directory over HTTP (module
+     workers can't load from file://) and open
+
+         browser.html?wasm=program.wasm
+
+     The program runs in a Web Worker (festina_wasi_worker.js) on the
+     in-browser WASI host (festina_wasi_browser.js); its stdout/stderr
+     stream into the page, and when it exits `window.festinaResult` is
+     set to {code, stdout, stderr, files} -- which is what
+     tests/test_wasm_browser.py reads back through a real Chromium.
+     `window.festinaRun(url, options)` runs another one on demand. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Festina in the browser</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+    pre { background: #111; color: #eee; padding: 1rem; min-height: 6rem; white-space: pre-wrap; }
+    .err { color: #f88; }
+    #status { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Festina in the browser</h1>
+  <p id="status">waiting for a program&hellip;</p>
+  <pre id="out"></pre>
+  <script type="module">
+    const out = document.getElementById("out");
+    const status = document.getElementById("status");
+
+    window.festinaResult = null;
+    window.festinaRun = (url, options = {}) => new Promise(async (resolve, reject) => {
+      window.festinaResult = null;
+      out.textContent = "";
+      status.textContent = `fetching ${url}…`;
+      let wasm;
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        wasm = await response.arrayBuffer();
+      } catch (err) {
+        status.textContent = `could not fetch ${url}: ${err.message}`;
+        reject(err);
+        return;
+      }
+      status.textContent = `running ${url}…`;
+      const worker = new Worker(new URL("./festina_wasi_worker.js", import.meta.url), { type: "module" });
+      worker.onmessage = ({ data }) => {
+        if (data.kind === "stdout") {
+          out.textContent += data.line + "\n";
+        } else if (data.kind === "stderr") {
+          const span = document.createElement("span");
+          span.className = "err";
+          span.textContent = data.line + "\n";
+          out.appendChild(span);
+        } else if (data.kind === "exit") {
+          status.textContent = `exited with code ${data.code}`;
+          window.festinaResult = data;
+          worker.terminate();
+          resolve(data);
+        } else if (data.kind === "error") {
+          status.textContent = "the host failed";
+          out.textContent += data.message + "\n";
+          window.festinaResult = { code: -1, stdout: "", stderr: data.message, files: {} };
+          worker.terminate();
+          reject(new Error(data.message));
+        }
+      };
+      worker.postMessage({ wasm, args: options.args || [url.split("/").pop()], files: options.files || {} }, [wasm]);
+    });
+
+    const wanted = new URLSearchParams(location.search).get("wasm");
+    if (wanted) window.festinaRun(wanted).catch(() => {});
+  </script>
+</body>
+</html>

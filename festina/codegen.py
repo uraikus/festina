@@ -320,6 +320,7 @@ choice rather than proper defined behavior.
 """
 import dataclasses
 import struct
+import sys
 
 from . import ast
 from . import types as types_mod
@@ -363,10 +364,10 @@ def _hoist_allocas_to_entry(ir_text):
     storage for struct/arr/map locals in the first place; a slot
     whose address escaped its iteration would already have been
     dangling after the enclosing function returned). Hoisting also
-    hardens the sjlj try/catch path: llvm.eh.sjlj.setjmp records the
-    stack pointer at try entry, and an unwind restores it -- a slot
-    alloca'd INSIDE the try body used to sit below that restored SP;
-    now every slot predates the save.
+    hardens the try/catch path: setjmp records the stack pointer at
+    try entry, and longjmp restores it -- a slot alloca'd INSIDE the
+    try body used to sit below that restored SP; now every slot
+    predates the save.
 
     Dynamic allocas (a runtime element count operand, e.g.
     `alloca i64, i64 %n`) are left exactly where they are -- moving
@@ -854,6 +855,48 @@ class _StackStructFieldsOnly:
         self.struct_type = struct_type
 
 
+def _setjmp_symbol_for(platform_name):
+    """claude.md #235: the libc setjmp entry point generated code calls
+    for a `try` (CodeGen._emit_try). Every POSIX libc this project
+    builds against (glibc, musl, Darwin's libSystem) exports `_setjmp`
+    -- the variant that does NOT save the signal mask, so entering a
+    try costs no syscall. Windows' C runtimes export no `_setjmp` at
+    all under UCRT (only `__intrinsic_setjmpex`, which MSVCRT in turn
+    lacks); `setjmp` is the one name both export, and on x64 both read
+    a second "frame" argument deciding whether longjmp performs an SEH
+    unwind through the frames in between. Generated code always passes
+    null there, so a throw's longjmp is a plain register restore, the
+    same thing it is everywhere else (see festina_throw's comment)."""
+    return "setjmp" if platform_name == "win32" else "_setjmp"
+
+
+def _contains_try(node):
+    """claude.md #236: does this program (or subtree) contain a `try`
+    statement anywhere -- inside any function, handler, thread body,
+    nested block? A generic walk over every Node's own attributes (the
+    AST is plain attribute-bag nodes, see ast.py), so a new statement
+    shape can't be missed by an incomplete per-class case list. Only
+    `try` counts, not `throw`: with no try anywhere, a throw is fail()
+    (see festina_throw) and there is nothing to unwind to."""
+    if isinstance(node, ast.TryStmt):
+        return True
+    if isinstance(node, ast.Node):
+        return any(_contains_try(v) for v in vars(node).values())
+    if isinstance(node, (list, tuple)):
+        return any(_contains_try(v) for v in node)
+    return False
+
+
+# claude.md #235: the buffer a `try` reserves for its setjmp -- generated
+# code never sees a platform's jmp_buf layout, only hands libc a block
+# large enough for any of them: glibc's aarch64 jmp_buf is 312 bytes
+# (registers plus a saved signal mask, present in the type whether or
+# not _setjmp fills it), Windows x64's is 256, glibc x86_64's 200,
+# Darwin arm64's 192. 1KB, 16-byte aligned (Windows' saves its XMM
+# registers with aligned stores), covers every one with room to spare.
+_JMP_BUF_BYTES = 1024
+
+
 class _TryFrameMarker:
     """claude.md #157: a placeholder entry in CodeGen._active_free_locals
     marking "a try block's own runtime catch-frame is still open here" --
@@ -884,7 +927,7 @@ class _StackArrayOrMap:
 
 
 class CodeGen:
-    def __init__(self, analyzed, filename="main.f", target="native"):
+    def __init__(self, analyzed, filename="main.f", target="native", host_platform=None):
         self.analyzed = analyzed
         self.entry_filename = filename         # the file actually passed to the compiler -- see generate()
         self.filename = filename               # mutated per top-level statement (see generate()); used by every error site
@@ -1061,12 +1104,23 @@ class CodeGen:
                                                 # that never touches audio doesn't pull in
                                                 # libasound (see cli.py's _ensure_runtime_objects)
         self.uses_try = False                  # claude.md #157: any try/throw anywhere -- unlike
-                                                # uses_graphics/uses_audio, festina_throw's own
-                                                # __builtin_longjmp is unconditional core, so this
-                                                # exists purely so compile_file can reject a
-                                                # wasm32-wasi build outright (there is no SjLj
-                                                # support for that target at all), the same way
-                                                # uses_exec below already does.
+                                                # uses_graphics/uses_audio, festina_throw is
+                                                # unconditional core (libc setjmp/longjmp since
+                                                # claude.md #235), so this exists purely so
+                                                # compile_file can reject a wasm32-wasi build
+                                                # outright (wasi-libc has no setjmp/longjmp at
+                                                # all), the same way uses_exec below already does.
+        # claude.md #235: which libc setjmp entry point _emit_try calls --
+        # see _setjmp_symbol_for. host_platform is injectable for the same
+        # unit-testability reason cli.py's own platform gates already are;
+        # a native build always targets the host it runs on.
+        self.setjmp_symbol = _setjmp_symbol_for(host_platform or sys.platform)
+        self.program_has_try = False           # claude.md #236: set by generate() from a whole-AST
+                                                # scan BEFORE anything is emitted (unlike uses_try,
+                                                # which only becomes true as a try is reached) --
+                                                # gates registering every managed local on the
+                                                # runtime's cleanup stack, see _track_local.
+        self._unwind_fns = {}                  # claude.md #236: per-kind cache for _unwind_fn_for
         self._sort_trampolines = {}            # claude.md #184: types_mod.type_name(element) ->
                                                 # LLVM symbol name for that element type's qsort()
                                                 # comparator trampoline -- one per DISTINCT element
@@ -1402,6 +1456,10 @@ class CodeGen:
         # _emit_main_and_entry).
         self.global_env.define("argv", "@argv", types_mod.ArrayType(TEXT))
         self.database_url_expr = getattr(program, "database_url", None)
+        # claude.md #236: decided once, up front, for the whole program
+        # -- every function body emitted below needs to know it, and
+        # the first one emitted may well come before the try itself.
+        self.program_has_try = _contains_try(program)
         # claude.md #140: every function's signature is registered before
         # ANY code is emitted -- "hoisting" -- so a call reached earlier
         # in this same walk than its own callee's declaration still
@@ -1478,24 +1536,25 @@ class CodeGen:
             # latent ABI mismatch that happened to work only because 0/1
             # were the only values ever produced.
             "declare void @festina_log_bool(i8)",
-            # claude.md #157: try/catch. _emit_try emits the actual
+            # claude.md #157/#235: try/catch. _emit_try emits the actual
             # setjmp call directly (see its own docstring for why a
-            # runtime-side wrapper doesn't work) via these four
-            # intrinsics -- the same, portable, fixed-size-buffer
-            # mechanism clang lowers __builtin_setjmp/__builtin_longjmp
-            # to. festina_try_push registers the buffer that direct
-            # setjmp call just populated as the new top catch frame
-            # (only on its normal, 0-returning arrival); festina_try_pop
-            # pops the current top frame on a NORMAL exit from a try
-            # body (_emit_free_active_locals's own _TryFrameMarker
-            # handling is the only generated-code caller); festina_try_error
-            # hands over (and releases the runtime's own ownership of)
-            # the thrown message as an ordinary owned text value;
-            # festina_throw never returns.
-            "declare ptr @llvm.frameaddress.p0(i32 immarg)",
-            "declare ptr @llvm.stacksave.p0()",
-            "declare i32 @llvm.eh.sjlj.setjmp(ptr)",
-            "declare void @llvm.eh.sjlj.longjmp(ptr)",
+            # runtime-side wrapper doesn't work) -- libc's own setjmp
+            # (which symbol: _setjmp_symbol_for), declared with a second
+            # pointer argument because Windows' entry point takes one
+            # (the frame for an SEH unwind; null means none) and the
+            # POSIX one simply never reads the extra register. The
+            # returns_twice attribute is what tells LLVM this call site
+            # is a longjmp target, exactly as clang marks its own
+            # setjmp calls. festina_try_push registers the buffer that
+            # direct setjmp call just populated as the new top catch
+            # frame (only on its normal, 0-returning arrival);
+            # festina_try_pop pops the current top frame on a NORMAL
+            # exit from a try body (_emit_free_active_locals's own
+            # _TryFrameMarker handling is the only generated-code
+            # caller); festina_try_error hands over (and releases the
+            # runtime's own ownership of) the thrown message as an
+            # ordinary owned text value; festina_throw never returns.
+            f"declare i32 @{self.setjmp_symbol}(ptr, ptr) returns_twice",
             "declare void @festina_try_push(ptr)",
             "declare void @festina_try_pop()",
             "declare ptr @festina_try_error()",
@@ -1503,6 +1562,7 @@ class CodeGen:
             # _emit_json_cleanup_push. (ptr value, ptr release-function)
             "declare void @festina_cleanup_push(ptr, ptr)",
             "declare void @festina_cleanup_pop()",
+            "declare void @festina_cleanup_pop_n(i64)",
             "declare void @festina_throw(ptr)",
             "declare void @festina_log_text(ptr)",
             "declare void @festina_fail(ptr)",
@@ -2389,6 +2449,7 @@ class CodeGen:
         """
         if down_to >= len(self._active_free_locals):
             return
+        popped = 0
         for frame in reversed(self._active_free_locals[down_to:]):
             for ref, type_ in frame:
                 if isinstance(type_, _TryFrameMarker):
@@ -2408,103 +2469,247 @@ class CodeGen:
                     # for this reason (see this method's own docstring).
                     if not skip_try_pop:
                         lines.append("  call void @festina_try_pop()")
-                elif isinstance(type_, _StackStructFieldsOnly):
-                    # claude.md #78: a stack-allocated struct local
-                    # (see _emit_block's own tracking comment) whose own
-                    # storage is never released here -- only whatever
-                    # its own struct-typed field(s) currently point to,
-                    # since a field write (_emit_assign) may have
-                    # retained a reference nothing else will ever
-                    # release otherwise.
-                    self._emit_release_nested_fields_only(ref, type_.struct_type, lines)
-                elif isinstance(type_, _StackArrayOrMap):
-                    # claude.md #79: a stack-allocated arr[T]/map[T]
-                    # local (see _emit_block's own tracking comment) --
-                    # `ref` is the local's own `alloca ptr` slot, so
-                    # this needs one load to reach the header's own
-                    # (stack) storage before GEPing into its own
-                    # data/entries field, the same pattern claude.md #78
-                    # already established for a stack-allocated struct's
-                    # own field access. Only that buffer is freed here,
-                    # never the header itself -- it has no refcount
-                    # header and isn't heap memory at all, so it must
-                    # never reach festina_release_array/_map.
-                    header = self.tmp()
-                    lines.append(f"  {header} = load ptr, ptr {ref}")
-                    if isinstance(type_.type_, types_mod.ArrayType):
-                        elem_type = type_.type_.element
-                        len_ptr = self.tmp()
-                        lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
-                        len_val = self.tmp()
-                        lines.append(f"  {len_val} = load i64, ptr {len_ptr}")
-                        field_ptr = self.tmp()
-                        lines.append(f"  {field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
-                        data_ptr = self.tmp()
-                        lines.append(f"  {data_ptr} = load ptr, ptr {field_ptr}")
-                        if (_is_refcounted(elem_type)
-                                or elem_type == TEXT):
-                            # claude.md #80 (widened by #83 to text):
-                            # this array's own elements are themselves
-                            # refcounted/copy-managed -- release each
-                            # one before freeing the data buffer they
-                            # live in, the same element-release loop
-                            # _release_fn_for_array's own generated
-                            # wrapper uses for the heap-allocated case.
-                            self._emit_release_array_elements(
-                                data_ptr, len_val, self._release_fn_for(elem_type),
-                                _llvm_type(elem_type), lines)
-                        lines.append(f"  call void @free(ptr {data_ptr})")
-                    else:
-                        # claude.md #74/#75/#175: unlike an array's plain
-                        # data buffer, a map's entries buffer has its
-                        # own nested allocation per live bucket (each key
-                        # is its own strdup'd copy -- see
-                        # festina_map_set's own comment) that a plain
-                        # free() of the entries pointer alone would leak.
-                        # festina_map_free_entries frees each live
-                        # bucket's key first, then the entries buffer
-                        # itself -- scanned by capacity, not count (a
-                        # bucket scan is driven by capacity, not a dense
-                        # [0,count) range).
-                        value_type = type_.type_.value
-                        field_ptr = self.tmp()
-                        lines.append(f"  {field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
-                        entries_ptr = self.tmp()
-                        lines.append(f"  {entries_ptr} = load ptr, ptr {field_ptr}")
-                        cap_ptr = self.tmp()
-                        lines.append(f"  {cap_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 2")
-                        cap_val = self.tmp()
-                        lines.append(f"  {cap_val} = load i64, ptr {cap_ptr}")
-                        if (_is_refcounted(value_type)
-                                or value_type == TEXT):
-                            # claude.md #80 (widened by #83 to text):
-                            # same as the array case just above, but
-                            # through festina_map_for_each and a
-                            # release trampoline, since a map's own
-                            # entries layout stays opaque to codegen --
-                            # see _release_fn_for_map's own comment.
-                            trampoline_name = self._emit_map_value_release_trampoline(value_type)
-                            lines.append(
-                                f"  call void @festina_map_for_each(ptr {entries_ptr}, i64 {cap_val}, ptr {trampoline_name})")
-                        lines.append(f"  call void @festina_map_free_entries(ptr {entries_ptr}, i64 {cap_val})")
-                elif _is_refcounted(type_) or type_ == TEXT:
-                    # claude.md #77/#79: release (not free) -- this
-                    # value is refcounted (see _emit_stmt's own VarDecl
-                    # handling), so its own reference simply needs
-                    # dropping; whichever function _release_fn_for
-                    # dispatches to only actually frees it once nothing
-                    # else references it. claude.md #83: for text,
-                    # _release_fn_for dispatches straight to a plain,
-                    # NULL-safe @free -- there's no refcount to check,
-                    # so freeing IS the whole job here (correct because
-                    # every text local is scheduled for this regardless
-                    # of escaping-ness -- see _emit_block's own tracking
-                    # comment -- so this always sees its own exclusively
-                    # owned copy, never a value some other binding still
-                    # needs).
-                    loaded = self.tmp()
-                    lines.append(f"  {loaded} = load ptr, ptr {ref}")
-                    lines.append(f"  call void {self._release_fn_for(type_)}(ptr {loaded})")
+                    continue
+                self._emit_release_tracked_entry(ref, type_, lines)
+                popped += 1
+        if popped and self.program_has_try:
+            # claude.md #236: these locals' own cleanup-stack entries
+            # (pushed by _track_local as each was bound) go with them
+            # -- popped here on every ordinary exit path, so the stack
+            # above any try frame is always exactly the locals still
+            # live. Count-based, one call for the whole walk: entries
+            # are pushed in binding order and this walk releases
+            # frames newest-first, so the entries released here are
+            # always the top of the runtime's stack.
+            lines.append(f"  call void @festina_cleanup_pop_n(i64 {popped})")
+
+    def _track_local(self, ref, type_, lines):
+        """claude.md #236: the ONE way an entry enters
+        self._active_free_locals -- every binding site (a VarDecl in
+        _emit_block, an escaping parameter in _emit_param_bindings, a
+        catch variable in _emit_try) records (slot, kind) here, so that
+        scope-exit release (_emit_free_active_locals) finds it. When the
+        program contains a `try` anywhere (self.program_has_try), the
+        same binding is ALSO registered on the runtime's per-thread
+        cleanup stack right now, paired with the generated function
+        that releases it through its slot (_unwind_fn_for) -- exactly
+        the (value, release) shape the JSON builders already register
+        (_emit_json_cleanup_push). festina_throw releases every entry
+        pushed since the catching try frame, newest first, on its way
+        to the catch: this local's, and every intermediate frame's on
+        the call chain between the try and the throw, which is the
+        leak claude.md #157 documented and left open. The matching pop
+        is emitted by _emit_free_active_locals wherever this entry's
+        ordinary release runs, so on every non-throwing path the two
+        stay balanced and the entries above any try frame are always
+        exactly the locals still live. A program with no `try` pays
+        nothing: a throw there is fail(), and the IR is unchanged.
+
+        The push happens after the slot holds its initial value, and
+        the unwind function reads the slot at throw time, not the value
+        at binding time -- a local reassigned before the throw releases
+        what it holds THEN (the ordinary scope-exit semantics), and one
+        nulled by `free` releases nothing (every release is null-safe,
+        see _emit_free)."""
+        self._active_free_locals[-1].append((ref, type_))
+        if self.program_has_try:
+            lines.append(f"  call void @festina_cleanup_push(ptr {ref}, ptr {self._unwind_fn_for(type_)})")
+
+    def _guard_call_arg_temps(self, arg_temps, lines):
+        """claude.md #236: the call-site half of throw unwinding. A
+        user-function call site owns whatever fresh argument values it
+        built -- a literal `[1, 2, 3]`, a template text, a call result,
+        a handle _coerce minted from a path -- and releases them right
+        after the call returns (_release_call_arg_temps, the loop
+        claude.md #83/#119/#192 built up). A callee that throws never
+        returns here, so those temporaries were the one thing left
+        leaking once every FRAME's locals were covered (found by the
+        stress program's first ASan run: the `[1, 2, 3]` passed to a
+        function three frames above the throw, and a template text
+        passed to one that parses it). Registered on the cleanup stack
+        as (value, release) pairs -- no slot needed, the identical shape
+        the JSON builders use -- for the duration of the call only.
+        Returns how many were pushed, so the pops match exactly."""
+        if not self.program_has_try:
+            return 0
+        pushed = 0
+        for arg_expr, val, vtype, ptype in arg_temps:
+            if _is_refcounted(ptype) and self._refcounted_source_is_fresh(arg_expr, vtype, ptype):
+                lines.append(f"  call void @festina_cleanup_push(ptr {val}, ptr {self._release_fn_for(ptype)})")
+                pushed += 1
+            elif vtype == TEXT and self._is_owning_text_source(arg_expr):
+                lines.append(f"  call void @festina_cleanup_push(ptr {val}, ptr @free)")
+                pushed += 1
+        return pushed
+
+    def _release_call_arg_temps(self, arg_temps, guarded, lines):
+        """claude.md #83/#119/#192: after a user-function call, release
+        every owning argument temporary -- after, not before, because
+        the callee borrows every argument for the duration of the call.
+        An OWNING refcounted argument -- a Call's fresh result, a
+        literal, an owned chain (`f(make().inner)`, `f(getRows()[0])`),
+        or a handle _coerce minted from a text path (the freshness test
+        is _refcounted_source_is_fresh, not the node-only
+        _is_owning_refcounted_source, for exactly that case: `show(`x${
+        n}.png`)` where `show` takes an img) -- is released. Sound
+        because parameters are borrows, and anything the callee KEPT
+        took its own retain on the way to wherever it was stored (an
+        escaping param retains at binding; a global/field store
+        retains; a returned alias is retained by the Return path), so
+        the caller's +1 is provably the last reference nothing else
+        will ever drop. A genuine owning text argument is freed
+        (_free_text_temp; _coerce already freed the text temp behind a
+        minted handle, so the else never sees one of those).
+
+        claude.md #236: `guarded` is what _guard_call_arg_temps pushed
+        before the call -- popped first, so the runtime's stack is
+        back to exactly the caller's own locals before anything here
+        is released."""
+        if guarded:
+            lines.append(f"  call void @festina_cleanup_pop_n(i64 {guarded})")
+        for arg_expr, val, vtype, ptype in arg_temps:
+            if (_is_refcounted(ptype)
+                    and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
+                lines.append(
+                    f"  call void {self._release_fn_for(ptype)}(ptr {val})")
+            else:
+                self._free_text_temp(arg_expr, val, vtype, lines)
+
+    def _unwind_fn_for(self, type_):
+        """claude.md #236: `@__festina_unwind_N(ptr %slot)` for one kind
+        of tracked local -- its body is exactly what
+        _emit_free_active_locals would emit inline for that entry, with
+        the slot as its argument (see _emit_release_tracked_entry, the
+        shared implementation), so a throw releases a local precisely
+        the way its own scope exit would have. Cached per kind: a plain
+        refcounted/text local by its type name, a stack-allocated
+        arr/map header by "stackbuf:" + element type, a stack struct
+        with managed fields by "stackfields:" + struct name."""
+        if isinstance(type_, _StackArrayOrMap):
+            key = "stackbuf:" + types_mod.type_name(type_.type_)
+        elif isinstance(type_, _StackStructFieldsOnly):
+            key = "stackfields:" + type_.struct_type.name
+        else:
+            key = "release:" + types_mod.type_name(type_)
+        found = self._unwind_fns.get(key)
+        if found is not None:
+            return found
+        name = f"@__festina_unwind_{self._unique()}"
+        self._unwind_fns[key] = name
+        body = [f"define void {name}(ptr %slot) {{", "entry:"]
+        self._emit_release_tracked_entry("%slot", type_, body)
+        body.append("  ret void")
+        body.append("}")
+        self.func_defs.extend(body)
+        self.func_defs.append("")
+        return name
+
+    def _emit_release_tracked_entry(self, ref, type_, lines):
+        """The release of ONE _active_free_locals entry (a local's own
+        `alloca ptr` slot plus the marker _emit_block chose for it) --
+        shared by _emit_free_active_locals's ordinary scope-exit walk
+        and, since claude.md #236, by the per-kind unwind functions
+        _unwind_fn_for generates so festina_throw can run the identical
+        release through the slot from the runtime. See
+        _emit_free_active_locals's docstring for what each kind means.
+        """
+        if isinstance(type_, _StackStructFieldsOnly):
+            # claude.md #78: a stack-allocated struct local
+            # (see _emit_block's own tracking comment) whose own
+            # storage is never released here -- only whatever
+            # its own struct-typed field(s) currently point to,
+            # since a field write (_emit_assign) may have
+            # retained a reference nothing else will ever
+            # release otherwise.
+            self._emit_release_nested_fields_only(ref, type_.struct_type, lines)
+        elif isinstance(type_, _StackArrayOrMap):
+            # claude.md #79: a stack-allocated arr[T]/map[T]
+            # local (see _emit_block's own tracking comment) --
+            # `ref` is the local's own `alloca ptr` slot, so
+            # this needs one load to reach the header's own
+            # (stack) storage before GEPing into its own
+            # data/entries field, the same pattern claude.md #78
+            # already established for a stack-allocated struct's
+            # own field access. Only that buffer is freed here,
+            # never the header itself -- it has no refcount
+            # header and isn't heap memory at all, so it must
+            # never reach festina_release_array/_map.
+            header = self.tmp()
+            lines.append(f"  {header} = load ptr, ptr {ref}")
+            if isinstance(type_.type_, types_mod.ArrayType):
+                elem_type = type_.type_.element
+                len_ptr = self.tmp()
+                lines.append(f"  {len_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 0")
+                len_val = self.tmp()
+                lines.append(f"  {len_val} = load i64, ptr {len_ptr}")
+                field_ptr = self.tmp()
+                lines.append(f"  {field_ptr} = getelementptr {FESTINA_ARRAY_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
+                data_ptr = self.tmp()
+                lines.append(f"  {data_ptr} = load ptr, ptr {field_ptr}")
+                if (_is_refcounted(elem_type)
+                        or elem_type == TEXT):
+                    # claude.md #80 (widened by #83 to text):
+                    # this array's own elements are themselves
+                    # refcounted/copy-managed -- release each
+                    # one before freeing the data buffer they
+                    # live in, the same element-release loop
+                    # _release_fn_for_array's own generated
+                    # wrapper uses for the heap-allocated case.
+                    self._emit_release_array_elements(
+                        data_ptr, len_val, self._release_fn_for(elem_type),
+                        _llvm_type(elem_type), lines)
+                lines.append(f"  call void @free(ptr {data_ptr})")
+            else:
+                # claude.md #74/#75/#175: unlike an array's plain
+                # data buffer, a map's entries buffer has its
+                # own nested allocation per live bucket (each key
+                # is its own strdup'd copy -- see
+                # festina_map_set's own comment) that a plain
+                # free() of the entries pointer alone would leak.
+                # festina_map_free_entries frees each live
+                # bucket's key first, then the entries buffer
+                # itself -- scanned by capacity, not count (a
+                # bucket scan is driven by capacity, not a dense
+                # [0,count) range).
+                value_type = type_.type_.value
+                field_ptr = self.tmp()
+                lines.append(f"  {field_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 1")
+                entries_ptr = self.tmp()
+                lines.append(f"  {entries_ptr} = load ptr, ptr {field_ptr}")
+                cap_ptr = self.tmp()
+                lines.append(f"  {cap_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, ptr {header}, i32 0, i32 2")
+                cap_val = self.tmp()
+                lines.append(f"  {cap_val} = load i64, ptr {cap_ptr}")
+                if (_is_refcounted(value_type)
+                        or value_type == TEXT):
+                    # claude.md #80 (widened by #83 to text):
+                    # same as the array case just above, but
+                    # through festina_map_for_each and a
+                    # release trampoline, since a map's own
+                    # entries layout stays opaque to codegen --
+                    # see _release_fn_for_map's own comment.
+                    trampoline_name = self._emit_map_value_release_trampoline(value_type)
+                    lines.append(
+                        f"  call void @festina_map_for_each(ptr {entries_ptr}, i64 {cap_val}, ptr {trampoline_name})")
+                lines.append(f"  call void @festina_map_free_entries(ptr {entries_ptr}, i64 {cap_val})")
+        elif _is_refcounted(type_) or type_ == TEXT:
+            # claude.md #77/#79: release (not free) -- this
+            # value is refcounted (see _emit_stmt's own VarDecl
+            # handling), so its own reference simply needs
+            # dropping; whichever function _release_fn_for
+            # dispatches to only actually frees it once nothing
+            # else references it. claude.md #83: for text,
+            # _release_fn_for dispatches straight to a plain,
+            # NULL-safe @free -- there's no refcount to check,
+            # so freeing IS the whole job here (correct because
+            # every text local is scheduled for this regardless
+            # of escaping-ness -- see _emit_block's own tracking
+            # comment -- so this always sees its own exclusively
+            # owned copy, never a value some other binding still
+            # needs).
+            loaded = self.tmp()
+            lines.append(f"  {loaded} = load ptr, ptr {ref}")
+            lines.append(f"  call void {self._release_fn_for(type_)}(ptr {loaded})")
 
     def _emit_analyzed_func_body(self, decl, body_env, return_type, body_lines, escaping):
         """claude.md #74: runs escape_analysis.find_escaping_names once
@@ -2663,12 +2868,12 @@ class CodeGen:
                 # here ever automatically decides this binding's
                 # lifetime.
                 body_lines.append(f"  call void @festina_retain(ptr {arg_ref})")
-                self._active_free_locals[-1].append((slot, t))
+                self._track_local(slot, t, body_lines)
             elif p.name in escaping and t == TEXT:
                 owned = self.tmp()
                 body_lines.append(f"  {owned} = call ptr @festina_text_own(ptr {arg_ref})")
                 arg_ref = owned
-                self._active_free_locals[-1].append((slot, t))
+                self._track_local(slot, t, body_lines)
             body_lines.append(f"  store {_llvm_type(t)} {arg_ref}, ptr {slot}")
             body_env.define(p.name, slot, t)
         return escaping
@@ -4485,7 +4690,7 @@ class CodeGen:
                             # structs.
                             is_stack_allocated = self._is_stack_allocatable_array_or_map_decl(stmt, type_)
                             if not is_stack_allocated:
-                                self._active_free_locals[-1].append((ref, type_))
+                                self._track_local(ref, type_, lines)
                             else:
                                 # arr[T]/map[T] still always calloc/
                                 # malloc their data/entries buffer
@@ -4497,8 +4702,7 @@ class CodeGen:
                                 # header still needs THAT buffer freed at
                                 # scope-exit; see _StackArrayOrMap's own
                                 # comment.
-                                self._active_free_locals[-1].append(
-                                    (ref, _StackArrayOrMap(type_)))
+                                self._track_local(ref, _StackArrayOrMap(type_), lines)
                         elif isinstance(type_, types_mod.StructType):
                             # claude.md #77 (widened): a struct local
                             # declared WITH an initializer never goes
@@ -4530,7 +4734,7 @@ class CodeGen:
                             is_stack_allocated = (stmt.init is None
                                                    and stmt.name not in self._current_escaping_names)
                             if not is_stack_allocated:
-                                self._active_free_locals[-1].append((ref, type_))
+                                self._track_local(ref, type_, lines)
                             elif self._struct_has_own_managed_field(type_.name):
                                 # claude.md #78: this local's own
                                 # storage is stack-allocated and never
@@ -4542,8 +4746,7 @@ class CodeGen:
                                 # extra reference unless this scope-exit
                                 # does. See _StackStructFieldsOnly's own
                                 # comment.
-                                self._active_free_locals[-1].append(
-                                    (ref, _StackStructFieldsOnly(type_)))
+                                self._track_local(ref, _StackStructFieldsOnly(type_), lines)
                         elif type_ == BLOB or type_ == REGEX or isinstance(
                                 type_, (types_mod.ImageType, types_mod.AudioType,
                                        types_mod.HttpType, types_mod.SocketType,
@@ -4589,7 +4792,7 @@ class CodeGen:
                             # /re/ literal's immortal header makes its
                             # release here a no-op rather than a
                             # use-after-free hazard.
-                            self._active_free_locals[-1].append((ref, type_))
+                            self._track_local(ref, type_, lines)
                         elif type_ == TEXT:
                             # claude.md #83: unlike the other three
                             # types, a text local is ALWAYS scheduled
@@ -4610,7 +4813,7 @@ class CodeGen:
                             # not by draining the source) -- so freeing
                             # it here can never affect any other
                             # binding, "escaping" or not.
-                            self._active_free_locals[-1].append((ref, type_))
+                            self._track_local(ref, type_, lines)
             if tracking and not ctx["terminated"]:
                 self._emit_free_active_locals(lines, down_to=len(self._active_free_locals) - 1)
         finally:
@@ -5148,14 +5351,29 @@ class CodeGen:
             # propagates out of the function, the whole frame is abandoned,
             # and everything down to the base is freed -- exactly as
             # before (identical to a Return).
-            throw_free_base = self._current_func_frame_base
-            for i in range(len(self._active_free_locals) - 1,
-                           self._current_func_frame_base - 1, -1):
-                if any(isinstance(t, _TryFrameMarker) for (_, t) in self._active_free_locals[i]):
-                    throw_free_base = i
-                    break
-            self._emit_free_active_locals(lines, down_to=throw_free_base,
-                                           skip_try_pop=True)
+            #
+            # claude.md #236: none of the above is emitted any more when
+            # the program has a try to reach. Every tracked local is
+            # registered on the runtime's cleanup stack as it is bound
+            # (_track_local), so festina_throw itself releases exactly
+            # the entries above the catching frame's recorded depth --
+            # this function's own locals since the try (or all of them,
+            # when the try is in a caller), AND every intermediate
+            # frame's, which no generated code here could ever reach.
+            # The two designs must not be combined: freeing here and
+            # then again from the stack would be the double free
+            # claude.md #192 fixed once already. self.program_has_try
+            # false means this throw is fail() -- the old walk stays
+            # for that case purely so the IR is unchanged there.
+            if not self.program_has_try:
+                throw_free_base = self._current_func_frame_base
+                for i in range(len(self._active_free_locals) - 1,
+                               self._current_func_frame_base - 1, -1):
+                    if any(isinstance(t, _TryFrameMarker) for (_, t) in self._active_free_locals[i]):
+                        throw_free_base = i
+                        break
+                self._emit_free_active_locals(lines, down_to=throw_free_base,
+                                               skip_try_pop=True)
             lines.append(f"  call void @festina_throw(ptr {text_val})")
             return
         if isinstance(stmt, ast.FreeStmt):
@@ -5347,16 +5565,23 @@ class CodeGen:
         have returned yet -- it can't exit before hitting one of the
         paths _TryFrameMarker instruments below.
 
-        llvm.eh.sjlj.setjmp/llvm.eh.sjlj.longjmp (not libc's own
-        setjmp/longjmp symbols) specifically because they're portable
-        LLVM intrinsics with a fixed-size buffer, not a platform/libc-
-        specific symbol name and struct layout -- the same mechanism
-        clang itself lowers __builtin_setjmp/__builtin_longjmp to. 0
-        means this is the first, normal arrival (run A); nonzero means
-        a throw's __builtin_longjmp (festina_throw, in the C runtime --
-        longjmp has no equivalent placement restriction, so it's free
-        to live in an ordinary nested function) landed straight back
-        here (run B).
+        claude.md #235: libc's own setjmp (self.setjmp_symbol, see
+        _setjmp_symbol_for), not the llvm.eh.sjlj.setjmp/longjmp
+        intrinsics the first version reached for. Those were chosen
+        as "portable, fixed-size-buffer, no libc struct layout to know"
+        -- but they have no lowering at all for wasm32 or AArch64 (so
+        try/catch was rejected outright on macOS, claude.md #170) and a
+        broken one on x86_64 Windows, where the catch ran but every
+        local read afterwards was garbage (three 0xC0000005 crashes on
+        the windows CI job). libc's setjmp/longjmp saves and restores
+        the platform's full callee-saved register set, works on every
+        native target, and needs nothing platform-specific here beyond
+        the symbol name and a buffer large enough for any jmp_buf
+        (_JMP_BUF_BYTES). 0 means this is the first, normal arrival
+        (run A); nonzero means a throw's longjmp (festina_throw, in the
+        C runtime -- longjmp has no equivalent placement restriction,
+        so it's free to live in an ordinary nested function) landed
+        straight back here (run B).
 
         This is a plain two-way branch structurally, exactly like
         _emit_if just above -- the only difference is A's own frame
@@ -5376,20 +5601,10 @@ class CodeGen:
         """
         self.uses_try = True
         lines = ctx["lines"]
-        buf = self.tmp()
-        lines.append(f"  {buf} = alloca [5 x ptr], align 16")
         bufp = self.tmp()
-        lines.append(f"  {bufp} = getelementptr inbounds [5 x ptr], ptr {buf}, i64 0, i64 0")
-        frame_addr = self.tmp()
-        lines.append(f"  {frame_addr} = call ptr @llvm.frameaddress.p0(i32 0)")
-        lines.append(f"  store ptr {frame_addr}, ptr {bufp}, align 16")
-        stack_save = self.tmp()
-        lines.append(f"  {stack_save} = call ptr @llvm.stacksave.p0()")
-        slot2 = self.tmp()
-        lines.append(f"  {slot2} = getelementptr inbounds ptr, ptr {bufp}, i64 2")
-        lines.append(f"  store ptr {stack_save}, ptr {slot2}, align 16")
+        lines.append(f"  {bufp} = alloca [{_JMP_BUF_BYTES} x i8], align 16")
         rc = self.tmp()
-        lines.append(f"  {rc} = call i32 @llvm.eh.sjlj.setjmp(ptr {bufp})")
+        lines.append(f"  {rc} = call i32 @{self.setjmp_symbol}(ptr {bufp}, ptr null)")
         is_catch = self.tmp()
         lines.append(f"  {is_catch} = icmp ne i32 {rc}, 0")
         try_label = self.label("try.body")
@@ -5428,7 +5643,8 @@ class CodeGen:
         catch_env = Env(env)
         catch_env.define(stmt.catch_var, err_slot, TEXT)
         if tracking:
-            self._active_free_locals.append([(err_slot, TEXT)])
+            self._active_free_locals.append([])
+            self._track_local(err_slot, TEXT, lines)
         try:
             catch_ctx = self._emit_block(stmt.catch_body, catch_env, return_type, lines)
         finally:
@@ -10923,22 +11139,17 @@ class CodeGen:
                     arg_temps.append((arg_expr, val, vtype, ptype))
                 args_ir = ", ".join(arg_vals)
                 ret_type = fn_type.return_type
+                guarded = self._guard_call_arg_temps(arg_temps, lines)
                 if ret_type is None:
                     lines.append(f"  call void {fn_ptr}({args_ir})")
                     out = "0"
                 else:
                     out = self.tmp()
                     lines.append(f"  {out} = call {_llvm_type(ret_type)} {fn_ptr}({args_ir})")
-                # claude.md #83/#119/#192: identical post-call argument
-                # cleanup to the direct-call path just below -- see its
-                # own comment for the full reasoning.
-                for arg_expr, val, vtype, ptype in arg_temps:
-                    if (_is_refcounted(ptype)
-                            and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
-                        lines.append(
-                            f"  call void {self._release_fn_for(ptype)}(ptr {val})")
-                    else:
-                        self._free_text_temp(arg_expr, val, vtype, lines)
+                # claude.md #83/#119/#192/#236: the same post-call
+                # argument cleanup every user-function call path shares
+                # -- see _release_call_arg_temps.
+                self._release_call_arg_temps(arg_temps, guarded, lines)
                 return out, ret_type
             # claude.md #210: a thread-private helper function -- only
             # reachable when this call site is itself inside a thread
@@ -10966,22 +11177,17 @@ class CodeGen:
                         arg_vals.append(f"{_llvm_type(ptype)} {val}")
                         arg_temps.append((arg_expr, val, vtype, ptype))
                     args_ir = ", ".join(arg_vals)
+                    guarded = self._guard_call_arg_temps(arg_temps, lines)
                     if ret_type is None:
                         lines.append(f"  call void {symbol}({args_ir})")
                         out = "0"
                     else:
                         out = self.tmp()
                         lines.append(f"  {out} = call {_llvm_type(ret_type)} {symbol}({args_ir})")
-                    # claude.md #83/#119/#192: identical post-call
-                    # argument cleanup to the ordinary direct-call path
-                    # just below -- see its own comment.
-                    for arg_expr, val, vtype, ptype in arg_temps:
-                        if (_is_refcounted(ptype)
-                                and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
-                            lines.append(
-                                f"  call void {self._release_fn_for(ptype)}(ptr {val})")
-                        else:
-                            self._free_text_temp(arg_expr, val, vtype, lines)
+                    # claude.md #83/#119/#192/#236: the same post-call
+                    # argument cleanup every user-function call path
+                    # shares -- see _release_call_arg_temps.
+                    self._release_call_arg_temps(arg_temps, guarded, lines)
                     return out, ret_type
             if name in self.func_decls:
                 decl = self.func_decls[name]
@@ -10998,50 +11204,19 @@ class CodeGen:
                     arg_temps.append((arg_expr, val, vtype, ptype))
                 ret_ref, ret_type = env.lookup(name)
                 args_ir = ", ".join(arg_vals)
+                guarded = self._guard_call_arg_temps(arg_temps, lines)
                 if ret_type is None:
                     lines.append(f"  call void @{name}({args_ir})")
                     out = "0"
                 else:
                     out = self.tmp()
                     lines.append(f"  {out} = call {_llvm_type(ret_type)} @{name}({args_ir})")
-                # claude.md #83: after the call, not before -- the callee
-                # borrows every text argument for the duration of the call.
-                #
-                # claude.md #119: an OWNING refcounted argument -- a
-                # Call's fresh result, a literal, an owned chain
-                # (`f(make().inner)`, `f(getRows()[0])`) -- is released
-                # after the call the same way, closing the
-                # argument-position half of #117's leftovers. Sound for
-                # the same reason the text free is: parameters are
-                # borrows, and anything the callee KEPT took its own
-                # retain on the way to wherever it was stored (an
-                # escaping param retains at binding; a global/field
-                # store retains; a returned alias is retained by the
-                # Return path) -- so the caller's +1 is provably the
-                # last reference nothing else will ever drop.
-                #
-                # claude.md #192: the freshness test is
-                # _refcounted_source_is_fresh, NOT _is_owning_refcounted_
-                # source -- a `show(`x${n}.png`)` where `show` takes an
-                # img mints a FRESH handle from the text path via _coerce
-                # above, exactly as fresh as a call result, but its AST
-                # node is a template/StringLit. The old node-only test
-                # missed it two ways: it never released the minted handle
-                # (a decoded image leaked per call for a literal path),
-                # and for an OWNING text source it fell to the else and
-                # ran _free_text_temp on `val` -- which by then is the img
-                # PAYLOAD, not text -- emitting free() on a handle:
-                # invalid free / heap corruption. The fresh-handle branch
-                # now releases it correctly, and _coerce (given
-                # source_expr above) already freed the arg's own text
-                # temp, so the else runs only for a genuine text arg.
-                for arg_expr, val, vtype, ptype in arg_temps:
-                    if (_is_refcounted(ptype)
-                            and self._refcounted_source_is_fresh(arg_expr, vtype, ptype)):
-                        lines.append(
-                            f"  call void {self._release_fn_for(ptype)}(ptr {val})")
-                    else:
-                        self._free_text_temp(arg_expr, val, vtype, lines)
+                # claude.md #83/#119/#192/#236: the post-call argument
+                # cleanup (after the call, not before -- the callee
+                # borrows every argument for the duration of the call),
+                # shared by all three user-function call paths; the
+                # full reasoning lives on _release_call_arg_temps.
+                self._release_call_arg_temps(arg_temps, guarded, lines)
                 return out, ret_type
             raise CodegenError(f"unknown function '{name}'", file=self.filename, line=callee.line)
         if (isinstance(callee, ast.Member) and not callee.computed and callee.prop == "reply"):
