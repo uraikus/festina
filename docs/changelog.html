@@ -33,6 +33,11 @@
     <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
     <nav class="toc" id="toc">
       <div class="nav-group">
+        <a href="#v0-42">0.42 — 2026-09-02</a>
+        <a href="#v0-41">0.41 — 2026-09-02</a>
+        <a href="#v0-40">0.40 — 2026-09-01</a>
+        <a href="#v0-39">0.39 — 2026-09-01</a>
+        <a href="#v0-38">0.38 — 2026-09-01</a>
         <a href="#v0-37">0.37 — 2026-09-01</a>
         <a href="#v0-36">0.36 — 2026-09-01</a>
         <a href="#v0-35">0.35 — 2026-09-01</a>
@@ -95,6 +100,98 @@
         implementation record predating 0.1 lives in
         <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>.
       </p>
+
+      <section class="doc-section" id="v0-42">
+        <h2><span class="version-badge">0.42</span><span class="version-date">2026-09-02</span> <a class="anchor" href="#v0-42">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>An <code>img</code> is now a self-contained drawing target</strong> (<a href="https://github.com/uraikus/festina/issues/93">uraikus/festina#93</a>) — three groups of methods mirroring the canvas calls name-for-name, each touching only the image it is called on (so they work from a worker thread too):
+            <ul class="changes">
+              <li><strong>A per-image transform and state stack:</strong> <code>img.translate(dx, dy)</code>, <code>img.rotate(degrees)</code>, <code>img.scale(sx, sy)</code>, <code>img.resetTransform()</code>, <code>img.saveState()</code>, <code>img.restoreState()</code>. Identity from creation, independent of the canvas's transform, applied to everything drawn, cleared or composited onto that image. The stack holds the image's transform only; style state stays with the canvas's <code>saveState()</code>.</li>
+              <li><strong>Clearing to transparent:</strong> <code>img.clear()</code>, <code>img.clearRect(x, y, w, h)</code>, <code>img.clearCircle(x, y, r)</code>, <code>img.clearPixel(x, y)</code> — alpha 0, so a later draw underneath shows through. <code>clear()</code> ignores the transform like <code>clearCanvas()</code>; the region forms honour it.</li>
+              <li><strong>Compositing:</strong> <code>img.drawImage(src, x, y)</code> and <code>img.drawImage(src, x, y, w, h)</code> — through the destination's transform, honouring <code>fillAlpha</code>; drawing an image onto itself copies it first.</li>
+            </ul>
+            A layer can now be painted in place — a rotated brush stroke, an eraser, a tiled background, a swayed sprite stamp — instead of being bounced through the canvas (<code>clearCanvas</code>, <code>drawImage</code> in, draw, <code>saveCanvas</code>, <code>clip</code>) at two window-sized copies per stamp.
+          </li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>The per-call colour forms (<code>drawRect(..., color[, border])</code>, <code>drawCircle(..., color[, border])</code>, <code>drawPixel(..., color)</code>, canvas and <code>img</code> alike) no longer write the global fill/border state around each call — a data race when a worker thread painted its own layer with them while main drew anything with a colour of its own. Same results, computed locally.</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li>api.md's Images table lists every <code>img</code> method (including the <code>getPixelColor</code> row it was missing and <code>drawCircle</code>'s colour forms), with a new "An image as a layer" section; <code>examples/layers.f</code> uses <code>.clear()</code> and a per-image transform for its HUD layer.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #234</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-41">
+        <h2><span class="version-badge">0.41</span><span class="version-date">2026-09-02</span> <a class="anchor" href="#v0-41">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong><code>.toStruct()</code>/<code>.toArr()</code> work again under <code>--target=wasm32-wasi</code> and on macOS, and their error path works again on Windows.</strong> 0.36's partial-parse leak fix put a <code>setjmp</code> catch frame inside every generated JSON parsing function, which made any program that parses JSON a "uses <code>try</code>" program — rejected outright on the two targets with no SjLj lowering, and silently broken on Windows (the catch never ran). The parsing functions now register what they are building on a per-thread <em>cleanup stack</em> in the runtime, which <code>throw</code> unwinds on its way to the catching <code>try</code>: plain portable C, no <code>setjmp</code>, and the per-call overhead 0.36 added is essentially gone (100k-object parse benchmark: median 233 → 225 ms; 223 ms before 0.36).</li>
+          <li>A duplicate <code>text</code> key whose second value fails to parse (<code>{"name":"a","name":5}</code> inside a <code>try</code>) no longer double-frees the first value.</li>
+          <li>Trailing data after a complete JSON value (<code>'{"id":1} extra'</code> inside a <code>try</code>) no longer leaks the parsed value.</li>
+          <li>A self-referencing struct nested pathologically deep (hundreds of thousands of <code>{"next":</code> levels — reachable through <code>req.toStruct()</code> on a network body) now throws <code>JSON nested too deeply</code> instead of overflowing the C stack.</li>
+          <li><strong>Windows: the HTTP runtime compiles again.</strong> <code>&lt;pthread.h&gt;</code> was only included on POSIX while a mutex added in 0.25 used it on every platform; every <code>openPort()</code> program failed to build on Windows.</li>
+          <li>Windows: <code>festina compile --target=wasm32-wasi tool.wasm.f</code> no longer names its output <code>tool.wasm.exe</code>.</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li>CI on <code>main</code> had been failing on all three platforms; besides the fixes above, the Linux job now installs <code>x11-apps</code>/<code>x11-utils</code> (four real-pixel tests needed <code>xwd</code>/<code>xprop</code>), the Linux-only <code>/proc</code> check and the POSIX-signal tests skip cleanly on the platforms that lack them, and one test that asserted the value of a field read through a freed struct (undefined behavior) now asserts the documented contract, <code>c == null</code>.</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li>api.md: what <code>free</code> promises (the binding reads <code>null</code>) versus what it does not (a field read through the freed binding), the JSON cleanup-stack design and its Valgrind coverage, <code>drain()</code> in every Threads method list; wasm.md/macos.md: JSON parsing is unaffected by the <code>try</code> gate; stale runtime/todo/contract wording refreshed.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #233</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-40">
+        <h2><span class="version-badge">0.40</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-40">#</a></h2>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong><code>NAME.drain()</code>'s bookkeeping no longer costs the worker an extra mutex round trip per message.</strong> The "finished dispatching" flag is now cleared inside the lock acquisition the worker already makes when it looks for its next message, and the wake-up broadcast is skipped entirely unless a <code>drain()</code> is actually waiting — a program that never calls <code>drain()</code> pays one predictable branch per message and nothing else. Measured on a 400,000-message fire-and-forget program: min 208 → 171 ms, median 300 → 225 ms.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><code>drain()</code> on a thread that stops while the call is blocked can no longer sleep forever — <code>alive</code> is part of the wait predicate and a stopping thread wakes any waiter on its way out. (Not reachable from Festina code today, where only the main program can call either <code>drain()</code> or <code>kill()</code> and never concurrently; kept correct rather than relied on.)</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li><code>drain()</code> waits for the thread's own side effects, not for a reply's <code>.callback(fn)</code> to run on main — spelled out in api.md, with a test pinning the order.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #232</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-39">
+        <h2><span class="version-badge">0.39</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-39">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>NAME.drain()</code></strong> blocks until a thread's own inbound queue is fully processed, then returns with the thread still running. The deliberate opposite of <code>kill()</code>'s own discard-don't-wait choice — exists specifically so <code>on close()</code>/<code>on exit(code:int)</code> can fire off a final <code>postMessage</code> (e.g. a database write on a thread with its own <code>DatabaseURL</code>) and be sure it landed before the teardown that follows a window closing or a graceful shutdown would otherwise discard it, unprocessed, exactly like <code>kill()</code> already does. Same main-only shape as <code>kill()</code>/<code>live()</code>/<code>isAlive()</code>, including <code>pool[i].drain()</code>. See <a href="api.html#thread-lifecycle">api.md</a>.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #231</a> (<a href="https://github.com/uraikus/festina/issues/91">uraikus/festina#91</a>).</p>
+      </section>
+
+      <section class="doc-section" id="v0-38">
+        <h2><span class="version-badge">0.38</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-38">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>A thread's second-ever <code>.reply()</code> was silently dropped.</strong> A worker's reply/<code>.callback()</code> mechanism delivered successfully only the first time, for that handle's entire process lifetime — every reply after that from the same sender was silently discarded, no error. Root cause: removing the last entry from a sender's own pending-callback list left its tail pointer dangling, corrupting the very next registration (a real use-after-free write) so it became unreachable from the list's own head. Fixed by tracking the previous node explicitly during removal and correcting the tail pointer whenever the removed node was it. api.md's own "reply at most once per message" documentation needed no change — it already described the intended behavior; the runtime just wasn't providing it.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #230</a> (<a href="https://github.com/uraikus/festina/issues/89">uraikus/festina#89</a>, <a href="https://github.com/uraikus/festina/issues/90">#90</a>).</p>
+      </section>
 
       <section class="doc-section" id="v0-37">
         <h2><span class="version-badge">0.37</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-37">#</a></h2>

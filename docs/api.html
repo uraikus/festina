@@ -125,7 +125,7 @@
         <a class="sub" href="#thread-reply">Request/response: .reply()</a>
         <a class="sub" href="#thread-private-state">Thread-private state</a>
         <a class="sub" href="#thread-private-functions">Thread-private functions</a>
-        <a class="sub" href="#thread-lifecycle">Lifecycle: kill()/live()</a>
+        <a class="sub" href="#thread-lifecycle">Lifecycle: kill()/live()/drain()</a>
         <a class="sub" href="#thread-isolation">Isolation</a>
         <a class="sub" href="#thread-database">A thread's own database</a>
         <a class="sub" href="#thread-pools">Thread pools: NAME[N]</a>
@@ -1966,7 +1966,12 @@ grass.save(<span class="str">'grass.png'</span>)                   <span class="
           <tr><td>img.width / img.height</td><td>Current size in pixels, as <code>int</code>.</td></tr>
           <tr><td>img.clip(x, y, w, h)</td><td>A <strong>new</strong> <code>img</code> holding that rectangle. The source is untouched, so one sheet can be clipped as many times as you like.</td></tr>
           <tr><td>img.resize(w, h)</td><td>Scales the image <strong>in place</strong> — it changes the image itself, so every name for it sees the new size.</td></tr>
-          <tr><td>img.drawRect(x, y, w, h[, color]) / img.drawPixel(x, y[, color]) / img.drawCircle(x, y, r) / img.drawText(text, x, y)</td><td>The same four canvas-level drawing calls, painting onto <strong>this image's own surface</strong> instead.</td></tr>
+          <tr><td>img.drawRect(x, y, w, h[, color[, border]]) / img.drawPixel(x, y[, color]) / img.drawCircle(x, y, r[, color[, border]]) / img.drawText(text, x, y)</td><td>The same four canvas-level drawing calls, painting onto <strong>this image's own surface</strong> instead.</td></tr>
+          <tr><td>img.translate(dx, dy) / img.rotate(degrees) / img.scale(sx, sy) / img.resetTransform()</td><td><strong>This image's own</strong> transform — identity from creation, independent of the canvas's — applied to everything drawn, cleared or composited onto it afterwards.</td></tr>
+          <tr><td>img.saveState() / img.restoreState()</td><td>Push/pop <strong>this image's own transform</strong> (style state is global and stays with the canvas's <code>saveState()</code>). <code>restoreState()</code> with nothing saved is an error, like the canvas's.</td></tr>
+          <tr><td>img.clear() / img.clearRect(x, y, w, h) / img.clearCircle(x, y, r) / img.clearPixel(x, y)</td><td>Erase to <strong>transparent</strong> (alpha 0, so whatever is later drawn underneath shows through). <code>clear()</code> ignores the image's transform, exactly as <code>clearCanvas()</code> ignores the canvas's; the three region forms honour it.</td></tr>
+          <tr><td>img.drawImage(src, x, y) / img.drawImage(src, x, y, w, h)</td><td>Composite <code>src</code> onto <strong>this image</strong> at <code>(x, y)</code> in this image's coordinates, through this image's transform, honouring <code>fillAlpha</code>; the five-argument form scales <code>src</code> to fit <code>w</code>×<code>h</code>. Drawing an image onto itself copies it first.</td></tr>
+          <tr><td>img.getPixelColor(x, y)</td><td>One pixel read back off this image's surface (<code>null</code> when transparent or out of bounds) — the <code>img</code> form of <code>getPixelColor</code> above.</td></tr>
         </table>
         </div>
         <p><code>clip</code> is the spritesheet operation: one PNG holding a grid of frames, sliced into the individual images you draw.</p>
@@ -1986,8 +1991,9 @@ grass.save(<span class="str">'grass.png'</span>)                   <span class="
           <strong>Drawing onto an image</strong> uses the same style
           state as the canvas (<code>fillStyle</code>,
           <code>borderColor</code>, <code>lineWidth</code>,
-          <code>changeFont</code>) and the same optional trailing
-          <code>color</code> on <code>drawRect</code>/<code>drawPixel</code>
+          <code>fillAlpha</code>, <code>changeFont</code>) and the same
+          optional trailing colours on
+          <code>drawRect</code>/<code>drawPixel</code>/<code>drawCircle</code>
           — but nothing else about the canvas. No window is needed (an
           image's surface already exists in full the moment the image
           does), and the canvas's own
@@ -2003,6 +2009,62 @@ fillStyle(red)
 icon.drawRect(0, 0, 16, 16)
 icon.drawPixel(24, 8, blue)      <span class="cm">// this pixel only -- fillStyle stays red after</span>
 icon.save(<span class="str">'icon-with-border.png'</span>)</pre>
+        <div class="callout">
+          <strong>An image as a layer.</strong> What an image
+          <em>does</em> have is a transform of its own, a way to erase
+          part of itself, and a way to take another image — the three
+          things that make it a self-contained drawing target rather
+          than something you bounce through the canvas (blit in, draw,
+          <code>saveCanvas</code>, <code>clip</code>) to edit. Every one
+          of these mirrors the canvas call of the same name and touches
+          only the image it's called on, so a layer can be painted from
+          wherever it lives — a worker thread included:
+          <pre class="code" style="margin:10px 0 6px;"><span class="cm">// A rotated brush stroke, painted straight into a chunk layer</span>
+<span class="kw">img</span> layer = blankImage(384, 384)
+layer.saveState()
+layer.translate(sx, sy)
+layer.rotate(strokeAngleDeg)                   <span class="cm">// degrees, like the canvas</span>
+layer.drawRect(-halfW, -halfH, sw, sh)         <span class="cm">// rotated about (sx, sy) ON THE IMAGE</span>
+layer.restoreState()                           <span class="cm">// layer back to identity; canvas untouched</span>
+
+<span class="cm">// An eraser</span>
+layer.clearCircle(localX, localY, radius)      <span class="cm">// to transparent, not "paint black"</span>
+
+<span class="cm">// Building a background once from tiles, no canvas involved</span>
+<span class="kw">img</span> bg = blankImage(CHUNK_PX, CHUNK_PX)
+<span class="kw">for int</span> ty = 0, ty &lt; CHUNK_TILES, ty++ {
+    <span class="kw">for int</span> tx = 0, tx &lt; CHUNK_TILES, tx++ {
+        bg.drawImage(grassTile, tx * TILE, ty * TILE)
+    }
+}
+
+<span class="cm">// Stamping a sprite into a layer with a sway rotation already applied</span>
+layer.saveState()
+layer.translate(pivotX, pivotY)
+layer.rotate(swayDeg)
+layer.drawImage(sprite, drawX - pivotX, drawTopY - pivotY)
+layer.restoreState()</pre>
+          The image's transform applies to its
+          <code>drawRect</code>/<code>drawPixel</code>/<code>drawCircle</code>/<code>drawText</code>,
+          to <code>clearRect</code>/<code>clearCircle</code>/<code>clearPixel</code>,
+          and to <code>drawImage</code> — the same set the canvas's
+          transform applies to on the canvas.
+          <code>img.saveState()</code>/<code>img.restoreState()</code>
+          push and pop only that image's transform: style state
+          (<code>fillStyle</code>, <code>borderColor</code>,
+          <code>lineWidth</code>, <code>fillAlpha</code>, font) is
+          global and stays with the canvas's own
+          <code>saveState()</code>. <code>img.clear()</code> wipes the
+          whole image to transparent regardless of its transform (as
+          <code>clearCanvas()</code> does for the canvas); the
+          region-shaped clears go through it. <code>img.drawImage</code>
+          honours <code>fillAlpha</code> exactly as the canvas
+          <code>drawImage</code> does, and drawing an image onto itself
+          is fine — the source is copied first, so tiling an image
+          with shifted copies of itself just works. A thread that
+          receives an image as a message gets its own copy with the
+          same current transform and an empty state stack.
+        </div>
         <p class="muted">
           Because <code>resize</code> changes the image itself, two
           names for one image stay in step:
@@ -2203,6 +2265,13 @@ restoreState()        <span class="cm">// transform (and style) back as it was</
           <strong>degrees</strong>. <code>Math.PI</code> is there if
           you'd rather work in radians.
         </p>
+        <p class="muted">
+          The canvas's transform never applies to drawing onto an
+          <code>img</code>; an image carries its own instead —
+          <code>img.translate()</code><wbr>/<code>rotate()</code><wbr>/<code>scale()</code><wbr>/<code>resetTransform()</code>
+          and <code>img.saveState()</code><wbr>/<code>restoreState()</code>,
+          the same calls as methods (see <a href="#images">Images</a>).
+        </p>
 
         <h3 id="gradients-and-transparency">Gradients and transparency <a class="anchor" href="#gradients-and-transparency">#</a></h3>
         <pre class="code"><span class="kw">color</span> a = <span class="str">'red'</span>
@@ -2226,7 +2295,8 @@ fillAlpha(0.5)                                 <span class="cm">// 0.0 transpare
           next — every fill
           (<code>drawRect</code>/<code>drawPixel</code>/<code>drawCircle</code>/<code>drawText</code>,
           whether onto the canvas or directly onto an <code>img</code>'s
-          own surface) <strong>and</strong> <code>drawImage</code>:
+          own surface) <strong>and</strong> <code>drawImage</code>, in
+          both its canvas form and its <code>img.drawImage</code> form:
         </p>
         <pre class="code">fillAlpha(0.4)
 drawImage(sprite, 100, 100)   <span class="cm">// blends 40% into whatever's underneath</span>
@@ -3145,6 +3215,20 @@ Worker.postMessage(c)</pre>
           treats as nothing-to-do. Constants and parameters can't be
           freed (a parameter borrows its caller's value).
         </p>
+        <div class="callout">
+          What <code>free</code> promises is that the <em>binding</em>
+          reads <code>null</code> afterwards — <code>c == null</code> is
+          <code>true</code>. It does not make a field read
+          <em>through</em> that binding safe: <code>c.x</code> on a
+          freed (or otherwise <code>null</code>) struct binding is a
+          read through a null pointer, undefined in exactly the way an
+          out-of-range index is (see
+          <a href="#indexing-is-not-bounds-checked">Indexing is not
+          bounds-checked</a>) — it happened to print <code>0</code> on
+          Linux and a stray heap address on macOS and Windows. Check
+          <code>c == null</code> first, or don't read a struct you've
+          freed.
+        </div>
 
         <h3 id="delete">delete <a class="anchor" href="#delete">#</a></h3>
         <pre class="code"><span class="kw">map[text]</span> example = {<span class="str">'data'</span>: <span class="str">'some data'</span>, <span class="str">'more-data'</span>: <span class="str">'Some more data'</span>}
@@ -3313,7 +3397,7 @@ worker.postMessage(21)</pre>
           difference matters throughout this section:
         </p>
         <ul>
-          <li><strong>the thread's own name</strong> (<code>worker</code>) — what you send <em>to</em>, and what the main program controls: <code>worker.postMessage(x)</code>, <code>worker.kill()</code>, <code>worker.live(cb)</code>, <code>worker.isAlive()</code>, <code>worker.giveRequest(r)</code>.</li>
+          <li><strong>the thread's own name</strong> (<code>worker</code>) — what you send <em>to</em>, and what the main program controls: <code>worker.postMessage(x)</code>, <code>worker.kill()</code>, <code>worker.live(cb)</code>, <code>worker.isAlive()</code>, <code>worker.drain()</code>, <code>worker.giveRequest(r)</code>.</li>
           <li><strong>a <code>thread</code> <em>value</em></strong> — what an <code>on message</code> handler receives as its first parameter, identifying whoever sent that message. It has exactly two operations: the field <code>.main</code> (was this sent by the main program?) and the method <code>.reply(x)</code>. It is deliberately minimal: it can't be compared (to <code>null</code> or to another <code>thread</code>), can't be sent through <code>postMessage</code>, and has no text form, so <code>log(w)</code> and <code>`${w}`</code> are compile errors rather than a printed pointer.</li>
         </ul>
 
@@ -3517,7 +3601,7 @@ worker.postMessage(21).callback(onDoubled)   <span class="cm">// logs 42</span><
           own state, exactly like its handlers already do.
         </p>
 
-        <h3 id="thread-lifecycle">Lifecycle: kill(), live(), isAlive() <a class="anchor" href="#thread-lifecycle">#</a></h3>
+        <h3 id="thread-lifecycle">Lifecycle: kill(), live(), isAlive(), drain() <a class="anchor" href="#thread-lifecycle">#</a></h3>
         <pre class="code">log(worker.isAlive())        <span class="cm">// true</span>
 worker.kill()                 <span class="cm">// blocks until the thread has stopped</span>
 log(worker.isAlive())        <span class="cm">// false</span>
@@ -3527,11 +3611,57 @@ log(worker.isAlive())        <span class="cm">// true</span></pre>
           <li><code>NAME.kill()</code> stops the thread (running <code>on exit(code:int)</code> first, if declared) and blocks until it has actually stopped. <code>code</code> is always <code>0</code> here — a thread's own <code>kill()</code> carries no exit code of its own to pass through (unlike the main program's own <code>on exit(code:int)</code>, which does — see <a href="#graceful-shutdown">Graceful shutdown</a>). Anything still queued for the thread is discarded rather than drained first, and any pending <code>.callback(fn)</code> waiting on it is dropped.</li>
           <li><code>NAME.live(callback)</code> respawns a killed thread and calls <code>callback(true)</code> once it's running again.</li>
           <li><code>NAME.isAlive()</code> reads whether the thread is currently running.</li>
+          <li><code>NAME.drain()</code> blocks until the thread has finished processing everything already queued for it — the deliberate opposite of <code>kill()</code>'s own discard-don't-wait choice. Unlike <code>kill()</code>, the thread keeps running afterward (still alive, still accepting new messages); this only waits, it never stops anything. A thread that isn't currently alive has nothing to drain and this returns immediately.</li>
         </ul>
+        <pre class="code"><span class="kw">thread</span> writer {
+    DatabaseURL = <span class="str">'writes.sqlite'</span>
+    <span class="kw">on</span> message(caller:<span class="kw">thread</span>, msg:<span class="kw">int</span>) {
+        sqlite(<span class="str">'INSERT INTO Log (n) VALUES (?)'</span>, [msg])
+    }
+}
+
+<span class="kw">on</span> close() {
+    writer.postMessage(finalValue)
+    writer.drain()   <span class="cm">// blocks until the INSERT above has actually run</span>
+}</pre>
+        <p class="muted">
+          This is what makes a thread with its own
+          <a href="#thread-database"><code>DatabaseURL</code></a> safe
+          to use for work that must survive the program exiting:
+          without an explicit <code>drain()</code>, a message posted
+          right before <code>close()</code> (or a window's own close
+          button, or a SIGINT/SIGTERM-driven
+          <a href="#graceful-shutdown">graceful shutdown</a>) races the
+          thread being killed during exit's own teardown — the send
+          might land, or the thread might be stopped first with that
+          message still sitting unprocessed in its queue, discarded
+          exactly like <code>kill()</code>'s own documented behavior
+          above. <code>on close()</code>/<code>on exit(code:int)</code>
+          are the natural place to call it: both already run to
+          completion before any teardown begins, so a
+          <code>postMessage(x)</code> immediately followed by
+          <code>drain()</code> there is a reliable "fire this off and
+          be sure it landed before we exit" pattern.
+        </p>
+        <p class="muted">
+          <code>drain()</code> is about the thread's own side effects,
+          not round-trip completion. It returns once the thread has
+          <em>processed</em> everything — including any
+          <code>.reply()</code> it made along the way — but a reply is
+          delivered to your <code>.callback(fn)</code> by the main
+          program's own event loop, which only runs once top-level code
+          returns. So after
+          <code>worker.postMessage(x).callback(fn); worker.drain()</code>,
+          the next line always runs <em>before</em> <code>fn</code>
+          does, never after. It also works on a thread with its own
+          <a href="#thread-http">HTTP context</a>, whose worker loop
+          polls rather than blocks — a drain there can take up to one
+          poll interval (~20ms) longer to notice an idle queue.
+        </p>
         <p>
-          These three are callable <strong>only</strong> from the main
-          program — a thread may message another thread, but may not
-          control its lifecycle.
+          All four of these are callable <strong>only</strong> from the
+          main program — a thread may message another thread, but may
+          not control its lifecycle.
         </p>
         <p class="muted">
           If the main program exits (including via <code>close(code)</code>
@@ -3549,9 +3679,11 @@ log(worker.isAlive())        <span class="cm">// true</span></pre>
           A thread's body <strong>may</strong> call
           <code>log</code>/<code>fail</code>,
           string/array/map/struct/enum operations, <code>Math</code>,
-          time functions, <code>blankImage()</code> plus
-          <code>img</code>-method drawing/clip/resize/pixel calls (each
-          touches only that one private image, never shared state),
+          time functions, <code>blankImage()</code> plus every
+          <code>img</code>-method call — drawing, clip/resize, pixel
+          reads, and the image's own transform/state stack, clears and
+          <code>drawImage</code> (each touches only that one private
+          image, never shared state) —
           <code>regex()</code>/<code>mkdir()</code>/<code>ls()</code>,
           and <code>exec()</code>.
         </p>
@@ -3640,7 +3772,7 @@ pool[3].postMessage(2)</pre>
           (<code>i</code> any <code>int</code> expression, not just a
           literal) everywhere a singleton thread's own bare
           <code>NAME</code> would be used —
-          <code>pool[i].postMessage(x)</code><wbr>/<code>.kill()</code><wbr>/<code>.live(callback)</code><wbr>/<code>.isAlive()</code><wbr>/<code>.giveRequest(r)</code>
+          <code>pool[i].postMessage(x)</code><wbr>/<code>.kill()</code><wbr>/<code>.live(callback)</code><wbr>/<code>.isAlive()</code><wbr>/<code>.drain()</code><wbr>/<code>.giveRequest(r)</code>
           all work identically to the singleton form, just
           per-instance. <strong>An out-of-range index is a silent
           no-op</strong> (this language's own established "test, don't
@@ -4292,39 +4424,46 @@ log(head.next.next.n)   <span class="cm">// 3</span></pre>
           chooses to <code>\u</code>-escape).
         </div>
         <p class="muted">
-          <strong>The partial-parse-failure leak this section used to
-          document is fixed.</strong> A JSON value that fails to parse
-          <em>partway through</em> being built — a struct whose third
-          field turns out to be the wrong type, having already parsed
-          the first two; an array whose fourth element fails, having
-          already collected three — used to leak whatever was already
-          built for that one call, the same structural class as
-          <code>throw</code>'s own intermediate-frame limitation above.
-          It no longer does: every generated
-          <code>toStruct</code>/<code>toArr</code>/map-field parsing
-          function now installs its own local
-          <code>try</code>/<code>catch</code> around its own build
-          loop, so a throw anywhere inside it — including several
-          levels of nesting deep, and including the in-flight JSON key
-          text a struct/map field read before its value threw — is
-          caught and released right there before re-throwing outward,
-          and the <code>.toStruct()</code>/<code>.toArr()</code> call
-          site itself does the same for its own <code>cursor</code> and
-          the receiver's own text. A <strong>successful</strong> parse
-          still leaks nothing (confirmed directly under Valgrind,
-          including 30 repeated calls in a loop), and a
-          <strong>failed</strong> one now leaks nothing either —
-          verified under Valgrind across a flat struct, a nested struct
-          field, an array, a <code>map[T]</code> field, a
-          self-referencing struct, and malformed JSON syntax itself,
-          400 iterations of each. Not verified under
-          <code>scripts/leak_stress.sh</code> (AddressSanitizer) — this
-          project's <code>try</code>/<code>throw</code> is built on
-          <code>llvm.eh.sjlj.setjmp</code>/<code>longjmp</code>, which
-          ASan cannot instrument through in this environment, which is
-          exactly why <code>try</code>/<code>throw</code>'s own
-          leak-freedom above was already stated as Valgrind-measured
-          rather than ASan-measured.
+          <strong>A parse that fails partway through leaks nothing.</strong>
+          A JSON value that fails to parse <em>partway through</em>
+          being built — a struct whose third field turns out to be the
+          wrong type, having already parsed the first two; an array
+          whose fourth element fails, having already collected three; a
+          complete value followed by trailing data — used to leak
+          whatever was already built for that one call, the same
+          structural class as <code>throw</code>'s own
+          intermediate-frame limitation above. It no longer does: every
+          generated parsing function registers the value it is building
+          (and each JSON key it has read but not yet freed) on a
+          per-thread <em>cleanup stack</em> in the runtime, and the
+          <code>.toStruct()</code>/<code>.toArr()</code> call site
+          registers its own cursor, the receiver's temporary text and
+          the finished value; a <code>throw</code> releases every one
+          of them, newest first, on its way to the catching
+          <code>try</code>. This is plain runtime C — no
+          <code>setjmp</code> of its own — which is why JSON parsing
+          works under <code>--target=wasm32-wasi</code> and on macOS
+          even though <code>try</code>/<code>catch</code> itself does
+          not (an uncaught parse failure there simply ends the program
+          the way any uncaught <code>throw</code> does). The same stack
+          bounds how deep a self-referencing struct may nest (1024
+          builder levels); input deeper than that <em>throws</em>
+          <code>JSON nested too deeply</code> instead of exhausting the
+          C stack, the same protection an unknown field's skipped value
+          already had. Verified under Valgrind across a flat struct, a
+          nested struct field, an array, a <code>map[T]</code> field, a
+          self-referencing struct, malformed syntax, a duplicate
+          <code>text</code> key whose second value fails, trailing data
+          after a complete value, and 2000-level nesting — 0 bytes lost
+          and 0 invalid frees. Valgrind rather than
+          <code>scripts/leak_stress.sh</code> (AddressSanitizer) only
+          because the <em>test program's</em> own
+          <code>try</code>/<code>catch</code> is built on
+          <code>llvm.eh.sjlj.setjmp</code>, which ASan cannot
+          instrument through in this environment (confirmed: even a
+          plain <code>try</code>/<code>catch</code> program with no
+          JSON involved crashes with SIGILL under
+          <code>-fsanitize=address</code>).
         </p>
       </section>
 

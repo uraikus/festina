@@ -74,6 +74,15 @@
           <a href="api.html#try-catch-throw">api.md</a>'s own
           Limitations note.
         </p>
+        <p>
+          <code>.toStruct()</code>/<code>.toArr()</code> are
+          <em>not</em> caught by that gate — their partial-parse
+          cleanup is plain runtime C, not a catch frame (an earlier
+          revision had briefly made them trip it, which showed up on
+          the macOS CI job only as 21 extra silent skips): they compile
+          and run here, and a parse failure ends the program the way
+          any uncaught <code>throw</code> does.
+        </p>
       </section>
 
       <section class="doc-section" id="gated-on-real-hardware">
