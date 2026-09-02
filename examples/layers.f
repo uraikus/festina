@@ -20,21 +20,22 @@
 //                   modified sparsely, not on every tick.
 //   2  trail        gains one more dot every single frame
 //                   (layers[LAYER_TRAIL].drawCircle(...)) at the bouncing
-//                   ball's new position. An `img` has no "clear" the way
-//                   the canvas does (api.md's Images section -- only
-//                   drawRect/drawPixel/drawCircle/drawText), so drawing
-//                   onto it repeatedly naturally accumulates into a trail,
-//                   the same "can only add" constraint tic_tac_toe.f
-//                   already relies on for the canvas itself.
+//                   ball's new position, deliberately never cleared, so
+//                   drawing onto it repeatedly accumulates into a trail --
+//                   and every 40 frames the oldest part of it is erased
+//                   with layers[LAYER_TRAIL].clearRect(...) (claude.md
+//                   #234: an img can clear part of itself to transparent,
+//                   so the background shows through again there).
 //   3  hud          the one layer that DOES need to look like it's
-//                   changing text every frame (a frame counter) -- since
-//                   there's no way to erase old text from an img either,
-//                   this layer is REPLACED wholesale each frame instead of
-//                   drawn onto: `blankTemplate.clip(...)` makes a fresh,
-//                   fully transparent img the same size as the canvas
-//                   (clip() always returns a new img, api.md's own
-//                   clip() row), which the fresh text is drawn onto before
-//                   it takes layers[LAYER_HUD]'s place.
+//                   changing text every frame (a frame counter). It is
+//                   the same img for the whole run: `layers[LAYER_HUD]
+//                   .clear()` wipes it to transparent each frame before
+//                   the fresh text is drawn (api.md's "An image as a
+//                   layer") -- no per-frame clip()/replacement needed.
+//                   The counter is also drawn through the HUD image's
+//                   OWN transform (translate + a slight rotate, saved
+//                   and restored around the draw), which the canvas's
+//                   transform never sees.
 
 log('opening the canvas -- close the window to exit')
 
@@ -120,10 +121,15 @@ void func renderFrame() {
     }
 
     // Layer 2, modified every frame: one more dot at the ball's new
-    // position, left behind permanently -- there's no way to erase it,
-    // so the accumulation itself IS the trail.
+    // position -- the accumulation itself IS the trail. Every 40
+    // frames the top-left quarter of the trail is erased to
+    // transparent (claude.md #234): the background and stars show
+    // through there again, and the trail starts over in that corner.
     fillStyle(trailColor)
     layers[LAYER_TRAIL].drawCircle(ballX, ballY, 3)
+    if frameCount % 40 == 0 {
+        layers[LAYER_TRAIL].clearRect(0, 0, Math.floor(clientWidth / 2), halfHeight)
+    }
 
     // Layer 1, modified sparsely: one new star every 15 frames, called
     // on the SAME img still sitting in the layer array -- proof that
@@ -136,13 +142,20 @@ void func renderFrame() {
         layers[LAYER_STARS].drawPixel(extraX, extraY)
     }
 
-    // Layer 3, REPLACED every frame rather than drawn onto -- see this
-    // file's own top comment for why. The old img this overwrites is
-    // released the same way any other rebinding already is.
-    layers[LAYER_HUD] = blankTemplate.clip(0, 0, clientWidth, clientHeight)
+    // Layer 3, the same img every frame: wiped to transparent, then the
+    // fresh counter drawn through the HUD image's OWN transform -- a
+    // saveState()/translate()/rotate()/restoreState() bracket that the
+    // canvas's transform never sees (claude.md #234, api.md's "An image
+    // as a layer"). The rotation is small on purpose: enough to prove
+    // it's really there, not enough to be hard to read.
+    layers[LAYER_HUD].clear()
     fillStyle(hudColor)
     changeFont(hudFont)
-    layers[LAYER_HUD].drawText(`Frame ${frameCount}/${totalFrames}`, 10, 20)
+    layers[LAYER_HUD].saveState()
+    layers[LAYER_HUD].translate(10, 20)
+    layers[LAYER_HUD].rotate(-3.0)
+    layers[LAYER_HUD].drawText(`Frame ${frameCount}/${totalFrames}`, 0, 0)
+    layers[LAYER_HUD].restoreState()
 
     // The overall Render function: composite every layer onto the
     // canvas, in array order (so later layers draw over earlier ones --

@@ -13183,6 +13183,223 @@ class TestImageDrawMethods:
                 semantic.analyze(program, filename="main.f")
 
 
+class TestImageLayerOps:
+    """claude.md #234 (uraikus/festina#93): an img as a self-contained
+    drawing target -- its own translate/rotate/scale/resetTransform
+    and saveState/restoreState stack, clear/clearRect/clearCircle/
+    clearPixel to transparent, and img.drawImage(src, x, y[, w, h]).
+    Every one of these needs no display (same as the four drawing
+    methods TestImageDrawMethods covers), so every pixel here is read
+    back headlessly through img.getPixelColor (claude.md #189) with
+    DISPLAY explicitly unset."""
+
+    def _run(self, compile_and_run, body):
+        source = "color red = 'red'\ncolor blue = 'blue'\n" + body
+        result = compile_and_run(source, env={"DISPLAY": ""})
+        assert result.returncode == 0, result.stderr
+        return result.stdout.split()
+
+    def test_translate_moves_the_images_own_drawing(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img a = blankImage(40, 40)
+        a.translate(10, 10)
+        a.drawRect(0, 0, 5, 5, blue)
+        log(a.getPixelColor(12, 12) == blue)
+        log(a.getPixelColor(2, 2) == null)
+        """) == ["true", "true"]
+
+    def test_rotate_is_in_degrees_about_the_translated_origin(self, compile_and_run):
+        # A 10x2 bar at the origin, after translate(20, 20) + rotate(90),
+        # stands vertically just left of x=20 from y=20 down to y=30.
+        assert self._run(compile_and_run, """
+        img b = blankImage(40, 40)
+        b.translate(20, 20)
+        b.rotate(90.0)
+        b.drawRect(0, 0, 10, 2, blue)
+        log(b.getPixelColor(19, 25) == blue)
+        log(b.getPixelColor(25, 21) == null)
+        """) == ["true", "true"]
+
+    def test_scale_grows_the_drawing(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img c = blankImage(40, 40)
+        c.scale(2.0, 2.0)
+        c.drawRect(0, 0, 5, 5, blue)
+        log(c.getPixelColor(8, 8) == blue)
+        log(c.getPixelColor(12, 12) == null)
+        """) == ["true", "true"]
+
+    def test_save_restore_and_reset_transform(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img d = blankImage(40, 40)
+        d.saveState()
+        d.translate(20, 20)
+        d.restoreState()
+        d.drawRect(0, 0, 3, 3, blue)          // back at identity
+        d.translate(30, 30)
+        d.resetTransform()
+        d.drawRect(10, 10, 3, 3, red)         // identity again
+        log(d.getPixelColor(1, 1) == blue)
+        log(d.getPixelColor(11, 11) == red)
+        log(d.getPixelColor(31, 31) == null)
+        """) == ["true", "true", "true"]
+
+    def test_the_image_transform_and_the_canvas_transform_are_independent(
+            self, compile_and_run):
+        # The canvas's own transform is never applied to image draws
+        # (unchanged from claude.md #134), and an image's transform never
+        # touches the canvas.
+        assert self._run(compile_and_run, """
+        translate(100, 100)
+        img e = blankImage(40, 40)
+        e.drawRect(0, 0, 3, 3, blue)
+        e.translate(15, 15)
+        fillStyle(red)
+        drawRect(0, 0, 3, 3)
+        log(e.getPixelColor(1, 1) == blue)
+        log(getPixelColor(101, 101) == red)
+        log(getPixelColor(1, 1) == null)
+        """) == ["true", "true", "true"]
+
+    def test_clears_erase_to_transparent(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img f = blankImage(40, 40)
+        f.drawRect(0, 0, 40, 40, blue)
+        f.clearRect(0, 0, 10, 10)
+        f.clearCircle(30, 30, 5)
+        f.clearPixel(20, 5)
+        log(f.getPixelColor(5, 5) == null)
+        log(f.getPixelColor(30, 30) == null)
+        log(f.getPixelColor(20, 5) == null)
+        log(f.getPixelColor(15, 15) == blue)
+        """) == ["true"] * 4
+
+    def test_region_clears_honour_the_transform_but_clear_does_not(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img f = blankImage(40, 40)
+        f.drawRect(0, 0, 40, 40, blue)
+        f.translate(20, 20)
+        f.clearRect(0, 0, 5, 5)
+        log(f.getPixelColor(22, 22) == null)
+        log(f.getPixelColor(15, 15) == blue)
+        f.clear()
+        log(f.getPixelColor(15, 15) == null)
+        log(f.getPixelColor(1, 1) == null)
+        """) == ["true"] * 4
+
+    def test_a_cleared_region_lets_a_later_draw_underneath_show(self, compile_and_run):
+        # The whole point of clearing to alpha 0 rather than painting
+        # transparent black: what is drawn UNDER the layer afterwards
+        # shows through where it was cleared.
+        assert self._run(compile_and_run, """
+        img layer = blankImage(20, 20)
+        layer.drawRect(0, 0, 20, 20, blue)
+        layer.clearCircle(10, 10, 4)
+        img under = blankImage(20, 20)
+        under.drawRect(0, 0, 20, 20, red)
+        under.drawImage(layer, 0, 0)
+        log(under.getPixelColor(10, 10) == red)
+        log(under.getPixelColor(1, 1) == blue)
+        """) == ["true", "true"]
+
+    def test_draw_image_plain_scaled_and_through_the_transform(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img src = blankImage(10, 10)
+        src.drawRect(0, 0, 10, 10, red)
+        img g = blankImage(40, 40)
+        g.drawImage(src, 5, 5)
+        g.drawImage(src, 20, 20, 20, 20)
+        log(g.getPixelColor(7, 7) == red)
+        log(g.getPixelColor(2, 2) == null)
+        log(g.getPixelColor(35, 35) == red)
+        img h = blankImage(40, 40)
+        h.translate(20, 20)
+        h.drawImage(src, 0, 0)
+        log(h.getPixelColor(22, 22) == red)
+        log(h.getPixelColor(2, 2) == null)
+        """) == ["true"] * 5
+
+    def test_draw_image_honours_fill_alpha(self, compile_and_run):
+        # 50% red over opaque blue is neither pure colour -- a real
+        # blend, the same fillAlpha contract the canvas drawImage has
+        # (claude.md #183).
+        assert self._run(compile_and_run, """
+        img src = blankImage(10, 10)
+        src.drawRect(0, 0, 10, 10, red)
+        img k = blankImage(10, 10)
+        k.drawRect(0, 0, 10, 10, blue)
+        fillAlpha(0.5)
+        k.drawImage(src, 0, 0)
+        fillAlpha(1.0)
+        color blended = k.getPixelColor(5, 5)
+        log(blended != red)
+        log(blended != blue)
+        log(blended != null)
+        """) == ["true"] * 3
+
+    def test_drawing_an_image_onto_itself_copies_first(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img m = blankImage(20, 20)
+        m.drawRect(0, 0, 10, 20, red)
+        m.drawImage(m, 10, 0)
+        log(m.getPixelColor(15, 5) == red)
+        log(m.getPixelColor(5, 5) == red)
+        """) == ["true", "true"]
+
+    def test_an_owning_clip_source_is_released_after_the_blit(self, compile_and_run):
+        assert self._run(compile_and_run, """
+        img sheet = blankImage(32, 32)
+        sheet.drawRect(0, 0, 32, 32, blue)
+        img n = blankImage(32, 32)
+        n.drawImage(sheet.clip(0, 0, 8, 8), 4, 4)
+        log(n.getPixelColor(6, 6) == blue)
+        log(n.getPixelColor(20, 20) == null)
+        """) == ["true", "true"]
+
+    def test_a_layer_in_an_array_is_edited_in_place(self, compile_and_run):
+        # The festina-game shape: layers held in an arr[img], each
+        # stamped through its own transform with no canvas round trip.
+        assert self._run(compile_and_run, """
+        arr[img] chunks = [blankImage(16, 16), blankImage(16, 16)]
+        chunks[1].saveState()
+        chunks[1].translate(8, 8)
+        chunks[1].rotate(45.0)
+        chunks[1].drawRect(-2, -2, 4, 4, red)
+        chunks[1].restoreState()
+        log(chunks[1].getPixelColor(8, 8) == red)
+        log(chunks[0].getPixelColor(8, 8) == null)
+        """) == ["true", "true"]
+
+    def test_restore_with_nothing_saved_fails_clearly(self, compile_and_run):
+        result = compile_and_run("img a = blankImage(4, 4)\na.restoreState()\nlog('unreachable')",
+                                 env={"DISPLAY": ""})
+        assert result.returncode != 0
+        assert "img.restoreState(): nothing was saved" in result.stdout + result.stderr
+
+    def test_nesting_past_64_saves_fails_clearly(self, compile_and_run):
+        result = compile_and_run(
+            "img a = blankImage(4, 4)\nint i = 0\nwhile i < 65 { a.saveState()\n i = i + 1 }\n"
+            "log('unreachable')", env={"DISPLAY": ""})
+        assert result.returncode != 0
+        assert "img.saveState(): nested too deeply" in result.stdout + result.stderr
+
+    def test_wrong_arity_and_types_are_rejected(self, parser, semantic, errors):
+        for source in [
+            "img s = blankImage(4, 4)\ns.rotate(45)",            # float, like the canvas's
+            "img s = blankImage(4, 4)\ns.translate(1.0, 2)",
+            "img s = blankImage(4, 4)\ns.scale(2.0)",
+            "img s = blankImage(4, 4)\ns.drawImage(1, 2, 3)",
+            "img s = blankImage(4, 4)\nimg t = blankImage(2, 2)\ns.drawImage(t, 2, 3, 4)",
+            "img s = blankImage(4, 4)\ns.restoreState(1)",
+            "img s = blankImage(4, 4)\ns.clearRect(0, 0, 1)",
+            "img s = blankImage(4, 4)\ns.clear(1)",
+            "text s = 'x'\ns.translate(1, 2)",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestImageClipRendersRealPixels:
     """claude.md #92, the tier the rest can't reach: that clip() lifts
     the region it was actually asked for. Asserting the runtime call was

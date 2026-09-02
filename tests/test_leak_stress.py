@@ -616,4 +616,17 @@ class TestLeakStress:
             # message, a double-free, or a missed/duplicate broadcast
             # would show up here.
             "thread_drain_churn.f",
+            # claude.md #234 (uraikus/festina#93): an img's own transform
+            # + saveState()/restoreState() stack (a malloc'd, growing
+            # per-image array -- freed with the image, or leaked), the
+            # clears, and img.drawImage (including the snapshot copy an
+            # image drawn onto ITSELF takes, and an owning clip() source
+            # passed straight in), all at volume, headless.
+            "image_layer_churn.f",
+            # claude.md #234: the same methods from a worker thread's own
+            # `on message`, while main paints its own layers with the
+            # per-call colour forms -- the race those overrides used to
+            # have on the global fill/border state is what this exists
+            # to keep fixed (TSan, via scripts/thread_tsan_stress.sh).
+            "thread_image_layer_churn.f",
         }

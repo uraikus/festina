@@ -1713,7 +1713,12 @@ clip, resize and `saveCanvas` without an X server.
 | `img.width` / `img.height` | Current size in pixels, as `int`. |
 | `img.clip(x, y, w, h)` | A **new** `img` holding that rectangle. The source is untouched, so one sheet can be clipped as many times as you like. |
 | `img.resize(w, h)` | Scales the image **in place** — it changes the image itself, so every name for it sees the new size. |
-| `img.drawRect(x, y, w, h[, color])` / `img.drawPixel(x, y[, color])` / `img.drawCircle(x, y, r)` / `img.drawText(text, x, y)` | The same four canvas-level drawing calls, painting onto **this image's own surface** instead. |
+| `img.drawRect(x, y, w, h[, color[, border]])` / `img.drawPixel(x, y[, color])` / `img.drawCircle(x, y, r[, color[, border]])` / `img.drawText(text, x, y)` | The same four canvas-level drawing calls, painting onto **this image's own surface** instead. |
+| `img.translate(dx, dy)` / `img.rotate(degrees)` / `img.scale(sx, sy)` / `img.resetTransform()` | **This image's own** transform — identity from creation, independent of the canvas's — applied to everything drawn, cleared or composited onto it afterwards. |
+| `img.saveState()` / `img.restoreState()` | Push/pop **this image's own transform** (style state is global and stays with the canvas's `saveState()`). `restoreState()` with nothing saved is an error, like the canvas's. |
+| `img.clear()` / `img.clearRect(x, y, w, h)` / `img.clearCircle(x, y, r)` / `img.clearPixel(x, y)` | Erase to **transparent** (alpha 0, so whatever is later drawn underneath shows through). `clear()` ignores the image's transform, exactly as `clearCanvas()` ignores the canvas's; the three region forms honour it. |
+| `img.drawImage(src, x, y)` / `img.drawImage(src, x, y, w, h)` | Composite `src` onto **this image** at `(x, y)` in this image's coordinates, through this image's transform, honouring `fillAlpha`; the five-argument form scales `src` to fit `w`×`h`. Drawing an image onto itself copies it first. |
+| `img.getPixelColor(x, y)` | One pixel read back off this image's surface (`null` when transparent or out of bounds) — the `img` form of `getPixelColor` above. |
 
 `clip` is the spritesheet operation: one PNG holding a grid of frames,
 sliced into the individual images you draw.
@@ -1733,13 +1738,13 @@ height *is* an error, since it could only ever produce an image nothing
 can draw.
 
 **Drawing onto an image** uses the same style state as the canvas
-(`fillStyle`, `borderColor`, `lineWidth`, `changeFont`) and the same
-optional trailing `color` on `drawRect`/`drawPixel` — but nothing else
-about the canvas. No window is needed (an image's surface already
-exists in full the moment the image does), and the canvas's own
-`translate`/`rotate`/`scale` transform is never applied — an image is a
-portable asset with its own local pixel coordinates, independent of
-whatever the canvas's transform happens to be set to:
+(`fillStyle`, `borderColor`, `lineWidth`, `fillAlpha`, `changeFont`) and
+the same optional trailing colours on `drawRect`/`drawPixel`/`drawCircle`
+— but nothing else about the canvas. No window is needed (an image's
+surface already exists in full the moment the image does), and the
+canvas's own `translate`/`rotate`/`scale` transform is never applied —
+an image is a portable asset with its own local pixel coordinates,
+independent of whatever the canvas's transform happens to be set to:
 
 ```festina
 color red = 'red'
@@ -1750,6 +1755,57 @@ icon.drawRect(0, 0, 16, 16)
 icon.drawPixel(24, 8, blue)      // this pixel only -- fillStyle stays red after
 icon.save('icon-with-border.png')
 ```
+
+**An image as a layer.** What an image *does* have is a transform of
+its own, a way to erase part of itself, and a way to take another image
+— the three things that make it a self-contained drawing target rather
+than something you bounce through the canvas (blit in, draw, `saveCanvas`,
+`clip`) to edit. Every one of these mirrors the canvas call of the same
+name and touches only the image it's called on, so a layer can be
+painted from wherever it lives — a worker thread included:
+
+```festina
+// A rotated brush stroke, painted straight into a chunk layer
+img layer = blankImage(384, 384)
+layer.saveState()
+layer.translate(sx, sy)
+layer.rotate(strokeAngleDeg)                   // degrees, like the canvas
+layer.drawRect(-halfW, -halfH, sw, sh)         // rotated about (sx, sy) ON THE IMAGE
+layer.restoreState()                           // layer back to identity; canvas untouched
+
+// An eraser
+layer.clearCircle(localX, localY, radius)      // to transparent, not "paint black"
+
+// Building a background once from tiles, no canvas involved
+img bg = blankImage(CHUNK_PX, CHUNK_PX)
+for int ty = 0, ty < CHUNK_TILES, ty++ {
+    for int tx = 0, tx < CHUNK_TILES, tx++ {
+        bg.drawImage(grassTile, tx * TILE, ty * TILE)
+    }
+}
+
+// Stamping a sprite into a layer with a sway rotation already applied
+layer.saveState()
+layer.translate(pivotX, pivotY)
+layer.rotate(swayDeg)
+layer.drawImage(sprite, drawX - pivotX, drawTopY - pivotY)
+layer.restoreState()
+```
+
+The image's transform applies to its `drawRect`/`drawPixel`/`drawCircle`/
+`drawText`, to `clearRect`/`clearCircle`/`clearPixel`, and to
+`drawImage` — the same set the canvas's transform applies to on the
+canvas. `img.saveState()`/`img.restoreState()` push and pop only that
+image's transform: style state (`fillStyle`, `borderColor`, `lineWidth`,
+`fillAlpha`, font) is global and stays with the canvas's own
+`saveState()`. `img.clear()` wipes the whole image to transparent
+regardless of its transform (as `clearCanvas()` does for the canvas);
+the region-shaped clears go through it. `img.drawImage` honours
+`fillAlpha` exactly as the canvas `drawImage` does, and drawing an image
+onto itself is fine — the source is copied first, so tiling an image
+with shifted copies of itself just works. A thread that receives an
+image as a message gets its own copy with the same current transform
+and an empty state stack.
 
 Because `resize` changes the image itself, two names for one image stay
 in step:
@@ -1961,6 +2017,11 @@ error rather than a silent no-op.
 Rotation is in **degrees**. `Math.PI` is there if you'd rather work in
 radians.
 
+The canvas's transform never applies to drawing onto an `img`; an image
+carries its own instead — `img.translate()`/`rotate()`/`scale()`/
+`resetTransform()` and `img.saveState()`/`restoreState()`, the same
+calls as methods (see [Images](#images)).
+
 ### Gradients and transparency
 
 ```festina
@@ -1982,7 +2043,8 @@ gradient a program draws, and needs no separate gradient type.
 
 `fillAlpha` applies uniformly to whatever's drawn next — every fill
 (`drawRect`/`drawPixel`/`drawCircle`/`drawText`, whether onto the
-canvas or directly onto an `img`'s own surface) **and** `drawImage`:
+canvas or directly onto an `img`'s own surface) **and** `drawImage`, in
+both its canvas form and its `img.drawImage` form:
 
 ```festina
 fillAlpha(0.4)
@@ -3300,9 +3362,11 @@ process.
 ### Isolation: what a thread body may and may not do
 
 A thread's body **may** call `log`/`fail`, string/array/map/struct/enum
-operations, `Math`, time functions, `blankImage()` plus `img`-method
-drawing/clip/resize/pixel calls (each touches only that one private
-image, never shared state), `regex()`/`mkdir()`/`ls()`, and `exec()`.
+operations, `Math`, time functions, `blankImage()` plus every
+`img`-method call — drawing, clip/resize, pixel reads, and the
+image's own transform/state stack, clears and `drawImage` (each touches
+only that one private image, never shared state) —
+`regex()`/`mkdir()`/`ls()`, and `exec()`.
 
 It may **not** call any canvas/window builtin (`drawRect`, `render`,
 `saveCanvas`, ...) or `setTimeout`/`setInterval`, and it may not call

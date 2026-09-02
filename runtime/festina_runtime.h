@@ -784,6 +784,28 @@ void festina_image_draw_circle_color(void *img, int64_t x, int64_t y, int64_t r,
 void festina_image_draw_circle_colors(void *img, int64_t x, int64_t y, int64_t r,
                                        int64_t fill_color, int64_t border_color);
 void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y);
+/* claude.md #234 (uraikus/festina#93): an img as a self-contained
+ * drawing target. Its OWN transform and transform stack (independent
+ * of the canvas's; style state stays global), clears to transparent
+ * (img.clear() ignores the transform like clearCanvas(); the three
+ * region forms honour it like clearRect()/clearCircle()/clearPixel()),
+ * and compositing one image onto another through the destination's
+ * transform, honouring fillAlpha (an image drawn onto itself is
+ * snapshotted first). Every one of the drawing calls above goes
+ * through the image's transform too. */
+void festina_image_translate(void *img, int64_t x, int64_t y);
+void festina_image_rotate(void *img, double degrees);
+void festina_image_scale(void *img, double sx, double sy);
+void festina_image_reset_transform(void *img);
+void festina_image_save_state(void *img);
+void festina_image_restore_state(void *img);
+void festina_image_clear(void *img);
+void festina_image_clear_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
+void festina_image_clear_circle(void *img, int64_t x, int64_t y, int64_t r);
+void festina_image_clear_pixel(void *img, int64_t x, int64_t y);
+void festina_image_draw_image(void *dst, void *src, int64_t x, int64_t y);
+void festina_image_draw_image_scaled(void *dst, void *src, int64_t x, int64_t y,
+                                     int64_t w, int64_t h);
 void festina_image_free(void *img);
 /* claude.md #198 Phase 4: `thread`'s own deep-clone of an img message/
  * field -- round-trips through festina_image_bytes/_from_bytes rather
