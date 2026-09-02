@@ -59,6 +59,9 @@ python3 benchmarks/canvas/run_canvas_benchmark.py --update-doc
 # to restore its NuGet package; without either it is skipped with a note
 # rather than failing the run.
 
+python3 benchmarks/layered_canvas/run_layered_canvas_benchmark.py             # multi-threaded Festina vs Worker+OffscreenCanvas
+python3 benchmarks/layered_canvas/run_layered_canvas_benchmark.py --update-doc
+
 python3 benchmarks/http/run_http_benchmarks.py                # the HTTP server comparison
 python3 benchmarks/http/run_http_benchmarks.py --update-doc
 
@@ -469,3 +472,50 @@ _Last run: 2026-09-01 on this machine (4 CPUs), `wrk -t4 -c50 -d5s` per route, p
   claim about optimal pool sizing for a production workload, which
   depends heavily on how CPU-bound (vs. I/O-bound) the real work
   actually is.
+
+## Layered canvas: multi-threaded Festina vs a browser's Worker + OffscreenCanvas
+
+<!-- LAYERED_RESULTS_START -->
+_Last run: 2026-09-02 on this machine (4 logical CPUs). Chromium 141.0.7390.37._
+
+Four independent layers -- a sparse sky, a band of hill texture, a band
+of ground texture, and a full-canvas foreground particle scatter --
+40,000 draw calls total into an 800x600 surface, the
+same order of magnitude as the single-threaded canvas benchmark's own
+40,000 above. Both multi-threaded runs hand each layer to its
+own worker (a real OS thread on the Festina side, a real Worker on the
+browser side) and get it back with **no per-pixel copy across the
+boundary** -- an `img?` ([api.md](api.md#t-manually-managed-values))
+shares its reference across `postMessage` instead of cloning it, and a
+Worker's `transferToImageBitmap()` is a genuine ownership transfer, not
+a copy. Compositing the finished layers onto one final surface IS a
+real pixel copy on both sides and both runs time it, not just the
+parallel drawing -- see
+[`run_layered_canvas_benchmark.py`](benchmarks/layered_canvas/run_layered_canvas_benchmark.py)
+for the rest of what makes this comparison fair, the same three rules
+`draw_shapes.f`'s own runner already established.
+
+| | Single-threaded | 4 threads/Workers | Speedup |
+|---|---|---|---|
+| Festina (Cairo, `img?`) | 84 ms (median 85 ms) | 62 ms (median 65 ms) | 1.35x |
+| Browser (Skia, OffscreenCanvas) | 61 ms (median 69 ms) | 52 ms (median 66 ms) | 1.18x |
+
+On this workload, both multi-threaded, **the browser's Workers draw it 1.2x faster**.
+
+Two outputs were checked, not one. Festina's multi-threaded run was
+compared against its OWN single-threaded run **byte-for-byte** — Cairo
+is deterministic, so any difference at all would mean four threads
+racing to paint four different `img?` buffers corrupted something; there
+wasn't one. Festina's multi-threaded output was then compared against
+the browser's, over the same tolerant 16x16 grid `draw_shapes.f`'s own
+runner uses (Cairo and Skia disagree about antialiasing on every circle,
+so exact bytes would only prove the two rasterizers are the same
+program) — same scene both times.
+
+Read the speedup column with the workload's own shape in mind: the four
+layers are NOT equal-sized (8,000/9,000/11,000/12,000 draws), so four
+threads finish in roughly however long the heaviest layer takes, not in
+a quarter of the single-threaded time — this measures what four
+genuinely independent, unevenly-loaded workers buy on real hardware, not
+an idealized 4x.
+<!-- LAYERED_RESULTS_END -->
