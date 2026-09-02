@@ -5,6 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Festina — a fast, simple language that compiles to native code</title>
 <meta name="description" content="Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, timers, and threads built in.">
+<link rel="canonical" href="https://festina.archtelos.com/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Festina">
+<meta property="og:title" content="Festina — a fast, simple language that compiles to native code">
+<meta property="og:description" content="Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, timers, and threads built in.">
+<meta property="og:url" content="https://festina.archtelos.com/">
+<meta property="og:image" content="https://festina.archtelos.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Festina — a fast, simple language that compiles to native code">
+<meta name="twitter:description" content="Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, timers, and threads built in.">
+<meta name="twitter:image" content="https://festina.archtelos.com/og-image.png">
 <meta name="theme-color" content="#7c1f1b">
 <meta name="color-scheme" content="light">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%237c1f1b'/%3E%3Crect x='4' y='4' width='56' height='56' fill='none' stroke='%2393731f' stroke-width='2'/%3E%3Ctext x='33' y='49' text-anchor='middle' font-family='Georgia, Times New Roman, serif' font-style='italic' font-weight='700' font-size='42' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
@@ -403,6 +416,34 @@
     .hero { padding: 56px 20px 40px; }
   }
 </style>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Festina",
+  "url": "https://festina.archtelos.com/",
+  "description": "Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, timers, threads, and an HTTP/WebSocket server built in.",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Linux, macOS, Windows",
+  "softwareVersion": "0.42",
+  "license": "https://github.com/uraikus/festina/blob/main/LICENSE",
+  "codeRepository": "https://github.com/uraikus/festina",
+  "programmingLanguage": "Festina",
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "Festina",
+  "url": "https://festina.archtelos.com/"
+}
+</script>
 </head>
 <body>
 
@@ -436,26 +477,30 @@
   </div>
 
   <div class="hero-code">
-    <pre class="code"><span class="kw">table</span> People {
+    <pre class="code"><span class="kw">table</span> Visits {
     id:<span class="kw">int</span>
-    name:<span class="kw">text</span>
+    place:<span class="kw">text</span>
 }
 
-<span class="kw">text func</span> greet(name:<span class="kw">text</span>) {
-    <span class="kw">return</span> <span class="str">`Hello, ${name}!`</span>
+sqlite(<span class="str">'INSERT INTO Visits (id, place) VALUES (?, ?)'</span>, [1, <span class="str">'the summit'</span>])
+<span class="kw">arr[Visits]</span> visits = sqlite(<span class="str">'SELECT * FROM Visits'</span>)
+
+<span class="kw">text func</span> describe(v:Visits) {
+    <span class="kw">return</span> <span class="str">`Visit #${v.id}: ${v.place}`</span>
 }
 
-log(greet(<span class="str">'Festina'</span>))</pre>
+log(describe(visits[0]))</pre>
 
     <div class="code-label">shell</div>
-    <pre class="code"><span class="mut">$</span> bin/festina compile examples/greet.f -o greet &amp;&amp; ./greet
-Hello, Festina!</pre>
+    <pre class="code"><span class="mut">$</span> bin/festina compile visits.f -o visits &amp;&amp; ./visits
+Visit #1: the summit</pre>
     <p class="section-intro" style="margin-top:8px;">
-      No imports. No config. No <code>main()</code>. Run this today —
-      <code>festina.sqlite</code> and the <code>People</code> table are
-      created and kept in sync automatically, the whole <code>festina</code>
-      runtime is one native binary, and it needs nothing Python or
-      JIT-shaped to execute.
+      No imports. No config. No <code>main()</code>, no ORM, no
+      migrations. Run this today — <code>festina.sqlite</code> and the
+      <code>Visits</code> table are created and kept in sync
+      automatically, a real parameterized query runs against it, the
+      whole <code>festina</code> runtime is one native binary, and it
+      needs nothing Python or JIT-shaped to execute.
     </p>
   </div>
 </section>
