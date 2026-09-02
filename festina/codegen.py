@@ -1917,6 +1917,20 @@ class CodeGen:
             "declare void @festina_image_draw_circle_color(ptr, i64, i64, i64, i64)",
             "declare void @festina_image_draw_circle_colors(ptr, i64, i64, i64, i64, i64)",
             "declare void @festina_image_draw_text(ptr, ptr, i64, i64)",
+            # claude.md #234 (uraikus/festina#93): an img's own transform/
+            # state stack, clears, and img.drawImage.
+            "declare void @festina_image_translate(ptr, i64, i64)",
+            "declare void @festina_image_rotate(ptr, double)",
+            "declare void @festina_image_scale(ptr, double, double)",
+            "declare void @festina_image_reset_transform(ptr)",
+            "declare void @festina_image_save_state(ptr)",
+            "declare void @festina_image_restore_state(ptr)",
+            "declare void @festina_image_clear(ptr)",
+            "declare void @festina_image_clear_rect(ptr, i64, i64, i64, i64)",
+            "declare void @festina_image_clear_circle(ptr, i64, i64, i64)",
+            "declare void @festina_image_clear_pixel(ptr, i64, i64)",
+            "declare void @festina_image_draw_image(ptr, ptr, i64, i64)",
+            "declare void @festina_image_draw_image_scaled(ptr, ptr, i64, i64, i64, i64)",
             "declare void @festina_image_free(ptr)",
             "declare i8 @festina_image_save(ptr, ptr)",
             "declare i8 @festina_image_save_copy(ptr, ptr)",
@@ -11637,6 +11651,41 @@ class CodeGen:
                             f"  call void @festina_image_draw_text(ptr {obj_val}, "
                             f"ptr {text}, i64 {x}, i64 {y})")
                         self._free_text_temp(expr.args[0], text, emitted[0][1], lines)
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return "0", None
+            # claude.md #234 (uraikus/festina#93): an img's own transform/
+            # state stack, clears, and img.drawImage -- see semantic.py's
+            # _IMAGE_LAYER_METHODS, which has already checked arity and
+            # types. Dispatched by arity exactly like the drawRect/...
+            # branch just above; each runtime entry point is the img-
+            # method counterpart of the same-named _CANVAS_OPS entry, and
+            # takes the receiver image first.
+            _IMAGE_LAYER_OPS = {
+                "translate": {2: ("festina_image_translate", ["i64", "i64"])},
+                "rotate": {1: ("festina_image_rotate", ["double"])},
+                "scale": {2: ("festina_image_scale", ["double", "double"])},
+                "resetTransform": {0: ("festina_image_reset_transform", [])},
+                "saveState": {0: ("festina_image_save_state", [])},
+                "restoreState": {0: ("festina_image_restore_state", [])},
+                "clear": {0: ("festina_image_clear", [])},
+                "clearRect": {4: ("festina_image_clear_rect", ["i64"] * 4)},
+                "clearCircle": {3: ("festina_image_clear_circle", ["i64"] * 3)},
+                "clearPixel": {2: ("festina_image_clear_pixel", ["i64"] * 2)},
+                "drawImage": {3: ("festina_image_draw_image", ["ptr", "i64", "i64"]),
+                              5: ("festina_image_draw_image_scaled", ["ptr"] + ["i64"] * 4)},
+            }
+            if callee.prop in _IMAGE_LAYER_OPS:
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ImageType):
+                    emitted = [self._emit_expr(a, env, lines) for a in expr.args]
+                    fn, arg_irs = _IMAGE_LAYER_OPS[callee.prop][len(expr.args)]
+                    sig = "".join(f", {ty} {v}" for ty, (v, _) in zip(arg_irs, emitted))
+                    lines.append(f"  call void @{fn}(ptr {obj_val}{sig})")
+                    if callee.prop == "drawImage":
+                        # An owning SOURCE (a clip()/blankImage() result
+                        # passed straight in) is done with once painted --
+                        # the same release an owning receiver gets.
+                        self._release_owned_receiver(expr.args[0], emitted[0][0], emitted[0][1], lines)
                     self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return "0", None
             # claude.md #38: music.play() / music.stop() / music.isPlaying()

@@ -9,6 +9,51 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.42] - 2026-09-02
+
+### Added
+
+- **An `img` is now a self-contained drawing target** (uraikus/festina#93)
+  -- three groups of methods mirroring the canvas calls name-for-name,
+  each touching only the image it is called on (so they work from a
+  worker thread too):
+  - **A per-image transform and state stack:** `img.translate(dx, dy)`,
+    `img.rotate(degrees)`, `img.scale(sx, sy)`, `img.resetTransform()`,
+    `img.saveState()`, `img.restoreState()`. Identity from creation,
+    independent of the canvas's transform, applied to everything drawn,
+    cleared or composited onto that image. The stack holds the image's
+    transform only; style state stays with the canvas's `saveState()`.
+  - **Clearing to transparent:** `img.clear()`, `img.clearRect(x, y, w,
+    h)`, `img.clearCircle(x, y, r)`, `img.clearPixel(x, y)` -- alpha 0,
+    so a later draw underneath shows through. `clear()` ignores the
+    transform like `clearCanvas()`; the region forms honour it.
+  - **Compositing:** `img.drawImage(src, x, y)` and `img.drawImage(src,
+    x, y, w, h)` -- through the destination's transform, honouring
+    `fillAlpha`; drawing an image onto itself copies it first.
+
+  A layer can now be painted in place -- a rotated brush stroke, an
+  eraser, a tiled background, a swayed sprite stamp -- instead of being
+  bounced through the canvas (`clearCanvas`, `drawImage` in, draw,
+  `saveCanvas`, `clip`) at two window-sized copies per stamp.
+
+### Fixed
+
+- The per-call colour forms (`drawRect(..., color[, border])`,
+  `drawCircle(..., color[, border])`, `drawPixel(..., color)`, canvas
+  and `img` alike) no longer write the global fill/border state around
+  each call -- a data race when a worker thread painted its own layer
+  with them while main drew anything with a colour of its own. Same
+  results, computed locally.
+
+### Documentation
+
+- api.md's Images table lists every `img` method (including the
+  `getPixelColor` row it was missing and `drawCircle`'s colour forms),
+  with a new "An image as a layer" section; `examples/layers.f` uses
+  `.clear()` and a per-image transform for its HUD layer.
+
+See claude.md #234.
+
 ## [0.41] - 2026-09-02
 
 ### Fixed

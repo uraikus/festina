@@ -359,3 +359,56 @@ class TestSetClientSize:
         program = parser.parse(f"{name}('400')")
         with pytest.raises(errors.CompileError, match=name):
             semantic.analyze(program)
+
+
+class TestImageLayerMethods:
+    """claude.md #234 (uraikus/festina#93): translate/rotate/scale/
+    resetTransform/saveState/restoreState, clear/clearRect/clearCircle/
+    clearPixel, and drawImage as methods on img -- the canvas calls
+    name-for-name, with the same argument shapes. Semantic-level only;
+    tests/test_codegen.py::TestImageLayerOps reads real pixels back."""
+
+    @pytest.mark.parametrize("call", [
+        "s.translate(1, 2)", "s.rotate(45.0)", "s.scale(2.0, 0.5)",
+        "s.resetTransform()", "s.saveState()", "s.restoreState()",
+        "s.clear()", "s.clearRect(0, 0, 4, 4)", "s.clearCircle(2, 2, 1)",
+        "s.clearPixel(1, 1)", "s.drawImage(t, 0, 0)", "s.drawImage(t, 0, 0, 8, 8)",
+    ])
+    def test_each_method_analyzes(self, parser, semantic, call):
+        program = parser.parse(f"img s = blankImage(4, 4)\nimg t = blankImage(2, 2)\n{call}")
+        semantic.analyze(program)
+
+    def test_rotate_and_scale_take_floats_like_the_canvas_versions(self, parser, semantic, errors):
+        for call in ["s.rotate(45)", "s.scale(2, 2)"]:
+            program = parser.parse(f"img s = blankImage(4, 4)\n{call}")
+            with pytest.raises(errors.CompileError, match="expects float"):
+                semantic.analyze(program)
+
+    def test_all_are_allowed_inside_a_thread_body(self, parser, semantic):
+        # Each touches only the one private image it's called on -- the
+        # same reason every other img method is allowed in a thread
+        # (api.md's "Isolation: what a thread body may and may not do").
+        program = parser.parse("""
+        thread painter {
+            on message(t:thread, n:int) {
+                img layer = blankImage(16, 16)
+                layer.saveState()
+                layer.translate(8, 8)
+                layer.rotate(30.0)
+                layer.scale(1.5, 1.5)
+                layer.drawRect(-2, -2, 4, 4)
+                layer.restoreState()
+                layer.clearCircle(8, 8, 2)
+                layer.drawImage(layer, 1, 1)
+                layer.clear()
+                layer.resetTransform()
+            }
+        }
+        painter.postMessage(1)
+        """)
+        semantic.analyze(program)
+
+    def test_a_bare_method_name_says_to_call_it(self, parser, semantic, errors):
+        program = parser.parse("img s = blankImage(4, 4)\nlog(s.clearRect)")
+        with pytest.raises(errors.CompileError, match="is a method on img"):
+            semantic.analyze(program)
