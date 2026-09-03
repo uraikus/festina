@@ -46,7 +46,7 @@
     <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
     <nav class="toc" id="toc">
       <div class="nav-group">
-        <a href="#try-catch-throw-unavailable">try/catch/throw is unavailable</a>
+        <a href="#try-catch-throw-unavailable">try/catch/throw works</a>
         <a href="#gated-on-real-hardware">Gated on real hardware</a>
         <a href="#porting-surface">Porting surface</a>
         <a href="#toolchain">Toolchain</a>
@@ -71,30 +71,21 @@
       </p>
 
       <section class="doc-section" id="try-catch-throw-unavailable">
-        <h2><code>try</code>/<code>catch</code>/<code>throw</code> is unavailable <a class="anchor" href="#try-catch-throw-unavailable">#</a></h2>
+        <h2><code>try</code>/<code>catch</code>/<code>throw</code> works (since 0.43) <a class="anchor" href="#try-catch-throw-unavailable">#</a></h2>
         <p>
-          <code>__builtin_longjmp</code> (which <code>festina_throw</code>
-          uses) is rejected by clang for <code>arm64-apple-macos14</code>
-          — the architecture every current Mac and every macOS CI runner
-          is. LLVM's AArch64 backend has no SjLj lowering at all, the
-          same gap <code>wasm32-wasi</code>'s backend has.
-          <code>try</code>/<code>catch</code>/<code>throw</code> is
-          rejected outright at compile time on darwin
-          (<code>festina/cli.py</code>'s
-          <code>_check_darwin_try_supported</code>) — this is not a
-          hardware-verification gate like audio/graphics below; the
-          backend genuinely doesn't support it. See
-          <a href="api.html#try-catch-throw">api.md</a>'s own
-          Limitations note.
-        </p>
-        <p>
-          <code>.toStruct()</code>/<code>.toArr()</code> are
-          <em>not</em> caught by that gate — their partial-parse
-          cleanup is plain runtime C, not a catch frame (an earlier
-          revision had briefly made them trip it, which showed up on
-          the macOS CI job only as 21 extra silent skips): they compile
-          and run here, and a parse failure ends the program the way
-          any uncaught <code>throw</code> does.
+          Earlier versions rejected <code>try</code>/<code>catch</code>/<code>throw</code>
+          outright on darwin: generated code called LLVM's SjLj
+          intrinsics, which have no lowering for AArch64
+          (<code>arm64-apple-macos14</code> — every current Mac and
+          every macOS CI runner). A <code>try</code> is a direct call
+          to libc's own <code>_setjmp</code> now, and a
+          <code>throw</code> is libc's <code>longjmp</code>, which
+          Darwin has always had — the CI job runs a real caught throw
+          (<code>tests/<wbr>test_platform.py<wbr>::TestOnMacOS<wbr>::test_try_catch_works</code>).
+          Nothing about <code>try</code>/<code>catch</code> is gated or
+          macOS-specific any more; see
+          <a href="api.html#try-catch-throw">api.md</a> for the feature
+          itself.
         </p>
       </section>
 

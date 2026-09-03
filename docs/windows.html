@@ -198,14 +198,23 @@
           "no display available" error don't apply on Windows at all
           (<code>windows-latest</code> always has a live desktop
           session) and are skipped there rather than asserting a
-          condition that cannot occur. What remains open is narrower:
-          this project's test suite has no Windows equivalent of the
-          Xvfb-backed <code>x_display</code>/<code>xdotool</code>
-          fixtures the windowed-input tests (click/key/resize/close
-          coverage) run under, so automated confirmation that
-          keyboard/mouse/resize/close behave identically to Linux
-          against the pinned event vocabulary awaits either new
-          Windows-native test infrastructure or real hardware.
+          condition that cannot occur. Windowed <em>input</em> is
+          driven on that job too:
+          <code>tests/<wbr>test_platform.py<wbr>::TestOnWindowsWindow</code>
+          finds the program's window by its class name through
+          <code>ctypes</code> and posts the same Win32 messages a
+          mouse, a keyboard and the window manager would —
+          <code>WM_LBUTTONDOWN</code>/<code>UP</code>,
+          <code>WM_KEYDOWN</code>/<code>UP</code>, a
+          <code>MoveWindow</code> resize, <code>WM_CLOSE</code> —
+          asserting every handler in the pinned event vocabulary
+          (<code>mouseDown</code>/<code>mouseUp</code> with
+          coordinates and button, <code>keyDown</code>/<code>keyUp</code>
+          with the key name, <code>resize</code> with the new client
+          size, <code>close</code>) against the program's own output;
+          the Windows counterpart of the Xvfb-backed
+          <code>x_display</code>/<code>xdotool</code> fixtures the
+          Linux suite uses.
         </p>
       </section>
 

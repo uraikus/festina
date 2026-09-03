@@ -46,6 +46,8 @@
     <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
     <nav class="toc" id="toc">
       <div class="nav-group">
+        <a href="#v0-44">0.44 — 2026-09-02</a>
+        <a href="#v0-43">0.43 — 2026-09-02</a>
         <a href="#v0-42">0.42 — 2026-09-02</a>
         <a href="#v0-41">0.41 — 2026-09-02</a>
         <a href="#v0-40">0.40 — 2026-09-01</a>
@@ -113,6 +115,44 @@
         implementation record predating 0.1 lives in
         <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>.
       </p>
+
+      <section class="doc-section" id="v0-44">
+        <h2><span class="version-badge">0.44</span><span class="version-date">2026-09-02</span> <a class="anchor" href="#v0-44">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>drawImage</code> accepts an <code>img?</code> source.</strong> Every form of the canvas <code>drawImage(...)</code> and of <code>img.drawImage(...)</code> takes a manually-managed <code>img?</code> where it says <code>img</code> — compositing only reads the source for the duration of the call and keeps no reference, so nothing changes hands. A layer painted by a worker thread can now be drawn straight onto the canvas with no <code>clip()</code> copy first. This is the one read-only exception to <code>T?</code> being a distinct type; assignment and every other call site are unchanged.</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong>Solid shapes are drawn without a rasterizer.</strong> An opaque flat-colour <code>drawRect</code>/<code>drawCircle</code>/<code>drawPixel</code> at an integer position (no <code>fillAlpha</code> below 1, gradient, border, scale or rotation) is written straight into the pixels, on the canvas and on an <code>img</code> alike; circles come from a per-radius coverage mask Cairo rasterizes once, blended with pixman's own arithmetic so the result is byte-identical to before. The canvas benchmark's 40,000-shape frame went from 35 ms to 7 ms; the layered-canvas benchmark's four <code>img?</code> layers from 84 ms to 8 ms on one thread. Everything outside that contract still goes through Cairo unchanged. <code>FESTINA_NO_DIRECT_FILL=1</code> switches the direct path off.</li>
+          <li><strong>Fresh image surfaces are faulted in when created</strong>, not one page at a time on first touch — the reason four threads painting four new <code>img?</code> layers ran no faster than one (first-touch page faults serialize across a process's threads). The layered benchmark's four-thread run went from 62 ms to 7 ms.</li>
+          <li><code>img.clip()</code>, <code>saveCanvas()</code>-to-<code>img</code> and <code>img.resize()</code> copy their source with Cairo's SOURCE operator instead of blending it OVER a transparent surface: the same pixels, a straight copy.</li>
+          <li>The per-call colour form of <code>drawCircle</code> now produces exactly the same pixels as the <code>fillStyle()</code> form (it used to tessellate where the plain form stamped a cached mask, 1/255 apart on a few edge pixels at larger radii).</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-43">
+        <h2><span class="version-badge">0.43</span><span class="version-date">2026-09-02</span> <a class="anchor" href="#v0-43">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>A compiled <code>.wasm</code> runs in a browser tab.</strong> <code>runtime/wasm/</code> ships a dependency-free WASI Preview 1 host of this project's own (<code>festina_wasi_browser.js</code>), a Web Worker that runs a program on it, and <code>browser.html?wasm=program.wasm</code>, the smallest page that does — stdout/stderr stream into the page and <code>window.festinaResult</code> holds the exit code, output and every file the program wrote to its in-memory sandbox. <code>node runtime/wasm/run_wasi_js.mjs</code> runs the same host outside a browser. Tested through the host under Node and in headless Chromium (files, directories, SQLite, timers, <code>argv</code>, exit codes). See <a href="wasm.html#in-a-browser">wasm.md's "In a browser"</a>.</li>
+          <li><strong>The Windows CI job drives a real window</strong>: a new test finds the compiled program's Win32 window and posts mouse, keyboard, resize and close messages to it, asserting every input handler's output.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong><code>try</code>/<code>catch</code>/<code>throw</code> works on macOS, and no longer crashes after a catch on Windows.</strong> A <code>try</code> is a direct call to libc's own <code>setjmp</code> now and a <code>throw</code> is libc's <code>longjmp</code>, replacing LLVM's SjLj intrinsics — which have no AArch64 lowering (macOS rejected <code>try</code> outright) and a broken x86_64 Windows one (the catch ran, then every local read as garbage). wasm32-wasi is the one target left without it (wasi-libc has no setjmp/longjmp). AddressSanitizer can instrument a <code>try</code>/<code>catch</code> program now, too.</li>
+          <li>On Windows, a program whose only listening port belongs to a <code>thread</code> no longer exits the moment its top-level code finishes (<code>WSAPoll</code> rejects an empty fd set where POSIX <code>poll</code> sleeps).</li>
+          <li>On Windows, <code>blob.append()</code> is an atomic append (<code>FILE_APPEND_DATA</code>), so two threads appending to one file no longer overwrite each other's bytes.</li>
+          <li>The Windows CI job is green: the four remaining failures were tests assuming <code>/bin/sh</code>, <code>/bin/echo</code> or <code>apt</code> exist, fixed in the tests.</li>
+          <li><strong>A <code>throw</code> no longer leaks the locals of the functions it unwinds through.</strong> A function that merely called something which eventually threw — no <code>try</code> or <code>throw</code> of its own — used to skip its scope-exit cleanup entirely (the one documented leak of the try/throw mechanism). In a program containing a <code>try</code>, every managed local is now registered on the runtime's per-thread cleanup stack as it is bound, and every call site's owning argument temporaries for the duration of the call; a <code>throw</code> releases everything above the catching <code>try</code>, newest first. 0 bytes leaked under AddressSanitizer and Valgrind through three frames, every kind of local, a rethrow and a JSON failure. A program with no <code>try</code> is unchanged; one with a <code>try</code> pays about 8 ns per managed local binding.</li>
+          <li>The JSON nesting cap is the parser's own (1000 levels) rather than a side effect of the cleanup stack's size: <code>JSON nested too deeply (more than 1000 levels)</code>.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #235-#238</a>.</p>
+      </section>
 
       <section class="doc-section" id="v0-42">
         <h2><span class="version-badge">0.42</span><span class="version-date">2026-09-02</span> <a class="anchor" href="#v0-42">#</a></h2>

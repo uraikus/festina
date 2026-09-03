@@ -1578,7 +1578,12 @@ setClientHeight(768)
           without a separate <code>.clip()</code> call first. A source
           region reaching past the image's own edge behaves like
           <code>.clip()</code>'s own: the overlap is drawn, the rest is
-          simply not there.
+          simply not there. All three forms (and both
+          <code>img.drawImage</code> forms) also accept a
+          manually-managed <code>img?</code> as the source —
+          compositing only reads it, so a layer a worker thread painted
+          can be drawn directly, with no <code>clip()</code> copy first
+          (see <a href="#t-manually-managed-values"><code>T?</code></a>).
         </p>
         <p>
           <code>blankImage(w, h)</code> returns a fresh, fully-transparent
@@ -2120,6 +2125,26 @@ drawRect(0, 0, 20, 20)        <span class="cm">// brand</span>
 drawRect(30, 0, 20, 20, line) <span class="cm">// line, just this once</span>
 drawRect(60, 0, 20, 20)       <span class="cm">// brand again</span></pre>
         <p class="muted"><code>borderColor</code>/<code>lineWidth</code> still apply as configured either way — only the fill is a per-call override, not the border.</p>
+        <div class="callout">
+          <strong>The common case never touches a rasterizer.</strong>
+          An opaque flat-colour <code>drawRect</code>,
+          <code>drawCircle</code> or <code>drawPixel</code> at an
+          integer position — no <code>fillAlpha</code> below 1, no
+          gradient, no border, no <code>scale</code>/<code>rotate</code>,
+          at most a whole-pixel <code>translate</code> — is written
+          straight into the pixels, on the canvas and on an
+          <code>img</code> alike (circles from a per-radius coverage
+          mask that Cairo rasterizes once). The pixels are
+          byte-identical to what the Cairo path produces; it is just
+          several times faster, which is what makes a frame of
+          thousands of shapes cheap (see
+          <a href="benchmark.html#canvas">benchmark.md</a>). Anything
+          outside that contract goes through Cairo exactly as before.
+          <code>FESTINA_NO_DIRECT_FILL=1</code> in the environment
+          switches the direct path off for a whole program — the test
+          suite uses it to check the two agree, and it is the escape
+          hatch should they ever not on some platform.
+        </div>
         <div class="callout">
           <strong>Colors and fonts must be declared.</strong> Anything
           other than raw RGB numbers has to be a <code>color</code> or
@@ -3125,6 +3150,24 @@ Circle? alias = plain             <span class="cm">// error: cannot assign value
           <code>T?</code>-declared parameter) — the fresh-construction
           allowance only ever applies at the birth point.
         </p>
+        <p>
+          <strong>One read-only exception: <code>drawImage</code>
+          accepts an <code>img?</code> source.</strong> Every form of
+          the canvas <code>drawImage(...)</code> and of
+          <code>img.drawImage(...)</code> takes an <code>img?</code>
+          where it says <code>img</code>, because compositing only
+          <em>reads</em> the source for the duration of the call and
+          keeps no reference to it — nothing changes hands, so there is
+          nothing for the no-conversion rule to protect. That is what
+          lets a layer painted by a worker thread be drawn straight
+          onto the canvas (or onto another image) with no
+          <code>clip()</code> copy in between:
+        </p>
+        <pre class="code"><span class="kw">img?</span> layer = blankImage(800, 600)
+Painter.postMessage(layer)        <span class="cm">// a thread paints into it</span>
+Painter.drain()
+drawImage(layer, 0, 0)            <span class="cm">// composited directly, no copy</span>
+<span class="kw">free</span> layer                        <span class="cm">// still yours to release</span></pre>
         <div class="callout">
           <strong><code>free</code>/<code>delete</code> work on a
           <code>T?</code> value exactly as documented above</strong> —
@@ -4318,46 +4361,55 @@ log(<span class="str">'still running'</span>)</pre>
           whatever <code>try</code> encloses <em>that</em>.
         </p>
         <div class="callout">
-          <strong>One real, honest limitation.</strong>
+          <strong>A throw leaks nothing on its way out (0.43).</strong>
           <code>throw</code> unwinds by jumping directly to the catching
           <code>try</code> (not by returning normally through every call
-          frame in between), so a local declared in the function that
-          <em>directly</em> contains the <code>throw</code> is always
-          freed correctly — no different from an early
-          <code>return</code> from that same function. But a function
-          that merely <em>calls</em> something which eventually throws,
-          without itself containing a <code>throw</code> or a
-          <code>try</code>, never gets the chance to run any of its own
-          cleanup: whatever <code>struct</code>/<code>arr</code>/<code>map</code>/<code>text</code>/etc.
-          locals it declared leak. This is a leak, never a crash or
-          corrupted state — confirmed directly (not just reasoned
-          about) via Valgrind: 0 bytes leaked throwing from the
-          function a <code>try</code> calls directly, and 0 bytes
-          leaked one level deeper still; a real, reproducible leak, one
-          allocation per call, the moment a genuine <em>intermediate</em>
-          frame sits between the <code>try</code> and the actual
-          <code>throw</code>. Keep whatever a <code>try</code>-adjacent
-          call chain allocates minimal, or accept the same class of
-          leak this language already accepts elsewhere.
+          frame in between), which used to mean that a function which
+          merely <em>called</em> something that eventually threw — no
+          <code>throw</code> or <code>try</code> of its own — never ran
+          its scope-exit cleanup, and its
+          <code>struct</code>/<code>arr</code>/<code>map</code>/<code>text</code>/etc.
+          locals leaked. Not any more: in a program that contains a
+          <code>try</code> anywhere, every managed local is registered
+          on a per-thread <em>cleanup stack</em> in the runtime as it is
+          bound (the same stack <code>.toStruct()</code>/<code>.toArr()</code>
+          already use for their half-built values), and a
+          <code>throw</code> releases every entry above the catching
+          <code>try</code>, newest first — the throwing function's own
+          locals, every intermediate frame's, the argument temporaries
+          each call site on the chain was holding for its callee (a
+          literal <code>[1, 2, 3]</code>, a template text, a call
+          result), and a catch variable of a frame that rethrows.
+          Measured under AddressSanitizer and Valgrind: 0 bytes leaked
+          across every kind of local, through three frames, a
+          loop-body local, an escaping parameter, a rethrow and a JSON
+          parse failure two frames down. A program with no
+          <code>try</code> pays nothing (its generated code is
+          unchanged: a <code>throw</code> there is <code>fail()</code>);
+          one with a <code>try</code> pays one runtime call per managed
+          local binding plus one per scope exit — about 8 ns per
+          binding, measured as roughly a third more on a function that
+          binds a text, two arrays and a struct and does nothing else
+          (2 million calls: 0.25 s to 0.33 s), and lost in the noise on
+          anything that does real work with them.
         </div>
         <p class="muted">
-          <strong>Not available under <code>--target=wasm32-wasi</code>,
-          or on macOS.</strong> WASI has no setjmp/longjmp support at
-          all — rejected at compile time; see
-          <a href="wasm.html">wasm.md</a>.
-          macOS is the same story for a different reason: LLVM's
-          AArch64 backend (Apple Silicon, what every current Mac runs
-          on) has no SjLj lowering either, so
-          <code>try</code>/<code>catch</code>/<code>throw</code>
-          anywhere in a program is rejected outright at compile time
-          there too, no override. A program that never writes
-          <code>try</code>/<code>catch</code>/<code>throw</code> is
-          completely unaffected on macOS (a
+          <strong>Not available under <code>--target=wasm32-wasi</code>.</strong>
+          wasi-libc has no setjmp/longjmp support at all — rejected at
+          compile time; see <a href="wasm.html">wasm.md</a>. A program
+          that never writes <code>try</code>/<code>catch</code>/<code>throw</code>
+          is completely unaffected there (a
           <code>.toStruct()</code>/<code>.toArr()</code> parse failure,
           for example, still behaves exactly like the documented "no
           enclosing try" case above — prints and exits(1) — since that
           was always the fallback for an uncaught throw anyway); what's
-          actually unavailable there is catching one.
+          actually unavailable is catching one. Every native target —
+          Linux, macOS and Windows — has it: a <code>try</code> is a
+          direct call to libc's own <code>setjmp</code> and a
+          <code>throw</code> is libc's <code>longjmp</code> (earlier
+          versions used LLVM's SjLj intrinsics, which have no AArch64
+          lowering — so macOS rejected <code>try</code> outright — and
+          a broken x86_64 Windows one).
         </p>
       </section>
 
@@ -4455,12 +4507,12 @@ log(head.next.next.n)   <span class="cm">// 3</span></pre>
           of them, newest first, on its way to the catching
           <code>try</code>. This is plain runtime C — no
           <code>setjmp</code> of its own — which is why JSON parsing
-          works under <code>--target=wasm32-wasi</code> and on macOS
-          even though <code>try</code>/<code>catch</code> itself does
-          not (an uncaught parse failure there simply ends the program
-          the way any uncaught <code>throw</code> does). The same stack
-          bounds how deep a self-referencing struct may nest (1024
-          builder levels); input deeper than that <em>throws</em>
+          works under <code>--target=wasm32-wasi</code> even though
+          <code>try</code>/<code>catch</code> itself does not (an
+          uncaught parse failure there simply ends the program the way
+          any uncaught <code>throw</code> does). The same stack bounds
+          how deep a self-referencing struct may nest (1000 builder
+          levels); input deeper than that <em>throws</em>
           <code>JSON nested too deeply</code> instead of exhausting the
           C stack, the same protection an unknown field's skipped value
           already had. Verified under Valgrind across a flat struct, a
@@ -4468,15 +4520,14 @@ log(head.next.next.n)   <span class="cm">// 3</span></pre>
           self-referencing struct, malformed syntax, a duplicate
           <code>text</code> key whose second value fails, trailing data
           after a complete value, and 2000-level nesting — 0 bytes lost
-          and 0 invalid frees. Valgrind rather than
-          <code>scripts/leak_stress.sh</code> (AddressSanitizer) only
-          because the <em>test program's</em> own
-          <code>try</code>/<code>catch</code> is built on
-          <code>llvm.eh.sjlj.setjmp</code>, which ASan cannot
-          instrument through in this environment (confirmed: even a
-          plain <code>try</code>/<code>catch</code> program with no
-          JSON involved crashes with SIGILL under
-          <code>-fsanitize=address</code>).
+          and 0 invalid frees (<code>tests/<wbr>valgrind_stress/<wbr>json_parse_fail_churn.f</code>,
+          run by <code>scripts/valgrind_stress.sh</code>; since 0.43
+          the same program also runs clean under
+          <code>scripts/leak_stress.sh</code>'s AddressSanitizer build
+          — the Valgrind tier originally existed only because ASan
+          could not instrument through the LLVM SjLj intrinsics
+          <code>try</code> used to be built on, which 0.43 replaced
+          with libc's own <code>setjmp</code>/<code>longjmp</code>).
         </p>
       </section>
 
