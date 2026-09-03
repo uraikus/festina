@@ -195,7 +195,7 @@ _Last run: 2026-09-01 on this machine -- see benchmark.md's "Methodology" sectio
 ## Canvas: Festina vs an HTML `<canvas>` vs MonoGame
 
 <!-- CANVAS_RESULTS_START -->
-_Last run: 2026-09-01 on this machine. Chromium 141.0.7390.37._
+_Last run: 2026-09-02 on this machine. Chromium 141.0.7390.37._
 
 20,000 filled rectangles and 20,000 filled circles, fill colour changed
 between every shape, into an 800x600 surface. Both sides draw
@@ -207,9 +207,9 @@ which documents what each one cost when it was measured the other way.
 
 | | Frame (min) | Frame (median) | First frame |
 |---|---|---|---|
-| Festina (Cairo) | 35 ms | 37 ms | 25 ms (process start + PNG encode) |
-| HTML `<canvas>` (Chromium/Skia) | 68 ms | 108 ms | 1279 ms (browser launch) |
-| MonoGame (SpriteBatch, **software** GL) | 231 ms | 237 ms | 177 ms (.NET runtime + GL context) |
+| Festina | 7 ms | 8 ms | 21 ms (process start + PNG encode) |
+| HTML `<canvas>` (Chromium/Skia) | 65 ms | 67 ms | 258 ms (browser launch) |
+| MonoGame (SpriteBatch, **software** GL) | 172 ms | 188 ms | 162 ms (.NET runtime + GL context) |
 
 > **The MonoGame row needs its caveat read before its number.**
 > MonoGame is a GPU framework, and this machine has no GPU — its GL
@@ -231,9 +231,9 @@ which documents what each one cost when it was measured the other way.
 > not as a figure precise to the millisecond the way the other two
 > rows are.
 
-On this workload **Festina draws it 1.9x faster**.
+On this workload **Festina draws it 9.3x faster**.
 
-That took one change, and finding it took measuring rather than
+That took two changes, and finding each took measuring rather than
 guessing. The first version of this benchmark had Festina 1.4x SLOWER,
 and the obvious culprit -- a fresh Cairo context per draw call -- turned
 out to account for 4 ms of 90. Splitting the frame by shape type found
@@ -242,14 +242,29 @@ circles cost 76 ms, because `cairo_arc` + `cairo_fill` tessellates the
 curve into Beziers and scan-converts a general polygon every single
 time. Rasterizing each radius once into an alpha mask and stamping it
 thereafter -- what a glyph cache does -- took circles to 20 ms and the
-frame from 90 ms to 31 ms (claude.md #104). The remaining split is
-11 ms of rectangles, 20 ms of circles, and setting the fill colour
-20,000 times is too cheap to measure.
+frame from 90 ms to 31 ms (claude.md #104), leaving 11 ms of rectangles
+and 20 ms of circles.
+
+The second change (claude.md #240) noticed that neither of those needs
+a rasterizer at all. An opaque flat-colour rectangle at integer
+coordinates covers whole pixels, so its result is the colour written
+into each of them; an opaque circle's per-pixel coverage is the same
+for every circle of that radius, so Cairo rasterizes it once and the
+runtime blends it by hand thereafter with pixman's own 8-bit
+arithmetic. Every such call now writes straight into the ARGB32 pixels
+-- no context, path, compositor dispatch or pixman call per shape -- and
+the pixels are byte-identical to what Cairo's mask stamp produced
+(verified by drawing the same scene both ways, not by eye). That took
+20,000 rectangles from 11 ms to 2 ms and 20,000 circles from 20 ms to
+6 ms. Setting the fill colour 20,000 times is still too cheap to
+measure. Anything the contract does not cover -- a translucent fill, a
+gradient, a border, a scaled or rotated canvas -- still goes through
+Cairo exactly as before.
 
 Two things are worth reading alongside the headline. The browser's frame
-time is far noisier -- 68 ms at best against a 108 ms median here, and
+time is far noisier -- 65 ms at best against a 67 ms median here, and
 the median moves by 20+ ms between runs of this same script, while
-Festina's two numbers (35 and 37 ms) sit on top of each other. For a
+Festina's two numbers (7 and 8 ms) sit on top of each other. For a
 frame budget, predictability is not a footnote. And getting to the
 *first* frame differs by more than an order of magnitude in the same
 direction, because one side starts a process and the other starts a
@@ -497,10 +512,10 @@ for the rest of what makes this comparison fair, the same three rules
 
 | | Single-threaded | 4 threads/Workers | Speedup |
 |---|---|---|---|
-| Festina (Cairo, `img?`) | 84 ms (median 85 ms) | 62 ms (median 65 ms) | 1.35x |
-| Browser (Skia, OffscreenCanvas) | 61 ms (median 69 ms) | 52 ms (median 66 ms) | 1.18x |
+| Festina (`img?`) | 8 ms (median 9 ms) | 7 ms (median 8 ms) | 1.14x |
+| Browser (Skia, OffscreenCanvas) | 115 ms (median 121 ms) | 45 ms (median 49 ms) | 2.57x |
 
-On this workload, both multi-threaded, **the browser's Workers draw it 1.2x faster**.
+On this workload, both multi-threaded, **Festina's threads draw it 6.4x faster**.
 
 Two outputs were checked, not one. Festina's multi-threaded run was
 compared against its OWN single-threaded run **byte-for-byte** — Cairo
@@ -512,10 +527,31 @@ runner uses (Cairo and Skia disagree about antialiasing on every circle,
 so exact bytes would only prove the two rasterizers are the same
 program) — same scene both times.
 
-Read the speedup column with the workload's own shape in mind: the four
+Read the speedup column with the workload's own shape in mind. The four
 layers are NOT equal-sized (8,000/9,000/11,000/12,000 draws), so four
 threads finish in roughly however long the heaviest layer takes, not in
 a quarter of the single-threaded time — this measures what four
 genuinely independent, unevenly-loaded workers buy on real hardware, not
-an idealized 4x.
+an idealized 4x. And on the Festina side the parallel part is now
+small: after claude.md #240 the 40,000 draw calls take about 4 ms on
+one thread, so the ~4 ms of serial work both runs share — four
+full-surface `clip()` copies to turn each `img?` back into a plain
+`img`, then four composites onto the canvas — is roughly half of either
+number, and no amount of threading touches it.
+
+When this benchmark was first written (claude.md #239) Festina drew it
+in 84 ms single-threaded and 62 ms with four threads, and the browser's
+Workers were 1.2x faster than Festina's threads. Measuring where those
+62 ms went found two things (claude.md #240). Circles onto an `img` were
+tessellated by Cairo on every call, 32–40 ms per layer; they are now
+stamped from a cached per-radius coverage mask, blended directly into
+the pixels, and byte-identical. And the four threads were not running
+in parallel at all: each painted a freshly allocated 1.92 MB surface,
+and the page faults that materialize fresh memory on first touch
+serialize across threads inside one process, so four threads' worth of
+faults took four threads' worth of time — every layer finished in the
+11–12 ms a single thread needed for all four. Surfaces are now faulted
+in when created (one `madvise` on Linux), which took the four-thread
+draw from 12 ms to 3.4 ms in an isolated reproduction and is what the
+table above reflects.
 <!-- LAYERED_RESULTS_END -->

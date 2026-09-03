@@ -441,7 +441,7 @@ for the rest of what makes this comparison fair, the same three rules
 
 | | Single-threaded | 4 threads/Workers | Speedup |
 |---|---|---|---|
-| Festina (Cairo, `img?`) | {fs_min:.0f} ms (median {fs_med:.0f} ms) | {fm_min:.0f} ms (median {fm_med:.0f} ms) | {fest_speedup:.2f}x |
+| Festina (`img?`) | {fs_min:.0f} ms (median {fs_med:.0f} ms) | {fm_min:.0f} ms (median {fm_med:.0f} ms) | {fest_speedup:.2f}x |
 | Browser (Skia, OffscreenCanvas) | {bs_min:.0f} ms (median {bs_med:.0f} ms) | {bm_min:.0f} ms (median {bm_med:.0f} ms) | {browser_speedup:.2f}x |
 
 On this workload, both multi-threaded, **{verdict}**.
@@ -456,12 +456,33 @@ runner uses (Cairo and Skia disagree about antialiasing on every circle,
 so exact bytes would only prove the two rasterizers are the same
 program) — same scene both times.
 
-Read the speedup column with the workload's own shape in mind: the four
+Read the speedup column with the workload's own shape in mind. The four
 layers are NOT equal-sized (8,000/9,000/11,000/12,000 draws), so four
 threads finish in roughly however long the heaviest layer takes, not in
 a quarter of the single-threaded time — this measures what four
 genuinely independent, unevenly-loaded workers buy on real hardware, not
-an idealized 4x.
+an idealized 4x. And on the Festina side the parallel part is now
+small: after claude.md #240 the 40,000 draw calls take about 4 ms on
+one thread, so the ~4 ms of serial work both runs share — four
+full-surface `clip()` copies to turn each `img?` back into a plain
+`img`, then four composites onto the canvas — is roughly half of either
+number, and no amount of threading touches it.
+
+When this benchmark was first written (claude.md #239) Festina drew it
+in 84 ms single-threaded and 62 ms with four threads, and the browser's
+Workers were 1.2x faster than Festina's threads. Measuring where those
+62 ms went found two things (claude.md #240). Circles onto an `img` were
+tessellated by Cairo on every call, 32–40 ms per layer; they are now
+stamped from a cached per-radius coverage mask, blended directly into
+the pixels, and byte-identical. And the four threads were not running
+in parallel at all: each painted a freshly allocated 1.92 MB surface,
+and the page faults that materialize fresh memory on first touch
+serialize across threads inside one process, so four threads' worth of
+faults took four threads' worth of time — every layer finished in the
+11–12 ms a single thread needed for all four. Surfaces are now faulted
+in when created (one `madvise` on Linux), which took the four-thread
+draw from 12 ms to 3.4 ms in an isolated reproduction and is what the
+table above reflects.
 <!-- LAYERED_RESULTS_END -->"""
 
     with open(BENCHMARK_MD) as f:

@@ -1853,6 +1853,20 @@ drawRect(60, 0, 20, 20)       // brand again
 `borderColor`/`lineWidth` still apply as configured either way — only
 the fill is a per-call override, not the border.
 
+**The common case never touches a rasterizer.** An opaque flat-colour
+`drawRect`, `drawCircle` or `drawPixel` at an integer position — no
+`fillAlpha` below 1, no gradient, no border, no `scale`/`rotate`, at
+most a whole-pixel `translate` — is written straight into the pixels,
+on the canvas and on an `img` alike (circles from a per-radius coverage
+mask that Cairo rasterizes once). The pixels are byte-identical to what
+the Cairo path produces; it is just several times faster, which is what
+makes a frame of thousands of shapes cheap (see
+[benchmark.md](benchmark.md#canvas-festina-vs-an-html-canvas-vs-monogame)).
+Anything outside that contract goes through Cairo exactly as before.
+`FESTINA_NO_DIRECT_FILL=1` in the environment switches the direct path
+off for a whole program — the test suite uses it to check the two agree,
+and it is the escape hatch should they ever not on some platform.
+
 > **Colors and fonts must be declared.** Anything other than raw RGB
 > numbers has to be a `color` or `font` declaration first:
 >
