@@ -23,6 +23,7 @@
 #include <errno.h>      /* strerror -- festina_load_image's error message */
 #include <stdint.h>     /* uint32_t -- claude.md #101's JPEG pixel conversion */
 #include <math.h>       /* floor -- claude.md #104's transform check */
+#include <stdatomic.h>  /* claude.md #240: the lock-free circle-coverage cache */
 #include <setjmp.h>     /* libjpeg reports errors by longjmp -- claude.md #101 */
 #include <jpeglib.h>    /* claude.md #101: JPEG decoding */
 /* windows.md Phase 2 / claude.md #128: <sys/select.h> and the connect-
@@ -189,10 +190,67 @@ static void festina_graphics_present(void);
  * "does this program need a GUI?" a question the compiler can answer by
  * looking for render(), rather than something implied by whether any
  * drawing happens at all. */
+/* claude.md #240: fault a fresh image surface's pixel memory in NOW,
+ * in one batch, instead of one page at a time on first touch.
+ *
+ * A new 800x600 ARGB32 surface is 1.92MB that Cairo gets from calloc,
+ * which for a block that size is fresh, untouched mmap'd memory: every
+ * one of its 469 pages is materialized by a page fault the first time
+ * something writes to it. Drawing into the surface later pays those
+ * faults scattered through the draw calls, a couple of microseconds
+ * each -- invisible on one thread (the layered-canvas benchmark's
+ * single-threaded run loses ~2ms per layer to them), but the reason
+ * four threads painting four fresh `img?` layers at once ran no faster
+ * than one: concurrent first-touch faults in one process serialize on
+ * the kernel's per-process memory lock, so four threads' worth of them
+ * take four threads' worth of time, and every layer finished in the
+ * 11-12ms a single thread would have taken for all four together.
+ * Measured (this machine, 4 threads, 40,000 stamps into 4 layers):
+ * 12.2ms wall with lazily-faulted surfaces, 3.4ms with pre-faulted
+ * ones, and the pre-faulting itself costs 0.5ms per surface on main.
+ *
+ * MADV_POPULATE_WRITE (Linux 5.14+) does it in one syscall without a
+ * trap per page -- half the cost of touching them from user space,
+ * which is the fallback everywhere else (a volatile read-back write of
+ * one byte per page, so the pixels are never changed, only
+ * materialized). Applied at every ARGB32 surface creation whose whole
+ * area is about to be used anyway (a blank image, a clip, a canvas
+ * snapshot, a resize, the backing store), so the faults move rather
+ * than multiply: for a single-threaded program this is at worst a
+ * wash and usually a small win; for one drawing from several threads
+ * it is the difference between parallel and serial. */
+#if defined(__linux__)
+#include <sys/mman.h>
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+#endif
+static void festina_surface_prefault(cairo_surface_t *s) {
+    if (!s || cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) return;
+    unsigned char *data = cairo_image_surface_get_data(s);
+    if (!data) return;
+    size_t bytes = (size_t)cairo_image_surface_get_stride(s)
+                 * (size_t)cairo_image_surface_get_height(s);
+    if (bytes == 0) return;
+#if defined(__linux__)
+    {
+        uintptr_t page = 4096;
+        uintptr_t lo = (uintptr_t)data & ~(page - 1);
+        uintptr_t hi = ((uintptr_t)data + bytes + page - 1) & ~(page - 1);
+        if (madvise((void *)lo, hi - lo, MADV_POPULATE_WRITE) == 0) return;
+        /* an older kernel (EINVAL) or a locked-down one: fall through */
+    }
+#endif
+    volatile unsigned char *p = data;
+    for (size_t i = 0; i < bytes; i += 4096) p[i] = p[i];
+    p[bytes - 1] = p[bytes - 1];
+}
+
 static void festina_backing_require(void) {
     if (g_backing_surface) return;
     g_backing_surface = cairo_image_surface_create(
         CAIRO_FORMAT_ARGB32, (int)g_canvas_width, (int)g_canvas_height);
+    festina_surface_prefault(g_backing_surface);
     /* claude.md #136: a fresh canvas starts fully transparent, not
      * opaque white -- the same blank state every clear* function now
      * fills back to (see their own shared comment). Explicit rather
@@ -702,6 +760,282 @@ static void festina_fill_and_border_with_colors(cairo_t *cr, int64_t fill_color,
     festina_fill_and_border_override(cr, fill_color, 1, border_color, 1);
 }
 
+/* ---- claude.md #240: the solid-fill fast path -------------------------
+ *
+ * The overwhelmingly common draw call -- a flat, fully opaque colour,
+ * no border, no gradient, an integer position on an untransformed (or
+ * whole-pixel-translated) surface -- does not need a rasterizer at
+ * all. A rectangle at integer coordinates covers whole pixels, so its
+ * result is simply the source colour written into each of them; a
+ * circle's coverage per pixel is the same for every circle of that
+ * radius, so it can be rasterized ONCE and blended by hand thereafter.
+ * Going through Cairo for these costs a context, a path, a gstate
+ * lookup, a compositor dispatch and a pixman call per shape -- about
+ * 0.5 us for a 6x6 rectangle and 2.5 us for a radius-2 circle on the
+ * layered-canvas benchmark's machine, against ~30 ns for the direct
+ * write. Measured before this existed (single thread, per layer of that
+ * benchmark): 12,000 radius-2 circles 32 ms, 9,000 radius-5 circles
+ * 40 ms, 8,000 6x6 rectangles 4 ms, 11,000 5x5 rectangles 6 ms.
+ *
+ * Exactness is the whole contract here, and it is what makes this safe
+ * to switch on silently: the coverage bytes come from Cairo's own
+ * rasterizer (the same A8 mask claude.md #104's canvas circle cache
+ * already stamps), and the blend is pixman's own 8-bit premultiplied
+ * OVER, reproduced operation for operation (MUL_UN8's rounding, the
+ * saturating add) so the pixels are BYTE-IDENTICAL to what
+ * cairo_mask_surface produced -- verified by drawing the same scene both
+ * ways and comparing the PNGs (tests/test_codegen.py's
+ * TestSolidFillFastPath), not by eyeballing. Anything outside the
+ * contract -- fillAlpha() below 1, an active gradient, a border, a
+ * rotation/scale/fractional translation, a colour of `none`, a radius
+ * over FESTINA_COVERAGE_MAX_RADIUS -- takes the Cairo path exactly as
+ * before, so nothing observable changes except the time.
+ *
+ * The coverage cache is one immutable record per radius, published
+ * with a compare-and-swap into a fixed table and never freed or
+ * replaced: any thread can look one up with a single acquire load, and
+ * two threads racing to create the same radius simply agree on
+ * whichever won (the loser frees its copy). That lock-free shape is
+ * what lets four `thread`s stamp circles into four `img?` layers at
+ * once (the layered-canvas benchmark) without a mutex on the hot path
+ * and without ThreadSanitizer having anything to report. Bounded by
+ * construction: at most FESTINA_COVERAGE_MAX_RADIUS + 1 records, ~2.9MB
+ * if a program genuinely used every radius, reachable from a global so
+ * LeakSanitizer never counts it.
+ *
+ * FESTINA_NO_DIRECT_FILL=1 in the environment switches the fast path
+ * off (read once). That is the test hook the byte-identity check uses
+ * -- same program, same scene, two PNGs -- and the escape hatch if a
+ * platform's pixman ever disagreed with the arithmetic here. */
+#define FESTINA_COVERAGE_MAX_RADIUS 128
+
+typedef struct {
+    int size;               /* the mask is size x size: 2r + 2, like #104's */
+    unsigned char cov[];    /* row-major coverage, 0..255 */
+} FestinaCircleCoverage;
+
+static _Atomic(FestinaCircleCoverage *) g_circle_coverage[FESTINA_COVERAGE_MAX_RADIUS + 1];
+static atomic_int g_direct_fill_enabled = -1;   /* -1: environment not read yet */
+
+static int festina_direct_fill_enabled(void) {
+    int v = atomic_load_explicit(&g_direct_fill_enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *env = getenv("FESTINA_NO_DIRECT_FILL");
+        v = !(env && *env);
+        atomic_store_explicit(&g_direct_fill_enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static const FestinaCircleCoverage *festina_circle_coverage(int64_t r) {
+    if (r <= 0 || r > FESTINA_COVERAGE_MAX_RADIUS) return NULL;
+    FestinaCircleCoverage *have =
+        atomic_load_explicit(&g_circle_coverage[r], memory_order_acquire);
+    if (have) return have;
+
+    /* Rasterize exactly the way festina_circle_mask does, so the shape
+     * is Cairo's own: an A8 surface of 2r+2 pixels, the arc centred on
+     * it, filled with the default antialiasing. */
+    int size = (int)(r * 2) + 2;
+    cairo_surface_t *mask = cairo_image_surface_create(CAIRO_FORMAT_A8, size, size);
+    if (cairo_surface_status(mask) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(mask);
+        return NULL;
+    }
+    cairo_t *mc = cairo_create(mask);
+    cairo_set_source_rgba(mc, 0.0, 0.0, 0.0, 1.0);
+    cairo_arc(mc, size / 2.0, size / 2.0, (double)r, 0.0, 2.0 * 3.14159265358979323846);
+    cairo_fill(mc);
+    cairo_destroy(mc);
+    cairo_surface_flush(mask);
+
+    FestinaCircleCoverage *made = malloc(sizeof(*made) + (size_t)size * (size_t)size);
+    if (!made) {
+        cairo_surface_destroy(mask);
+        return NULL;
+    }
+    made->size = size;
+    const unsigned char *data = cairo_image_surface_get_data(mask);
+    int stride = cairo_image_surface_get_stride(mask);
+    for (int row = 0; row < size; row++) {
+        memcpy(made->cov + (size_t)row * size, data + (size_t)row * stride, (size_t)size);
+    }
+    cairo_surface_destroy(mask);
+
+    FestinaCircleCoverage *expected = NULL;
+    if (!atomic_compare_exchange_strong_explicit(&g_circle_coverage[r], &expected, made,
+                                                 memory_order_acq_rel, memory_order_acquire)) {
+        free(made);         /* another thread published this radius first */
+        return expected;
+    }
+    return made;
+}
+
+/* pixman's UN8 multiply: a*b/255, rounded, in the exact integer form
+ * pixman-combine32.h uses (ONE_HALF then the add-the-high-byte trick),
+ * which its SSE2/NEON paths are bit-exact with. */
+static inline uint32_t festina_mul_un8(uint32_t a, uint32_t b) {
+    uint32_t t = a * b + 0x80;
+    return ((t >> 8) + t) >> 8;
+}
+
+/* `s` (premultiplied, already scaled by coverage) OVER `d`:
+ * d = MUL_UN8(d, 255 - s.a) + s per channel, saturating -- pixman's
+ * combine_over_u. */
+static inline uint32_t festina_over_un8x4(uint32_t s, uint32_t d) {
+    uint32_t sa = s >> 24;
+    if (sa == 0xFF) return s;
+    if (s == 0) return d;
+    uint32_t ia = 0xFF - sa, out = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
+        uint32_t c = festina_mul_un8((d >> shift) & 0xFF, ia) + ((s >> shift) & 0xFF);
+        if (c > 0xFF) c = 0xFF;
+        out |= c << shift;
+    }
+    return out;
+}
+
+/* One 8-bit channel exactly as Cairo derives it from a double: to a
+ * 16-bit short (d * 65535 + 0.5), then pixman's high byte. Every
+ * fillStyle()/colour literal in the language is an integer over 255.0,
+ * for which this is the identity, but the conversion is spelled out so
+ * it can never drift from Cairo's own. */
+static inline uint32_t festina_channel_byte(double d) {
+    if (d < 0.0) d = 0.0;
+    if (d > 1.0) d = 1.0;
+    return (uint32_t)(uint16_t)(d * 65535.0 + 0.5) >> 8;
+}
+
+static inline uint32_t festina_solid_pixel_from_style(void) {
+    return 0xFF000000u | (festina_channel_byte(g_fill_r) << 16)
+                       | (festina_channel_byte(g_fill_g) << 8)
+                       | festina_channel_byte(g_fill_b);
+}
+
+static inline uint32_t festina_solid_pixel_from_color(int64_t color) {
+    return 0xFF000000u | ((uint32_t)color & 0xFFFFFFu);
+}
+
+/* The style-state half of the contract for the plain (fillStyle-driven)
+ * forms: an opaque flat colour and nothing to stroke. The colour
+ * override forms check `color >= 0` in place of g_fill_none and ignore
+ * any gradient (they always did -- see festina_fill_and_border_override). */
+static int festina_solid_style_ok(void) {
+    if (g_fill_none || g_fill_gradient) return 0;
+    if (g_fill_alpha != 1.0) return 0;
+    if (g_border_set && g_line_width > 0.0) return 0;
+    return 1;
+}
+
+static int festina_solid_override_ok(int64_t color, int border_effective) {
+    if (color < 0 || border_effective) return 0;
+    if (g_fill_alpha != 1.0) return 0;
+    return 1;
+}
+
+/* A matrix the fast path can honour: identity, or a whole-pixel
+ * translation. Same test claude.md #104's festina_circle_fast_path_ok
+ * makes, returning the offset instead of just yes/no. */
+static int festina_matrix_integer_offset(const cairo_matrix_t *m, int ready,
+                                         int64_t *tx, int64_t *ty) {
+    if (!ready) { *tx = 0; *ty = 0; return 1; }
+    if (m->xx != 1.0 || m->yy != 1.0 || m->xy != 0.0 || m->yx != 0.0) return 0;
+    if (m->x0 != floor(m->x0) || m->y0 != floor(m->y0)) return 0;
+    if (fabs(m->x0) > 1073741824.0 || fabs(m->y0) > 1073741824.0) return 0;
+    *tx = (int64_t)m->x0;
+    *ty = (int64_t)m->y0;
+    return 1;
+}
+
+static int festina_canvas_integer_offset(int64_t *tx, int64_t *ty) {
+    return festina_matrix_integer_offset(&g_transform, g_transform_ready, tx, ty);
+}
+
+/* Coordinates the arithmetic below can add and clip without overflow.
+ * Anything wilder is not a shape anyone meant to draw, and Cairo's
+ * fixed-point clamping is the behaviour it already had. */
+#define FESTINA_DIRECT_COORD_LIMIT ((int64_t)1 << 30)
+static inline int festina_direct_coord_ok(int64_t v) {
+    return v > -FESTINA_DIRECT_COORD_LIMIT && v < FESTINA_DIRECT_COORD_LIMIT;
+}
+
+/* Pins down the writable pixels of an ARGB32 image surface. Every
+ * surface this runtime draws on (the canvas backing store, every img)
+ * is one, but the check costs nothing and keeps the assumption honest. */
+static uint32_t *festina_direct_target(cairo_surface_t *s, int *stride_px, int *w, int *h) {
+    if (cairo_surface_get_type(s) != CAIRO_SURFACE_TYPE_IMAGE) return NULL;
+    if (cairo_image_surface_get_format(s) != CAIRO_FORMAT_ARGB32) return NULL;
+    cairo_surface_flush(s);
+    unsigned char *data = cairo_image_surface_get_data(s);
+    if (!data) return NULL;
+    *stride_px = cairo_image_surface_get_stride(s) / 4;
+    *w = cairo_image_surface_get_width(s);
+    *h = cairo_image_surface_get_height(s);
+    return (uint32_t *)data;
+}
+
+/* Fills the integer rectangle (x+tx, y+ty, w, h) with an opaque pixel.
+ * Returns 0 -- having touched nothing -- when the fast path does not
+ * apply, so the caller falls through to Cairo. A negative width or
+ * height extends the other way, as cairo_rectangle's does. */
+static int festina_direct_rect(cairo_surface_t *s, int64_t x, int64_t y, int64_t tx, int64_t ty,
+                               int64_t w, int64_t h, uint32_t pixel) {
+    if (!festina_direct_coord_ok(x) || !festina_direct_coord_ok(y) ||
+        !festina_direct_coord_ok(w) || !festina_direct_coord_ok(h)) return 0;
+    if (w < 0) { x += w; w = -w; }
+    if (h < 0) { y += h; h = -h; }
+    x += tx;
+    y += ty;
+    int stride_px, sw, sh;
+    uint32_t *data = festina_direct_target(s, &stride_px, &sw, &sh);
+    if (!data) return 0;
+    int64_t x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int64_t x1 = x + w > sw ? sw : x + w, y1 = y + h > sh ? sh : y + h;
+    if (x0 >= x1 || y0 >= y1) return 1;    /* nothing inside the surface: drawn, trivially */
+    for (int64_t row = y0; row < y1; row++) {
+        uint32_t *p = data + row * stride_px + x0;
+        for (int64_t i = 0, n = x1 - x0; i < n; i++) p[i] = pixel;
+    }
+    cairo_surface_mark_dirty_rectangle(s, (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
+    return 1;
+}
+
+/* Stamps the cached coverage for radius r, centred on (cx+tx, cy+ty),
+ * blending an opaque pixel by coverage. Same fallthrough contract as
+ * festina_direct_rect. */
+static int festina_direct_circle(cairo_surface_t *s, int64_t cx, int64_t cy, int64_t tx, int64_t ty,
+                                 int64_t r, uint32_t pixel) {
+    if (!festina_direct_coord_ok(cx) || !festina_direct_coord_ok(cy)) return 0;
+    const FestinaCircleCoverage *cov = festina_circle_coverage(r);
+    if (!cov) return 0;
+    int stride_px, sw, sh;
+    uint32_t *data = festina_direct_target(s, &stride_px, &sw, &sh);
+    if (!data) return 0;
+    int size = cov->size;
+    /* size is even, so the mask origin is a whole pixel: exactly the
+     * `x - size / 2.0` festina_draw_circle's stamp used. */
+    int64_t ox = cx + tx - size / 2, oy = cy + ty - size / 2;
+    int64_t x0 = ox < 0 ? 0 : ox, y0 = oy < 0 ? 0 : oy;
+    int64_t x1 = ox + size > sw ? sw : ox + size, y1 = oy + size > sh ? sh : oy + size;
+    if (x0 >= x1 || y0 >= y1) return 1;
+    for (int64_t row = y0; row < y1; row++) {
+        uint32_t *p = data + row * stride_px;
+        const unsigned char *m = cov->cov + (row - oy) * size;
+        for (int64_t col = x0; col < x1; col++) {
+            uint32_t a = m[col - ox];
+            if (a == 0) continue;
+            if (a == 0xFF) { p[col] = pixel; continue; }
+            uint32_t in = (festina_mul_un8(a, 0xFF) << 24)
+                        | (festina_mul_un8((pixel >> 16) & 0xFF, a) << 16)
+                        | (festina_mul_un8((pixel >> 8) & 0xFF, a) << 8)
+                        | festina_mul_un8(pixel & 0xFF, a);
+            p[col] = festina_over_un8x4(in, p[col]);
+        }
+    }
+    cairo_surface_mark_dirty_rectangle(s, (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
+    return 1;
+}
+
 /* claude.md #123: opens the platform window through the seam, exactly
  * once -- self-guarding (returns immediately if already open) rather
  * than relying on every call site to check first, since this is a
@@ -912,8 +1246,29 @@ static void festina_graphics_present(void) {
     festina_window_present(g_backing_surface);
 }
 
+/* claude.md #240: every filled rectangle/pixel/circle below tries the
+ * solid-fill fast path first (see its own section above) and falls
+ * through to the Cairo path it always had when the contract does not
+ * hold. The two helpers here are just the canvas's own "is the style
+ * state solid and is the transform an integer offset" check, spelled
+ * once. */
+static int festina_canvas_direct_ok(int64_t *tx, int64_t *ty) {
+    return festina_direct_fill_enabled() && festina_solid_style_ok()
+        && festina_canvas_integer_offset(tx, ty);
+}
+
+static int festina_canvas_direct_override_ok(int64_t color, int border_effective,
+                                             int64_t *tx, int64_t *ty) {
+    return festina_direct_fill_enabled() && festina_solid_override_ok(color, border_effective)
+        && festina_canvas_integer_offset(tx, ty);
+}
+
 void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     festina_backing_require();
+    int64_t tx, ty;
+    if (festina_canvas_direct_ok(&tx, &ty) &&
+        festina_direct_rect(g_backing_surface, x, y, tx, ty, w, h,
+                            festina_solid_pixel_from_style())) return;
     cairo_t *cr = festina_canvas_context();
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border(cr); /* claude.md #89 */
@@ -925,6 +1280,10 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
  * restore-fillStyle semantics. */
 void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color) {
     festina_backing_require();
+    int64_t tx, ty;
+    if (festina_canvas_direct_override_ok(color, g_border_set && g_line_width > 0.0, &tx, &ty) &&
+        festina_direct_rect(g_backing_surface, x, y, tx, ty, w, h,
+                            festina_solid_pixel_from_color(color))) return;
     cairo_t *cr = festina_canvas_context();
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border_with_color(cr, color);
@@ -937,6 +1296,10 @@ void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t
 void festina_draw_rect_colors(int64_t x, int64_t y, int64_t w, int64_t h,
                                int64_t fill_color, int64_t border_color) {
     festina_backing_require();
+    int64_t tx, ty;
+    if (festina_canvas_direct_override_ok(fill_color, border_color >= 0 && g_line_width > 0.0, &tx, &ty) &&
+        festina_direct_rect(g_backing_surface, x, y, tx, ty, w, h,
+                            festina_solid_pixel_from_color(fill_color))) return;
     cairo_t *cr = festina_canvas_context();
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border_with_colors(cr, fill_color, border_color);
@@ -952,6 +1315,14 @@ void festina_draw_rect_colors(int64_t x, int64_t y, int64_t w, int64_t h,
  * stroke, unlike drawRect/drawCircle. */
 void festina_draw_pixel(int64_t x, int64_t y) {
     festina_backing_require();
+    int64_t tx, ty;
+    /* claude.md #240: a pixel never strokes, so only the fill half of
+     * the solid-fill contract applies (not festina_solid_style_ok's
+     * border check). */
+    if (festina_direct_fill_enabled() && !g_fill_none && !g_fill_gradient && g_fill_alpha == 1.0 &&
+        festina_canvas_integer_offset(&tx, &ty) &&
+        festina_direct_rect(g_backing_surface, x, y, tx, ty, 1, 1,
+                            festina_solid_pixel_from_style())) return;
     cairo_t *cr = festina_canvas_context();
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
     cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
@@ -972,6 +1343,10 @@ void festina_draw_pixel(int64_t x, int64_t y) {
  * save and restore around it at all. */
 void festina_draw_pixel_color(int64_t x, int64_t y, int64_t color) {
     festina_backing_require();
+    int64_t tx, ty;
+    if (festina_canvas_direct_override_ok(color, 0, &tx, &ty) &&
+        festina_direct_rect(g_backing_surface, x, y, tx, ty, 1, 1,
+                            festina_solid_pixel_from_color(color))) return;
     cairo_t *cr = festina_canvas_context();
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
     cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
@@ -1143,6 +1518,13 @@ static int festina_circle_fast_path_ok(int64_t r) {
 
 void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
     festina_backing_require();
+    int64_t tx, ty;
+    /* claude.md #240: the opaque flat-colour case skips Cairo entirely;
+     * a gradient or a fillAlpha() below 1 still gets #104's mask stamp
+     * just below, and everything else the tessellating fallback. */
+    if (festina_canvas_direct_ok(&tx, &ty) &&
+        festina_direct_circle(g_backing_surface, x, y, tx, ty, r,
+                              festina_solid_pixel_from_style())) return;
     cairo_t *cr = festina_canvas_context();
     if (festina_circle_fast_path_ok(r)) {
         cairo_surface_t *mask = festina_circle_mask(r);
@@ -1161,12 +1543,18 @@ void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
 
 /* claude.md #188 (uraikus/festina#76 item 8): drawCircle(x, y, r,
  * fillColor)/drawCircle(x, y, r, fillColor, borderColor) -- same
- * per-call override as drawRect's own color/colors forms; no fast-path
- * mask cache here (unlike plain festina_draw_circle just above) since
- * an occasional colour override is not the hot path that optimization
- * exists for. */
+ * per-call override as drawRect's own color/colors forms. claude.md
+ * #240: the opaque case takes the same direct stamp as plain
+ * festina_draw_circle now (this used to say a colour override was
+ * "not the hot path" -- the layered-canvas benchmark's threads made
+ * it exactly that), so the two forms produce identical pixels; the
+ * Cairo fallback is the tessellating one it always was. */
 void festina_draw_circle_color(int64_t x, int64_t y, int64_t r, int64_t color) {
     festina_backing_require();
+    int64_t tx, ty;
+    if (festina_canvas_direct_override_ok(color, g_border_set && g_line_width > 0.0, &tx, &ty) &&
+        festina_direct_circle(g_backing_surface, x, y, tx, ty, r,
+                              festina_solid_pixel_from_color(color))) return;
     cairo_t *cr = festina_canvas_context();
     cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border_with_color(cr, color);
@@ -1176,6 +1564,10 @@ void festina_draw_circle_color(int64_t x, int64_t y, int64_t r, int64_t color) {
 void festina_draw_circle_colors(int64_t x, int64_t y, int64_t r,
                                  int64_t fill_color, int64_t border_color) {
     festina_backing_require();
+    int64_t tx, ty;
+    if (festina_canvas_direct_override_ok(fill_color, border_color >= 0 && g_line_width > 0.0, &tx, &ty) &&
+        festina_direct_circle(g_backing_surface, x, y, tx, ty, r,
+                              festina_solid_pixel_from_color(fill_color))) return;
     cairo_t *cr = festina_canvas_context();
     cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border_with_colors(cr, fill_color, border_color);
@@ -1631,10 +2023,19 @@ void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h) 
     festina_check_image_size("clip", w, h);
     cairo_surface_t *src = ((FestinaImageBox *)img)->surface;
     cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
+    festina_surface_prefault(out);
     cairo_t *cr = cairo_create(out);
     /* Offsetting the source by -x/-y puts the requested region at the
      * new surface's origin. */
     cairo_set_source_surface(cr, src, -(double)x, -(double)y);
+    /* claude.md #240: SOURCE, not the default OVER. The destination
+     * was created transparent a moment ago, and OVER onto transparent
+     * black is the source pixel exactly -- so this is the same result
+     * as a straight copy, which is what SOURCE lets pixman do
+     * (a per-row memcpy instead of a per-pixel blend). Measured on the
+     * layered-canvas benchmark's four 800x600 clips: 3.1 ms -> under
+     * 1 ms, pixel-identical. */
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_paint(cr);
     cairo_destroy(cr);
     return festina_image_box(out);
@@ -1656,6 +2057,7 @@ void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h) 
 void *festina_blank_image(int64_t w, int64_t h) {
     festina_check_image_size("blankImage", w, h);
     cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
+    festina_surface_prefault(out);   /* claude.md #240 */
     return festina_image_box(out);
 }
 
@@ -1675,8 +2077,10 @@ void *festina_canvas_to_image(void) {
     int w = cairo_image_surface_get_width(g_backing_surface);
     int h = cairo_image_surface_get_height(g_backing_surface);
     cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    festina_surface_prefault(out);
     cairo_t *cr = cairo_create(out);
     cairo_set_source_surface(cr, g_backing_surface, 0, 0);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE); /* claude.md #240: see festina_image_clip */
     cairo_paint(cr);
     cairo_destroy(cr);
     return festina_image_box(out);
@@ -1694,6 +2098,7 @@ void festina_image_resize(void *img, int64_t w, int64_t h) {
     int src_h = cairo_image_surface_get_height(box->surface);
     if (src_w <= 0 || src_h <= 0) return;
     cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
+    festina_surface_prefault(out);
     cairo_t *cr = cairo_create(out);
     cairo_scale(cr, (double)w / src_w, (double)h / src_h);
     cairo_set_source_surface(cr, box->surface, 0, 0);
@@ -1738,6 +2143,13 @@ void festina_image_resize(void *img, int64_t w, int64_t h) {
  * this returns. */
 static void festina_image_bytes_now_stale(void *img) {
     FestinaImageBox *box = (FestinaImageBox *)img;
+    /* claude.md #240: read before writing. This runs on every draw
+     * call, and the four boxes of four `img?` layers painted by four
+     * threads at once are small consecutive allocations -- writing
+     * NULL over an already-NULL field on each call had those threads
+     * ping-ponging the same cache lines between cores on every single
+     * shape (false sharing). A read of an unchanged line is free. */
+    if (!box->bytes) return;
     free(box->bytes);
     box->bytes = NULL;
     box->byte_count = 0;
@@ -1756,9 +2168,34 @@ static cairo_t *festina_image_context(FestinaImageBox *box) {
     return cr;
 }
 
+/* claude.md #240: the img half of the solid-fill fast path -- the same
+ * contract as the canvas's festina_canvas_direct_ok, against THIS
+ * image's own transform. This is the path that made the layered-canvas
+ * benchmark's four worker threads fast: each stamps into its own
+ * `img?` with no Cairo context, no shared cache lock and no global
+ * state written (the style globals are only read, exactly as #234
+ * already required of the colour-override forms). */
+static int festina_image_direct_ok(FestinaImageBox *box, int64_t *tx, int64_t *ty) {
+    return festina_direct_fill_enabled() && festina_solid_style_ok()
+        && festina_matrix_integer_offset(&box->transform, box->transform_ready, tx, ty);
+}
+
+static int festina_image_direct_override_ok(FestinaImageBox *box, int64_t color, int border_effective,
+                                            int64_t *tx, int64_t *ty) {
+    return festina_direct_fill_enabled() && festina_solid_override_ok(color, border_effective)
+        && festina_matrix_integer_offset(&box->transform, box->transform_ready, tx, ty);
+}
+
 void festina_image_draw_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h) {
     if (!img) return;
-    cairo_t *cr = festina_image_context((FestinaImageBox *)img);
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t tx, ty;
+    if (festina_image_direct_ok(box, &tx, &ty) &&
+        festina_direct_rect(box->surface, x, y, tx, ty, w, h, festina_solid_pixel_from_style())) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
+    cairo_t *cr = festina_image_context(box);
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border(cr);
     cairo_destroy(cr);
@@ -1767,7 +2204,14 @@ void festina_image_draw_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t
 
 void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, int64_t h, int64_t color) {
     if (!img) return;
-    cairo_t *cr = festina_image_context((FestinaImageBox *)img);
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t tx, ty;
+    if (festina_image_direct_override_ok(box, color, g_border_set && g_line_width > 0.0, &tx, &ty) &&
+        festina_direct_rect(box->surface, x, y, tx, ty, w, h, festina_solid_pixel_from_color(color))) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
+    cairo_t *cr = festina_image_context(box);
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border_with_color(cr, color);
     cairo_destroy(cr);
@@ -1778,7 +2222,14 @@ void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, i
 void festina_image_draw_rect_colors(void *img, int64_t x, int64_t y, int64_t w, int64_t h,
                                      int64_t fill_color, int64_t border_color) {
     if (!img) return;
-    cairo_t *cr = festina_image_context((FestinaImageBox *)img);
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t tx, ty;
+    if (festina_image_direct_override_ok(box, fill_color, border_color >= 0 && g_line_width > 0.0, &tx, &ty) &&
+        festina_direct_rect(box->surface, x, y, tx, ty, w, h, festina_solid_pixel_from_color(fill_color))) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
+    cairo_t *cr = festina_image_context(box);
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border_with_colors(cr, fill_color, border_color);
     cairo_destroy(cr);
@@ -1789,7 +2240,15 @@ void festina_image_draw_rect_colors(void *img, int64_t x, int64_t y, int64_t w, 
  * in this file) for why antialiasing is disabled around the fill. */
 void festina_image_draw_pixel(void *img, int64_t x, int64_t y) {
     if (!img) return;
-    cairo_t *cr = festina_image_context((FestinaImageBox *)img);
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t tx, ty;
+    if (festina_direct_fill_enabled() && !g_fill_none && !g_fill_gradient && g_fill_alpha == 1.0 &&
+        festina_matrix_integer_offset(&box->transform, box->transform_ready, &tx, &ty) &&
+        festina_direct_rect(box->surface, x, y, tx, ty, 1, 1, festina_solid_pixel_from_style())) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
+    cairo_t *cr = festina_image_context(box);
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
     cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
     cairo_rectangle(cr, (double)x, (double)y, 1, 1);
@@ -1806,7 +2265,14 @@ void festina_image_draw_pixel(void *img, int64_t x, int64_t y) {
 
 void festina_image_draw_pixel_color(void *img, int64_t x, int64_t y, int64_t color) {
     if (!img) return;
-    cairo_t *cr = festina_image_context((FestinaImageBox *)img);
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t tx, ty;
+    if (festina_image_direct_override_ok(box, color, 0, &tx, &ty) &&
+        festina_direct_rect(box->surface, x, y, tx, ty, 1, 1, festina_solid_pixel_from_color(color))) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
+    cairo_t *cr = festina_image_context(box);
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
     cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
     cairo_rectangle(cr, (double)x, (double)y, 1, 1);
@@ -1823,15 +2289,25 @@ void festina_image_draw_pixel_color(void *img, int64_t x, int64_t y, int64_t col
     festina_image_bytes_now_stale(img);
 }
 
-/* No circle-mask fast path here (unlike the canvas's own drawCircle,
- * claude.md #104) -- that cache is keyed on the CANVAS's own transform
- * state, which images deliberately do not use (see this section's own
- * comment above), and drawing onto an image is a far rarer, less
- * hot-path call than drawing a frame's worth of shapes onto the canvas
- * every tick. */
+/* claude.md #240: img circles take the solid-fill fast path too (the
+ * stamped coverage is Cairo's own, so the pixels match). This used to
+ * say drawing onto an image was "a far rarer, less hot-path call" than
+ * the canvas's -- true until `img?` layers painted by worker threads
+ * (claude.md #239) made it THE hot path: 21,000 of the layered
+ * benchmark's 40,000 calls are img circles, and they were 72 of its
+ * 84 single-threaded milliseconds. The Cairo fallback is the
+ * tessellating one it always was (no #104-style mask stamp: that
+ * cache is the canvas's, keyed on its transform state). */
 void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r) {
     if (!img) return;
-    cairo_t *cr = festina_image_context((FestinaImageBox *)img);
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t tx, ty;
+    if (festina_image_direct_ok(box, &tx, &ty) &&
+        festina_direct_circle(box->surface, x, y, tx, ty, r, festina_solid_pixel_from_style())) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
+    cairo_t *cr = festina_image_context(box);
     cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border(cr);
     cairo_destroy(cr);
@@ -1841,7 +2317,14 @@ void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r) {
 /* claude.md #188 (uraikus/festina#76 item 8) */
 void festina_image_draw_circle_color(void *img, int64_t x, int64_t y, int64_t r, int64_t color) {
     if (!img) return;
-    cairo_t *cr = festina_image_context((FestinaImageBox *)img);
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t tx, ty;
+    if (festina_image_direct_override_ok(box, color, g_border_set && g_line_width > 0.0, &tx, &ty) &&
+        festina_direct_circle(box->surface, x, y, tx, ty, r, festina_solid_pixel_from_color(color))) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
+    cairo_t *cr = festina_image_context(box);
     cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border_with_color(cr, color);
     cairo_destroy(cr);
@@ -1851,7 +2334,14 @@ void festina_image_draw_circle_color(void *img, int64_t x, int64_t y, int64_t r,
 void festina_image_draw_circle_colors(void *img, int64_t x, int64_t y, int64_t r,
                                        int64_t fill_color, int64_t border_color) {
     if (!img) return;
-    cairo_t *cr = festina_image_context((FestinaImageBox *)img);
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    int64_t tx, ty;
+    if (festina_image_direct_override_ok(box, fill_color, border_color >= 0 && g_line_width > 0.0, &tx, &ty) &&
+        festina_direct_circle(box->surface, x, y, tx, ty, r, festina_solid_pixel_from_color(fill_color))) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
+    cairo_t *cr = festina_image_context(box);
     cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border_with_colors(cr, fill_color, border_color);
     cairo_destroy(cr);
@@ -2024,8 +2514,10 @@ static cairo_surface_t *festina_surface_snapshot(cairo_surface_t *src) {
     int w = cairo_image_surface_get_width(src);
     int h = cairo_image_surface_get_height(src);
     cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    festina_surface_prefault(out);
     cairo_t *cr = cairo_create(out);
     cairo_set_source_surface(cr, src, 0, 0);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE); /* claude.md #240: see festina_image_clip */
     cairo_paint(cr);
     cairo_destroy(cr);
     return out;
@@ -2338,6 +2830,7 @@ static void festina_set_client_size(int64_t width, int64_t height) {
         cairo_surface_destroy(g_backing_surface);
         g_backing_surface = cairo_image_surface_create(
             CAIRO_FORMAT_ARGB32, (int)width, (int)height);
+        festina_surface_prefault(g_backing_surface);   /* claude.md #240 */
         /* claude.md #136: fresh canvas state is transparent, not white
          * -- see festina_backing_require's own identical block. */
         cairo_t *cr = cairo_create(g_backing_surface);
@@ -2438,6 +2931,7 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
         cairo_surface_destroy(g_backing_surface);
         g_backing_surface = cairo_image_surface_create(
             CAIRO_FORMAT_ARGB32, (int)ev->width, (int)ev->height);
+        festina_surface_prefault(g_backing_surface);   /* claude.md #240 */
         cairo_t *cr = cairo_create(g_backing_surface);
         cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
         cairo_set_source_rgba(cr, 0, 0, 0, 0);

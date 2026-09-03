@@ -9,6 +9,45 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.44] - 2026-09-02
+
+### Added
+
+- **`drawImage` accepts an `img?` source.** Every form of the canvas
+  `drawImage(...)` and of `img.drawImage(...)` takes a manually-managed
+  `img?` where it says `img` — compositing only reads the source for
+  the duration of the call and keeps no reference, so nothing changes
+  hands. A layer painted by a worker thread can now be drawn straight
+  onto the canvas with no `clip()` copy first. This is the one
+  read-only exception to `T?` being a distinct type; assignment and
+  every other call site are unchanged.
+
+### Changed
+
+- **Solid shapes are drawn without a rasterizer.** An opaque
+  flat-colour `drawRect`/`drawCircle`/`drawPixel` at an integer
+  position (no `fillAlpha` below 1, gradient, border, scale or
+  rotation) is written straight into the pixels, on the canvas and on
+  an `img` alike; circles come from a per-radius coverage mask Cairo
+  rasterizes once, blended with pixman's own arithmetic so the result
+  is byte-identical to before. The canvas benchmark's 40,000-shape
+  frame went from 35 ms to 7 ms; the layered-canvas benchmark's four
+  `img?` layers from 84 ms to 8 ms on one thread. Everything outside
+  that contract still goes through Cairo unchanged.
+  `FESTINA_NO_DIRECT_FILL=1` switches the direct path off.
+- **Fresh image surfaces are faulted in when created**, not one page
+  at a time on first touch — the reason four threads painting four
+  new `img?` layers ran no faster than one (first-touch page faults
+  serialize across a process's threads). The layered benchmark's
+  four-thread run went from 62 ms to 7 ms.
+- `img.clip()`, `saveCanvas()`-to-`img` and `img.resize()` copy their
+  source with Cairo's SOURCE operator instead of blending it OVER a
+  transparent surface: the same pixels, a straight copy.
+- The per-call colour form of `drawCircle` now produces exactly the
+  same pixels as the `fillStyle()` form (it used to tessellate where
+  the plain form stamped a cached mask, 1/255 apart on a few edge
+  pixels at larger radii).
+
 ## [0.43] - 2026-09-02
 
 ### Added

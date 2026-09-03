@@ -498,13 +498,13 @@ which documents what each one cost when it was measured the other way.
 
 | | Frame (min) | Frame (median) | First frame |
 |---|---|---|---|
-| Festina (Cairo) | {fmin:.0f} ms | {fmed:.0f} ms | {baseline * 1000:.0f} ms (process start + PNG encode) |
+| Festina | {fmin:.0f} ms | {fmed:.0f} ms | {baseline * 1000:.0f} ms (process start + PNG encode) |
 | HTML `<canvas>` (Chromium/Skia) | {bmin:.0f} ms | {bmed:.0f} ms | {browser['startup_s'] * 1000:.0f} ms (browser launch) |
 {mg_row}
 {mg_note}
 On this workload **{verdict}**.
 
-That took one change, and finding it took measuring rather than
+That took two changes, and finding each took measuring rather than
 guessing. The first version of this benchmark had Festina 1.4x SLOWER,
 and the obvious culprit -- a fresh Cairo context per draw call -- turned
 out to account for 4 ms of 90. Splitting the frame by shape type found
@@ -513,9 +513,24 @@ circles cost 76 ms, because `cairo_arc` + `cairo_fill` tessellates the
 curve into Beziers and scan-converts a general polygon every single
 time. Rasterizing each radius once into an alpha mask and stamping it
 thereafter -- what a glyph cache does -- took circles to 20 ms and the
-frame from 90 ms to 31 ms (claude.md #104). The remaining split is
-11 ms of rectangles, 20 ms of circles, and setting the fill colour
-20,000 times is too cheap to measure.
+frame from 90 ms to 31 ms (claude.md #104), leaving 11 ms of rectangles
+and 20 ms of circles.
+
+The second change (claude.md #240) noticed that neither of those needs
+a rasterizer at all. An opaque flat-colour rectangle at integer
+coordinates covers whole pixels, so its result is the colour written
+into each of them; an opaque circle's per-pixel coverage is the same
+for every circle of that radius, so Cairo rasterizes it once and the
+runtime blends it by hand thereafter with pixman's own 8-bit
+arithmetic. Every such call now writes straight into the ARGB32 pixels
+-- no context, path, compositor dispatch or pixman call per shape -- and
+the pixels are byte-identical to what Cairo's mask stamp produced
+(verified by drawing the same scene both ways, not by eye). That took
+20,000 rectangles from 11 ms to 2 ms and 20,000 circles from 20 ms to
+6 ms. Setting the fill colour 20,000 times is still too cheap to
+measure. Anything the contract does not cover -- a translucent fill, a
+gradient, a border, a scaled or rotated canvas -- still goes through
+Cairo exactly as before.
 
 Two things are worth reading alongside the headline. The browser's frame
 time is far noisier -- {bmin:.0f} ms at best against a {bmed:.0f} ms median here, and

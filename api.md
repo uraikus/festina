@@ -1350,6 +1350,10 @@ the way a sprite sheet or a variable-size paint brush pulls one piece
 out of a larger stored image without a separate `.clip()` call first.
 A source region reaching past the image's own edge behaves like
 `.clip()`'s own: the overlap is drawn, the rest is simply not there.
+All three forms (and both `img.drawImage` forms) also accept a
+manually-managed `img?` as the source — compositing only reads it, so
+a layer a worker thread painted can be drawn directly, with no `clip()`
+copy first (see [`T?`](#t-manually-managed-values)).
 
 `blankImage(w, h)` returns a fresh, fully-transparent `img` at the
 given size — with no existing image or canvas to derive it from,
@@ -1852,6 +1856,20 @@ drawRect(60, 0, 20, 20)       // brand again
 
 `borderColor`/`lineWidth` still apply as configured either way — only
 the fill is a per-call override, not the border.
+
+**The common case never touches a rasterizer.** An opaque flat-colour
+`drawRect`, `drawCircle` or `drawPixel` at an integer position — no
+`fillAlpha` below 1, no gradient, no border, no `scale`/`rotate`, at
+most a whole-pixel `translate` — is written straight into the pixels,
+on the canvas and on an `img` alike (circles from a per-radius coverage
+mask that Cairo rasterizes once). The pixels are byte-identical to what
+the Cairo path produces; it is just several times faster, which is what
+makes a frame of thousands of shapes cheap (see
+[benchmark.md](benchmark.md#canvas-festina-vs-an-html-canvas-vs-monogame)).
+Anything outside that contract goes through Cairo exactly as before.
+`FESTINA_NO_DIRECT_FILL=1` in the environment switches the direct path
+off for a whole program — the test suite uses it to check the two agree,
+and it is the escape hatch should they ever not on some platform.
 
 > **Colors and fonts must be declared.** Anything other than raw RGB
 > numbers has to be a `color` or `font` declaration first:
@@ -2839,6 +2857,23 @@ someone else's automatic responsibility. Once a value is bound as
 (another declaration with no initializer, an aliasing assignment from
 an existing `T?`, or a `T?`-declared parameter) — the fresh-
 construction allowance only ever applies at the birth point.
+
+**One read-only exception: `drawImage` accepts an `img?` source.**
+Every form of the canvas `drawImage(...)` and of `img.drawImage(...)`
+takes an `img?` where it says `img`, because compositing only *reads*
+the source for the duration of the call and keeps no reference to it —
+nothing changes hands, so there is nothing for the no-conversion rule
+to protect. That is what lets a layer painted by a worker thread be
+drawn straight onto the canvas (or onto another image) with no
+`clip()` copy in between:
+
+```festina
+img? layer = blankImage(800, 600)
+Painter.postMessage(layer)        // a thread paints into it
+Painter.drain()
+drawImage(layer, 0, 0)            // composited directly, no copy
+free layer                        // still yours to release
+```
 
 **`free`/`delete` work on a `T?` value exactly as documented above** —
 same reference-count decrement, same "an alias survives" behavior,
