@@ -2075,6 +2075,108 @@ char *festina_str_concat(const char *a, const char *b) {
     return out;
 }
 
+/* claude.md #243: `s = `${s}x`` / `s = s + x` grow `s` IN PLACE.
+ *
+ * festina_str_concat above is what every concatenation used to
+ * compile to: a fresh buffer sized to the combined length, both
+ * operands copied in, the old buffer freed by the assignment. For a
+ * string built up one piece at a time that is O(n^2) in bytes moved --
+ * the `string_concat` benchmark (15,000 one-character appends) shifted
+ * ~112MB through memcpy, 6ms natively and ~26ms under wasm, where
+ * memcpy is a plain compiled loop.
+ *
+ * This is the same operation as an ownership TRANSFER: `a` is the
+ * variable's own current buffer (exclusively owned -- claude.md #83's
+ * whole text model is that a binding never shares its buffer), the
+ * assignment is about to free it and store the concatenation, so the
+ * buffer can just be grown and handed back instead. Growth is
+ * geometric (1.5x plus a little), and a buffer that already has room
+ * -- which malloc_usable_size (malloc_size on macOS, _msize on
+ * Windows) reports without a call into the allocator's slow path --
+ * is not reallocated at all, so the amortized cost per append is the
+ * bytes of the piece, not the bytes of the string.
+ *
+ * The length is the other half. Rediscovering it with strlen on every
+ * call would keep the whole thing O(n^2) (measured: no gain at all
+ * under wasm, where strlen is a compiled loop too), so the COMPILER
+ * tracks it: alongside every text variable's own slot, codegen keeps
+ * a shadow pair {pointer, length} that this call's `out_len` result
+ * fills in and that a later append reads back -- but only when the
+ * variable still holds that same pointer (`a_len` is passed as -1
+ * otherwise, and this falls back to strlen). Every other store into
+ * the variable clears the shadow (see codegen's own
+ * _emit_local_text_own_release/_emit_global_retain_release), so a
+ * stale length is never consulted; the `a[a_len] != '\0'` check below
+ * is a second, cheap line of defence against exactly that, and
+ * FESTINA_VERIFY_APPEND=1 in the environment turns it into a full
+ * strlen cross-check that aborts on any mismatch -- the test suite's
+ * way of proving no store site was missed. Capacity is never trusted
+ * from anywhere but the allocator itself, so the length can only
+ * ever affect WHICH bytes are written, never whether they are inside
+ * the allocation.
+ *
+ * NULL-safe on both sides (a text's zero value is NULL): a NULL `a`
+ * starts a fresh buffer, a NULL `b` appends nothing. Returns the
+ * buffer to store -- possibly moved by realloc, so the caller must
+ * store the result, never keep using `a`. */
+#if defined(__linux__) || defined(__wasi__)
+#include <malloc.h>
+static size_t festina_usable_size(void *p) { return malloc_usable_size(p); }
+#elif defined(__APPLE__)
+#include <malloc/malloc.h>
+static size_t festina_usable_size(void *p) { return malloc_size(p); }
+#elif defined(_WIN32)
+#include <malloc.h>
+static size_t festina_usable_size(void *p) { return _msize(p); }
+#else
+static size_t festina_usable_size(void *p) { (void)p; return 0; }
+#endif
+
+static int festina_verify_append_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *env = getenv("FESTINA_VERIFY_APPEND");
+        mode = (env && *env) ? 1 : 0;
+    }
+    return mode;
+}
+
+char *festina_text_append(char *a, int64_t a_len, const char *b, int64_t b_len, int64_t *out_len) {
+    if (!b) b = "";
+    size_t lb = b_len >= 0 ? (size_t)b_len : strlen(b);
+    if (!a) {
+        char *out = malloc(lb + 1 + 16);
+        if (!out) festina_fail("out of memory in festina_text_append");
+        memcpy(out, b, lb);
+        out[lb] = '\0';
+        if (out_len) *out_len = (int64_t)lb;
+        return out;
+    }
+    size_t la;
+    if (a_len >= 0 && a[a_len] == '\0') {
+        la = (size_t)a_len;
+        if (festina_verify_append_mode() && strlen(a) != la) {
+            fprintf(stderr, "festina: internal error: text append length %lld does not match "
+                            "the string's real length %lld\n",
+                    (long long)la, (long long)strlen(a));
+            abort();
+        }
+    } else {
+        la = strlen(a);
+    }
+    size_t need = la + lb + 1;
+    if (festina_usable_size(a) < need) {
+        size_t cap = need + need / 2 + 16;
+        char *grown = realloc(a, cap);
+        if (!grown) festina_fail("out of memory in festina_text_append");
+        a = grown;
+    }
+    memcpy(a + la, b, lb);
+    a[la + lb] = '\0';
+    if (out_len) *out_len = (int64_t)(la + lb);
+    return a;
+}
+
 /* claude.md #83: text values are reference-managed by copying, not
  * counting -- every text-typed binding (local, global, struct field,
  * array element, map value) always holds either NULL or a fresh,

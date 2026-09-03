@@ -360,6 +360,26 @@ empty text separator splits per UTF-8 code point. `join` renders a
 `null` element as an empty string (`[1, null, 3].join('-')` is
 `'1--3'`).
 
+**Building a string piece by piece is O(n).** Every `text` binding
+owns its buffer outright, so an assignment that appends to itself —
+
+```festina
+text out = ''
+for int i = 0, i < n, i++ {
+    out = `${out}${i},`          // or: out = out + row.name + '\n'
+}
+```
+
+— is compiled as a real append: `out`'s own buffer is grown in place
+(geometrically, with a length the compiler tracks), not copied into a
+fresh one on every step. The shape is exactly `x = `${x}…`` or `x = x
++ …` where `x` is a plain `text` variable, parameter or top-level
+global, `x` appears once at the front, and every further piece is a
+literal, another variable, or a plain field read (anything that could
+call a function, or read `x` again, takes the ordinary copying path).
+Nothing about it is visible except the time: 15,000 appends move a few
+kilobytes instead of ~112 MB.
+
 ### Parsing an int
 
 ```festina

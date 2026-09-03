@@ -24,6 +24,23 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Changed
 
+- **Building a string one piece at a time is O(n), not O(n²).**
+  `s = `${s}...`` and `s = s + ...` (any number of further pieces:
+  literals, other variables, plain field reads) now grow `s`'s own
+  buffer in place with a compiler-tracked length instead of copying
+  the whole string into a fresh buffer on every step. The
+  `string_concat` benchmark's 15,000 appends move a few kilobytes
+  instead of ~112 MB. Nothing observable changes: the pattern is only
+  taken when `s` is a plain text variable, the pieces cannot run user
+  code, and `s` appears exactly once, at the front.
+- **A `.wasm` that never touches a database is 31 KB, not 1.47 MB.**
+  The wasm32-wasi link now uses link-time optimization across the
+  program and the core runtime and strips the sysroot libc's debug
+  sections. The vendored SQLite was kept alive only by `main()`'s
+  closing `festina_db_close()` on a null handle — that call is no
+  longer emitted for a program with no `table`/`sqlite()`, and the
+  linker drops all of SQLite. A program that does use a database still
+  gets all of it (about 1.1 MB). Smaller modules also load faster.
 - **Solid shapes are drawn without a rasterizer.** An opaque
   flat-colour `drawRect`/`drawCircle`/`drawPixel` at an integer
   position (no `fillAlpha` below 1, gradient, border, scale or
@@ -65,6 +82,11 @@ round-by-round design and implementation record predating 0.1 lives in
 - **The Windows CI job drives a real window**: a new test finds the
   compiled program's Win32 window and posts mouse, keyboard, resize and
   close messages to it, asserting every input handler's output.
+- **A browser-side wasm benchmark.** `benchmarks/run_wasm_browser_benchmarks.py`
+  runs the five wasm.md programs, compiled from Festina, C and Go, inside
+  headless Chromium on the project's own WASI host, timing compile,
+  instantiate and run separately with `performance.now()` inside the
+  worker. Results are in wasm.md's "In a browser: Festina vs C vs Go".
 
 ### Fixed
 

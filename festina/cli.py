@@ -786,7 +786,7 @@ _WASM_SQLITE_C = os.path.join(_WASM_DIR, "sqlite3.c")
 _WASM_ENTRY_SRC = os.path.join(_RUNTIME_DIR, "festina_runtime_wasm_entry.ll")
 
 
-def _ensure_wasm_object(cc, name, source, include_dirs=()):
+def _ensure_wasm_object(cc, name, source, include_dirs=(), lto=False):
     """The WASM counterpart to _ensure_runtime_object -- same cache-once
     -and-reuse shape (a real compile-time cost: the vendored sqlite3.c
     amalgamation alone takes ~20 real seconds even at -O2), but a
@@ -795,11 +795,16 @@ def _ensure_wasm_object(cc, name, source, include_dirs=()):
     to know about. `festina_wasm_{name}` (not `festina_runtime_{name}`)
     keeps this cache namespace-separate from native's own -- the two
     are never the same object even when `cc` (plain "clang", no
-    --target flag baked into the string itself) happens to match."""
+    --target flag baked into the string itself) happens to match.
+
+    claude.md #242: `lto=True` compiles to LLVM bitcode (`-flto`) under
+    its own cache name, so the link can optimize across the program/
+    runtime boundary -- see _compile_via_wasm for what that buys."""
     cache_dir = os.path.join(tempfile.gettempdir(), "festina-runtime-cache")
     os.makedirs(cache_dir, exist_ok=True)
     cc_key = hashlib.sha1(cc.encode()).hexdigest()[:8]
-    obj_path = os.path.join(cache_dir, f"festina_wasm_{name}.{cc_key}.o")
+    suffix = ".lto.o" if lto else ".o"
+    obj_path = os.path.join(cache_dir, f"festina_wasm_{name}.{cc_key}{suffix}")
 
     freshness_sources = [source, *_RUNTIME_HEADERS]
     if (os.path.exists(obj_path)
@@ -807,7 +812,9 @@ def _ensure_wasm_object(cc, name, source, include_dirs=()):
         return obj_path
 
     include_flags = [f"-I{d}" for d in include_dirs]
-    cmd = [cc, f"--target={_WASM_TARGET}", "-O2", "-c", source, *include_flags, "-o", obj_path]
+    lto_flags = ["-flto"] if lto else []
+    cmd = [cc, f"--target={_WASM_TARGET}", "-O2", *lto_flags, "-c", source, *include_flags,
+           "-o", obj_path]
     result = _run_tool(cmd)
     if result.returncode != 0:
         raise CompileError(f"failed to compile the Festina WASM runtime ({name}):\n{result.stderr}",
@@ -815,18 +822,27 @@ def _ensure_wasm_object(cc, name, source, include_dirs=()):
     return obj_path
 
 
-def _wasm_runtime_objects(cc):
+def _wasm_runtime_objects(cc, lto=False):
     """core (linked against the vendored sqlite3.h, see runtime/wasm/
     README.md) + the vendored sqlite3.c itself + the __main_argc_argv
     entry bridge (see festina_runtime_wasm_entry.ll's own top comment
     for why that one exists at all, and why it's raw LLVM IR rather
     than C) -- no graphics, no audio, ever: see
     _check_wasm_feature_supported, called unconditionally before this
-    even runs, for why."""
+    even runs, for why.
+
+    claude.md #242: with `lto`, core and the entry bridge are bitcode;
+    sqlite3 deliberately stays an ordinary -O2 object either way. It is
+    the one translation unit whose ~20-second compile the cache exists
+    to amortize, LTO-ing it would repeat a large part of that on every
+    link, and it gains nothing from cross-module inlining -- the whole
+    point is that a program which never touches a database does not
+    keep any of its 1MB of code alive, and the linker's own dead-code
+    elimination handles that for a plain object just as well."""
     return [
-        _ensure_wasm_object(cc, "core", _RUNTIME_C, include_dirs=[_WASM_DIR]),
+        _ensure_wasm_object(cc, "core", _RUNTIME_C, include_dirs=[_WASM_DIR], lto=lto),
         _ensure_wasm_object(cc, "sqlite3", _WASM_SQLITE_C),
-        _ensure_wasm_object(cc, "entry", _WASM_ENTRY_SRC),
+        _ensure_wasm_object(cc, "entry", _WASM_ENTRY_SRC, lto=lto),
     ]
 
 
@@ -1433,14 +1449,45 @@ def _compile_via_wasm(ir, entry_path, output_path, cc, needs_graphics, needs_aud
             f"only clang can target wasm32-wasi at all. See wasm.md.",
             file=entry_path, category="missing dependency")
 
-    runtime_objects = _wasm_runtime_objects(cc)
-
+    # claude.md #242: link-time optimization across the program and the
+    # core runtime, and no DWARF in the output. Measured on the five
+    # wasm.md benchmarks: a program that never touches a database went
+    # from a 1.47MB .wasm to 31KB. Two things were in that 1.47MB. The
+    # vendored SQLite (~1MB of code) was kept alive by exactly one
+    # reference -- main()'s closing festina_db_close() on a database
+    # handle that is NULL for every such program -- and the linker's
+    # per-function dead-code elimination could not see through a call
+    # into a separately compiled object; with core as bitcode the call
+    # folds away, nothing references sqlite3_* any more, and every
+    # SQLite function is dropped (codegen now also omits that call
+    # outright for a program with no tables/sqlite(), so this does not
+    # hinge on the optimizer). And 375KB was DWARF debug sections
+    # inherited from the sysroot's own libc.a, which nothing ever read:
+    # --strip-debug removes them and keeps the `name` section, so a
+    # browser's stack trace still names the wasm function it was in.
+    # A smaller module is also faster to load: Node compiles the whole
+    # module before the first instruction runs, ~6ms for 1.47MB. The
+    # generated code itself is unchanged in speed -- see wasm.md's
+    # "Reading these numbers" for where wasm's remaining gap to native
+    # comes from.
+    #
+    # `-flto` needs a wasm-ld built with LLVM's LTO support (every
+    # distro/Homebrew lld is); if this toolchain's is not, the link is
+    # retried the plain way rather than failing over an optimization.
+    strip = ["-Wl,--strip-debug"]
     with tempfile.NamedTemporaryFile(suffix=".ll", mode="w", delete=False) as tmp:
         tmp.write(ir)
         ir_path = tmp.name
     try:
-        cmd = [cc, f"--target={_WASM_TARGET}", "-O2", ir_path, *runtime_objects, "-o", output_path]
+        runtime_objects = _wasm_runtime_objects(cc, lto=True)
+        cmd = [cc, f"--target={_WASM_TARGET}", "-O2", "-flto", ir_path, *runtime_objects,
+               *strip, "-o", output_path]
         result = _run_tool(cmd)
+        if result.returncode != 0:
+            runtime_objects = _wasm_runtime_objects(cc)
+            cmd = [cc, f"--target={_WASM_TARGET}", "-O2", ir_path, *runtime_objects,
+                   *strip, "-o", output_path]
+            result = _run_tool(cmd)
         if result.returncode != 0:
             raise CompileError(f"WASM linking failed:\n{result.stderr}",
                                 file=entry_path, category="link error")

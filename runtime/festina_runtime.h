@@ -163,6 +163,11 @@ char *festina_str_from_int(int64_t v);
 char *festina_str_from_float(double v);
 char *festina_str_from_bool(int8_t v);
 char *festina_str_concat(const char *a, const char *b);
+/* claude.md #243: grows `a` (a text binding's own exclusively-owned
+ * buffer, consumed) by `b` in place, amortized O(1) per append;
+ * `a_len`/`b_len` are lengths the caller already knows or -1; the new
+ * length is written to *out_len. Returns the buffer to store. */
+char *festina_text_append(char *a, int64_t a_len, const char *b, int64_t b_len, int64_t *out_len);
 /* claude.md #114: the string builder behind JSON-like rendering of
  * structs/rows/arrays/maps in log() and `${}`. Structure walking lives
  * in generated IR; byte handling lives here. See the .c doc comment. */

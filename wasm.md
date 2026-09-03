@@ -42,23 +42,59 @@ code.
 **Compiling:** `_compile_via_wasm` in `festina/cli.py` hands the same
 LLVM IR text every other target's `_compile_via_clang_ir_frontend`
 fallback path already produces straight to
-`clang --target=wasm32-wasi -O2`, linked against three object files
-(`_wasm_runtime_objects`):
+`clang --target=wasm32-wasi -O2 -flto`, linked against three object
+files (`_wasm_runtime_objects`):
 
 1. **`festina_runtime.c`**, compiled against the vendored
    `runtime/wasm/sqlite3.h` instead of a system one — core, the same
-   translation unit every native target uses.
+   translation unit every native target uses. Compiled to LLVM bitcode
+   (`-flto`) so the link optimizes across the program/runtime boundary
+   — see [Binary size](#binary-size) below for why that matters.
 2. **`runtime/wasm/sqlite3.c`** — SQLite's own single-file amalgamation
-   build, vendored because table/`sqlite()` support is unconditional
-   core (every compiled program links against sqlite3 symbols whether
-   or not it declares a `table`), and there is no system `libsqlite3`
-   for `wasm32-wasi` to link against at all — see
+   build, vendored because the core runtime's table/`sqlite()` support
+   is compiled against sqlite3 symbols and there is no system
+   `libsqlite3` for `wasm32-wasi` to link against at all — see
    [`runtime/wasm/README.md`](runtime/wasm/README.md) for exactly why
    vendoring it (something this project doesn't do for native targets,
-   which link the system's own libsqlite3) is the only option here.
+   which link the system's own libsqlite3) is the only option here. A
+   plain `-O2` object, not bitcode: it is the one translation unit
+   whose ~20-second compile the object cache exists to amortize, and
+   the linker drops every function of it from a program that never
+   touches a database (below).
 3. **`runtime/festina_runtime_wasm_entry.ll`** — a small entry-point
    bridge, see [below](#the-main-entry-point) and
    [below](#why-the-entry-bridge-is-raw-ir-not-c).
+
+### Binary size
+
+A `.wasm` for a program that never declares a `table` or calls
+`sqlite()` is about **31 KB** (`hello`); one that does is about
+1.1 MB, almost all of it SQLite. Two things made the first number
+possible, both found by measuring a 1.47 MB `hello.wasm`
+(claude.md #242):
+
+- **SQLite is dead-code eliminated when nothing uses it.** `wasm-ld`
+  drops unreferenced functions by default, but the whole ~1 MB of
+  SQLite was kept alive by exactly one reference: `main()`'s closing
+  `festina_db_close()` on a database handle that is null for every
+  such program. The linker cannot see through a call into a
+  separately compiled object, so it kept the call, the function, and
+  everything SQLite it reached. With the core runtime as bitcode and
+  `-flto` on the link, that call folds away; codegen now also omits it
+  outright for a program with no database, so the result does not
+  hinge on the optimizer.
+- **No DWARF.** The sysroot's own `libc.a` ships with debug sections,
+  and they were being copied into every output — 375 KB that nothing
+  reads. The link passes `--strip-debug`, which removes them but keeps
+  the `name` section, so a browser's stack trace still names the wasm
+  function it was in.
+
+A smaller module also loads faster: Node (and a browser) compiles the
+whole module before the first instruction runs, about 6 ms for the old
+1.47 MB. The generated code itself runs at the same speed either way.
+If a toolchain's `wasm-ld` was built without LTO support the link is
+retried without `-flto` (SQLite then stays in), rather than failing
+over an optimization.
 
 No libLLVM in-process object-emission path is used for wasm at all
 (unlike native, where it's the fast path when available) — this
@@ -320,6 +356,9 @@ Reproduce locally:
 ```bash
 python3 benchmarks/run_wasm_benchmarks.py               # print results
 python3 benchmarks/run_wasm_benchmarks.py --update-doc   # regenerate this file's tables
+
+python3 benchmarks/run_wasm_browser_benchmarks.py               # the same programs inside Chromium
+python3 benchmarks/run_wasm_browser_benchmarks.py --update-doc  # (needs Playwright + its Chromium)
 ```
 
 Needs a wasm32-wasi-capable clang (see [Setup](#setup) above), Go
@@ -327,49 +366,97 @@ Needs a wasm32-wasi-capable clang (see [Setup](#setup) above), Go
 than failing the run, same spirit as `run_benchmarks.py`.
 
 <!-- WASM_BENCHMARK_RESULTS_START -->
-_Last run: 2026-09-01 on this machine -- see wasm.md's "Benchmark methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-09-03 on this machine -- see wasm.md's "Benchmark methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 50.4 ms | 82.0 ms | 1.47 MB |
-| C | 43.7 ms | 72.3 ms | 45.8 KB |
-| Go | 70.4 ms | 142.8 ms | 2.31 MB |
+| Festina | 50.1 ms | 100.3 ms | 31.7 KB |
+| C | 47.1 ms | 88.4 ms | 45.8 KB |
+| Go | 73.5 ms | 163.4 ms | 2.31 MB |
 
 ### `fib` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 61.2 ms | 84.3 ms | 1.47 MB |
-| C | 54.0 ms | 118.8 ms | 92.1 KB |
-| Go | 106.6 ms | 151.8 ms | 2.31 MB |
+| Festina | 59.6 ms | 120.0 ms | 31.6 KB |
+| C | 60.7 ms | 92.9 ms | 92.1 KB |
+| Go | 111.0 ms | 177.6 ms | 2.31 MB |
 
 ### `loop_sum` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 783.2 ms | 86.5 ms | 1.47 MB |
-| C | 824.6 ms | 79.1 ms | 92.1 KB |
-| Go | 972.8 ms | 157.9 ms | 2.31 MB |
+| Festina | 807.9 ms | 115.1 ms | 31.6 KB |
+| C | 832.0 ms | 92.2 ms | 92.1 KB |
+| Go | 979.3 ms | 162.9 ms | 2.31 MB |
 
 ### `array_sum` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 189.5 ms | 96.9 ms | 1.47 MB |
-| C | 211.8 ms | 83.5 ms | 92.2 KB |
-| Go | 268.8 ms | 182.1 ms | 2.31 MB |
+| Festina | 194.0 ms | 132.4 ms | 31.8 KB |
+| C | 217.7 ms | 90.0 ms | 92.2 KB |
+| Go | 277.8 ms | 155.0 ms | 2.31 MB |
 
 ### `string_concat` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 72.0 ms | 85.8 ms | 1.47 MB |
-| C | 50.4 ms | 87.8 ms | 93.8 KB |
-| Go | 125.1 ms | 163.7 ms | 2.31 MB |
+| Festina | 51.0 ms | 139.8 ms | 33.8 KB |
+| C | 53.2 ms | 92.3 ms | 93.8 KB |
+| Go | 122.5 ms | 167.3 ms | 2.31 MB |
 
 <!-- WASM_BENCHMARK_RESULTS_END -->
+
+### In a browser: Festina vs C vs Go
+
+The same five programs, run inside headless Chromium on this project's own browser WASI host (`runtime/wasm/festina_wasi_browser.js`) instead of Node's -- see [`run_wasm_browser_benchmarks.py`](benchmarks/run_wasm_browser_benchmarks.py) for exactly what is timed.
+
+<!-- WASM_BROWSER_RESULTS_START -->
+_Last run: 2026-09-03 on this machine, Chromium 141.0.7390.37; every number is measured with `performance.now()` inside the worker, so the browser's own launch cost is in none of them. See "Benchmark methodology" above for the runs/min/median rule._
+
+### `hello` (in Chromium, on the project's own WASI host)
+
+| Language | Run (min of 7) | Run (median) | Compile + instantiate (min) | Total (min) | .wasm size |
+|---|---|---|---|---|---|
+| Festina | 0.1 ms | 0.1 ms | 0.4 ms | 0.6 ms | 31.7 KB |
+| C | 0.0 ms | 0.0 ms | 0.2 ms | 0.2 ms | 45.8 KB |
+| Go | 2.0 ms | 2.3 ms | 6.9 ms | 9.4 ms | 2.31 MB |
+
+### `fib` (in Chromium, on the project's own WASI host)
+
+| Language | Run (min of 7) | Run (median) | Compile + instantiate (min) | Total (min) | .wasm size |
+|---|---|---|---|---|---|
+| Festina | 5.1 ms | 7.7 ms | 0.4 ms | 5.7 ms | 31.6 KB |
+| C | 4.6 ms | 4.8 ms | 0.3 ms | 5.0 ms | 92.1 KB |
+| Go | 37.9 ms | 40.6 ms | 6.8 ms | 45.8 ms | 2.31 MB |
+
+### `loop_sum` (in Chromium, on the project's own WASI host)
+
+| Language | Run (min of 7) | Run (median) | Compile + instantiate (min) | Total (min) | .wasm size |
+|---|---|---|---|---|---|
+| Festina | 483.6 ms | 484.8 ms | 0.6 ms | 484.2 ms | 31.6 KB |
+| C | 485.3 ms | 488.1 ms | 0.5 ms | 486.0 ms | 92.1 KB |
+| Go | 459.0 ms | 462.5 ms | 6.9 ms | 465.9 ms | 2.31 MB |
+
+### `array_sum` (in Chromium, on the project's own WASI host)
+
+| Language | Run (min of 7) | Run (median) | Compile + instantiate (min) | Total (min) | .wasm size |
+|---|---|---|---|---|---|
+| Festina | 81.7 ms | 82.2 ms | 0.5 ms | 82.3 ms | 31.8 KB |
+| C | 91.1 ms | 91.5 ms | 0.5 ms | 91.6 ms | 92.2 KB |
+| Go | 115.5 ms | 118.9 ms | 7.4 ms | 124.3 ms | 2.31 MB |
+
+### `string_concat` (in Chromium, on the project's own WASI host)
+
+| Language | Run (min of 7) | Run (median) | Compile + instantiate (min) | Total (min) | .wasm size |
+|---|---|---|---|---|---|
+| Festina | 0.2 ms | 0.3 ms | 0.4 ms | 0.6 ms | 33.8 KB |
+| C | 1.6 ms | 2.0 ms | 0.3 ms | 2.0 ms | 93.8 KB |
+| Go | 31.8 ms | 35.9 ms | 7.7 ms | 39.8 ms | 2.31 MB |
+<!-- WASM_BROWSER_RESULTS_END -->
 
 ### Reading these numbers
 
@@ -382,12 +469,33 @@ benchmark.md itself leads with. What the numbers above actually show:
   (pure arithmetic, all three languages converge to the same ~910ms,
   suggesting Node's WASI dispatch overhead — not code quality — is the
   floor on a loop this tight).
-- **Festina's `.wasm` is consistently larger than C's** (the vendored
-  SQLite amalgamation alone dwarfs any of these five tiny programs —
-  every Festina binary pays that cost unconditionally, same as it does
-  natively) but noticeably *smaller* than Go's (whose runtime —
-  goroutine scheduler, GC — ships in every binary regardless of whether
-  a given program uses any of it).
+- **Festina's `.wasm` is smaller than C's on these five programs**
+  — since claude.md #242 the vendored SQLite is dead-code eliminated
+  from any program that never touches a database, and the sysroot's
+  debug sections are stripped (see [Binary size](#binary-size) above);
+  before that every Festina binary carried all 1.47 MB of it
+  unconditionally, the way native binaries still statically link
+  libsqlite3. Go's runtime — goroutine scheduler, GC — ships in every
+  binary regardless of whether a given program uses any of it.
+- **Where the gap to native comes from.** Against benchmark.md's native
+  table, `hello` under wasm is ~50 ms against 1.4 ms — but ~30 ms of
+  that is Node's own startup and another ~18 ms is importing
+  `node:wasi` and instantiating any module at all (C's 46 KB `hello`
+  measures the same), so it is the host, not the program. On the
+  compute benchmarks the remaining ratio is what V8's wasm tier is
+  known for: `loop_sum` 1.5x native, `fib` and `array_sum` about 2x
+  (every memory access is bounds-checked, calls are dearer).
+  `string_concat` used to be the outlier at ~5x its native time once
+  startup was subtracted: the benchmark was O(n²) copying — 15,000
+  concatenations of a string growing to 15,000 characters, ~112 MB
+  through `memcpy` — and a wasm `memcpy` is a compiled loop, not the
+  SIMD one glibc has, so the same copies simply cost more. Since
+  claude.md #243 that pattern compiles as an in-place append (see
+  api.md's "Strings"), the copying is gone on every target, and the
+  wasm run sits a few milliseconds above the host's own floor.
+  Link-time optimization across the program/runtime boundary was
+  measured too and changes none of these by more than noise; the wins
+  from it are all size.
 - **Go is consistently the slowest of the three to start** (`hello`),
   most visible on the smallest program, where there's no real work to
   amortize a heavier runtime-init cost against.

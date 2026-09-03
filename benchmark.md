@@ -27,7 +27,7 @@ Festina's canvas against a browser's and MonoGame's — see
 | `fib` | Recursive function-call overhead and raw compute throughput — naive recursive `fib(32)` (no memoization), ~7 million calls. Deliberately not reducible to a closed form by an optimizer (unlike a linear sum), so this actually measures generated-code quality, not the compiler's algebra. |
 | `loop_sum` | Tight-loop / branch-free arithmetic throughput — a 100,000,000-iteration polynomial-hash accumulation (`total = (total * 1000003 + i) % 1000000007`), each iteration depending on the last so it can't be folded into a closed-form constant either — a plain running-sum version of this loop optimizes away entirely, running in ~2ms regardless of iteration count (see `loop_sum.f`'s own comment). |
 | `array_sum` | Allocation-heavy throughput — 2,000,000 iterations, each building a fresh 8-element `arr[int]` literal (never escaping, so Festina reclaims it at that iteration's own scope-exit — see [todo.md](todo.md#memory-model)) and summing its elements into a running total. Directly exercises automatic memory management: every iteration is a genuine allocate-fill-read cycle, not just arithmetic. Each element's value depends on the *previous* iteration's own running total, the same closed-form-resistance trick `loop_sum` already uses. The hot loop lives inside a `void func run(...)`, not bare top-level code — escape analysis only ever analyzes a function/handler's own body, never the top-level statement sequence, so this is what lets Festina prove `nums` never escapes (see `array_sum.f`'s own comment). |
-| `string_concat` | String-heavy throughput — 15,000 iterations of naive repeated concatenation (`` s = `${s}x` ``/`s = s + "x"`), `s` growing by one character each time. There's no growable string buffer to amortize into, so this is the textbook O(n²) naive-concatenation pattern. |
+| `string_concat` | String-heavy throughput — 15,000 iterations of repeated concatenation (`` s = `${s}x` ``/`s = s + "x"`), `s` growing by one character each time. Written as the textbook O(n²) naive-concatenation pattern; since claude.md #243 Festina compiles that exact shape as an in-place append onto `s`'s own buffer (amortized O(1) each), so its row now measures that path rather than a quadratic copy. |
 
 Each language uses its own normal toolchain and optimization settings
 (`festina program.f -o program`, `rustc -O`, `go build`, `bun run` —
@@ -74,52 +74,52 @@ failing — see [setup.md](setup.md) for what each one needs.
 ## Results
 
 <!-- BENCHMARK_RESULTS_START -->
-_Last run: 2026-09-01 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-09-03 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.4 ms | 67.0 ms | 1.49 MB |
-| Rust | 1.5 ms | 80.5 ms | 3.77 MB |
-| Go | 1.3 ms | 159.7 ms | 2.11 MB |
-| Bun | 11.3 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.6 ms | 80.0 ms | 1.49 MB |
+| Rust | 1.9 ms | 97.8 ms | 3.77 MB |
+| Go | 1.3 ms | 189.2 ms | 2.11 MB |
+| Bun | 12.8 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `fib`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 7.7 ms | 71.8 ms | 1.49 MB |
-| Rust | 8.2 ms | 96.6 ms | 3.77 MB |
-| Go | 14.0 ms | 162.3 ms | 2.11 MB |
-| Bun | 31.3 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 8.0 ms | 84.5 ms | 1.49 MB |
+| Rust | 8.5 ms | 107.8 ms | 3.77 MB |
+| Go | 14.7 ms | 190.3 ms | 2.11 MB |
+| Bun | 31.5 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `loop_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 519.0 ms | 76.9 ms | 1.49 MB |
-| Rust | 526.5 ms | 89.1 ms | 3.77 MB |
-| Go | 461.3 ms | 159.4 ms | 2.11 MB |
-| Bun | 9024.2 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 524.2 ms | 86.0 ms | 1.49 MB |
+| Rust | 530.9 ms | 101.9 ms | 3.77 MB |
+| Go | 464.6 ms | 189.1 ms | 2.11 MB |
+| Bun | 9109.4 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `array_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 92.3 ms | 88.2 ms | 1.49 MB |
-| Rust | 91.0 ms | 103.4 ms | 3.77 MB |
-| Go | 88.7 ms | 180.5 ms | 2.11 MB |
-| Bun | 2345.7 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 93.7 ms | 108.7 ms | 1.49 MB |
+| Rust | 90.9 ms | 203.2 ms | 3.77 MB |
+| Go | 89.6 ms | 182.7 ms | 2.11 MB |
+| Bun | 2456.0 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `string_concat`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 3.7 ms | 72.9 ms | 1.49 MB |
-| Rust | 1.6 ms | 109.3 ms | 3.77 MB |
-| Go | 35.9 ms | 193.9 ms | 2.11 MB |
-| Bun | 12.4 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.9 ms | 84.5 ms | 1.49 MB |
+| Rust | 1.7 ms | 123.8 ms | 3.77 MB |
+| Go | 38.9 ms | 181.5 ms | 2.11 MB |
+| Bun | 14.2 ms | n/a (JIT, no separate build step) | n/a |
 
 <!-- BENCHMARK_RESULTS_END -->
 
@@ -152,25 +152,22 @@ _Last run: 2026-09-01 on this machine -- see benchmark.md's "Methodology" sectio
   give a fixed-size `alloca`). The remaining, small gap is ordinary
   codegen-maturity noise, not an allocation-strategy gap.
 - **`string_concat`** is where Festina's `text` ownership model shows up
-  directly: every intermediate buffer this benchmark's naive
-  concatenation builds is genuinely freed once nothing references it
-  any more, so the heap grows linearly with the final string's own
-  length, not quadratically with the number of concatenations — the
-  underlying O(n²) naive-copy algorithm is unchanged, but nothing about
-  it depends on allocator pressure from an unfreed buffer. Festina sits
-  second in this benchmark, ahead of both Go (~9x) and Bun (~3x) and
-  within about 2.4x of Rust. The remaining Rust gap is genuinely
-  algorithmic, not something this benchmark is meant to close: Rust's
-  `String` `+` reuses the left operand's own spare capacity in place
-  when it has room (amortized growth, the same idea `Vec` uses), so it
-  isn't doing the full O(n²) copy at all. Go's `+` on immutable strings
-  has no spare capacity to grow into either, which is why it lands on
-  the same side of the divide as Festina; Bun's V8 backend uses
+  directly. A text binding's buffer is exclusively its own (claude.md
+  #83), so `` s = `${s}x` `` is an assignment that is about to free the
+  very buffer it is copying from — and since claude.md #243 the
+  compiler treats it as what it is: an append onto `s`'s own buffer,
+  grown in place with a length the compiler tracks, amortized O(1) per
+  step instead of a fresh copy of the whole string. That is the same
+  idea Rust's `String` `+` uses (reusing the left operand's spare
+  capacity, like `Vec`), which is why the two now land together; before
+  #243 Festina did the full O(n²) copy and sat about 2.4x behind Rust.
+  Go's `+` on immutable strings has no spare capacity to grow into,
+  which is why it does the quadratic copy; Bun's V8 backend uses
   rope/cons-string representations internally, deferring the copy until
-  the string is actually read, which is why it avoids the quadratic
-  blowup despite naive-looking source. None of this is a bug in any of
-  the four — it's exactly the kind of language/runtime difference this
-  benchmark exists to surface.
+  the string is actually read, which is why it avoids the blowup despite
+  naive-looking source. None of this is a bug in any of the four — it's
+  exactly the kind of language/runtime difference this benchmark exists
+  to surface.
 - **The canvas comparison** (below) is the one benchmark here that
   isn't against another *language*. It's against the thing a 2D game
   would otherwise most likely be written on: an HTML `<canvas>`. Circles
