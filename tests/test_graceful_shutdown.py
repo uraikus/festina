@@ -101,7 +101,17 @@ class TestHttpGracefulShutdown:
         time.sleep(0.2)  # let the signal actually get noticed
         sock.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
         sock.settimeout(5)
-        data = sock.recv(4096)
+        # claude.md #235: the status line + headers and the body are
+        # two separate send() calls (festina_http_send's own comment),
+        # so a single recv() can legitimately return just the headers
+        # -- seen once on the linux CI job. Read until the body has
+        # arrived or the server closes the socket.
+        data = b""
+        while b"still here" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
         sock.close()
         assert b"still here" in data
         server.process.wait(timeout=5)

@@ -119,12 +119,13 @@ while i < 400 {
     i = i + 1
 }
 
-// claude.md #233: a self-referencing struct nested far deeper than the
-// cleanup stack allows (1024 builder levels) -- this used to recurse
-// straight off the C stack (SIGSEGV) with no cap at all; now it throws
-// from festina_cleanup_push, and the release cascade of the ~1024
-// levels already built must leave nothing behind. Built once (not per
-// pass -- the text alone is ~40KB) and parsed 20 times.
+// claude.md #233/#236: a self-referencing struct nested far deeper than
+// the parser allows (FESTINA_JSON_MAX_DEPTH, 1000 builder levels) --
+// this used to recurse straight off the C stack (SIGSEGV) with no cap
+// at all; now it throws from festina_json_object_start, and the release
+// cascade of the ~1000 levels already built must leave nothing behind.
+// Built once (not per pass -- the text alone is ~40KB) and parsed 20
+// times.
 text deep = ''
 int d = 0
 while d < 2000 {

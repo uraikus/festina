@@ -664,7 +664,7 @@ static int festina_thread_try_dispatch_one(FestinaThreadHandle *h, int *killed_o
  * on_load() once, then dispatch messages forever until killed. An
  * uncaught throw inside on_load/on_message/on_exit is not separately
  * guarded here (unlike festina_runtime_http.c's own worker, this file
- * needs no __builtin_setjmp catch-frame machinery yet) -- cloning
+ * needs no setjmp catch-frame machinery yet) -- cloning
  * itself (codegen's own _clone_fn_for_*) can't throw for any message
  * type this runtime accepts today, and an uncaught festina_throw from
  * Festina code currently terminates the whole process (see
@@ -727,6 +727,12 @@ static void *festina_thread_main(void *arg) {
      * runtime will ever close on this thread's behalf). */
     if (h->db_close) h->db_close();
     if (h->http_teardown) h->http_teardown();
+    /* claude.md #236: this thread's own cleanup stack buffer (grown on
+     * demand by every managed local its handlers ever bound while the
+     * program has a `try`) -- same placement and reasoning as the two
+     * OS-level handles just above: nothing else will ever run on this
+     * thread again. */
+    festina_cleanup_stack_free();
     pthread_mutex_lock(&h->in_lock);
     h->alive = 0;
     /* claude.md #232: release any drain() waiter -- its predicate

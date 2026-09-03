@@ -296,3 +296,224 @@ class TestRuntimeBehavior:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.splitlines() == ["3", "7"]
+
+
+class TestThrowUnwindsIntermediateFrames:
+    """claude.md #236: a throw reached THROUGH a function that merely
+    calls something which eventually throws -- no try, no throw of its
+    own -- releases that function's locals on the way to the catching
+    try. claude.md #157 documented this as the mechanism's one leak
+    (longjmp skips every intermediate frame's scope-exit code); every
+    managed local is registered on the runtime's per-thread cleanup
+    stack as it is bound now (codegen.py's _track_local) and
+    festina_throw releases the entries above the catching frame. The
+    leak-freedom itself is measured by tests/stress/throw_unwind_churn.f
+    under ASan (scripts/leak_stress.sh); these pin the behaviour around
+    it and the IR shape."""
+
+    def _ir(self, parser, semantic, codegen, source):
+        program = parser.parse(source)
+        gen = codegen.CodeGen(semantic.analyze(program), host_platform="linux")
+        return gen.generate(program)
+
+    def test_a_program_without_try_registers_nothing(self, parser, semantic, codegen):
+        # No try anywhere: a throw is fail(), there is nothing to unwind
+        # to, and the IR must be exactly what it was -- no push, no pop,
+        # no unwind functions, for a program that never pays for them.
+        ir = self._ir(parser, semantic, codegen, """
+        void func f() {
+            text s = 'x'
+            arr[int] xs = [1]
+            throw s
+        }
+        f()
+        """)
+        assert "@__festina_unwind_" not in ir
+        assert "call void @festina_cleanup_push" not in ir
+        assert "call void @festina_cleanup_pop" not in ir
+
+    def test_a_program_with_try_registers_every_tracked_local(self, parser, semantic, codegen):
+        ir = self._ir(parser, semantic, codegen, """
+        struct P { name:text }
+        void func g() { throw 'boom' }
+        void func f() {
+            text s = 'x'
+            arr[int] xs = [1]
+            map[int] m = {'k': 1}
+            P p
+            p.name = s
+            arr[P] ps = [p]
+            g()
+        }
+        try { f() } catch (e:text) { log(e) }
+        """)
+        pushes = [l for l in ir.splitlines() if "call void @festina_cleanup_push(ptr %" in l]
+        # s, xs, m, p (escapes into ps), ps -- one registration each --
+        # plus the catch variable `e` itself, a tracked text local of
+        # the catch body
+        assert len(pushes) == 6, pushes
+        assert all("@__festina_unwind_" in l for l in pushes)
+        # every registration names a generated unwind function that
+        # takes the slot, and every ordinary exit pops what it
+        # releases (one call per scope exit, counted)
+        assert ir.count("define void @__festina_unwind_") >= 3
+        assert "call void @festina_cleanup_pop_n(i64 " in ir
+        # and the throw itself no longer frees anything inline: the
+        # runtime does, from the stack
+        g_body = ir[ir.index("define void @g"):]
+        g_body = g_body[:g_body.index("\n}\n")]
+        assert "festina_throw" in g_body
+
+    def test_intermediate_frames_locals_do_not_disturb_the_survivors(self, compile_and_run):
+        # The observable half of the fix: everything declared BEFORE
+        # the try, at every level, is intact afterwards, and the
+        # program keeps running -- through three frames, a loop-body
+        # local, and an escaping parameter.
+        source = """
+        struct P { id:int  name:text }
+        arr[text] trail = []
+        void func deepest(i:int) {
+            text t = `deep ${i}`
+            throw t
+        }
+        void func middle(i:int) {
+            text s = `mid ${i}`
+            arr[int] xs = [i, i + 1]
+            map[text] m = {'k': s}
+            P p
+            p.id = i
+            p.name = s
+            arr[P] ps = [p]
+            int k = 0
+            while k < 3 {
+                text inner = `loop ${k}`
+                if k == 2 { deepest(i) }
+                k = k + 1
+            }
+            trail.push('unreachable')
+        }
+        void func outer(held:arr[int], i:int) {
+            held = [i]
+            text o = `outer ${i}`
+            middle(i)
+            trail.push('unreachable')
+        }
+        text before = 'kept'
+        arr[int] keep = [9, 8]
+        int i = 0
+        while i < 3 {
+            try {
+                outer([1, 2, 3], i)
+            } catch (e:text) {
+                trail.push(e)
+            }
+            i = i + 1
+        }
+        log(trail.join(','))
+        log(before)
+        log(keep.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.splitlines() == ["deep 0,deep 1,deep 2", "kept", "2"]
+
+    def test_a_rethrow_from_an_intermediate_catch_crosses_both_frames(self, compile_and_run):
+        source = """
+        void func deepest() { throw 'inner' }
+        void func rethrower() {
+            text a = 'a'
+            try {
+                text b = 'b'
+                deepest()
+            } catch (e:text) {
+                text c = `re-${e}`
+                throw c
+            }
+            log('unreachable')
+        }
+        try { rethrower() } catch (e:text) { log(e) }
+        log('done')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.splitlines() == ["re-inner", "done"]
+
+    def test_a_json_failure_two_frames_down_is_caught_and_the_program_continues(
+            self, compile_and_run):
+        source = """
+        struct Person { id:int  name:text }
+        void func parses(src:text) {
+            text label = `parsing ${src}`
+            Person who = src.toStruct(Person)
+            log(who.name)
+        }
+        void func via(i:int) {
+            arr[text] scratch = [`${i}`]
+            parses(`{"id": ${i}, "name": ${i}}`)
+        }
+        try { via(1) } catch (e:text) { log('caught') }
+        via(2)
+        """
+        result = compile_and_run(source)
+        # the second call is uncaught: it must behave exactly like
+        # fail() -- after the first was caught cleanly
+        assert result.returncode == 1
+        assert result.stdout.splitlines() == ["caught"]
+        assert result.stderr.strip().startswith("fail:")
+
+    def test_the_stack_stays_balanced_across_many_ordinary_calls(self, compile_and_run):
+        # Every push has its pop on the non-throwing path: if it didn't,
+        # 20000 calls would leave 60000 stale entries whose slots are
+        # long gone, and the throw at the end would release through
+        # them -- a crash, not a caught message.
+        source = """
+        struct P { name:text }
+        void func quiet(i:int) {
+            text s = `q ${i}`
+            arr[int] xs = [i]
+            P p
+            p.name = s
+            arr[P] ps = [p]
+            if i < 0 { throw s }
+        }
+        int i = 0
+        while i < 20000 {
+            quiet(i)
+            i = i + 1
+        }
+        try { quiet(-1) } catch (e:text) { log(e) }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "q -1"
+
+    def test_a_worker_thread_unwinds_on_its_own_stack(self, compile_and_run):
+        # The cleanup stack is per thread: a throw inside a worker's own
+        # handler, caught by a try in that same worker, releases only
+        # that worker's locals, while main is mid-way through its own
+        # tracked locals.
+        source = """
+        int got = 0
+        on message(w:thread, msg:text) {
+            log(msg)
+            got = got + 1
+            if got == 3 { close(0) }
+        }
+        thread worker {
+            void func deep(i:int) {
+                text t = `w ${i}`
+                throw t
+            }
+            on message(w:thread, msg:int) {
+                text mine = 'worker-local'
+                try { deep(msg) } catch (e:text) { postMessage(e) }
+            }
+        }
+        text keep = 'main-local'
+        worker.postMessage(1)
+        worker.postMessage(2)
+        worker.postMessage(3)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert sorted(result.stdout.split()) == ["1", "2", "3", "w", "w", "w"]

@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -438,37 +439,50 @@ class TestFeatureGating:
         assert "wrong shell" not in "\n".join(lines)
 
 
-class TestDarwinTryGating:
-    """claude.md #170: try/catch/throw is a hard, non-overridable
-    rejection on darwin -- LLVM's AArch64 backend (what every real
-    macOS CI runner and every Apple Silicon Mac is) has no SjLj
-    lowering at all, confirmed directly the same way wasm32-wasi's own
-    identical rejection was (clang rejects __builtin_longjmp outright
-    for that target). Unlike TestFeatureGating's audio/graphics/http
-    gates just above, there is no FESTINA_ENABLE_* env var here --
-    nothing to try, the backend genuinely doesn't exist, the same
-    "genuinely absent" shape _check_wasm_feature_supported already
-    established."""
+class TestSetjmpSymbol:
+    """claude.md #235: a `try` calls libc's own setjmp directly from the
+    generated IR (codegen.py's _emit_try) -- `_setjmp` on every POSIX
+    libc (no signal-mask syscall per try), `setjmp` on Windows (the one
+    name both UCRT and MSVCRT export) with an explicit null frame
+    argument so a throw's longjmp is a plain register restore, not an
+    SEH unwind. This replaced the LLVM SjLj intrinsics, which have no
+    AArch64 lowering (so try/catch was rejected outright on macOS,
+    claude.md #170 -- TestDarwinTryGating used to live here) and a
+    broken x86_64 Windows one (three 0xC0000005 crashes on the windows
+    CI job). The old darwin gate is gone with it: TestOnMacOS's own
+    test_try_catch_works below runs a real caught throw on macos-14."""
 
-    def test_rejected_on_darwin(self, cli_mod, errors):
-        with pytest.raises(errors.CompileError) as excinfo:
-            cli_mod._check_darwin_try_supported("darwin")
-        assert excinfo.value.category == "unsupported platform feature"
-        assert "macos.md" in str(excinfo.value)
+    def _ir(self, parser, semantic, codegen, platform_name):
+        program = parser.parse("try { throw 'x' } catch (e:text) { log(e) }\n")
+        analyzed = semantic.analyze(program)
+        gen = codegen.CodeGen(analyzed, host_platform=platform_name)
+        return gen.generate(program)
 
-    def test_not_gated_on_linux(self, cli_mod):
-        cli_mod._check_darwin_try_supported("linux")   # no raise
+    @pytest.mark.parametrize("platform_name", ["linux", "darwin"])
+    def test_posix_calls__setjmp(self, parser, semantic, codegen, platform_name):
+        ir = self._ir(parser, semantic, codegen, platform_name)
+        assert "declare i32 @_setjmp(ptr, ptr) returns_twice" in ir
+        assert "call i32 @_setjmp(ptr %" in ir
+        assert "@llvm.eh.sjlj" not in ir
 
-    def test_not_gated_on_windows(self, cli_mod):
-        cli_mod._check_darwin_try_supported("win32")   # no raise
+    def test_windows_calls_setjmp_with_a_null_frame(self, parser, semantic, codegen):
+        ir = self._ir(parser, semantic, codegen, "win32")
+        assert "declare i32 @setjmp(ptr, ptr) returns_twice" in ir
+        assert "@_setjmp" not in ir
+        # The second argument is the SEH frame: null means longjmp does
+        # no unwind -- see _setjmp_symbol_for.
+        assert ", ptr null)" in [l for l in ir.splitlines() if "call i32 @setjmp(" in l][0]
 
-    def test_defaults_to_live_sys_platform(self, cli_mod, monkeypatch):
-        # No platform_name passed -- must consult sys.platform itself,
-        # the same injectable-but-defaults-live shape every other gate
-        # in this module already has.
-        monkeypatch.setattr(sys, "platform", "darwin")
-        with pytest.raises(cli_mod.CompileError):
-            cli_mod._check_darwin_try_supported()
+    def test_buffer_is_large_enough_for_any_jmp_buf(self, parser, semantic, codegen):
+        # glibc's aarch64 jmp_buf is the largest this project meets
+        # (312 bytes); Windows x64's needs 16-byte alignment.
+        ir = self._ir(parser, semantic, codegen, "linux")
+        assert "alloca [1024 x i8], align 16" in ir
+
+    def test_defaults_to_live_sys_platform(self, parser, semantic, codegen, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        ir = self._ir(parser, semantic, codegen, None)
+        assert "call i32 @setjmp(ptr %" in ir
 
 
 class TestDetectPackageManager:
@@ -1036,26 +1050,30 @@ class TestOnMacOS:
         assert result.returncode == 0
         assert result.stdout.strip() == "hello from darwin"
 
-    def test_try_catch_is_rejected(self, cli_mod, errors, tmp_path):
-        # claude.md #170: confirmed for real on this exact CI job --
-        # LLVM's AArch64 backend has no SjLj lowering, so a program
-        # using try/catch must fail at compile time with a clear
-        # message, not crash or hang trying to compile
-        # __builtin_longjmp's nonexistent lowering. Goes through
-        # compile_file itself (not just _check_darwin_try_supported
-        # directly, TestDarwinTryGating's own job above) to confirm the
-        # real wiring, on real hardware.
+    def test_try_catch_works(self, cli_mod, tmp_path):
+        # claude.md #235: this used to assert try/catch was REJECTED
+        # here (claude.md #170 -- the LLVM SjLj intrinsics generated
+        # code called have no AArch64 lowering). A try is a direct call
+        # to libc's own _setjmp now, which Darwin has always had, so the
+        # gate is gone: a real caught throw on the real macos-14 runner,
+        # the local declared before the try surviving it, and the
+        # program carrying on afterwards.
         src = tmp_path / "main.f"
-        src.write_text("try { log('x') } catch (e:text) { log(e) }\n", encoding="utf-8")
-        with pytest.raises(errors.CompileError) as excinfo:
-            cli_mod.compile_file(str(src), str(tmp_path / "out"))
-        assert excinfo.value.category == "unsupported platform feature"
+        src.write_text(
+            "arr[int] kept = [1, 2, 3]\n"
+            "try { throw 'boom' } catch (e:text) { log(`caught ${e}`) }\n"
+            "log(kept.length)\n", encoding="utf-8")
+        out = cli_mod.compile_file(str(src), str(tmp_path / "out"))
+        result = subprocess.run([out], capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.split() == ["caught", "boom", "3"]
 
     def test_to_struct_is_not_rejected(self, cli_mod, tmp_path):
         # claude.md #233: the darwin counterpart of test_wasm.py's own
         # test_to_struct_and_to_arr_work_under_wasm. claude.md #223's
         # sjlj frame inside every JSON builder made .toStruct()/
-        # .toArr() trip the darwin try gate just above -- and because
+        # .toArr() trip the darwin try gate (claude.md #170, since
+        # lifted by #235) -- and because
         # conftest's compile_file_or_skip turns that category into a
         # skip, every JSON parsing test on this job quietly became a
         # skip (21 more skips than the run before it) rather than a
@@ -1117,3 +1135,111 @@ class TestOnWindows:
             line for line in result.stdout.splitlines() if "DLL Name" in line)
         assert "libgcc" not in dll_names.lower()
         assert "libwinpthread" not in dll_names.lower()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs on the Windows CI job")
+class TestOnWindowsWindow:
+    """claude.md #238: windowed input on real Win32, driven from the
+    test itself. GitHub's windows-latest runners have a live desktop
+    session, so a compiled graphics program really opens a window there
+    -- what was missing (windows.md) was any way to DRIVE it the way
+    the Linux suite drives Xvfb windows with xdotool. This is that: the
+    program's window is found by its class name through ctypes
+    (FindWindowW), and the same Win32 messages a mouse, a keyboard and
+    the window manager would send are posted to it (PostMessageW /
+    MoveWindow / WM_CLOSE), so every handler in the pinned event
+    vocabulary -- mouseDown/mouseUp with coordinates and button,
+    keyDown/keyUp with the key name, resize with the new client size,
+    close -- is asserted against the program's own log output."""
+
+    WM_CLOSE = 0x0010
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    MK_LBUTTON = 0x0001
+    VK_A = 0x41
+    SCANCODE_A = 0x1E
+
+    def _find_window(self, user32, process, timeout=15):
+        import ctypes
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if process.poll() is not None:
+                pytest.fail(f"the program exited before opening a window (code {process.returncode}):\n"
+                            f"{process.stdout.read()}")
+            hwnd = user32.FindWindowW("FestinaWindowClass", None)
+            if hwnd:
+                return hwnd
+            time.sleep(0.05)
+        process.kill()
+        pytest.fail("no FestinaWindowClass window appeared within the timeout")
+
+    def test_mouse_key_resize_and_close_reach_their_handlers(self, cli_mod, tmp_path):
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+        user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+
+        src = tmp_path / "win.f"
+        src.write_text(
+            "on mouseDown(x:int, y:int, button:int) { log(`down ${x} ${y} ${button}`) }\n"
+            "on mouseUp(x:int, y:int, button:int) { log(`up ${x} ${y} ${button}`) }\n"
+            "on keyDown(key:text) { log(`keydown ${key}`) }\n"
+            "on keyUp(key:text) { log(`keyup ${key}`) }\n"
+            "on resize() { log(`resize ${clientWidth} ${clientHeight}`) }\n"
+            "on close() { log('close') }\n"
+            "setClientWidth(320)\n"
+            "setClientHeight(200)\n"
+            "drawRect(0, 0, 10, 10)\n"
+            "render()\n", encoding="utf-8")
+        out = cli_mod.compile_file(str(src), str(tmp_path / "win.exe"))
+        process = subprocess.Popen([out], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8")
+        try:
+            hwnd = self._find_window(user32, process)
+            time.sleep(0.3)   # let the first paint and any creation-time resize settle
+
+            # a left click at client (40, 30): lParam packs x in the low
+            # word, y in the high word
+            lparam = (30 << 16) | 40
+            user32.PostMessageW(hwnd, self.WM_LBUTTONDOWN, self.MK_LBUTTON, lparam)
+            user32.PostMessageW(hwnd, self.WM_LBUTTONUP, 0, lparam)
+
+            # the `a` key: WM_KEYDOWN/WM_KEYUP carry the virtual key in
+            # wParam and the scancode in bits 16-23 of lParam (the
+            # backend's own ToUnicode translation reads it)
+            user32.PostMessageW(hwnd, self.WM_KEYDOWN, self.VK_A, (self.SCANCODE_A << 16) | 1)
+            user32.PostMessageW(hwnd, self.WM_KEYUP, self.VK_A, (self.SCANCODE_A << 16) | 1 | (1 << 30) | (1 << 31))
+
+            # a resize: grow the outer window by exactly 80x60, so the
+            # client area grows by the same amount whatever the chrome
+            # around it measures on this runner
+            before = wintypes.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(before))
+            outer = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(outer))
+            user32.MoveWindow(hwnd, outer.left, outer.top,
+                              outer.right - outer.left + 80, outer.bottom - outer.top + 60, True)
+            expected_w = before.right - before.left + 80
+            expected_h = before.bottom - before.top + 60
+            time.sleep(0.3)
+
+            user32.PostMessageW(hwnd, self.WM_CLOSE, 0, 0)
+            stdout, _ = process.communicate(timeout=15)
+        finally:
+            if process.poll() is None:
+                process.kill()
+        lines = stdout.splitlines()
+        assert process.returncode == 0, stdout
+        assert "down 40 30 1" in lines, lines
+        assert "up 40 30 1" in lines, lines
+        assert "keydown a" in lines, lines
+        assert "keyup a" in lines, lines
+        assert f"resize {expected_w} {expected_h}" in lines, lines
+        assert lines[-1] == "close", lines

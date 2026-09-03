@@ -9,6 +9,99 @@ it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
 [claude.md](claude.md).
 
+## [0.44] - 2026-09-02
+
+### Added
+
+- **`drawImage` accepts an `img?` source.** Every form of the canvas
+  `drawImage(...)` and of `img.drawImage(...)` takes a manually-managed
+  `img?` where it says `img` — compositing only reads the source for
+  the duration of the call and keeps no reference, so nothing changes
+  hands. A layer painted by a worker thread can now be drawn straight
+  onto the canvas with no `clip()` copy first. This is the one
+  read-only exception to `T?` being a distinct type; assignment and
+  every other call site are unchanged.
+
+### Changed
+
+- **Solid shapes are drawn without a rasterizer.** An opaque
+  flat-colour `drawRect`/`drawCircle`/`drawPixel` at an integer
+  position (no `fillAlpha` below 1, gradient, border, scale or
+  rotation) is written straight into the pixels, on the canvas and on
+  an `img` alike; circles come from a per-radius coverage mask Cairo
+  rasterizes once, blended with pixman's own arithmetic so the result
+  is byte-identical to before. The canvas benchmark's 40,000-shape
+  frame went from 35 ms to 7 ms; the layered-canvas benchmark's four
+  `img?` layers from 84 ms to 8 ms on one thread. Everything outside
+  that contract still goes through Cairo unchanged.
+  `FESTINA_NO_DIRECT_FILL=1` switches the direct path off.
+- **Fresh image surfaces are faulted in when created**, not one page
+  at a time on first touch — the reason four threads painting four
+  new `img?` layers ran no faster than one (first-touch page faults
+  serialize across a process's threads). The layered benchmark's
+  four-thread run went from 62 ms to 7 ms.
+- `img.clip()`, `saveCanvas()`-to-`img` and `img.resize()` copy their
+  source with Cairo's SOURCE operator instead of blending it OVER a
+  transparent surface: the same pixels, a straight copy.
+- The per-call colour form of `drawCircle` now produces exactly the
+  same pixels as the `fillStyle()` form (it used to tessellate where
+  the plain form stamped a cached mask, 1/255 apart on a few edge
+  pixels at larger radii).
+
+## [0.43] - 2026-09-02
+
+### Added
+
+- **A compiled `.wasm` runs in a browser tab.** `runtime/wasm/` ships
+  a dependency-free WASI Preview 1 host of this project's own
+  (`festina_wasi_browser.js`), a Web Worker that runs a program on it,
+  and `browser.html?wasm=program.wasm`, the smallest page that does --
+  stdout/stderr stream into the page and `window.festinaResult` holds
+  the exit code, output and every file the program wrote to its
+  in-memory sandbox. `node runtime/wasm/run_wasi_js.mjs` runs the same
+  host outside a browser. Tested through the host under Node and in
+  headless Chromium (files, directories, SQLite, timers, `argv`, exit
+  codes). See wasm.md's "In a browser".
+- **The Windows CI job drives a real window**: a new test finds the
+  compiled program's Win32 window and posts mouse, keyboard, resize and
+  close messages to it, asserting every input handler's output.
+
+### Fixed
+
+- **`try`/`catch`/`throw` works on macOS, and no longer crashes after
+  a catch on Windows.** A `try` is a direct call to libc's own
+  `setjmp` now and a `throw` is libc's `longjmp`, replacing LLVM's SjLj
+  intrinsics -- which have no AArch64 lowering (macOS rejected `try`
+  outright) and a broken x86_64 Windows one (the catch ran, then every
+  local read as garbage). wasm32-wasi is the one target left without
+  it (wasi-libc has no setjmp/longjmp). AddressSanitizer can instrument
+  a `try`/`catch` program now, too.
+- On Windows, a program whose only listening port belongs to a
+  `thread` no longer exits the moment its top-level code finishes
+  (`WSAPoll` rejects an empty fd set where POSIX `poll` sleeps).
+- On Windows, `blob.append()` is an atomic append (`FILE_APPEND_DATA`),
+  so two threads appending to one file no longer overwrite each other's
+  bytes.
+- The Windows CI job is green: the four remaining failures were tests
+  assuming `/bin/sh`, `/bin/echo` or `apt` exist, fixed in the tests.
+- **A `throw` no longer leaks the locals of the functions it unwinds
+  through.** A function that merely called something which eventually
+  threw -- no `try` or `throw` of its own -- used to skip its scope-exit
+  cleanup entirely (the one documented leak of the try/throw
+  mechanism). In a program containing a `try`, every managed local is
+  now registered on the runtime's per-thread cleanup stack as it is
+  bound, and every call site's owning argument temporaries for the
+  duration of the call; a `throw` releases everything above the
+  catching `try`, newest first. 0 bytes leaked under AddressSanitizer
+  and Valgrind through three frames, every kind of local, a rethrow and
+  a JSON failure. A program with no `try` is unchanged; one with a
+  `try` pays about 8 ns per managed local binding.
+- The JSON nesting cap is the parser's own (1000 levels) rather than a
+  side effect of the cleanup stack's size: `JSON nested too deeply
+  (more than 1000 levels)`.
+
+See claude.md #235-#238.
+
 ## [0.42] - 2026-09-02
 
 ### Added

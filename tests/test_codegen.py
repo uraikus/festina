@@ -13851,6 +13851,379 @@ def _decode_png_rgba(path):
     return width, height, pixel
 
 
+_SOLID_FILL_HEAD = """color red = '#c81e1e'
+color green = '#1ec81e'
+color blue = '#1e1ec8'
+color white = '#ffffff'
+color none = 'none'
+"""
+
+# claude.md #240: one scene, drawn onto the canvas (T="") or onto an img
+# (T="layer."). Every solid-fill entry point is in here -- plain
+# fillStyle() forms and per-call colour forms of drawRect/drawCircle/
+# drawPixel, over a translucent wash and an opaque band so partially
+# covered edge pixels blend against real alpha -- plus the awkward cases:
+# negative extents, shapes straddling and entirely outside the surface,
+# a whole-pixel translation, and a radius past the coverage cache
+# (which must fall back, identically). Circles stay within radius 20
+# (the range claude.md #104 verified mask-vs-tessellation identical) and
+# the per-call COLOUR form of drawCircle is left to its own test below:
+# before #240 that form tessellated where the plain form stamped a mask,
+# and the two disagree by 1/255 on a few edge pixels at larger radii.
+_SOLID_FILL_SCENE = """fillStyle(30, 60, 90)
+fillAlpha(0.5)
+{T}drawRect(0, 0, 800, 600)
+fillAlpha(1.0)
+fillStyle(200, 200, 40)
+{T}drawRect(0, 300, 800, 120)
+int i{K} = 0
+while i{K} < 300 {{
+    int x = (i{K} * 37) % 820 - 10
+    int y = (i{K} * 53) % 620 - 10
+    fillStyle(i{K} % 255, (i{K} * 7) % 255, (i{K} * 13) % 255)
+    {T}drawRect(x, y, 12, 9)
+    {T}drawCircle(x + 6, y + 4, 1 + i{K} % 20)
+    {T}drawPixel(x + 1, y + 1)
+    i{K} = i{K} + 1
+}}
+fillStyle(red)
+{T}drawRect(400, 300, -50, -40)
+{T}drawRect(-100, -100, 50, 50)
+{T}drawRect(790, 590, 100, 100)
+{T}drawRect(10, 10, 0, 50)
+{T}drawCircle(-5, -5, 3)
+{T}drawCircle(5, 5, 0)
+{T}drawCircle(700, 100, 200)
+{T}drawRect(9000000000000000000, 5, 5, 5)
+{T}drawCircle(5, -9000000000000000000, 5)
+{T}drawRect(20, 500, 60, 40, green)
+{T}drawRect(90, 500, 60, 40, blue, none)
+{T}drawPixel(300, 520, blue)
+{T}drawRect(320, 500, 30, 30, none)
+{T}translate(5, 7)
+{T}drawCircle(400, 520, 10)
+{T}drawRect(430, 500, 20, 20, green)
+{T}drawPixel(460, 520)
+{T}resetTransform()
+int r{K} = 1
+while r{K} < 21 {{
+    fillStyle((r{K} * 40) % 255, 80, 200)
+    {T}drawCircle(30 * r{K}, 450, r{K})
+    r{K} = r{K} + 1
+}}
+"""
+
+
+def _solid_fill_program(canvas_png, layer_png=None):
+    prog = _SOLID_FILL_HEAD + "clearCanvas()\n" + _SOLID_FILL_SCENE.format(T="", K="a")
+    if layer_png:
+        prog += ("img layer = blankImage(800, 600)\n"
+                 + _SOLID_FILL_SCENE.format(T="layer.", K="b")
+                 + f"log(layer.save('{layer_png}'))\n")
+    prog += f"log(saveCanvas('{canvas_png}'))\n"
+    return prog
+
+
+def _png_pixels(path):
+    """Every pixel of a PNG as one bytes object, for whole-image
+    equality with a useful failure message from _png_diff below."""
+    w, h, stride, bpp, out = _png_raw(path)
+    assert bpp == 4, (path, bpp)
+    return w, h, bytes(out)
+
+
+def _png_diff(a, b):
+    """The differing pixels between two same-size PNGs, as
+    (x, y, rgba_a, rgba_b) tuples -- empty when identical."""
+    wa, ha, pa = _png_pixels(a)
+    wb, hb, pb = _png_pixels(b)
+    assert (wa, ha) == (wb, hb)
+    diffs = []
+    for y in range(ha):
+        row = y * wa * 4
+        if pa[row:row + wa * 4] == pb[row:row + wa * 4]:
+            continue
+        for x in range(wa):
+            off = row + x * 4
+            if pa[off:off + 4] != pb[off:off + 4]:
+                diffs.append((x, y, tuple(pa[off:off + 4]), tuple(pb[off:off + 4])))
+    return diffs
+
+
+class TestSolidFillFastPath:
+    """claude.md #240: an opaque flat-colour rectangle, circle or pixel
+    at an integer position on an untransformed (or whole-pixel
+    translated) surface is written straight into the ARGB32 pixels --
+    no Cairo context, path, or compositor per call -- on the canvas AND
+    on an img. Circle coverage is rasterized once per radius by Cairo
+    itself and blended by hand with pixman's own 8-bit arithmetic, so
+    the result is byte-identical to what Cairo's mask stamp (claude.md
+    #104) produced; anything outside the contract (fillAlpha below 1,
+    a gradient, a border, a scale/rotation/fractional translation, a
+    colour of `none`, a radius over 128) falls through to the Cairo path
+    it always had. The FESTINA_NO_DIRECT_FILL=1 environment switch turns
+    the fast path off, which is what lets these tests draw the SAME
+    scene both ways and demand identical bytes rather than eyeball it.
+
+    Measured on the layered-canvas benchmark's single-threaded run
+    (benchmarks/layered_canvas/): 84 ms -> 8 ms.
+    """
+
+    def _run(self, compile_and_run, monkeypatch, program, direct=True):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        env = {} if direct else {"FESTINA_NO_DIRECT_FILL": "1"}
+        result = compile_and_run(program, env=env)
+        assert result.returncode == 0, result.stderr
+        assert all(line == "true" for line in result.stdout.split()), result.stdout
+
+    def test_the_canvas_fast_path_is_byte_identical_to_cairo(self, compile_and_run, tmp_path,
+                                                             monkeypatch):
+        self._run(compile_and_run, monkeypatch, _solid_fill_program("fast.png"))
+        self._run(compile_and_run, monkeypatch, _solid_fill_program("slow.png"), direct=False)
+        diffs = _png_diff(str(tmp_path / "fast.png"), str(tmp_path / "slow.png"))
+        assert diffs == [], diffs[:10]
+
+    def test_an_img_gets_the_same_pixels_as_the_canvas(self, compile_and_run, tmp_path,
+                                                       monkeypatch):
+        # Same scene on a layer and on the canvas, fast path both:
+        # identical. And the layer's fast path against the canvas's
+        # CAIRO path: identical too -- that is the "matches Cairo's own
+        # mask stamp" claim, checked from the img side.
+        self._run(compile_and_run, monkeypatch, _solid_fill_program("canvas_fast.png", "layer_fast.png"))
+        self._run(compile_and_run, monkeypatch, _solid_fill_program("canvas_slow.png"), direct=False)
+        assert _png_diff(str(tmp_path / "layer_fast.png"), str(tmp_path / "canvas_fast.png")) == []
+        diffs = _png_diff(str(tmp_path / "layer_fast.png"), str(tmp_path / "canvas_slow.png"))
+        assert diffs == [], diffs[:10]
+
+    def test_colour_form_circles_match_the_plain_form_exactly(self, compile_and_run, tmp_path,
+                                                              monkeypatch):
+        # drawCircle(x, y, r, color) used to tessellate where plain
+        # drawCircle stamped a mask (claude.md #188 skipped the cache for
+        # it) -- 1/255 apart on a few edge pixels. Both stamp the same
+        # coverage now, on the canvas and on an img alike.
+        shapes = "".join(
+            f"{{T}}drawCircle({40 * r}, 100, {r}, white)\n"
+            f"{{T}}drawCircle({40 * r}, 200, {r}, red, none)\n"
+            for r in (1, 2, 3, 5, 8, 13, 18, 25, 40, 128))
+        plain = "".join(
+            f"fillStyle(white)\n{{T}}drawCircle({40 * r}, 100, {r})\n"
+            f"fillStyle(red)\n{{T}}drawCircle({40 * r}, 200, {r})\n"
+            for r in (1, 2, 3, 5, 8, 13, 18, 25, 40, 128))
+        wash = "fillStyle(30, 60, 90)\nfillAlpha(0.5)\n{T}drawRect(0, 0, 800, 600)\nfillAlpha(1.0)\n"
+        program = (_SOLID_FILL_HEAD + "clearCanvas()\n" + (wash + shapes).format(T="")
+                   + "log(saveCanvas('colour.png'))\nclearCanvas()\n"
+                   + (wash + plain).format(T="") + "log(saveCanvas('plain.png'))\n"
+                   + "img a = blankImage(800, 600)\n" + (wash + shapes).format(T="a.")
+                   + "log(a.save('img_colour.png'))\n"
+                   + "img b = blankImage(800, 600)\n" + (wash + plain).format(T="b.")
+                   + "log(b.save('img_plain.png'))\n")
+        self._run(compile_and_run, monkeypatch, program)
+        assert _png_diff(str(tmp_path / "colour.png"), str(tmp_path / "plain.png")) == []
+        assert _png_diff(str(tmp_path / "img_colour.png"), str(tmp_path / "colour.png")) == []
+        assert _png_diff(str(tmp_path / "img_plain.png"), str(tmp_path / "plain.png")) == []
+
+    def test_alpha_gradient_and_border_still_take_the_cairo_path(self, compile_and_run, tmp_path,
+                                                                 monkeypatch):
+        program = (_SOLID_FILL_HEAD + "clearCanvas()\n"
+                   "img a = blankImage(800, 600)\n"
+                   "fillStyle(white)\ndrawRect(0, 0, 800, 600)\na.drawRect(0, 0, 800, 600)\n"
+                   # translucent black over white: a grey, not black
+                   "fillStyle(0, 0, 0)\nfillAlpha(0.5)\ndrawCircle(60, 60, 20)\n"
+                   "a.drawCircle(60, 60, 20)\ndrawRect(100, 40, 40, 40)\na.drawRect(100, 40, 40, 40)\n"
+                   "fillAlpha(1.0)\n"
+                   # a gradient rect must still be a gradient
+                   "fillLinearGradient(200, 0, red, 400, 0, blue)\n"
+                   "drawRect(200, 40, 200, 40)\na.drawRect(200, 40, 200, 40)\n"
+                   "drawCircle(300, 150, 30)\na.drawCircle(300, 150, 30)\n"
+                   # a border must still be stroked
+                   "fillStyle(255, 255, 0)\nborderColor(blue)\nlineWidth(4)\n"
+                   "drawCircle(500, 60, 20)\na.drawCircle(500, 60, 20)\n"
+                   "drawRect(600, 40, 40, 40)\na.drawRect(600, 40, 40, 40)\n"
+                   "borderColor(none)\n"
+                   "log(saveCanvas('canvas.png'))\nlog(a.save('img.png'))\n")
+        self._run(compile_and_run, monkeypatch, program)
+        for name in ("canvas.png", "img.png"):
+            _, _, pixel = _decode_png(str(tmp_path / name))
+            r, g, b = pixel(60, 60)
+            assert 100 < r < 160 and r == g == b, (name, r, g, b)      # 50% black over white
+            r, g, b = pixel(120, 60)
+            assert 100 < r < 160 and r == g == b, (name, r, g, b)
+            left, right = pixel(205, 60), pixel(395, 60)
+            assert left[0] > left[2] and right[2] > right[0], (name, left, right)   # red -> blue
+            cl, cr = pixel(275, 150), pixel(325, 150)
+            assert cl[0] > cl[2] and cr[2] > cr[0], (name, cl, cr)
+            assert pixel(500, 60) == (255, 255, 0), name                 # bordered fill
+            ring = pixel(500, 40)
+            assert ring[2] > ring[0] and ring[2] > ring[1], (name, ring)
+            edge = pixel(600, 60)
+            assert edge[2] > edge[0], (name, edge)                      # rect border
+
+    def test_a_scaled_img_circle_is_the_scaled_size(self, compile_and_run, tmp_path, monkeypatch):
+        # img.scale() must fall back exactly as the canvas's scale()
+        # does (TestCircleMaskFastPath): the give-away is the extent.
+        program = (_SOLID_FILL_HEAD + "img a = blankImage(800, 600)\n"
+                   "fillStyle(0, 0, 0)\na.scale(2.0, 2.0)\na.drawCircle(50, 50, 10)\n"
+                   "a.drawRect(100, 100, 10, 10)\nlog(a.save('img.png'))\n")
+        self._run(compile_and_run, monkeypatch, program)
+        _, _, pixel = _decode_png_rgba(str(tmp_path / "img.png"))
+        assert pixel(100, 100)[:3] == (0, 0, 0)
+        assert pixel(100, 84)[:3] == (0, 0, 0)        # 16px out, inside a radius-20 circle
+        assert pixel(100, 78) == (0, 0, 0, 0)          # 22px out, beyond it
+        assert pixel(215, 215)[:3] == (0, 0, 0)        # the rect is 20x20 at (200, 200)
+        assert pixel(225, 225) == (0, 0, 0, 0)
+
+    def test_four_threads_stamping_at_once_match_one_thread(self, compile_and_run, tmp_path,
+                                                            monkeypatch):
+        # The per-radius coverage cache is shared by every thread and
+        # published lock-free; four threads racing to create AND use the
+        # same two radii at once must produce exactly what one thread
+        # produces. (scripts/thread_tsan_stress.sh covers the race
+        # itself; this covers the pixels.)
+        thread = """thread {name} {{
+    color c = '{colour}'
+    on message(worker:thread, msg:img?) {{
+        int i = 0
+        while i < 3000 {{
+            msg.drawCircle((i * 53) % 800, (i * 59) % 600, 2 + i % 2 * 3, c)
+            msg.drawRect((i * 37) % 800, (i * 31) % 600, 4, 3, c)
+            i = i + 1
+        }}
+    }}
+}}
+"""
+        names = ("a", "b", "c", "d")
+        program = "".join(thread.format(name=f"t{n}", colour="#ffffff") for n in names)
+        program += "".join(f"img? l{n} = blankImage(800, 600)\n" for n in names)
+        program += "".join(f"t{n}.postMessage(l{n})\n" for n in names)
+        program += "".join(f"t{n}.drain()\n" for n in names)
+        program += """color white = '#ffffff'
+img solo = blankImage(800, 600)
+int i = 0
+while i < 3000 {
+    solo.drawCircle((i * 53) % 800, (i * 59) % 600, 2 + i % 2 * 3, white)
+    solo.drawRect((i * 37) % 800, (i * 31) % 600, 4, 3, white)
+    i = i + 1
+}
+log(solo.save('solo.png'))
+"""
+        program += "".join(
+            f"img p{n} = l{n}.clip(0, 0, 800, 600)\nlog(p{n}.save('{n}.png'))\nfree l{n}\n"
+            for n in names)
+        program += "close(0)\n"
+        self._run(compile_and_run, monkeypatch, program)
+        solo = (tmp_path / "solo.png").read_bytes()
+        for n in names:
+            assert (tmp_path / f"{n}.png").read_bytes() == solo, n
+
+    def test_a_large_blank_image_is_prefaulted_and_usable(self, compile_and_run, tmp_path,
+                                                           monkeypatch):
+        # blankImage/clip/resize/saveCanvas() materialize their pixel
+        # memory up front (one madvise on Linux, a touch per page
+        # elsewhere) -- 36MB here, then drawn on and read back.
+        program = (_SOLID_FILL_HEAD + "img big = blankImage(3000, 3000)\n"
+                   "big.drawRect(2990, 2990, 10, 10, red)\n"
+                   "img corner = big.clip(2990, 2990, 10, 10)\n"
+                   "log(corner.save('corner.png'))\n")
+        self._run(compile_and_run, monkeypatch, program)
+        _, _, pixel = _decode_png(str(tmp_path / "corner.png"))
+        assert pixel(5, 5) == (200, 30, 30)
+
+
+class TestDrawImageAcceptsManagedImage:
+    """claude.md #241: every form of the canvas drawImage() and of
+    img.drawImage() takes an `img?` where it says `img`. Compositing
+    only READS the source for the duration of the call and keeps no
+    reference (the same bare pointer reaches the runtime either way),
+    so nothing changes hands and `T?`'s no-conversion rule has nothing
+    to guard. It is the ONE such exception: assignment between img and
+    img? stays a compile error in both directions."""
+
+    _HEAD = ("color red = '#c81e1e'\ncolor blue = '#1e1ec8'\n"
+             "img? layer = blankImage(800, 600)\nlayer.drawRect(10, 10, 50, 50, red)\n"
+             "img? small = blankImage(20, 20)\nsmall.drawRect(0, 0, 20, 20, blue)\n")
+
+    def test_every_canvas_form_composites_an_img_layer(self, compile_and_run, tmp_path,
+                                                        monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run(self._HEAD +
+                                 "clearCanvas()\n"
+                                 "drawImage(layer, 0, 0)\n"
+                                 "drawImage(small, 100, 100, 40, 40)\n"
+                                 "drawImage(small, 0, 0, 10, 10, 200, 200, 30, 30)\n"
+                                 "log(saveCanvas('out.png'))\nfree layer\nfree small\n")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "true"
+        _, _, pixel = _decode_png_rgba(str(tmp_path / "out.png"))
+        assert pixel(30, 30) == (200, 30, 30, 255)     # the layer, drawn at its size
+        assert pixel(120, 120) == (30, 30, 200, 255)   # scaled 20x20 -> 40x40
+        assert pixel(135, 135) == (30, 30, 200, 255)   # still inside the 40x40 box
+        assert pixel(215, 215) == (30, 30, 200, 255)   # region form
+        assert pixel(300, 300) == (0, 0, 0, 0)
+
+    def test_both_img_method_forms_take_an_img_source(self, compile_and_run, tmp_path,
+                                                       monkeypatch):
+        # Onto an img? receiver AND onto a plain img receiver: the
+        # relaxation is about the SOURCE argument only.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run(self._HEAD +
+                                 "img? dst = blankImage(800, 600)\n"
+                                 "dst.drawImage(layer, 0, 0)\n"
+                                 "dst.drawImage(small, 300, 300)\n"
+                                 "dst.drawImage(small, 400, 400, 60, 60)\n"
+                                 "img plain = blankImage(800, 600)\n"
+                                 "plain.drawImage(layer, 0, 0)\n"
+                                 "log(dst.save('dst.png'))\nlog(plain.save('plain.png'))\n"
+                                 "free layer\nfree small\nfree dst\n")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == ["true", "true"]
+        _, _, pixel = _decode_png_rgba(str(tmp_path / "dst.png"))
+        assert pixel(30, 30) == (200, 30, 30, 255)
+        assert pixel(310, 310) == (30, 30, 200, 255)
+        assert pixel(430, 430) == (30, 30, 200, 255)
+        _, _, pixel = _decode_png_rgba(str(tmp_path / "plain.png"))
+        assert pixel(30, 30) == (200, 30, 30, 255)
+        assert pixel(310, 310) == (0, 0, 0, 0)
+
+    def test_a_thread_painted_layer_needs_no_clip_copy(self, compile_and_run, tmp_path,
+                                                        monkeypatch):
+        # The motivating case (benchmarks/layered_canvas/): the worker
+        # paints the shared img?, main composites it directly.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run(
+            "thread Painter {\n"
+            "    color c = '#c81e1e'\n"
+            "    on message(worker:thread, msg:img?) {\n"
+            "        msg.drawRect(10, 10, 50, 50, c)\n"
+            "    }\n"
+            "}\n"
+            "img? layer = blankImage(800, 600)\n"
+            "Painter.postMessage(layer)\n"
+            "Painter.drain()\n"
+            "clearCanvas()\n"
+            "drawImage(layer, 0, 0)\n"
+            "log(saveCanvas('out.png'))\n"
+            "free layer\n"
+            "close(0)\n")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "true"
+        _, _, pixel = _decode_png_rgba(str(tmp_path / "out.png"))
+        assert pixel(30, 30) == (200, 30, 30, 255)
+
+    @pytest.mark.parametrize("source, message", [
+        ("img? layer = blankImage(8, 8)\nimg plain = layer\n",
+         "cannot assign value of type img? to img"),
+        ("img plain = blankImage(8, 8)\nimg? layer = plain\n",
+         "cannot assign value of type img to img?"),
+    ])
+    def test_assignment_between_img_and_managed_img_is_still_an_error(self, compile_and_run,
+                                                                       source, message):
+        # The relaxation is drawImage's alone.
+        from festina.errors import CompileError
+        with pytest.raises(CompileError) as exc:
+            compile_and_run(source)
+        assert message in str(exc.value)
+
+
 class TestSaveCanvas:
     """claude.md #93: saveCanvas() writes the canvas to a PNG through
     Cairo's own writer -- compiled into the very library whose reader
@@ -15523,9 +15896,22 @@ class TestExec:
     to avoid colliding with the pre-existing internal SQL-DDL helper of
     that name."""
 
+    # claude.md #235: `/bin/sh` and `/bin/echo` are MSYS2 virtual paths
+    # on Windows -- the shell resolves them, but festina_process_exec's
+    # own _spawnvp (a plain CRT call, PATH-searched) cannot, so both
+    # exec tests came back -1/empty on the windows CI job. `cmd /c` is
+    # the Windows spelling of the same two programs; the runtime's own
+    # contract (real exit code, inherited stdio) is what's under test,
+    # not a particular shell.
+    _SHELL_EXIT_3 = (["cmd", "/c", "exit 3"] if sys.platform == "win32"
+                     else ["/bin/sh", "-c", "exit 3"])
+    _ECHO_FROM_CHILD = (["cmd", "/c", "echo from-child"] if sys.platform == "win32"
+                        else ["/bin/echo", "from-child"])
+
     def test_successful_exec_returns_the_real_exit_code(self, compile_and_run):
-        source = """
-        arr[text] cmd = ['/bin/sh', '-c', 'exit 3']
+        cmd = ", ".join(f"'{part}'" for part in self._SHELL_EXIT_3)
+        source = f"""
+        arr[text] cmd = [{cmd}]
         log(exec(cmd))
         """
         result = compile_and_run(source)
@@ -15547,8 +15933,9 @@ class TestExec:
     def test_stdio_is_inherited(self, compile_and_run):
         # exec() inherits stdout rather than capturing it -- the child's
         # own output lands directly in the parent's stdout stream.
-        source = """
-        arr[text] cmd = ['/bin/echo', 'from-child']
+        cmd = ", ".join(f"'{part}'" for part in self._ECHO_FROM_CHILD)
+        source = f"""
+        arr[text] cmd = [{cmd}]
         exec(cmd)
         """
         result = compile_and_run(source)

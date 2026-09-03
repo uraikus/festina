@@ -1,15 +1,23 @@
 """claude.md #223: the Valgrind counterpart to test_leak_stress.py.
 
 tests/stress/*.f runs under AddressSanitizer/LeakSanitizer via
-scripts/leak_stress.sh -- but AddressSanitizer is incompatible with this
-project's try/throw mechanism in this environment (confirmed directly:
-llvm.eh.sjlj.setjmp/longjmp-based try/throw crashes with SIGILL under
--fsanitize=address, even for a plain pre-existing try/catch with nothing
-new involved). Any stress program that uses try/throw lives in
-tests/valgrind_stress/ instead, and is checked here via
+scripts/leak_stress.sh. This second tier exists because
+AddressSanitizer was incompatible with the try/throw mechanism of the
+time (confirmed directly: llvm.eh.sjlj.setjmp/longjmp-based try/throw
+crashed with SIGILL under -fsanitize=address, even for a plain
+try/catch with nothing else involved), so every stress program using
+try/throw lived in tests/valgrind_stress/ instead, checked here via
 scripts/valgrind_stress.sh -- an ordinary compiled binary run under
 `valgrind --leak-check=full`, the same tool api.md's own try/throw
 leak-freedom claim was already using for manual verification.
+
+claude.md #235 rebuilt try/throw on libc's own setjmp/longjmp, which
+ASan intercepts and handles: tests/stress/ programs may use try/throw
+freely now (confirmed by running this directory's own program through
+scripts/leak_stress.sh: clean). This tier stays as an independent
+second tool -- Valgrind sees invalid frees and uninitialised reads the
+same run, with no instrumented rebuild -- not as the only place a
+throwing program can be leak-checked.
 """
 import os
 import shutil
