@@ -13375,15 +13375,22 @@ class CodeGen:
             # once-per-iteration way as festina_async_io_outstanding/
             # _drain just above).
             main_lines.append("  call void @festina_run_timer_loop()")
-        # claude.md #126 round nine: unconditional, last thing main()
-        # does -- @__festina_db defaults to (and stays) null for a
-        # program with no `table` declarations, which festina_db_close
-        # treats as a no-op, so this is safe to call every time rather
-        # than gated on self.uses_sqlite. See that function's own
-        # comment for why an explicit close (not just letting the OS
-        # reclaim the fd on exit) matters.
-        main_lines.append("  %final_db = load ptr, ptr @__festina_db")
-        main_lines.append("  call void @festina_db_close(ptr %final_db)")
+        # claude.md #126 round nine: the last thing main() does -- see
+        # festina_db_close's own comment for why an explicit close (not
+        # just letting the OS reclaim the fd on exit) matters. It used
+        # to be emitted unconditionally (@__festina_db stays null for a
+        # program with no `table`, which festina_db_close treats as a
+        # no-op). claude.md #242: gated on the same condition that opens
+        # the database in the prologue above, because for a program that
+        # never touches one this call was the ONLY live reference from
+        # the program into the runtime's SQLite code -- and on the
+        # wasm32-wasi target the one thing keeping the whole vendored
+        # SQLite (~1MB of a 1.47MB .wasm) from being dead-code
+        # eliminated by the linker. Nothing changes for a program that
+        # does have one.
+        if self.tables or self.uses_sqlite:
+            main_lines.append("  %final_db = load ptr, ptr @__festina_db")
+            main_lines.append("  call void @festina_db_close(ptr %final_db)")
         main_lines.append("  ret i32 0")
         main_lines.append("}")
 

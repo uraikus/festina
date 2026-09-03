@@ -24,6 +24,14 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Changed
 
+- **A `.wasm` that never touches a database is 31 KB, not 1.47 MB.**
+  The wasm32-wasi link now uses link-time optimization across the
+  program and the core runtime and strips the sysroot libc's debug
+  sections. The vendored SQLite was kept alive only by `main()`'s
+  closing `festina_db_close()` on a null handle — that call is no
+  longer emitted for a program with no `table`/`sqlite()`, and the
+  linker drops all of SQLite. A program that does use a database still
+  gets all of it (about 1.1 MB). Smaller modules also load faster.
 - **Solid shapes are drawn without a rasterizer.** An opaque
   flat-colour `drawRect`/`drawCircle`/`drawPixel` at an integer
   position (no `fillAlpha` below 1, gradient, border, scale or

@@ -31,6 +31,18 @@ blocking: AddressSanitizer/LeakSanitizer coverage for the target.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately: each new
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
+- **In-place text append** for the `s = \`${s}x\`` / `s = s + x`
+  pattern: today every concatenation allocates a fresh buffer sized to
+  the combined length and copies both operands (`festina_str_concat`),
+  so a string grown one piece at a time is O(n²) in copying -- the
+  `string_concat` benchmark is exactly that, 15,000 appends moving
+  ~112 MB, 6 ms natively and ~26 ms under wasm where `memcpy` is a
+  plain compiled loop (claude.md #242). When the left operand is a
+  uniquely-owned text that the assignment is about to release anyway,
+  codegen could hand it to a `realloc`-and-append runtime call instead
+  and make the whole pattern O(n). Needs the same ownership reasoning
+  the refcounted `text` representation (claude.md #85) already does
+  for aliasing, applied at one more site; not started.
 
 ## Memory model
 
