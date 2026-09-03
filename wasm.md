@@ -369,41 +369,41 @@ _Last run: 2026-09-03 on this machine -- see wasm.md's "Benchmark methodology" s
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 48.9 ms | 98.2 ms | 31.7 KB |
-| C | 44.2 ms | 91.4 ms | 45.8 KB |
-| Go | 79.9 ms | 183.7 ms | 2.31 MB |
+| Festina | 50.1 ms | 100.3 ms | 31.7 KB |
+| C | 47.1 ms | 88.4 ms | 45.8 KB |
+| Go | 73.5 ms | 163.4 ms | 2.31 MB |
 
 ### `fib` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 58.9 ms | 100.0 ms | 31.6 KB |
-| C | 56.4 ms | 89.6 ms | 92.1 KB |
-| Go | 119.7 ms | 168.2 ms | 2.31 MB |
+| Festina | 59.6 ms | 120.0 ms | 31.6 KB |
+| C | 60.7 ms | 92.9 ms | 92.1 KB |
+| Go | 111.0 ms | 177.6 ms | 2.31 MB |
 
 ### `loop_sum` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 796.5 ms | 103.1 ms | 31.6 KB |
-| C | 826.1 ms | 91.4 ms | 92.1 KB |
-| Go | 975.3 ms | 197.7 ms | 2.31 MB |
+| Festina | 807.9 ms | 115.1 ms | 31.6 KB |
+| C | 832.0 ms | 92.2 ms | 92.1 KB |
+| Go | 979.3 ms | 162.9 ms | 2.31 MB |
 
 ### `array_sum` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 189.5 ms | 111.4 ms | 31.8 KB |
-| C | 213.7 ms | 86.8 ms | 92.2 KB |
-| Go | 270.8 ms | 154.4 ms | 2.31 MB |
+| Festina | 194.0 ms | 132.4 ms | 31.8 KB |
+| C | 217.7 ms | 90.0 ms | 92.2 KB |
+| Go | 277.8 ms | 155.0 ms | 2.31 MB |
 
 ### `string_concat` (wasm32-wasi, run via Node's WASI host)
 
 | Language | Run time (min of 7 runs) | Build time | .wasm size |
 |---|---|---|---|
-| Festina | 65.0 ms | 111.9 ms | 32.1 KB |
-| C | 52.6 ms | 88.8 ms | 93.8 KB |
-| Go | 118.1 ms | 164.4 ms | 2.31 MB |
+| Festina | 51.0 ms | 139.8 ms | 33.8 KB |
+| C | 53.2 ms | 92.3 ms | 93.8 KB |
+| Go | 122.5 ms | 167.3 ms | 2.31 MB |
 
 <!-- WASM_BENCHMARK_RESULTS_END -->
 
@@ -433,15 +433,18 @@ benchmark.md itself leads with. What the numbers above actually show:
   measures the same), so it is the host, not the program. On the
   compute benchmarks the remaining ratio is what V8's wasm tier is
   known for: `loop_sum` 1.5x native, `fib` and `array_sum` about 2x
-  (every memory access is bounds-checked, calls are dearer). The one
-  outlier is `string_concat`, ~5x its native time once startup is
-  subtracted: the benchmark is deliberately O(n²) copying — 15,000
+  (every memory access is bounds-checked, calls are dearer).
+  `string_concat` used to be the outlier at ~5x its native time once
+  startup was subtracted: the benchmark was O(n²) copying — 15,000
   concatenations of a string growing to 15,000 characters, ~112 MB
   through `memcpy` — and a wasm `memcpy` is a compiled loop, not the
-  SIMD one glibc has, so the same copies simply cost more. Link-time
-  optimization across the program/runtime boundary was measured too
-  and changes none of these by more than noise; the wins from it are
-  all size.
+  SIMD one glibc has, so the same copies simply cost more. Since
+  claude.md #243 that pattern compiles as an in-place append (see
+  api.md's "Strings"), the copying is gone on every target, and the
+  wasm run sits a few milliseconds above the host's own floor.
+  Link-time optimization across the program/runtime boundary was
+  measured too and changes none of these by more than noise; the wins
+  from it are all size.
 - **Go is consistently the slowest of the three to start** (`hello`),
   most visible on the smallest program, where there's no real work to
   amortize a heavier runtime-init cost against.

@@ -13851,6 +13851,152 @@ def _decode_png_rgba(path):
     return width, height, pixel
 
 
+class TestInPlaceTextAppend:
+    """claude.md #243: `s = `${s}...`` / `s = s + ...` grows s's own
+    buffer in place with a compiler-tracked length instead of copying
+    the whole string on every step -- O(n) for a string built up piece
+    by piece, where it was O(n^2). Every text local, parameter and
+    top-level global keeps a {pointer, length} shadow beside its slot;
+    an ordinary store clears it, a fresh declaration starts it null,
+    and the runtime only trusts a length when the binding still holds
+    the exact buffer it described. FESTINA_VERIFY_APPEND=1 makes the
+    runtime cross-check every trusted length with strlen and abort on
+    a mismatch, so every program here runs under it: a stale length
+    is a crash, not a silently wrong string.
+    """
+
+    def _ir(self, parser, semantic, codegen, source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    def _run(self, compile_and_run, source):
+        result = compile_and_run(source, env={"FESTINA_VERIFY_APPEND": "1"})
+        assert result.returncode == 0, result.stderr
+        return result.stdout.split("\n")
+
+    def test_the_pattern_compiles_to_an_append_not_a_concat(self, parser, semantic, codegen):
+        ir = self._ir(parser, semantic, codegen,
+                      "text s = ''\nfor int i = 0, i < 3, i++ {\n    s = `${s}x${i}`\n}\n"
+                      "text t = 'a'\nt = t + 'b' + s\nlog(s)\nlog(t)\n")
+        assert "call ptr @festina_text_append(" in ir
+        assert "call ptr @festina_str_concat(" not in ir
+
+    def test_shapes_that_must_not_be_appends_still_concatenate(self, parser, semantic, codegen):
+        # The target read twice (its buffer moves when grown), a piece
+        # that calls a function (which could reassign the target), the
+        # target not at the front: all take the ordinary path.
+        for body in ("d = `${d}${d}`", "d = d + d", "d = `${d}${f()}`",
+                     "d = `x${d}`", "d = 'x' + d"):
+            ir = self._ir(parser, semantic, codegen,
+                          "text func f() { return 'q' }\ntext d = 'ab'\n" + body + "\nlog(d)\n")
+            assert "call ptr @festina_text_append(" not in ir, body
+            assert "call ptr @festina_str_concat(" in ir, body
+
+    def test_globals_locals_params_and_loop_scoped_locals(self, compile_and_run):
+        lines = self._run(compile_and_run, """
+text g = ''
+for int i = 0, i < 5, i++ {
+    g = `${g}${i}`
+}
+log(g)
+g = 'reset'
+g = `${g}!`
+log(g)
+g = 'abc'
+g = g + 'd' + 'e'
+log(g)
+text func build(s:text, times:int) {
+    for int i = 0, i < times, i++ {
+        s = `${s}-${i}`
+    }
+    return s
+}
+log(build('x', 3))
+text keep = 'base'
+log(build(keep, 2))
+log(keep)
+for int k = 0, k < 3, k++ {
+    text local = 'L'
+    local = `${local}${k}`
+    local = local + '.'
+    log(local)
+}
+""")
+        assert lines[:9] == ["01234", "reset!", "abcde", "x-0-1-2", "base-0-1", "base",
+                             "L0.", "L1.", "L2."]
+
+    def test_pieces_of_every_allowed_kind(self, compile_and_run):
+        lines = self._run(compile_and_run, """
+struct P { name:text n:int }
+P p
+p.name = 'nm'
+p.n = 7
+text t = 'T:'
+text other = 'O'
+bool b = true
+float f = 1.5
+t = `${t}${p.name}|${p.n}|${other}|${b}|${f}`
+log(t)
+""")
+        assert lines[0] == "T:nm|7|O|true|1.5"
+
+    def test_reassignment_free_and_null_start_forget_the_length(self, compile_and_run):
+        # A fresh value of a similar length may land at the very same
+        # address the grown buffer had; the shadow must not remember
+        # the old length across an ordinary store, a `free`, or a
+        # declaration with no initializer.
+        lines = self._run(compile_and_run, """
+text other = 'O'
+text w = 'aaaa'
+w = `${w}bb`
+w = other.replace('O', 'zzzzzz')
+w = `${w}!`
+log(w)
+text z = 'zz'
+z = `${z}z`
+free z
+z = `${z}q`
+log(z)
+text n
+n = `${n}n1`
+n = n + 'n2'
+log(n)
+text d = 'ab'
+d = `${d}${d}`
+log(d)
+""")
+        assert lines[:4] == ["zzzzzz!", "q", "n1n2", "abab"]
+
+    def test_a_long_build_is_linear(self, compile_and_run):
+        # 200,000 appends: quadratic copying would move ~20 GB here and
+        # take minutes; the append takes well under a second.
+        import time
+        t0 = time.perf_counter()
+        lines = self._run(compile_and_run, """
+text s = ''
+for int i = 0, i < 200000, i++ {
+    s = `${s}x`
+}
+log(s.split('x').length)
+""")
+        assert lines[0] == "200001"
+        assert time.perf_counter() - t0 < 30
+
+    def test_the_same_program_under_wasm(self, compile_and_run_wasm):
+        result = compile_and_run_wasm("""
+text s = ''
+for int i = 0, i < 20000, i++ {
+    s = `${s}x`
+}
+text t = 'a'
+t = t + 'b' + s
+log(t.split('x').length)
+""")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "20001"
+
+
 _SOLID_FILL_HEAD = """color red = '#c81e1e'
 color green = '#1ec81e'
 color blue = '#1e1ec8'

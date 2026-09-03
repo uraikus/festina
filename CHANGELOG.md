@@ -24,6 +24,15 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Changed
 
+- **Building a string one piece at a time is O(n), not O(n²).**
+  `s = `${s}...`` and `s = s + ...` (any number of further pieces:
+  literals, other variables, plain field reads) now grow `s`'s own
+  buffer in place with a compiler-tracked length instead of copying
+  the whole string into a fresh buffer on every step. The
+  `string_concat` benchmark's 15,000 appends move a few kilobytes
+  instead of ~112 MB. Nothing observable changes: the pattern is only
+  taken when `s` is a plain text variable, the pieces cannot run user
+  code, and `s` appears exactly once, at the front.
 - **A `.wasm` that never touches a database is 31 KB, not 1.47 MB.**
   The wasm32-wasi link now uses link-time optimization across the
   program and the core runtime and strips the sysroot libc's debug
