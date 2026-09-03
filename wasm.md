@@ -356,6 +356,9 @@ Reproduce locally:
 ```bash
 python3 benchmarks/run_wasm_benchmarks.py               # print results
 python3 benchmarks/run_wasm_benchmarks.py --update-doc   # regenerate this file's tables
+
+python3 benchmarks/run_wasm_browser_benchmarks.py               # the same programs inside Chromium
+python3 benchmarks/run_wasm_browser_benchmarks.py --update-doc  # (needs Playwright + its Chromium)
 ```
 
 Needs a wasm32-wasi-capable clang (see [Setup](#setup) above), Go
@@ -406,6 +409,54 @@ _Last run: 2026-09-03 on this machine -- see wasm.md's "Benchmark methodology" s
 | Go | 122.5 ms | 167.3 ms | 2.31 MB |
 
 <!-- WASM_BENCHMARK_RESULTS_END -->
+
+### In a browser: Festina vs C vs Go
+
+The same five programs, run inside headless Chromium on this project's own browser WASI host (`runtime/wasm/festina_wasi_browser.js`) instead of Node's -- see [`run_wasm_browser_benchmarks.py`](benchmarks/run_wasm_browser_benchmarks.py) for exactly what is timed.
+
+<!-- WASM_BROWSER_RESULTS_START -->
+_Last run: 2026-09-03 on this machine, Chromium 141.0.7390.37; every number is measured with `performance.now()` inside the worker, so the browser's own launch cost is in none of them. See "Benchmark methodology" above for the runs/min/median rule._
+
+### `hello` (in Chromium, on the project's own WASI host)
+
+| Language | Run (min of 7) | Run (median) | Compile + instantiate (min) | Total (min) | .wasm size |
+|---|---|---|---|---|---|
+| Festina | 0.1 ms | 0.1 ms | 0.4 ms | 0.6 ms | 31.7 KB |
+| C | 0.0 ms | 0.0 ms | 0.2 ms | 0.2 ms | 45.8 KB |
+| Go | 2.0 ms | 2.3 ms | 6.9 ms | 9.4 ms | 2.31 MB |
+
+### `fib` (in Chromium, on the project's own WASI host)
+
+| Language | Run (min of 7) | Run (median) | Compile + instantiate (min) | Total (min) | .wasm size |
+|---|---|---|---|---|---|
+| Festina | 5.1 ms | 7.7 ms | 0.4 ms | 5.7 ms | 31.6 KB |
+| C | 4.6 ms | 4.8 ms | 0.3 ms | 5.0 ms | 92.1 KB |
+| Go | 37.9 ms | 40.6 ms | 6.8 ms | 45.8 ms | 2.31 MB |
+
+### `loop_sum` (in Chromium, on the project's own WASI host)
+
+| Language | Run (min of 7) | Run (median) | Compile + instantiate (min) | Total (min) | .wasm size |
+|---|---|---|---|---|---|
+| Festina | 483.6 ms | 484.8 ms | 0.6 ms | 484.2 ms | 31.6 KB |
+| C | 485.3 ms | 488.1 ms | 0.5 ms | 486.0 ms | 92.1 KB |
+| Go | 459.0 ms | 462.5 ms | 6.9 ms | 465.9 ms | 2.31 MB |
+
+### `array_sum` (in Chromium, on the project's own WASI host)
+
+| Language | Run (min of 7) | Run (median) | Compile + instantiate (min) | Total (min) | .wasm size |
+|---|---|---|---|---|---|
+| Festina | 81.7 ms | 82.2 ms | 0.5 ms | 82.3 ms | 31.8 KB |
+| C | 91.1 ms | 91.5 ms | 0.5 ms | 91.6 ms | 92.2 KB |
+| Go | 115.5 ms | 118.9 ms | 7.4 ms | 124.3 ms | 2.31 MB |
+
+### `string_concat` (in Chromium, on the project's own WASI host)
+
+| Language | Run (min of 7) | Run (median) | Compile + instantiate (min) | Total (min) | .wasm size |
+|---|---|---|---|---|---|
+| Festina | 0.2 ms | 0.3 ms | 0.4 ms | 0.6 ms | 33.8 KB |
+| C | 1.6 ms | 2.0 ms | 0.3 ms | 2.0 ms | 93.8 KB |
+| Go | 31.8 ms | 35.9 ms | 7.7 ms | 39.8 ms | 2.31 MB |
+<!-- WASM_BROWSER_RESULTS_END -->
 
 ### Reading these numbers
 

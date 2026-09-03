@@ -4620,3 +4620,25 @@ Requested directly ("knock out that todo item" -- the in-place append #242 recor
 **Tests/verification.** `tests/test_codegen.py::TestInPlaceTextAppend` (7): the pattern compiles to `festina_text_append` and not `festina_str_concat`; five shapes that must NOT (target twice, a call piece, target not first) still concatenate; globals, locals, parameters and loop-scoped locals; every allowed piece kind (field, int, bool, float, other variable); reassignment to a similar-length fresh value, `free`, and a null start all forget the length (the address-reuse trap, directly); a 200,000-append build; the same under wasm. `scripts/leak_stress.sh` on the shapes program and on `string_concat.f`: clean. `scripts/thread_tsan_stress.sh` default set: clean. Docs: api.md "Strings" ("Building a string piece by piece is O(n)"), benchmark.md's methodology row and string_concat bullet, wasm.md's bullet, `benchmarks/string_concat.f`'s own comment, todo.md's item removed, CHANGELOG 0.44.
 
 **Full suite (recorded after the entry above), run under `FESTINA_VERIFY_APPEND=1`** so every trusted append length in every test program was cross-checked against strlen: 2301 passed, 14 skipped, 0 failed in 7m23s. No abort anywhere -- no store site was missed. README updated.
+
+244. THE WASM BENCHMARKS INSIDE A BROWSER: FESTINA vs C vs GO, ONE HOST, ONE CHROMIUM
+
+Requested directly: "What is the wasms speed compared to wasms compiled in another language, but all ran through a browser". wasm.md's existing table answers the Node question (`node:wasi`, whole-process time, ~48ms of which is Node's own floor). This answers the browser one, measured rather than extrapolated.
+
+**How.** `benchmarks/run_wasm_browser_benchmarks.py` reuses `run_wasm_benchmarks.py`'s three toolchains to build the same five programs (Festina via `festina compile --target=wasm32-wasi`, C via `clang --target=wasm32-wasi -O2`, Go via `GOOS=wasip1 GOARCH=wasm go build`), serves them with the project's own browser WASI host (`runtime/wasm/festina_wasi_browser.js`, claude.md #237) from a local HTTP server with the cross-origin-isolation headers, and drives headless Chromium through Playwright (the same `FESTINA_CHROMIUM` override tests/test_wasm_browser.py accepts). A small page + module worker fetches the bytes once and, per run, creates a fresh host and times three steps with `performance.now()` INSIDE the worker: `WebAssembly.compile`, `WebAssembly.instantiate`, and `_start()` to `proc_exit`. 1 warmup + 7 timed runs, min and median. All three languages go through the identical host -- Go's wasip1 runtime ran on it with no changes (every WASI import it needs is either implemented or answered ENOSYS by the host's own Proxy fallback) -- and every language's stdout is checked to match the others' before a row is kept, the same rule the Node runner has. `--update-doc` writes a "### In a browser: Festina vs C vs Go" block into wasm.md.
+
+**The numbers (this machine, Chromium 141, run = the program itself, min of 7):**
+
+| | Festina | C | Go |
+|---|---|---|---|
+| `hello` | 0.1ms | 0.0ms | 2.0ms |
+| `fib` | 5.6ms | 4.7ms | 37.0ms |
+| `loop_sum` | 484ms | 483ms | 460ms |
+| `array_sum` | 82ms | 90ms | 114ms |
+| `string_concat` | 0.2ms | 1.3ms | 33ms |
+| compile + instantiate | 0.3-0.5ms | 0.2-0.5ms | 6.7-7.2ms |
+| `.wasm` | 32KB | 46-94KB | 2.31MB |
+
+**Reading them.** In the browser Festina and C are the same program on `loop_sum` (within 0.4%), Festina is 9% ahead on `array_sum` (escape analysis keeps the per-iteration array off the heap, the same explanation wasm.md already gives for Node), C is 19% ahead on `fib` (pure call overhead; Festina's calls carry a little more prologue), and `string_concat` is Festina 0.2ms against C's 1.3ms -- #243's in-place append against C's `realloc`-per-iteration loop. Go is 7-8x slower on `fib`, 40% slower on `array_sum`, and pays ~7ms of compile + instantiate and 2ms of runtime start on every load for its 2.31MB module, against under half a millisecond for Festina's 32KB; on `loop_sum` alone Go is 5% ahead, the same ordering benchmark.md's native table shows for that loop. Two things the Node table could not show: the program itself runs FASTER in Chromium than the Node figures suggested (`loop_sum` 484ms here against ~790ms whole-process under Node, `fib` 5.6ms against ~11ms net of the host floor) -- Node's number carried its own startup, host import, and a colder tier-up; and compile + instantiate for a 32KB module is sub-millisecond, so #242's size work is what makes Festina's browser start effectively free where Go's is not.
+
+**Docs.** wasm.md: the new section (generated block), the methodology's reproduce commands. CHANGELOG 0.44 (an "Added" line for the runner). No language or runtime change here, so no version bump beyond the 0.44 already in progress.

@@ -82,6 +82,11 @@ round-by-round design and implementation record predating 0.1 lives in
 - **The Windows CI job drives a real window**: a new test finds the
   compiled program's Win32 window and posts mouse, keyboard, resize and
   close messages to it, asserting every input handler's output.
+- **A browser-side wasm benchmark.** `benchmarks/run_wasm_browser_benchmarks.py`
+  runs the five wasm.md programs, compiled from Festina, C and Go, inside
+  headless Chromium on the project's own WASI host, timing compile,
+  instantiate and run separately with `performance.now()` inside the
+  worker. Results are in wasm.md's "In a browser: Festina vs C vs Go".
 
 ### Fixed
 
