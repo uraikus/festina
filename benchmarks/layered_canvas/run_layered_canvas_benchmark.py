@@ -18,11 +18,12 @@ single-threaded canvas benchmark's own 40,000
   Worker's `transferToImageBitmap()` is a genuine ownership TRANSFER
   (Structured Clone's own documented zero-copy path for exactly this
   object), not a copy either. Both sides composite the finished layers
-  onto one final surface afterward, which IS a real pixel copy on both
-  sides (Cairo's own `.clip()` and the browser's own `drawImage()`) --
-  compositing was never free, only the cross-thread HANDOFF was made
-  free, and both benchmarks below time that composite step too, not
-  just the parallel drawing.
+  onto one final surface afterward, which IS a real per-pixel blend on
+  both sides (the canvas `drawImage()` on each -- since claude.md #241
+  Festina's takes the `img?` layer directly, with no `.clip()` copy
+  into a plain img first) -- compositing was never free, only the
+  cross-thread HANDOFF was made free, and both benchmarks below time
+  that composite step too, not just the parallel drawing.
 
 Two comparisons matter here, and they answer different questions:
 
@@ -433,8 +434,10 @@ boundary** -- an `img?` ([api.md](api.md#t-manually-managed-values))
 shares its reference across `postMessage` instead of cloning it, and a
 Worker's `transferToImageBitmap()` is a genuine ownership transfer, not
 a copy. Compositing the finished layers onto one final surface IS a
-real pixel copy on both sides and both runs time it, not just the
-parallel drawing -- see
+real per-pixel blend on both sides (the canvas `drawImage()` on each,
+which since claude.md #241 takes an `img?` layer directly on the
+Festina side) and both runs time it, not just the parallel drawing --
+see
 [`run_layered_canvas_benchmark.py`](benchmarks/layered_canvas/run_layered_canvas_benchmark.py)
 for the rest of what makes this comparison fair, the same three rules
 `draw_shapes.f`'s own runner already established.
@@ -463,10 +466,13 @@ a quarter of the single-threaded time — this measures what four
 genuinely independent, unevenly-loaded workers buy on real hardware, not
 an idealized 4x. And on the Festina side the parallel part is now
 small: after claude.md #240 the 40,000 draw calls take about 4 ms on
-one thread, so the ~4 ms of serial work both runs share — four
-full-surface `clip()` copies to turn each `img?` back into a plain
-`img`, then four composites onto the canvas — is roughly half of either
-number, and no amount of threading touches it.
+one thread, so the serial work both runs share — clearing the canvas
+and compositing four full-surface layers onto it — is a real fraction
+of either number, and no amount of threading touches it. (Until
+claude.md #241 each layer also had to be `clip()`-copied into a plain
+`img` before `drawImage()` would take it — four 1.92 MB copies per
+frame, as much time as all the drawing; `drawImage()` accepts an
+`img?` source directly now.)
 
 When this benchmark was first written (claude.md #239) Festina drew it
 in 84 ms single-threaded and 62 ms with four threads, and the browser's

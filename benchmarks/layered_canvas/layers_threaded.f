@@ -132,24 +132,19 @@ hillThread.drain()
 groundThread.drain()
 fxThread.drain()
 
-// The top-level canvas drawImage() builtin takes a plain img -- img?
-// is "a genuinely different type from img, not a looser version of it"
-// (api.md's own T? section), so compositing needs one real, ordinary
-// img per layer. .clip(0, 0, 800, 600) on the whole surface is exactly
-// that: a single 800x600 ARGB32 copy (1.92MB) done ONCE per layer here
-// on main, after the parallel drawing is already finished -- nothing
-// like the 40,000 individual draw calls that would have cost the same
-// copy-on-every-call if img? hadn't kept them all thread-local.
-img skyPlain = sky.clip(0, 0, 800, 600)
-img hillPlain = hill.clip(0, 0, 800, 600)
-img groundPlain = ground.clip(0, 0, 800, 600)
-img fxPlain = fx.clip(0, 0, 800, 600)
-
+// claude.md #241: the top-level canvas drawImage() builtin accepts an
+// img? source directly -- it only READS the layer for the duration of
+// the call and keeps no reference, so no ownership crosses and there
+// is nothing for `T?`'s "no conversion" rule to guard. Before #241 each
+// layer had to be .clip()'d into a plain img first: a full 800x600
+// ARGB32 copy (1.92MB, freshly allocated and faulted in) per layer,
+// four of them, on every frame -- roughly half of this benchmark's
+// multi-threaded time once #240 had made the drawing itself cheap.
 clearCanvas()
-drawImage(skyPlain, 0, 0)
-drawImage(hillPlain, 0, 0)
-drawImage(groundPlain, 0, 0)
-drawImage(fxPlain, 0, 0)
+drawImage(sky, 0, 0)
+drawImage(hill, 0, 0)
+drawImage(ground, 0, 0)
+drawImage(fx, 0, 0)
 
 int elapsed = now() - start
 log(elapsed)
@@ -159,9 +154,5 @@ free sky
 free hill
 free ground
 free fx
-free skyPlain
-free hillPlain
-free groundPlain
-free fxPlain
 
 close(0)

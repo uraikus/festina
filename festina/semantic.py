@@ -482,6 +482,32 @@ _IMAGE = types_mod.ImageType()
 _HTTP = types_mod.HttpType()
 _SOCKET = types_mod.SocketType()
 
+
+def _is_read_only_image_borrow(expected, actual):
+    """claude.md #241: `drawImage(layer, x, y)` / `dst.drawImage(layer, x,
+    y)` accept an `img?` where a plain `img` is expected.
+
+    `T?` is deliberately "a genuinely different type from T" (api.md's
+    own T? section): no conversion in either direction, because every
+    conversion would hand a value from one ownership regime to the
+    other. drawImage is the one place that hands nothing anywhere -- it
+    reads the source image's pixels for the duration of the call and
+    keeps no reference (codegen passes the same bare pointer either
+    way, and the runtime composites and returns), so there is no
+    aliasing hazard for the rule to guard against. Before this, the
+    only way to composite an `img?` layer painted by a worker thread
+    was a full-surface `clip()` copy into a plain `img` per layer --
+    1.92MB copied and faulted in, four times, on every frame of the
+    layered-canvas benchmark, roughly half its multi-threaded time
+    once claude.md #240 had made the drawing itself cheap. Only the
+    SOURCE argument is relaxed: the receiver of the method form is
+    whatever img/img? it already was, and nothing else about `T?`
+    changes."""
+    return (isinstance(expected, types_mod.ImageType)
+            and not getattr(expected, "manually_managed", False)
+            and isinstance(actual, types_mod.ImageType)
+            and getattr(actual, "manually_managed", False))
+
 # claude.md #234 (uraikus/festina#93): an img as a self-contained
 # drawing target -- its own transform and state stack, clears, and
 # drawing one image onto another. Method forms on img mirroring the
@@ -2859,6 +2885,9 @@ def analyze(program, filename="<string>"):
                         )
                     for i, (arg_expr, expected) in enumerate(zip(expr.args, sig)):
                         arg_type = infer(arg_expr, scope)
+                        if (name == "drawImage"
+                                and _is_read_only_image_borrow(expected, arg_type)):
+                            continue    # claude.md #241: an img? source is fine
                         if arg_type is not None and arg_type is not NULL and arg_type != expected:
                             raise CompileError(
                                 f"{name}()'s argument {i + 1} expects "
@@ -4054,6 +4083,9 @@ def analyze(program, filename="<string>"):
                     )
                 for i, (arg, expected) in enumerate(zip(expr.args, sig)):
                     arg_type = infer(arg, scope)
+                    if (callee.prop == "drawImage"
+                            and _is_read_only_image_borrow(expected, arg_type)):
+                        continue    # claude.md #241: an img? source is fine
                     if arg_type is not None and arg_type is not NULL and arg_type != expected:
                         raise CompileError(
                             f"img.{callee.prop}()'s argument {i + 1} expects "

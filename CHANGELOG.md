@@ -11,6 +11,17 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ## [0.44] - 2026-09-02
 
+### Added
+
+- **`drawImage` accepts an `img?` source.** Every form of the canvas
+  `drawImage(...)` and of `img.drawImage(...)` takes a manually-managed
+  `img?` where it says `img` — compositing only reads the source for
+  the duration of the call and keeps no reference, so nothing changes
+  hands. A layer painted by a worker thread can now be drawn straight
+  onto the canvas with no `clip()` copy first. This is the one
+  read-only exception to `T?` being a distinct type; assignment and
+  every other call site are unchanged.
+
 ### Changed
 
 - **Solid shapes are drawn without a rasterizer.** An opaque

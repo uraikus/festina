@@ -14129,6 +14129,101 @@ log(solo.save('solo.png'))
         assert pixel(5, 5) == (200, 30, 30)
 
 
+class TestDrawImageAcceptsManagedImage:
+    """claude.md #241: every form of the canvas drawImage() and of
+    img.drawImage() takes an `img?` where it says `img`. Compositing
+    only READS the source for the duration of the call and keeps no
+    reference (the same bare pointer reaches the runtime either way),
+    so nothing changes hands and `T?`'s no-conversion rule has nothing
+    to guard. It is the ONE such exception: assignment between img and
+    img? stays a compile error in both directions."""
+
+    _HEAD = ("color red = '#c81e1e'\ncolor blue = '#1e1ec8'\n"
+             "img? layer = blankImage(800, 600)\nlayer.drawRect(10, 10, 50, 50, red)\n"
+             "img? small = blankImage(20, 20)\nsmall.drawRect(0, 0, 20, 20, blue)\n")
+
+    def test_every_canvas_form_composites_an_img_layer(self, compile_and_run, tmp_path,
+                                                        monkeypatch):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run(self._HEAD +
+                                 "clearCanvas()\n"
+                                 "drawImage(layer, 0, 0)\n"
+                                 "drawImage(small, 100, 100, 40, 40)\n"
+                                 "drawImage(small, 0, 0, 10, 10, 200, 200, 30, 30)\n"
+                                 "log(saveCanvas('out.png'))\nfree layer\nfree small\n")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "true"
+        _, _, pixel = _decode_png_rgba(str(tmp_path / "out.png"))
+        assert pixel(30, 30) == (200, 30, 30, 255)     # the layer, drawn at its size
+        assert pixel(120, 120) == (30, 30, 200, 255)   # scaled 20x20 -> 40x40
+        assert pixel(135, 135) == (30, 30, 200, 255)   # still inside the 40x40 box
+        assert pixel(215, 215) == (30, 30, 200, 255)   # region form
+        assert pixel(300, 300) == (0, 0, 0, 0)
+
+    def test_both_img_method_forms_take_an_img_source(self, compile_and_run, tmp_path,
+                                                       monkeypatch):
+        # Onto an img? receiver AND onto a plain img receiver: the
+        # relaxation is about the SOURCE argument only.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run(self._HEAD +
+                                 "img? dst = blankImage(800, 600)\n"
+                                 "dst.drawImage(layer, 0, 0)\n"
+                                 "dst.drawImage(small, 300, 300)\n"
+                                 "dst.drawImage(small, 400, 400, 60, 60)\n"
+                                 "img plain = blankImage(800, 600)\n"
+                                 "plain.drawImage(layer, 0, 0)\n"
+                                 "log(dst.save('dst.png'))\nlog(plain.save('plain.png'))\n"
+                                 "free layer\nfree small\nfree dst\n")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == ["true", "true"]
+        _, _, pixel = _decode_png_rgba(str(tmp_path / "dst.png"))
+        assert pixel(30, 30) == (200, 30, 30, 255)
+        assert pixel(310, 310) == (30, 30, 200, 255)
+        assert pixel(430, 430) == (30, 30, 200, 255)
+        _, _, pixel = _decode_png_rgba(str(tmp_path / "plain.png"))
+        assert pixel(30, 30) == (200, 30, 30, 255)
+        assert pixel(310, 310) == (0, 0, 0, 0)
+
+    def test_a_thread_painted_layer_needs_no_clip_copy(self, compile_and_run, tmp_path,
+                                                        monkeypatch):
+        # The motivating case (benchmarks/layered_canvas/): the worker
+        # paints the shared img?, main composites it directly.
+        monkeypatch.delenv("DISPLAY", raising=False)
+        result = compile_and_run(
+            "thread Painter {\n"
+            "    color c = '#c81e1e'\n"
+            "    on message(worker:thread, msg:img?) {\n"
+            "        msg.drawRect(10, 10, 50, 50, c)\n"
+            "    }\n"
+            "}\n"
+            "img? layer = blankImage(800, 600)\n"
+            "Painter.postMessage(layer)\n"
+            "Painter.drain()\n"
+            "clearCanvas()\n"
+            "drawImage(layer, 0, 0)\n"
+            "log(saveCanvas('out.png'))\n"
+            "free layer\n"
+            "close(0)\n")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "true"
+        _, _, pixel = _decode_png_rgba(str(tmp_path / "out.png"))
+        assert pixel(30, 30) == (200, 30, 30, 255)
+
+    @pytest.mark.parametrize("source, message", [
+        ("img? layer = blankImage(8, 8)\nimg plain = layer\n",
+         "cannot assign value of type img? to img"),
+        ("img plain = blankImage(8, 8)\nimg? layer = plain\n",
+         "cannot assign value of type img to img?"),
+    ])
+    def test_assignment_between_img_and_managed_img_is_still_an_error(self, compile_and_run,
+                                                                       source, message):
+        # The relaxation is drawImage's alone.
+        from festina.errors import CompileError
+        with pytest.raises(CompileError) as exc:
+            compile_and_run(source)
+        assert message in str(exc.value)
+
+
 class TestSaveCanvas:
     """claude.md #93: saveCanvas() writes the canvas to a PNG through
     Cairo's own writer -- compiled into the very library whose reader
