@@ -15,10 +15,12 @@ targets WASI, which has no shared-library story a Festina binary could
 dynamically link against, and no `apt`/Homebrew/pacman-installed
 *static* `libsqlite3.a` built for `wasm32-wasi` exists to statically
 link either -- there is nothing "system" to reach for. `table`/
-`sqlite()` support is unconditional core (every compiled program links
-against sqlite3's symbols, whether or not it ever declares a `table`),
-so WASM export cannot work at all without a real, working sqlite3
-compiled for `wasm32-wasi` -- it compiles cleanly against `wasi-libc`
+`sqlite()` support lives in the core runtime translation unit, which
+is compiled against sqlite3's symbols (claude.md #242: the LINK then
+drops every SQLite function from a program that never declares a
+`table` or calls `sqlite()` -- see wasm.md's "Binary size" -- but the
+symbols still have to resolve), so WASM export cannot work at all
+without a real, working sqlite3 compiled for `wasm32-wasi` -- it compiles cleanly against `wasi-libc`
 with zero changes needed (see `wasm.md`'s own design section for the
 exact flags this project builds it with).
 

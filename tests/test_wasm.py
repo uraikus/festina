@@ -137,6 +137,36 @@ class TestWasmRun:
         assert result.returncode == 0
         assert result.stdout.strip() == "Ada"
 
+    def test_a_program_with_no_database_ships_no_sqlite(self, compile_and_run_wasm, tmp_path):
+        # claude.md #242: the .wasm is linked with LTO and stripped of
+        # DWARF, and main() no longer references festina_db_close for a
+        # program with no table/sqlite() -- so the vendored SQLite (~1MB
+        # of code) and the sysroot libc's debug sections (~375KB) are
+        # both gone. 1.47MB before; 31KB measured after. The bound is
+        # loose on purpose: any regression that brings SQLite back is a
+        # jump of a megabyte, not a few kilobytes.
+        result = compile_and_run_wasm("log('small')\n")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "small"
+        size = os.path.getsize(tmp_path / "program.wasm")
+        assert size < 200_000, size
+        assert b".debug_info" not in (tmp_path / "program.wasm").read_bytes()
+
+    def test_a_program_with_a_table_still_ships_sqlite(self, compile_and_run_wasm, tmp_path):
+        # The other half of the same claim: SQLite is dropped because it
+        # is unreferenced, not because it went missing -- a program that
+        # uses it still gets all of it, and it still works.
+        result = compile_and_run_wasm(
+            "table People { id:int, name:text }\n"
+            "sqlite(\"INSERT INTO People (name) VALUES (?)\", ['Ada'])\n"
+            "arr[People] rows = sqlite('SELECT * FROM People')\n"
+            "log(rows[0].name)\n"
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "Ada"
+        size = os.path.getsize(tmp_path / "program.wasm")
+        assert size > 500_000, size
+
     def test_regex_is_available(self, compile_and_run_wasm):
         # windows.md Phase 0's own "regex is unconditional core, not a
         # feature tier" fact applies just as much to wasm -- <regex.h>

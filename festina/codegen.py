@@ -1008,6 +1008,10 @@ class CodeGen:
         self.func_decls = {}                   # name -> ast.FuncDecl (for signatures)
         self.cur_block = None                  # label of the block currently being emitted into
         self.uses_sqlite = False               # any sqlite() call anywhere -- see _emit_sqlite_call
+        # claude.md #243: text binding ref -> (pointer-shadow slot,
+        # length-shadow slot) for every text local/global/parameter
+        # eligible for in-place append -- see _emit_text_append_assign.
+        self._append_shadows = {}
         self._table_arrays_cache = {}          # table name -> (names_global, types_global, ncols);
                                                 # schema sync and query codegen can both ask for the
                                                 # same table's column-name/type globals, and emitting
@@ -1592,6 +1596,8 @@ class CodeGen:
             "declare ptr @festina_str_from_float(double)",
             "declare ptr @festina_str_from_bool(i8)",
             "declare ptr @festina_str_concat(ptr, ptr)",
+            # claude.md #243: in-place append for `s = `${s}...`` / `s = s + ...`
+            "declare ptr @festina_text_append(ptr, i64, ptr, i64, ptr)",
             # claude.md #83: text values are copy-managed, not
             # refcounted -- this is the "make my own exclusive copy"
             # primitive every aliasing text binding site calls (a
@@ -2281,6 +2287,12 @@ class CodeGen:
             llvm_ty = _llvm_type(type_)
             zero = self._zero_value(type_)
             lines.append(f"{ref} = global {llvm_ty} {zero}")
+            if type_ == TEXT and ref in self._append_shadows:
+                # claude.md #243: the global's {pointer, length} append
+                # shadow pair -- see _emit_text_append_assign.
+                ptr_ref, len_ref = self._append_shadows[ref]
+                lines.append(f"{ptr_ref} = global ptr null")
+                lines.append(f"{len_ref} = global i64 0")
         return lines
 
     def _zero_value(self, type_):
@@ -2366,6 +2378,8 @@ class CodeGen:
             if stmt.manually_managed:
                 self._manually_managed_refs.add(ref)
             self.global_env.define(stmt.name, ref, type_)
+            if type_ == TEXT and not stmt.manually_managed:
+                self._register_global_text_append_shadow(ref)   # claude.md #243
             self.entry_stmts.append(stmt)
             return
         # claude.md #7: any other executable top-level statement goes into
@@ -2852,6 +2866,8 @@ class CodeGen:
             # already carries this exact suffix for this exact reason.
             slot = f"%{p.name}.{self._unique()}"
             body_lines.append(f"  {slot} = alloca {_llvm_type(t)}")
+            if t == TEXT and not p.manually_managed:
+                self._define_text_append_shadow(slot, body_lines)   # claude.md #243
             arg_ref = f"%arg.{p.name}"
             if p.manually_managed:
                 self._manually_managed_refs.add(slot)
@@ -5147,6 +5163,12 @@ class CodeGen:
                 # whole effort already follows.
                 slot = f"%{stmt.name}.{self._unique()}"
                 lines.append(f"  {slot} = alloca ptr")
+                # claude.md #243: the shadow pair lives next to the slot
+                # itself -- a fresh, null one per declaration, so a
+                # loop-body-scoped text local starts every iteration
+                # with no remembered length, exactly like its own slot
+                # starts with no remembered value.
+                self._define_text_append_shadow(slot, lines)
                 if stmt.init is not None:
                     val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                     val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
@@ -8556,6 +8578,7 @@ class CodeGen:
                 lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
                 val = owned
             lines.append(f"  call void @free(ptr {old})")
+            self._clear_text_append_shadow(ref, lines)   # claude.md #243
             return val
         if not _is_refcounted(ttype):
             return val
@@ -9051,7 +9074,150 @@ class CodeGen:
             lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
             val = owned
         lines.append(f"  call void @free(ptr {old})")
+        # claude.md #243: any ordinary store forgets the remembered
+        # append length -- see _emit_text_append_assign.
+        self._clear_text_append_shadow(ref, lines)
         return val
+
+    # ---- claude.md #243: in-place text append ----------------------------
+    #
+    # `s = `${s}x`` and `s = s + x` (with any number of further pieces)
+    # used to compile as every other concatenation does: a fresh buffer
+    # of the combined length, both operands copied, the old buffer freed
+    # by the assignment -- O(n^2) in bytes moved for a string built up
+    # one piece at a time. Here the assignment's own old value is
+    # instead handed to festina_text_append, which grows it in place
+    # (see the runtime's own comment for the allocator side) and returns
+    # the buffer to store. What makes that sound is the rule the whole
+    # text model already rests on (claude.md #83): a text binding's
+    # buffer is exclusively its own, so consuming it inside the very
+    # assignment that was about to free it changes nothing anyone else
+    # can observe.
+    #
+    # The length is the part the compiler has to carry. Every text
+    # local, parameter and top-level global gets a {pointer, length}
+    # shadow pair beside its slot; an append writes the new length there
+    # and remembers which buffer it belongs to, and the next append
+    # trusts the length only if the binding STILL holds that exact
+    # pointer. Every other store into the binding (the reassignment
+    # helpers above and below) clears the pointer shadow, and a fresh
+    # declaration gets a fresh, null pair, so a remembered length can
+    # never outlive the buffer it described. The runtime never trusts
+    # the length for bounds (capacity always comes from the allocator),
+    # so a missed store site could only ever mis-position bytes inside
+    # the allocation, never write outside it -- and FESTINA_VERIFY_APPEND
+    # =1 makes the runtime cross-check every trusted length against
+    # strlen and abort, which is how the test suite proves no site was
+    # missed.
+    #
+    # Deliberately narrow: the target is a plain text variable; the value
+    # is a template whose first piece is exactly that variable, or a `+`
+    # chain whose leftmost operand is; every other piece is a literal, a
+    # different variable, or a plain field read -- nothing that could
+    # call user code (which might reassign the target under us) or read
+    # the target again (its buffer moves the moment it is grown). Any
+    # other shape takes the ordinary path, unchanged. Thread-private
+    # state is not covered (it takes the ordinary path too).
+
+    def _define_text_append_shadow(self, ref, lines):
+        """Allocates and registers the {pointer, length} shadow pair for
+        the text LOCAL/parameter slot `ref`, initialized to (null, 0)."""
+        ptr_slot, len_slot = f"{ref}.ap", f"{ref}.aplen"
+        lines.append(f"  {ptr_slot} = alloca ptr")
+        lines.append(f"  {len_slot} = alloca i64")
+        lines.append(f"  store ptr null, ptr {ptr_slot}")
+        lines.append(f"  store i64 0, ptr {len_slot}")
+        self._append_shadows[ref] = (ptr_slot, len_slot)
+
+    def _register_global_text_append_shadow(self, ref):
+        """The global counterpart -- the pair's storage is emitted by
+        _global_var_defs; this only names it."""
+        self._append_shadows[ref] = (f"{ref}.ap", f"{ref}.aplen")
+
+    def _clear_text_append_shadow(self, ref, lines):
+        shadow = self._append_shadows.get(ref)
+        if shadow is not None:
+            lines.append(f"  store ptr null, ptr {shadow[0]}")
+
+    def _text_append_pieces(self, target_name, value_expr):
+        """The pieces to append, in order, as ("const", text) /
+        ("expr", node) tuples, when `target = value_expr` is an
+        append onto `target` this optimization handles -- else None."""
+        def simple(e):
+            if isinstance(e, ast.Identifier):
+                return e.name != target_name
+            if isinstance(e, (ast.StringLit, ast.NumberLit, ast.BoolLit)):
+                return True
+            if isinstance(e, ast.Member) and not e.computed:
+                return simple(e.obj)
+            return False
+
+        pieces = []
+        if isinstance(value_expr, ast.TemplateLit):
+            if value_expr.parts[0] != "" or not value_expr.exprs:
+                return None
+            first = value_expr.exprs[0]
+            if not (isinstance(first, ast.Identifier) and first.name == target_name):
+                return None
+            if value_expr.parts[1]:
+                pieces.append(("const", value_expr.parts[1]))
+            for part_expr, next_part in zip(value_expr.exprs[1:], value_expr.parts[2:]):
+                if not simple(part_expr):
+                    return None
+                pieces.append(("expr", part_expr))
+                if next_part:
+                    pieces.append(("const", next_part))
+        elif isinstance(value_expr, ast.BinOp) and value_expr.op == "+":
+            chain = []
+            e = value_expr
+            while isinstance(e, ast.BinOp) and e.op == "+":
+                chain.append(e.right)
+                e = e.left
+            if not (isinstance(e, ast.Identifier) and e.name == target_name):
+                return None
+            for piece in reversed(chain):
+                if not simple(piece):
+                    return None
+                pieces.append(("expr", piece))
+        else:
+            return None
+        return pieces or None
+
+    def _emit_text_append_assign(self, ref, pieces, env, lines):
+        """Emits `target = target + pieces...` as in-place appends onto
+        the binding's own buffer. See the section comment above."""
+        ptr_slot, len_slot = self._append_shadows[ref]
+        old = self.tmp()
+        lines.append(f"  {old} = load ptr, ptr {ref}")
+        remembered = self.tmp()
+        lines.append(f"  {remembered} = load ptr, ptr {ptr_slot}")
+        remembered_len = self.tmp()
+        lines.append(f"  {remembered_len} = load i64, ptr {len_slot}")
+        same = self.tmp()
+        lines.append(f"  {same} = icmp eq ptr {old}, {remembered}")
+        known = self.tmp()
+        lines.append(f"  {known} = select i1 {same}, i64 {remembered_len}, i64 -1")
+        cur, cur_len = old, known
+        for kind, piece in pieces:
+            if kind == "const":
+                piece_val = self._const_string(piece, lines)
+                owned = False
+            else:
+                val, vtype = self._emit_expr(piece, env, lines)
+                piece_val = self._to_text(val, vtype, lines)
+                self._release_owned_receiver(piece, val, vtype, lines)
+                owned = vtype != TEXT or self._is_owning_text_source(piece)
+            grown = self.tmp()
+            lines.append(f"  {grown} = call ptr @festina_text_append(ptr {cur}, i64 {cur_len}, "
+                         f"ptr {piece_val}, i64 -1, ptr {len_slot})")
+            if owned:
+                lines.append(f"  call void @free(ptr {piece_val})")
+            new_len = self.tmp()
+            lines.append(f"  {new_len} = load i64, ptr {len_slot}")
+            cur, cur_len = grown, new_len
+        lines.append(f"  store ptr {cur}, ptr {ref}")
+        lines.append(f"  store ptr {cur}, ptr {ptr_slot}")
+        return cur, TEXT
 
     def _release_fn_for(self, type_):
         """claude.md #79 (widened by claude.md #80): the single dispatch
@@ -10100,6 +10266,13 @@ class CodeGen:
                 raise CodegenError(f"unknown variable '{expr.target.name}'",
                                     file=self.filename, line=expr.target.line)
             ref, ttype = found
+            if (ttype == TEXT and ref in self._append_shadows
+                    and ref not in self._manually_managed_refs):
+                # claude.md #243: `s = `${s}...`` / `s = s + ...` grows
+                # s's own buffer in place instead of copying it.
+                pieces = self._text_append_pieces(expr.target.name, expr.value)
+                if pieces is not None:
+                    return self._emit_text_append_assign(ref, pieces, env, lines)
             val, vtype = self._emit_value_for(expr.value, env, lines, ttype)
             val = self._coerce(val, vtype, ttype, lines, source_expr=expr.value)
             if _is_refcounted(ttype):
@@ -13375,15 +13548,22 @@ class CodeGen:
             # once-per-iteration way as festina_async_io_outstanding/
             # _drain just above).
             main_lines.append("  call void @festina_run_timer_loop()")
-        # claude.md #126 round nine: unconditional, last thing main()
-        # does -- @__festina_db defaults to (and stays) null for a
-        # program with no `table` declarations, which festina_db_close
-        # treats as a no-op, so this is safe to call every time rather
-        # than gated on self.uses_sqlite. See that function's own
-        # comment for why an explicit close (not just letting the OS
-        # reclaim the fd on exit) matters.
-        main_lines.append("  %final_db = load ptr, ptr @__festina_db")
-        main_lines.append("  call void @festina_db_close(ptr %final_db)")
+        # claude.md #126 round nine: the last thing main() does -- see
+        # festina_db_close's own comment for why an explicit close (not
+        # just letting the OS reclaim the fd on exit) matters. It used
+        # to be emitted unconditionally (@__festina_db stays null for a
+        # program with no `table`, which festina_db_close treats as a
+        # no-op). claude.md #242: gated on the same condition that opens
+        # the database in the prologue above, because for a program that
+        # never touches one this call was the ONLY live reference from
+        # the program into the runtime's SQLite code -- and on the
+        # wasm32-wasi target the one thing keeping the whole vendored
+        # SQLite (~1MB of a 1.47MB .wasm) from being dead-code
+        # eliminated by the linker. Nothing changes for a program that
+        # does have one.
+        if self.tables or self.uses_sqlite:
+            main_lines.append("  %final_db = load ptr, ptr @__festina_db")
+            main_lines.append("  call void @festina_db_close(ptr %final_db)")
         main_lines.append("  ret i32 0")
         main_lines.append("}")
 
