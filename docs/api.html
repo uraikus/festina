@@ -61,6 +61,7 @@
         <a class="sub" href="#function-hoisting">Functions are hoisted</a>
         <a href="#control-flow">Control flow</a>
         <a href="#strings">Strings</a>
+        <a class="sub" href="#building-a-string-piece-by-piece">Building a string piece by piece</a>
         <a class="sub" href="#parsing-an-int">Parsing an int</a>
         <a class="sub" href="#indexing-a-character-out">Indexing a character out</a>
         <a href="#logging-and-rendering">Logging and rendering</a>
@@ -555,6 +556,31 @@ sentence = words.join(<span class="str">'\t'</span>)              <span class="c
           UTF-8 code point. <code>join</code> renders a <code>null</code>
           element as an empty string:
           <code>[1, null, 3].join('-')</code> is <code>'1--3'</code>.
+        </p>
+
+        <h3 id="building-a-string-piece-by-piece">Building a string piece by piece <a class="anchor" href="#building-a-string-piece-by-piece">#</a></h3>
+        <p class="muted">
+          <strong>This is O(n).</strong> Every <code>text</code>
+          binding owns its buffer outright, so an assignment that
+          appends to itself —
+        </p>
+        <pre class="code"><span class="kw">text</span> out = <span class="str">''</span>
+<span class="kw">for</span> <span class="kw">int</span> i = <span class="num">0</span>, i &lt; n, i++ {
+    out = <span class="str">`${out}${i},`</span>          <span class="cm">// or: out = out + row.name + '\n'</span>
+}</pre>
+        <p class="muted">
+          — is compiled as a real append: <code>out</code>'s own
+          buffer is grown in place (geometrically, with a length the
+          compiler tracks), not copied into a fresh one on every step.
+          The shape is exactly <code>x = `${x}…`</code> or
+          <code>x = x + …</code> where <code>x</code> is a plain
+          <code>text</code> variable, parameter or top-level global,
+          <code>x</code> appears once at the front, and every further
+          piece is a literal, another variable, or a plain field read
+          (anything that could call a function, or read <code>x</code>
+          again, takes the ordinary copying path). Nothing about it is
+          visible except the time: 15,000 appends move a few kilobytes
+          instead of ~112 MB.
         </p>
 
         <h3 id="parsing-an-int">Parsing an int <a class="anchor" href="#parsing-an-int">#</a></h3>
