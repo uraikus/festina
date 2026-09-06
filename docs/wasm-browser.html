@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser client — Festina</title>
+<meta name="description" content="Running a compiled Festina .wasm in a browser tab: browser.html quick start, embedding festina_wasi_worker.js in your own page, feeding files in and reading them back, and the FestinaWasi API.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%237c1f1b'/%3E%3Crect x='4' y='4' width='56' height='56' fill='none' stroke='%2393731f' stroke-width='2'/%3E%3Ctext x='33' y='49' text-anchor='middle' font-family='Georgia, Times New Roman, serif' font-style='italic' font-weight='700' font-size='42' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
+<link rel="canonical" href="https://festina.archtelos.com/wasm-browser.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Festina">
+<meta property="og:title" content="Browser client — Festina">
+<meta property="og:description" content="Running a compiled Festina .wasm in a browser tab: browser.html quick start, embedding festina_wasi_worker.js in your own page, feeding files in and reading them back, and the FestinaWasi API.">
+<meta property="og:url" content="https://festina.archtelos.com/wasm-browser.html">
+<meta property="og:image" content="https://festina.archtelos.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Browser client — Festina">
+<meta name="twitter:description" content="Running a compiled Festina .wasm in a browser tab: browser.html quick start, embedding festina_wasi_worker.js in your own page, feeding files in and reading them back, and the FestinaWasi API.">
+<meta name="twitter:image" content="https://festina.archtelos.com/og-image.png">
+<meta name="theme-color" content="#7c1f1b">
+<meta name="color-scheme" content="light">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,440;0,9..144,560;1,9..144,440&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#quickstart">Quick start: browser.html</a>
+        <a href="#embedding">Embedding it in your own page</a>
+        <a href="#files-in-out">Feeding files in, reading them back</a>
+        <a href="#args-env">Arguments and environment variables</a>
+        <a href="#main-thread">Running without a Worker</a>
+        <a href="#api-reference">API reference</a>
+        <a class="sub" href="#festinawasi-class">The FestinaWasi class</a>
+        <a class="sub" href="#worker-protocol">The worker message protocol</a>
+        <a class="sub" href="#browser-html-api">browser.html's own window API</a>
+        <a href="#serving-and-headers">Serving it and cross-origin isolation</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">WebAssembly</p>
+      <h1 class="page-title">Browser client</h1>
+      <p class="lede">
+        Everything on this page is about the <strong>client side</strong>:
+        the HTML and JavaScript that loads and runs an already-compiled
+        <code>program.wasm</code> in a tab. For cross-compiling a
+        Festina program to <code>wasm32-wasi</code> in the first place
+        — <code>festina compile --target=wasm32-wasi</code>, setup,
+        design, limitations and benchmarks — see
+        <a href="wasm.html">wasm.md</a>, whose own
+        <a href="wasm.html#in-a-browser">"In a browser"</a> section this
+        page is the worked-example counterpart to.
+      </p>
+      <p class="lede">
+        Three files, copied straight from
+        <a href="https://github.com/uraikus/festina/tree/main/runtime/wasm">runtime/wasm/</a>,
+        are all a page needs: <code>festina_wasi_browser.js</code> (the
+        WASI host itself — a dependency-free ES module),
+        <code>festina_wasi_worker.js</code> (runs a program on that host
+        inside a Web Worker, so the page's own thread never blocks),
+        and, if you want it as-is rather than writing your own page,
+        <code>browser.html</code>.
+      </p>
+
+      <section class="doc-section" id="quickstart">
+        <h2>Quick start: browser.html <a class="anchor" href="#quickstart">#</a></h2>
+        <p>
+          The fastest way to see a compiled program run in a tab needs
+          no custom code at all:
+        </p>
+        <pre class="code"><span class="mut">$</span> festina compile --target=wasm32-wasi program.f -o program.wasm
+<span class="mut">$</span> cp runtime/wasm/browser.html runtime/wasm/festina_wasi_browser.js runtime/wasm/festina_wasi_worker.js .
+<span class="mut">$</span> python3 -m http.server 8000    <span class="cm"># any static file server -- module workers need real HTTP</span></pre>
+        <p>
+          Then open
+          <code>http://localhost:8000/browser.html?wasm=program.wasm</code>.
+          <code>browser.html</code> fetches the <code>.wasm</code> the
+          query string names, runs it in a Worker, and streams
+          stdout/stderr onto the page as plain text (stderr in red) as
+          the program writes them — no build step, no bundler, just the
+          three files above sitting next to your <code>.wasm</code>.
+        </p>
+        <div class="callout">
+          <strong><code>window.festinaResult</code> holds the finished
+          run.</strong> Once the program exits, <code>browser.html</code>
+          sets <code>window.festinaResult</code> to
+          <code>{code, stdout, stderr, files}</code> — the same shape
+          every example on this page produces, and exactly what a
+          driving test (or your own outer page, via an <code>iframe</code>)
+          would read back to check the result programmatically instead
+          of eyeballing the rendered text.
+        </div>
+      </section>
+
+      <section class="doc-section" id="embedding">
+        <h2>Embedding it in your own page <a class="anchor" href="#embedding">#</a></h2>
+        <p>
+          <code>browser.html</code> is a real page, not a black box —
+          its entire run loop is one <code>festinaRun()</code> function
+          you can write yourself, with your own UI around it.
+          <code>festina_wasi_worker.js</code> is the actual seam: give
+          it a <code>.wasm</code>'s bytes and it posts back one message
+          per line of output, then one final message with the exit
+          code. A minimal custom page:
+        </p>
+        <pre class="code"><span class="cm">&lt;!-- index.html --&gt;</span>
+&lt;!doctype html&gt;
+&lt;html&gt;
+&lt;body&gt;
+  &lt;button id="run"&gt;Run program.wasm&lt;/button&gt;
+  &lt;pre id="output"&gt;&lt;/pre&gt;
+
+  &lt;script type="module"&gt;
+    <span class="kw">const</span> output = document.getElementById(<span class="str">'output'</span>);
+
+    document.getElementById(<span class="str">'run'</span>).onclick = <span class="kw">async</span> () =&gt; {
+      output.textContent = <span class="str">''</span>;
+
+      <span class="kw">const</span> wasm = <span class="kw">await</span> fetch(<span class="str">'program.wasm'</span>).then(r =&gt; r.arrayBuffer());
+      <span class="kw">const</span> worker = <span class="kw">new</span> Worker(<span class="str">'festina_wasi_worker.js'</span>, { type: <span class="str">'module'</span> });
+
+      worker.onmessage = ({ data }) =&gt; {
+        <span class="kw">if</span> (data.kind === <span class="str">'stdout'</span> || data.kind === <span class="str">'stderr'</span>) {
+          output.textContent += data.line + <span class="str">'\n'</span>;
+        } <span class="kw">else</span> <span class="kw">if</span> (data.kind === <span class="str">'exit'</span>) {
+          output.textContent += <span class="str">`\n[exited with code ${data.code}]`</span>;
+          worker.terminate();
+        } <span class="kw">else</span> <span class="kw">if</span> (data.kind === <span class="str">'error'</span>) {
+          output.textContent += <span class="str">`\n[host error] ${data.message}`</span>;
+          worker.terminate();
+        }
+      };
+
+      <span class="cm">// the ArrayBuffer is transferred, not copied -- cheap even for a large .wasm</span>
+      worker.postMessage({ wasm, args: [<span class="str">'program.wasm'</span>] }, [wasm]);
+    };
+  &lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;</pre>
+        <p class="muted">
+          Served from the same directory as
+          <code>festina_wasi_browser.js</code><wbr>/<code>festina_wasi_worker.js</code>
+          and a compiled <code>program.wasm</code>, this is the entire
+          client side of a Festina-in-the-browser app: no framework, no
+          bundler, no build step — <code>festina_wasi_worker.js</code>
+          imports <code>festina_wasi_browser.js</code> as a relative ES
+          module on its own, so dropping both files next to your page
+          is the whole integration.
+        </p>
+      </section>
+
+      <section class="doc-section" id="files-in-out">
+        <h2>Feeding files in, reading them back <a class="anchor" href="#files-in-out">#</a></h2>
+        <p>
+          A Festina program's filesystem is sandboxed and in-memory in
+          the browser (see
+          <a href="wasm.html#in-a-browser">wasm.md</a>) — nothing it
+          reads or writes touches the visitor's real disk. The
+          <code>files</code> option seeds that sandbox before the
+          program starts; the <code>exit</code> message hands back
+          every file the program left there when it's done, as plain
+          <code>Uint8Array</code>s:
+        </p>
+        <pre class="code"><span class="kw">const</span> wasm = <span class="kw">await</span> fetch(<span class="str">'program.wasm'</span>).then(r =&gt; r.arrayBuffer());
+<span class="kw">const</span> worker = <span class="kw">new</span> Worker(<span class="str">'festina_wasi_worker.js'</span>, { type: <span class="str">'module'</span> });
+
+worker.onmessage = ({ data }) =&gt; {
+  <span class="kw">if</span> (data.kind === <span class="str">'exit'</span>) {
+    <span class="kw">const</span> bytes = data.files[<span class="str">'/report.txt'</span>];      <span class="cm">// Uint8Array, or undefined if never written</span>
+    <span class="kw">const</span> text  = <span class="kw">new</span> TextDecoder().decode(bytes);
+    console.log(<span class="str">'the program wrote:'</span>, text);
+  }
+};
+
+worker.postMessage({
+  wasm,
+  args: [<span class="str">'program.wasm'</span>],
+  files: {
+    <span class="str">'/config.json'</span>: JSON.stringify({ name: <span class="str">'demo'</span>, limit: 10 }),
+    <span class="str">'/data/seed.csv'</span>: <span class="str">'id,value\n1,7\n2,9\n'</span>,   <span class="cm">// directories are created as needed</span>
+  },
+}, [wasm]);</pre>
+        <p class="muted">
+          A seeded path may be a <code>text</code> string or bytes
+          (anything <code>TextEncoder</code>/a typed array already
+          handles) — the host stores it as bytes either way. On the
+          Festina side this is just <code>blob</code>/<code>mkdir</code>/<code>ls</code>
+          and SQLite's own database file working exactly as documented
+          in <a href="api.html">api.md</a>; the browser page is simply
+          the one deciding what's there before the program starts, and
+          collecting what's there after it ends.
+        </p>
+      </section>
+
+      <section class="doc-section" id="args-env">
+        <h2>Arguments and environment variables <a class="anchor" href="#args-env">#</a></h2>
+        <p>
+          <code>args</code> becomes the program's own
+          <a href="api.html#command-line-arguments">command-line arguments</a>
+          array (<code>args[0]</code> is conventionally the program's
+          own name, matching <code>argv[0]</code> on every native
+          target); <code>env</code> becomes what
+          <code>environment.NAME</code> reads:
+        </p>
+        <pre class="code">worker.postMessage({
+  wasm,
+  args: [<span class="str">'program.wasm'</span>, <span class="str">'--verbose'</span>, room],
+  env: { API_KEY: <span class="str">'demo-key'</span> },
+}, [wasm]);</pre>
+        <p class="muted">
+          Both are ordinary JavaScript values built from whatever the
+          page already has — a form field, a URL query parameter, a
+          value read from <code>localStorage</code> — there is nothing
+          Festina-specific about constructing them; the host just
+          copies them into the sandboxed process's own
+          <code>args</code>/<code>environ</code> before it starts.
+        </p>
+      </section>
+
+      <section class="doc-section" id="main-thread">
+        <h2>Running without a Worker <a class="anchor" href="#main-thread">#</a></h2>
+        <p>
+          <code>festina_wasi_worker.js</code> is a thin wrapper: it
+          imports the host directly and simply posts its callbacks back
+          as messages. Nothing stops calling <code>FestinaWasi</code>
+          itself from a page's own main-thread script, or from inside a
+          Worker you're already running for other reasons:
+        </p>
+        <pre class="code"><span class="kw">import</span> { FestinaWasi } <span class="kw">from</span> <span class="str">'./festina_wasi_browser.js'</span>;
+
+<span class="kw">const</span> wasm = <span class="kw">await</span> fetch(<span class="str">'program.wasm'</span>).then(r =&gt; r.arrayBuffer());
+<span class="kw">const</span> host = <span class="kw">new</span> FestinaWasi({
+  args: [<span class="str">'program.wasm'</span>],
+  stdout: line =&gt; console.log(line),
+  stderr: line =&gt; console.error(line),
+});
+
+<span class="kw">const</span> code = <span class="kw">await</span> host.run(wasm);
+console.log(<span class="str">'exited with'</span>, code, host.files());   <span class="cm">// Map&lt;path, Uint8Array&gt;</span></pre>
+        <div class="callout">
+          <strong>This blocks whatever thread runs it for the whole
+          program.</strong> A Festina program is an ordinary synchronous
+          <code>main()</code> (plus its own timer loop), and WebAssembly
+          has no way to yield back to JavaScript from inside a running
+          instance — so calling <code>host.run()</code> from the page's
+          own main thread freezes the tab (no scrolling, no repaint,
+          no other event handler) until the program exits. Fine for a
+          program that finishes in a few milliseconds and touches no
+          timers; anything longer, or anything using
+          <code>setTimeout</code>/<code>setInterval</code>, belongs in
+          a Worker via <code>festina_wasi_worker.js</code> — which is
+          why <code>browser.html</code> always uses one.
+        </div>
+      </section>
+
+      <section class="doc-section" id="api-reference">
+        <h2>API reference <a class="anchor" href="#api-reference">#</a></h2>
+
+        <h3 id="festinawasi-class">The FestinaWasi class <a class="anchor" href="#festinawasi-class">#</a></h3>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>new FestinaWasi(options)</td><td><code>options.args</code> — <code>arr[text]</code>-shaped argv, default <code>['program.wasm']</code>. <code>options.env</code> — a plain object of environment variables, default <code>{}</code>. <code>options.files</code> — initial sandbox contents, path → text/bytes, default <code>{}</code>. <code>options.stdout</code>/<code>options.stderr</code> — called with one complete line at a time as the program writes it (no trailing newline).</td></tr>
+            <tr><td>host.run(wasmBytes)</td><td>Instantiates and runs the module — an <code>ArrayBuffer</code> or <code>Uint8Array</code> in, a <code>Promise&lt;int&gt;</code> out, resolving to the program's real exit code (<code>close(code)</code>, or <code>0</code>/<code>1</code> for a normal/failed return from <code>main()</code>, exactly matching every native target and Node's own <code>node:wasi</code> host).</td></tr>
+            <tr><td>host.files()</td><td>A <code>Map&lt;text, Uint8Array&gt;</code> of every regular file present in the sandbox once <code>run()</code> resolves — the seeded ones (if untouched) and anything the program wrote or created.</td></tr>
+            <tr><td>host.stdout / host.stderr</td><td>The complete captured output as one string each, newline-joined — the same text the line-by-line callbacks already delivered, kept for convenience.</td></tr>
+          </table>
+        </div>
+        <p class="muted">
+          One <code>FestinaWasi</code> instance is good for exactly one
+          <code>run()</code> — its sandbox and captured output belong to
+          that one process. Running another program means constructing
+          another instance (or, in a Worker, letting the worker exit and
+          starting a fresh one — which is what posting a new
+          <code>wasm</code> message to a new <code>Worker</code>
+          amounts to).
+        </p>
+
+        <h3 id="worker-protocol">The worker message protocol <a class="anchor" href="#worker-protocol">#</a></h3>
+        <p>
+          Everything <code>festina_wasi_worker.js</code> understands, in
+          both directions:
+        </p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>→ worker.postMessage({wasm, args, env, files})</td><td>Starts a run. <code>wasm</code> is required (an <code>ArrayBuffer</code>); transfer it (the second <code>postMessage</code> argument, <code>[wasm]</code>) rather than letting it be structured-cloned, especially for anything but a tiny module. <code>args</code>/<code>env</code>/<code>files</code> all default the same way <code>FestinaWasi</code>'s own constructor does.</td></tr>
+            <tr><td>← {kind: 'stdout', line} / {kind: 'stderr', line}</td><td>One per line, as the program writes it — not batched, so a page can render output live rather than only after the program exits.</td></tr>
+            <tr><td>← {kind: 'exit', code, stdout, stderr, files}</td><td>Sent once, when the program finishes. <code>files</code> is a plain object (not a <code>Map</code> — messages are structured-cloned) of path → <code>Uint8Array</code>, built from <code>host.files()</code>.</td></tr>
+            <tr><td>← {kind: 'error', message}</td><td>The host itself failed before or during the run (a malformed <code>.wasm</code>, an import the host doesn't implement) — distinct from the program's own exit code, which is always a clean <code>0</code>-<code>255</code> even for a Festina-level failure (an uncaught <code>throw</code>, an unhandled <code>fail()</code>).</td></tr>
+          </table>
+        </div>
+
+        <h3 id="browser-html-api">browser.html's own window API <a class="anchor" href="#browser-html-api">#</a></h3>
+        <p>
+          If you're using <code>browser.html</code> as-is (rather than
+          building the custom page above), it exposes the whole run
+          loop as one global function, which is also what a test
+          harness driving it through Playwright (or a plain
+          <code>iframe</code>) calls directly:
+        </p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>window.festinaRun(url, options)</td><td>Fetches <code>url</code>, runs it exactly like the <code>?wasm=</code> query string does, and returns a <code>Promise</code> resolving to the same <code>{code, stdout, stderr, files}</code> shape. <code>options.args</code>/<code>options.files</code> pass through to the worker; <code>args</code> defaults to <code>[url's own filename]</code> if omitted.</td></tr>
+            <tr><td>window.festinaResult</td><td><code>null</code> until a run finishes, then the same object <code>festinaRun</code>'s own promise resolved with — what to poll (or <code>await</code> a matching <code>page.waitForFunction</code> against, from outside the page) if you'd rather not thread a promise through.</td></tr>
+          </table>
+        </div>
+      </section>
+
+      <section class="doc-section" id="serving-and-headers">
+        <h2>Serving it and cross-origin isolation <a class="anchor" href="#serving-and-headers">#</a></h2>
+        <p>
+          Every example on this page needs real HTTP, not
+          <code>file://</code> — module workers refuse to load a script
+          from a <code>file:</code> URL in every current browser. Any
+          static file server works (<code>python3 -m http.server</code>,
+          <code>npx serve</code>, whatever the rest of your app already
+          uses); there's nothing server-side to configure beyond serving
+          plain static files.
+        </p>
+        <p class="muted">
+          One optional header pair changes how a Festina program's own
+          timers behave, not whether anything works:
+          <code>Cross-Origin-Opener-Policy: same-origin</code> and
+          <code>Cross-Origin-Embedder-Policy: require-corp</code> make a
+          page cross-origin isolated, which is what lets
+          <code>setTimeout</code>/<code>setInterval</code> sleep with a
+          real <code>Atomics.wait</code> inside the Worker instead of
+          spinning — see
+          <a href="wasm.html#in-a-browser">wasm.md</a>. A program with
+          no timers, or one that only cares about its final exit code
+          and output, needs neither header.
+        </p>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="wasm.html">
+          <span class="label">← Previous</span>
+          WebAssembly
+        </a>
+        <a class="next" href="security.html">
+          <span class="label">Next →</span>
+          Security
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="doc.js"></script>
+
+</body>
+</html>

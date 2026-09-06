@@ -49,6 +49,12 @@
     <priority>0.6</priority>
   </url>
   <url>
+    <loc>https://festina.archtelos.com/wasm-browser.html</loc>
+    <lastmod>2026-09-03</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.6</priority>
+  </url>
+  <url>
     <loc>https://festina.archtelos.com/security.html</loc>
     <lastmod>2026-08-29</lastmod>
     <changefreq>monthly</changefreq>
