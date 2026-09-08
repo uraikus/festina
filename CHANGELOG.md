@@ -58,6 +58,11 @@ round-by-round design and implementation record predating 0.1 lives in
   on a dirty working tree, a detached `HEAD`, genuinely diverged
   history, or an installation that isn't a git checkout at all (e.g. a
   packaged binary) — it never force-resets over local work.
+- **`text.length` and `blob.length`.** `text.length` is the number of
+  UTF-8 code points (the same unit `s[i]`/`charCodeAt`/`split('')`
+  already use, not bytes) — a real scan, since UTF-8 is variable-width.
+  `blob.length` is the exact byte count, an O(1) stored-field read.
+  Both read-only, like `arr[T].length`.
 
 ### Fixed
 

@@ -1886,6 +1886,21 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
+            # claude.md #251: text.length/blob.length are read-only too,
+            # same placement/reasoning as arr[T]'s own .length just
+            # above (a runtime call, not a real addressable field --
+            # `_is_blob_type`, not `== _BLOB`, so `blob?` is covered the
+            # same way it already reads .length identically to plain
+            # blob, per that helper's own doc comment).
+            if (isinstance(expr.target, ast.Member) and not expr.target.computed
+                    and expr.target.prop == "length"
+                    and (infer(expr.target.obj, scope) == _TEXT
+                         or _is_blob_type(infer(expr.target.obj, scope)))):
+                raise CompileError(
+                    "'.length' is read-only and cannot be assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
             # claude.md #39/#139/#181: clientWidth/clientHeight/
             # screenWidth/screenHeight/devicePixelRatio are read-only
             # too -- same reasoning and same "catch it before the
@@ -2373,6 +2388,34 @@ def analyze(program, filename="<string>"):
                     category="invalid field access",
                 )
             return types_mod.PrimitiveType("int")
+        if obj_type == _TEXT:
+            # claude.md #251: text.length -> int, the number of UTF-8
+            # CODE POINTS -- the same unit s[i]/charCodeAt/split('')
+            # already use, not a byte count. The one other readable
+            # thing on `text` (besides `[i]`, handled in the computed
+            # branch above) is this, so anything else is a hard error,
+            # matching ArrayType's own strict `.length`-or-nothing
+            # branch just above.
+            if expr.prop != "length":
+                raise CompileError(
+                    f"text has no field '{expr.prop}' (did you mean '.length'?)",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            return _INT
+        if _is_blob_type(obj_type):
+            # claude.md #251: blob.length -> int, the byte count (an
+            # exact count, unlike text's -- a blob is raw bytes with no
+            # UTF-8 structure to walk). `_is_blob_type`, not `==_BLOB`,
+            # so `blob?` reads it identically to plain `blob` (see that
+            # helper's own doc comment).
+            if expr.prop != "length":
+                raise CompileError(
+                    f"blob has no field '{expr.prop}' (did you mean '.length'?)",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            return _INT
         if isinstance(obj_type, types_mod.ImageType):
             # claude.md #92: img has exactly two readable properties.
             # Strict, like ArrayType's own `.length` handling just above

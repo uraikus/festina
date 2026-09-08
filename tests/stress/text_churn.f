@@ -80,15 +80,18 @@ while j < 300 {
 // constant-fold in Python and never touch the runtime path at all.
 int k = 0
 while k < 500 {
-    // 'café{k}!' is always at least 6 codepoints (c-a-f-é plus one
-    // digit plus '!'), so `k % 6` never reaches into a text.length
-    // this language doesn't have (indexing/charCodeAt stay bounds-
-    // checked at runtime regardless -- see festina_text_char_at's own
-    // "test, don't fail" doc comment -- this is just about keeping
-    // this loop on the REAL-VALUE path most iterations, with the
-    // fixed 9999 below covering the null/out-of-range one instead).
+    // claude.md #251: word.length now exists -- a computed (call-
+    // result) text receiver every iteration, so a missed free here is
+    // one leak per pass, same shape as charCodeAt's own receiver just
+    // below. `k % word.length` keeps the charCodeAt index in real
+    // bounds every iteration (word is at least 6 code points --
+    // c-a-f-é plus 1-3 digits plus '!' -- and never zero), with the
+    // fixed 9999 below still covering the null/out-of-range path on
+    // its own.
     text word = decorate(`café${k}`)
-    int cp = word.charCodeAt(k % 6)
+    int wlen = word.length
+    if wlen < 6 { log('unreachable') }
+    int cp = word.charCodeAt(k % wlen)
     text back = cp.toChar()
     if back == null { log('unreachable') }
     log(back.charCodeAt(0) == cp)

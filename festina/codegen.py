@@ -1734,6 +1734,8 @@ class CodeGen:
             "declare void @festina_blob_release(ptr)",
             "declare ptr @festina_blob_to_text(ptr)",
             "declare ptr @festina_blob_bytes(ptr, ptr)",
+            # claude.md #251: blob.length.
+            "declare i64 @festina_blob_length(ptr)",
             "declare i8 @festina_blob_write(ptr, ptr)",
             "declare i8 @festina_blob_append(ptr, ptr)",
             "declare i8 @festina_blob_exists(ptr)",
@@ -1765,6 +1767,8 @@ class CodeGen:
             # claude.md #249: text.charCodeAt(i)/int.toChar().
             "declare i64 @festina_text_char_code_at(ptr, i64)",
             "declare ptr @festina_int_to_char(i64)",
+            # claude.md #251: text.length.
+            "declare i64 @festina_text_length(ptr)",
             "declare ptr @festina_argv_array(i32, ptr)",
             "declare i64 @festina_process_exec(ptr)",
             "declare i64 @strlen(ptr)",
@@ -6078,6 +6082,39 @@ class CodeGen:
                     if pending is not None:
                         self._release_member_chain(pending, expr.obj, obj_val,
                                                    obj_type, INT, lines)
+                    return out, INT
+                # claude.md #251: text.length -- a runtime call (an
+                # O(n) UTF-8 walk, unlike arr[T]'s stored-count GEP
+                # just above), so the receiver is a genuine temporary
+                # to release, not a field to load. text is not in
+                # _is_refcounted's family (claude.md #83: copy-on-
+                # alias, free-unconditionally, no header to retain), so
+                # this deliberately does NOT go through
+                # _release_member_chain (whose own call_receivers
+                # filter is `_is_refcounted(t)` -- a text receiver
+                # would never match it and so would silently leak) --
+                # _free_text_temp is the same direct-free helper
+                # charCodeAt's own receiver already uses (claude.md
+                # #249) for exactly this reason.
+                if obj_type == TEXT:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i64 @festina_text_length(ptr {obj_val})")
+                    self._free_text_temp(expr.obj, obj_val, obj_type, lines)
+                    return out, INT
+                # claude.md #251: blob.length -- blob IS refcounted
+                # (claude.md #109), but this follows img.width/height's
+                # own simpler _release_owned_receiver pattern just
+                # above in this file rather than the chain machinery:
+                # blob has no further sub-fields to chain through (no
+                # `make().someBlob.length` shape exists the way
+                # `make().inner.items.length` does for arr[T]), so the
+                # single-receiver release _release_owned_receiver
+                # already gives is exactly as correct and matches every
+                # other blob method's own receiver-release call site.
+                if obj_type == BLOB:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i64 @festina_blob_length(ptr {obj_val})")
+                    self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
                     return out, INT
             if expr.computed:
                 # claude.md #26/#72: arr[i] / map[key] -- expr.obj is

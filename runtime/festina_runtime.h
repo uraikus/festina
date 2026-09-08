@@ -232,6 +232,14 @@ char *festina_text_char_at(const char *s, int64_t index);
 int64_t festina_text_char_code_at(const char *s, int64_t index);
 char *festina_int_to_char(int64_t cp);
 
+/* claude.md #251: text.length -> int, the number of UTF-8 CODE POINTS
+ * (the same unit text[i]/charCodeAt/split('') already index by, NOT a
+ * byte count) -- an O(n) walk, since UTF-8 is variable-width, unlike
+ * blob.length's O(1) stored-length read just below. NULL-safe on a
+ * null receiver, treated as "" (length 0) like every other text-
+ * consuming call in this file. */
+int64_t festina_text_length(const char *s);
+
 /* claude.md #150: argv -- builds a fresh refcounted arr[text] (the same
  * shape festina_text_split's own pieces-array does) from the argc/argv
  * a compiled program's own `main` received; called once, in main()'s
@@ -1699,6 +1707,12 @@ void festina_blob_release(void *payload);
 void *festina_blob_clone(void *payload);
 char *festina_blob_to_text(void *payload);   /* owned copy, per claude.md #83 */
 const void *festina_blob_bytes(void *payload, int64_t *out_len);
+/* claude.md #251: blob.length -> int, the byte count -- an O(1) read
+ * off the same `length` field festina_blob_bytes already exposes via
+ * an out-param, trimmed to a single return value for the field-access
+ * codegen site (see that site's own comment). NULL-safe like every
+ * other blob accessor here. */
+int64_t festina_blob_length(void *payload);
 int8_t festina_blob_write(void *payload, const char *content);
 int8_t festina_blob_append(void *payload, const char *content);
 int8_t festina_blob_exists(void *payload);

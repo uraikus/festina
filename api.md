@@ -416,6 +416,20 @@ answers `null` rather than reading past the buffer. Read-only —
 `s[0] = 'x'` is a compile-time error, the same way `environment.NAME =
 ...` is.
 
+### Length
+
+```festina
+log('hello'.length)   // 5
+log('café'.length)    // 4 -- code points, not bytes ('é' is 2 bytes)
+log(''.length)        // 0
+```
+
+`text.length` is the number of UTF-8 **code points** — the same unit
+`s[i]`/`charCodeAt`/`split('')` already use, not a byte count. Because
+UTF-8 is variable-width, this is a real scan, not a stored count —
+unlike [`blob.length`](#files), which counts bytes exactly and is
+O(1). Read-only, like `arr[T].length`.
+
 ### charCodeAt() and toChar()
 
 ```festina
@@ -2148,11 +2162,17 @@ notes.append(' world')                // -> bool
 text body = notes.toText()            // -> the bytes, as text
 bool there = notes.exists()           // -> bool
 notes.delete()                        // -> bool; deletes the FILE
+int size = notes.length               // -> int; the byte count
 
 notes.save()                          // -> bool; write the bytes to its path
 notes.save('other.txt')               // -> bool; adopt that path, then write
 notes.saveCopy('backup.txt')          // -> bool; write there, keep its own path
 ```
+
+`.length` is the exact **byte** count — unlike `text.length`
+([Strings](#strings)), a blob has no UTF-8 structure to walk, so this
+is a plain stored count, not a scan. An unreadable path is `0`, the
+same "empty blob" answer `.exists()`/`.toText()` already give it.
 
 The path may be any text expression, like `img` and `aud`:
 `blob save = saveDir + 'slot1.dat'`.

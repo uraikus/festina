@@ -70,6 +70,19 @@ as the manual override. What remains open:
   scratch buffer, an iteration cursor — is not. Error-path-only,
   bounded per throw. (The general "intermediate frame" leak that used
   to be listed here is closed: claude.md #236.)
+- **`return <text-expr>` from a `blob func` (or `img`/`aud` — unverified,
+  same shape) leaks the intermediate text.** The implicit text-to-blob
+  conversion at a `return` site (`blob func f() { return `path${x}` }`)
+  passes the fresh concatenated text straight to `festina_blob_open`,
+  which `strdup`s the path internally — the original text buffer is
+  never freed afterward. Found via `tests/stress/media_churn.f` while
+  adding claude.md #251 (`text.length`), confirmed independent of that
+  feature (a bare `return <text-expr>` leaks with no `.length` call
+  anywhere) and via direct LLVM IR inspection; NOT fixed there — out of
+  scope for #251. The ordinary `blob b = <text-expr>` VarDecl
+  conversion is unaffected (proven leak-free by the same stress file).
+  Workaround: build the blob into a local first, then `return` that
+  local (`blob b = <text-expr>` `return b`).
 
 ## Deliberate behavior (documented, not planned work)
 

@@ -16356,6 +16356,113 @@ class TestCharCodeAtAndToChar:
             semantic.analyze(program)
 
 
+class TestTextAndBlobLength:
+    """claude.md #251: text.length:int and blob.length:int.
+
+    text.length is the number of UTF-8 CODE POINTS (the same unit
+    s[i]/charCodeAt/split('') already index by), not bytes -- 'café' is
+    4, not 5. blob.length is the byte count exactly, since a blob has
+    no UTF-8 structure to walk (an O(1) stored-field read, unlike
+    text's O(n) walk). Neither is settable: `.length = ...` on either
+    stays a compile error, the same way it already is for arr[T].
+    """
+
+    def test_ascii_text_length(self, compile_and_run):
+        result = compile_and_run("log('hello'.length)")
+        assert result.returncode == 0
+        assert result.stdout == "5\n"
+
+    def test_multibyte_text_length_counts_codepoints_not_bytes(self, compile_and_run):
+        # 'café' is 5 bytes UTF-8-encoded ('é' is 2 bytes) but 4 code
+        # points -- the same distinction
+        # TestCharCodeAtAndToChar::test_multibyte_utf8_codepoint_not_byte
+        # already pins for charCodeAt.
+        result = compile_and_run("log('café'.length)")
+        assert result.returncode == 0
+        assert result.stdout == "4\n"
+
+    def test_empty_text_length_is_zero(self, compile_and_run):
+        result = compile_and_run("log(''.length)")
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_a_null_text_receiver_reads_as_length_zero(self, compile_and_run):
+        # claude.md #150's own null-text convention (a missing regex
+        # match, here) -- treated as "" the same way
+        # festina_text_char_at already treats a NULL receiver, not a
+        # crash.
+        source = """
+        text nope = 'xyz'.match(/[0-9]+/)
+        log(nope == null)
+        log(nope.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n0\n"
+
+    def test_a_computed_text_receiver_goes_through_the_runtime_path(self, compile_and_run):
+        source = """
+        text func decorate(s:text) { return s + '!' }
+        log(decorate('hi').length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "3\n"
+
+    def test_text_length_is_not_settable(self, parser, semantic, errors):
+        program = parser.parse("text s = 'hi'\ns.length = 5")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_blob_length_is_the_byte_count(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        result = compile_and_run(f"blob b = '{path}'\nlog(b.length)")
+        assert result.returncode == 0
+        assert result.stdout == "5\n"
+
+    def test_blob_length_counts_bytes_not_codepoints(self, compile_and_run, tmp_path):
+        # 'café' is 5 UTF-8 bytes -- unlike text.length's 4 code points
+        # for the identical content, pinning the byte-vs-codepoint
+        # split between the two types explicitly.
+        path = tmp_path / "data.txt"
+        path.write_bytes("café".encode("utf-8"))
+        result = compile_and_run(f"blob b = '{path}'\nlog(b.length)")
+        assert result.returncode == 0
+        assert result.stdout == "5\n"
+
+    def test_a_missing_path_is_an_empty_blob_length_zero(self, compile_and_run):
+        result = compile_and_run("blob b = '/nonexistent/nowhere.txt'\nlog(b.length)")
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_a_computed_blob_receiver_goes_through_the_runtime_path(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        source = f"""
+        blob func makeBlob() {{ return '{path}' }}
+        log(makeBlob().length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "5\n"
+
+    def test_blob_length_is_not_settable(self, parser, semantic, errors):
+        program = parser.parse("blob b = 'x.txt'\nb.length = 5")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_wrong_field_name_on_text_mentions_length(self, parser, semantic, errors):
+        program = parser.parse("log('hi'.bogus)")
+        with pytest.raises(errors.CompileError, match="length"):
+            semantic.analyze(program)
+
+    def test_wrong_field_name_on_blob_mentions_length(self, parser, semantic, errors):
+        program = parser.parse("blob b = 'x.txt'\nlog(b.bogus)")
+        with pytest.raises(errors.CompileError, match="length"):
+            semantic.analyze(program)
+
+
 class TestEnums:
     """claude.md #176: enum + typeof end to end -- both representations
     (pure-struct self-tagging, mixed heap-boxed), typeof, coercion,

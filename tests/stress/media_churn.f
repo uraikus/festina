@@ -12,6 +12,22 @@ table Asset {
 
 sqlite('DELETE FROM Asset')
 
+blob func reload(i:int) {
+    // Built as a local first, then returned, rather than
+    // `return `save_${i % 4}.dat`` directly -- a known, pre-existing,
+    // unrelated leak in this compiler's implicit text->blob
+    // conversion AT a return site (the intermediate text from the
+    // template literal is never freed after festina_blob_open copies
+    // its path; found via this very stress file while adding
+    // claude.md #251, confirmed via LLVM IR inspection, NOT fixed
+    // here -- out of scope for #251, noted in claude.md instead). The
+    // ordinary `blob b = <text-expr>` VarDecl conversion this uses
+    // instead is unaffected -- `save` right below already proves
+    // that shape leak-free.
+    blob b = `save_${i % 4}.dat`
+    return b
+}
+
 int total = 0
 int i = 0
 while i < 120 {
@@ -92,6 +108,12 @@ while i < 120 {
     if alsoSave.exists() {
         total = total + 1
     }
+    // claude.md #251: blob.length -- an aliased (`save`, borrowed,
+    // needs no release of its own) and a computed (`reload()`, a
+    // fresh call-result blob) receiver both, so a missed release on
+    // the computed one is one leak per pass.
+    total = total + save.length
+    total = total + reload(i).length
     save = 'save_other.dat'          // releases the old handle
     save.write('other')
 

@@ -1931,6 +1931,26 @@ char *festina_int_to_char(int64_t cp) {
     return out;
 }
 
+/* claude.md #251: text.length -- counts UTF-8 CODE POINTS, the same
+ * unit festina_text_char_at/festina_text_char_code_at already walk by
+ * (one code point can be 1-4 bytes, so this is a real O(n) walk, not a
+ * stored count -- text carries no header to cache one in, and doing so
+ * would go stale the instant any in-place append (claude.md #243) grew
+ * the buffer underneath it). A NULL receiver is treated as "" (length
+ * 0), mirroring festina_text_char_at's own "null text behaves like
+ * empty text" contract. */
+int64_t festina_text_length(const char *s) {
+    if (!s) return 0;
+    int64_t count = 0;
+    const char *c = s;
+    while (*c) {
+        c++;
+        while ((*c & 0xC0) == 0x80) c++;
+        count++;
+    }
+    return count;
+}
+
 /* ---- claude.md #150: argv ---- */
 
 void *festina_argv_array(int argc, char **argv) {
@@ -2596,6 +2616,16 @@ const void *festina_blob_bytes(void *payload, int64_t *out_len) {
     FestinaBlob *b = (FestinaBlob *)payload;
     if (out_len) *out_len = b->length;
     return b->bytes;
+}
+
+/* claude.md #251: blob.length -- an O(1) read of the same `length`
+ * field festina_blob_bytes already exposes via its out-param, trimmed
+ * to a single return value since the field-access codegen site never
+ * needs the bytes pointer alongside it. */
+int64_t festina_blob_length(void *payload) {
+    if (!payload) return 0;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    return b->length;
 }
 
 /* Replaces the in-memory bytes as well as the file, so .toText()
