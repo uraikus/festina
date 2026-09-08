@@ -1,0 +1,993 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Festina — a fast, simple language that compiles to native code</title>
+<meta name="description" content="Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, timers, and threads built in.">
+<link rel="canonical" href="https://festina.archtelos.com/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Festina">
+<meta property="og:title" content="Festina — a fast, simple language that compiles to native code">
+<meta property="og:description" content="Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, timers, and threads built in.">
+<meta property="og:url" content="https://festina.archtelos.com/">
+<meta property="og:image" content="https://festina.archtelos.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Festina — a fast, simple language that compiles to native code">
+<meta name="twitter:description" content="Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, timers, and threads built in.">
+<meta name="twitter:image" content="https://festina.archtelos.com/og-image.png">
+<meta name="theme-color" content="#7c1f1b">
+<meta name="color-scheme" content="light">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%237c1f1b'/%3E%3Crect x='4' y='4' width='56' height='56' fill='none' stroke='%2393731f' stroke-width='2'/%3E%3Ctext x='33' y='49' text-anchor='middle' font-family='Georgia, Times New Roman, serif' font-style='italic' font-weight='700' font-size='42' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,440;0,9..144,560;1,9..144,440&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --primary: #7c1f1b;
+    --alternate: #93731f;
+    --bg: #f1e8d2;
+    --bg-raised: #fbf6e9;
+    --bg-deep: #e3d6b2;
+    --ink: #2a2018;
+    --ink-soft: #6b5c46;
+    --line: rgba(42, 32, 24, .2);
+    --code-bg: #2a1c16;
+    --code-text: #f1e8d2;
+    --code-muted: #a3927a;
+    --code-string: #dd8f72;
+    --code-keyword: #d9ab4a;
+    --code-comment: #8c7c65;
+    --shadow: 0 1px 2px rgba(42, 24, 16, 0.08), 0 8px 24px rgba(42, 24, 16, 0.10);
+  }
+
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'IBM Plex Sans', -apple-system, 'Segoe UI', sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--primary); }
+
+  code, pre, .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+
+  code:not(pre code) {
+    background: var(--bg-deep);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 0.1em 0.35em;
+    font-size: 0.87em;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: 'Fraunces', Georgia, serif;
+    font-weight: 480;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+    margin: 0 0 8px;
+  }
+
+  .wrap {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  .eyebrow {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.76rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--alternate);
+  }
+
+  /* Header */
+  header.site {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 60px;
+    padding: 0 24px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .wordmark {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 1.05rem;
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .wordmark .mark {
+    width: 26px;
+    height: 26px;
+    flex-shrink: 0;
+    background: var(--primary);
+    border: 1px solid var(--alternate);
+    color: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Fraunces', Georgia, serif;
+    font-style: italic;
+    font-weight: 600;
+    font-size: 1rem;
+    line-height: 1;
+  }
+  .wordmark span.name { font-family: 'Fraunces', Georgia, serif; font-weight: 560; }
+  #menu {
+    display: none;
+    width: 22px;
+    cursor: pointer;
+  }
+  #links {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    transition: height .4s;
+  }
+  header.site .link {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    text-decoration: none;
+    padding-bottom: 3px;
+    border-bottom: 1px solid transparent;
+    transition: color .2s, border-color .2s;
+  }
+  header.site .link:hover { color: var(--primary); border-color: var(--primary); }
+
+  /* Hero */
+  .hero {
+    padding: 88px 24px 56px;
+    text-align: center;
+    border-bottom: 1px double var(--line);
+  }
+  .hero h1 {
+    font-size: clamp(2rem, 5vw, 3rem);
+    line-height: 1.15;
+    max-width: 18ch;
+    margin: 18px auto 20px;
+  }
+  .hero h1 em { font-style: italic; color: var(--primary); }
+  .hero .motto {
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 1.05rem;
+    color: var(--ink-soft);
+    max-width: 46ch;
+    margin: 0 auto 30px;
+  }
+  .ctas {
+    display: flex;
+    gap: 14px;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 44px;
+  }
+  .button, a.button {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-decoration: none;
+    padding: 12px 22px;
+    border: 1px solid var(--primary);
+    background: var(--primary);
+    color: var(--bg);
+    transition: all .2s;
+  }
+  .button.invert, a.button.invert {
+    background: transparent;
+    color: var(--primary);
+  }
+  .button:hover { background: color-mix(in srgb, var(--primary) 84%, black); }
+  .button.invert:hover { background: var(--bg-deep); }
+
+  .hero-code { max-width: 640px; margin: 0 auto; text-align: left; }
+
+  /* Code blocks */
+  pre.code {
+    background: var(--code-bg);
+    color: var(--code-text);
+    padding: 20px 22px;
+    overflow-x: auto;
+    font-size: 0.86rem;
+    line-height: 1.65;
+    box-shadow: var(--shadow);
+    margin: 0 0 16px;
+    text-align: left;
+  }
+  pre.code .kw { color: var(--code-keyword); }
+  pre.code .str { color: var(--code-string); }
+  pre.code .re { color: var(--code-string); opacity: 0.85; }
+  pre.code .cm { color: var(--code-comment); font-style: italic; }
+  pre.code .mut { color: var(--code-muted); }
+
+  .code-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin: 0 0 8px;
+    font-size: 0.72rem;
+    color: var(--ink-soft);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+
+  /* Sections */
+  section { padding: 64px 0; border-top: 1px solid var(--line); }
+  section:first-of-type { border-top: none; }
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 18px;
+    margin-bottom: 40px;
+  }
+  .section-head h2 { font-size: 1.6rem; margin: 0; white-space: nowrap; }
+  .section-head hr {
+    flex-grow: 1;
+    border: none;
+    border-top: 1px solid var(--line);
+    margin: 0;
+  }
+  h2 { font-size: 1.5rem; }
+  .section-intro {
+    color: var(--ink-soft);
+    max-width: 640px;
+    margin: 0 0 28px;
+  }
+
+  /* Ledger (numbered entries) */
+  .ledger { padding-top: 64px; }
+  .entry {
+    display: grid;
+    grid-template-columns: 80px 1fr;
+    gap: 26px;
+    padding: 32px 0;
+    border-top: 1px solid var(--line);
+  }
+  .entry:last-child { border-bottom: 1px solid var(--line); }
+  .numeral {
+    font-family: 'Fraunces', serif;
+    font-size: 48px;
+    font-weight: 300;
+    font-style: italic;
+    color: var(--primary);
+    line-height: 1;
+    transition: color .25s;
+  }
+  .entry:hover .numeral { color: var(--alternate); }
+  .entry h3 {
+    font-size: 1.2rem;
+    margin: 0 0 8px;
+    display: inline-block;
+    border-bottom: 1px solid transparent;
+    transition: border-color .25s;
+  }
+  .entry:hover h3 { border-color: var(--primary); }
+  .entry p { margin: 0; color: var(--ink-soft); font-size: 0.94rem; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  th {
+    color: var(--ink-soft);
+    font-weight: 500;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    background: var(--bg-deep);
+  }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+  td.num, th.num { text-align: right; }
+  .row-festina td:first-child { color: var(--primary); font-weight: 600; }
+
+  .canvas-highlight {
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    padding: 24px;
+    margin: 32px 0;
+  }
+  .canvas-highlight-head {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .canvas-stat {
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 2.1rem;
+    font-weight: 400;
+    color: var(--primary);
+  }
+  .canvas-highlight-head h3 { margin: 0; font-size: 1.05rem; }
+
+  .docs-table a { text-decoration: none; font-weight: 600; }
+  .docs-table td:last-child { color: var(--ink-soft); }
+
+  ul.philosophy {
+    columns: 2;
+    gap: 32px;
+    padding-left: 20px;
+    color: var(--ink-soft);
+  }
+  ul.philosophy li { break-inside: avoid; margin-bottom: 8px; }
+
+  .status-line {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.95rem;
+    margin-bottom: 20px;
+  }
+  .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--alternate);
+    flex-shrink: 0;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--alternate) 22%, transparent);
+  }
+
+  /* Footer */
+  footer {
+    padding: 48px 24px 60px;
+    text-align: center;
+  }
+  footer .motto {
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 1rem;
+    margin-bottom: 16px;
+    color: var(--ink);
+  }
+  footer nav { margin-bottom: 14px; }
+  footer nav a {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-decoration: none;
+    color: var(--ink-soft);
+    margin: 0 12px;
+  }
+  footer nav a:hover { color: var(--primary); }
+  footer p { color: var(--ink-soft); font-size: 0.82rem; margin: 0; }
+
+  @media screen and (max-width: 768px) {
+    .entry { grid-template-columns: 1fr; gap: 8px; }
+    .numeral { font-size: 30px; }
+    header.site { padding: 0 14px; }
+    #menu { display: block; margin: 15px auto; }
+    #links {
+      position: absolute;
+      top: 60px;
+      left: 0;
+      right: 0;
+      flex-direction: column;
+      align-items: center;
+      gap: 14px;
+      height: 0;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    #links[data-expanded] {
+      height: auto;
+      padding: 16px 0 20px;
+      border-bottom: 1px solid var(--line);
+    }
+    ul.philosophy { columns: 1; }
+    .hero { padding: 56px 20px 40px; }
+  }
+</style>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Festina",
+  "url": "https://festina.archtelos.com/",
+  "description": "Festina is a fast, statically typed language that compiles through LLVM to a native executable, with SQLite, graphics, audio, timers, threads, and an HTTP/WebSocket server built in.",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Linux, macOS, Windows",
+  "softwareVersion": "0.44",
+  "license": "https://github.com/uraikus/festina/blob/main/LICENSE",
+  "codeRepository": "https://github.com/uraikus/festina",
+  "programmingLanguage": "Festina",
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "Festina",
+  "url": "https://festina.archtelos.com/"
+}
+</script>
+</head>
+<body>
+
+<header class="site">
+  <a class="wordmark" href="#top"><span class="mark">f</span><span class="name">Festina</span></a>
+  <div id="menu"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512" width="20" fill="currentColor"><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></div>
+  <nav id="links">
+    <a class="link" href="#why">Why</a>
+    <a class="link" href="#get-started">Get started</a>
+    <a class="link" href="#examples">Examples</a>
+    <a class="link" href="#benchmarks">Benchmarks</a>
+    <a class="link" href="api.html">API Reference</a>
+    <a class="link" href="examples.html">Code examples</a>
+    <a class="link" href="#docs">Docs</a>
+    <a class="link" href="https://github.com/uraikus/festina">GitHub</a>
+  </nav>
+</header>
+
+<div id="top"></div>
+<section class="hero">
+  <span class="eyebrow">Version 0.44 · MIT Licensed · Linux · macOS · Windows</span>
+  <h1>A fast, simple language <em>that compiles to native code.</em></h1>
+  <p class="motto">
+    Drop the interpreter, the runtime overhead, and the boilerplate —
+    SQLite, graphics, audio, timers, threads, and an HTTP/WebSocket server,
+    built
+    directly into the language.
+  </p>
+  <div class="ctas">
+    <a class="button" href="#get-started">Get started</a>
+    <a class="button invert" href="https://github.com/uraikus/festina">View on GitHub</a>
+  </div>
+
+  <div class="hero-code">
+    <pre class="code"><span class="kw">table</span> Visits {
+    id:<span class="kw">int</span>
+    place:<span class="kw">text</span>
+}
+
+sqlite(<span class="str">'INSERT INTO Visits (id, place) VALUES (?, ?)'</span>, [1, <span class="str">'the summit'</span>])
+<span class="kw">arr[Visits]</span> visits = sqlite(<span class="str">'SELECT * FROM Visits'</span>)
+
+<span class="kw">text func</span> describe(v:Visits) {
+    <span class="kw">return</span> <span class="str">`Visit #${v.id}: ${v.place}`</span>
+}
+
+log(describe(visits[0]))</pre>
+
+    <div class="code-label">shell</div>
+    <pre class="code"><span class="mut">$</span> bin/festina compile visits.f -o visits &amp;&amp; ./visits
+Visit #1: the summit</pre>
+    <p class="section-intro" style="margin-top:8px;">
+      No imports. No config. No <code>main()</code>, no ORM, no
+      migrations. Run this today — <code>festina.sqlite</code> and the
+      <code>Visits</code> table are created and kept in sync
+      automatically, a real parameterized query runs against it, the
+      whole <code>festina</code> runtime is one native binary, and it
+      needs nothing Python or JIT-shaped to execute.
+    </p>
+  </div>
+</section>
+
+<section class="ledger" id="why">
+  <div class="wrap">
+    <div class="section-head"><h2>Why Festina</h2><hr></div>
+
+    <div class="entry">
+      <div class="numeral">I</div>
+      <div>
+        <h3>Native compilation, not a VM</h3>
+        <p>Every Festina program compiles through LLVM to a real executable. No interpreter, no JIT warmup, no runtime shipped alongside your code.</p>
+      </div>
+    </div>
+    <div class="entry">
+      <div class="numeral">II</div>
+      <div>
+        <h3>A database that's just... there</h3>
+        <p>Declare a <code>table</code>, and <code>festina.sqlite</code> is created, migrated, and kept in sync automatically — no ORM, no migration scripts.</p>
+      </div>
+    </div>
+    <div class="entry">
+      <div class="numeral">III</div>
+      <div>
+        <h3>Graphics and audio, wired in</h3>
+        <p>A real canvas (<code>drawRect</code>, <code>on mouseDown</code>, paths, gradients, typed <code>color</code>/<code>font</code> values, …) and layered audio playback with channels (<code>aud music = 'music.mp3'</code>, then <code>music.play()</code>), backed by Cairo/X11 and ALSA.</p>
+      </div>
+    </div>
+    <div class="entry">
+      <div class="numeral">IV</div>
+      <div>
+        <h3>Real threads, without the footguns</h3>
+        <p><code>thread worker { ... }</code> runs on its own OS thread and can't touch a global or reach into another thread at all — every message across the boundary is a deep copy, so there is no shared mutable state to race on. Send with <code>worker.postMessage(x)</code>, answer with <code>t.reply(y)</code>, get the answer back with <code>.callback(fn)</code>, and scale out with <code>thread pool[N] { ... }</code>.</p>
+      </div>
+    </div>
+    <div class="entry">
+      <div class="numeral">V</div>
+      <div>
+        <h3>Automatic memory, manual override</h3>
+        <p>Values are reclaimed for you — and <code>free spritesheet</code> / <code>delete map.key</code> exist for the moments you know the lifetime better than the compiler does.</p>
+      </div>
+    </div>
+    <div class="entry">
+      <div class="numeral">VI</div>
+      <div>
+        <h3>Readable syntax, real guarantees</h3>
+        <p>Template strings, ternaries, familiar control flow — but every condition is a real <code>bool</code>, and everything is statically typed and checked before it runs.</p>
+      </div>
+    </div>
+    <div class="entry">
+      <div class="numeral">VII</div>
+      <div>
+        <h3>Slim by default</h3>
+        <p>A compiled program only links what it actually uses — skip graphics and audio in your source, and the binary skips Cairo, X11, and ALSA too.</p>
+      </div>
+    </div>
+    <div class="entry">
+      <div class="numeral">VIII</div>
+      <div>
+        <h3>Minimal setup, by design</h3>
+        <p>The fewest dependencies that get the job done, failing loudly and clearly the moment one is actually missing.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="get-started">
+  <div class="wrap">
+    <h2>Get started</h2>
+    <p class="section-intro">
+      One line, on Linux/macOS/MSYS2 UCRT64 bash on Windows — it clones
+      the source and checks/installs build dependencies for you:
+    </p>
+    <pre class="code"><span class="mut">$</span> curl -fsSL https://raw.githubusercontent.com/uraikus/festina/main/install.sh | sh</pre>
+    <p class="section-intro">Or from an existing checkout:</p>
+    <pre class="code"><span class="mut">$</span> sudo apt install clang libsqlite3-dev libcairo2-dev libx11-dev libasound2-dev pkg-config
+<span class="mut">$</span> bin/festina compile examples/hello.f -o hello
+<span class="mut">$</span> ./hello</pre>
+    <p class="section-intro">Or skip the intermediate binary and just run it:</p>
+    <pre class="code"><span class="mut">$</span> bin/festina run examples/hello.f</pre>
+    <p class="section-intro">
+      Not sure your machine has everything Festina needs?
+      <code>bin/festina doctor</code> checks every dependency above and
+      tells you exactly what's missing and how to install it —
+      including whether <code>festina</code> itself is on
+      <code>PATH</code> yet. Add <code>--fix</code> and it installs
+      whatever's missing for you (via <code>apt</code>/Homebrew/MSYS2's
+      <code>pacman</code>, whichever this machine has) and adds
+      <code>festina</code> to <code>PATH</code> too.
+    </p>
+    <p class="section-intro">
+      That's the whole loop — see
+      <a href="setup.html">setup.md</a>
+      for the full dependency breakdown, packaged-binary installs, and
+      running the test suite. macOS and Windows are supported too, each
+      with its own CI-verified toolchain section in setup.md.
+    </p>
+    <p class="section-intro">
+      Editing <code>.f</code> files in Vim or Neovim? See
+      <a href="https://github.com/uraikus/festina/blob/main/editors/vim/README.md">editors/vim</a>
+      for syntax highlighting (Vim's own bundled Fortran filetype
+      otherwise claims the <code>.f</code> extension).
+    </p>
+  </div>
+</section>
+
+<section id="examples">
+  <div class="wrap">
+    <h2>A familiar language, statically typed</h2>
+    <pre class="code"><span class="kw">int</span> count = 10
+<span class="kw">text</span> message = <span class="str">'Hello'</span>
+<span class="kw">bool</span> active = <span class="kw">true</span>
+
+<span class="kw">if</span> active {
+    log(<span class="str">`${message}, ${count} times`</span>)
+}
+
+<span class="kw">int func</span> add(a:<span class="kw">int</span>, b:<span class="kw">int</span>) {
+    <span class="kw">return</span> a + b
+}
+
+<span class="kw">for int</span> i = 0, i &lt; 10, i++ {
+    log(i)
+}</pre>
+    <p class="section-intro">
+      <code>int</code> and <code>float</code> mix freely — the <code>int</code>
+      side promotes to <code>float</code> automatically, and <code>/</code>
+      always returns <code>float</code>. The only way back to
+      <code>int</code> is <code>Math.floor/ceil/round/trunc</code>.
+      Division and modulo by zero return <code>null</code> instead of
+      crashing. See the
+      <a href="api.html">API reference</a>
+      for the full language and standard library documentation.
+    </p>
+
+    <h2 style="margin-top:40px;">Built in, not bolted on</h2>
+    <pre class="code"><span class="cm">// SQLite -- no setup code, no ORM</span>
+<span class="kw">table</span> People { id:<span class="kw">int</span>  name:<span class="kw">text</span> }
+<span class="kw">arr[People]</span> people = sqlite(<span class="str">'SELECT * FROM People'</span>)
+
+<span class="cm">// Graphics -- a real window, opened on first use</span>
+<span class="kw">color</span> brand = <span class="str">'#4a90d9'</span>
+<span class="kw">font</span>  title = <span class="str">'bold 24px sans-serif'</span>
+fillStyle(brand)
+changeFont(title)
+drawRect(0, 0, 100, 100)
+<span class="kw">on</span> mouseDown(x:<span class="kw">int</span>, y:<span class="kw">int</span>, button:<span class="kw">int</span>) { log(<span class="str">`pressed ${x}, ${y}`</span>) }
+<span class="kw">on</span> mouseUp(x:<span class="kw">int</span>, y:<span class="kw">int</span>, button:<span class="kw">int</span>)   { log(<span class="str">`released ${x}, ${y}`</span>) }
+
+<span class="cm">// Audio</span>
+<span class="kw">aud</span> music = <span class="str">'music.wav'</span>
+music.play()
+
+<span class="cm">// Files -- a blob is a file's bytes, and knows its own path</span>
+<span class="kw">blob</span> notes = <span class="str">'notes.txt'</span>
+notes.write(<span class="str">'hello'</span>)
+log(notes.toText())
+notes.saveCopy(<span class="str">'notes.bak'</span>)           <span class="cm">// img and aud save the same way</span>
+
+<span class="cm">// Timers</span>
+setTimeout(showMessage, 1000)
+setInterval(tick, 500)
+
+<span class="cm">// Regex, literal syntax</span>
+<span class="str">'room 42'</span>.replace(<span class="re">/[0-9]+/</span>, <span class="str">'N'</span>)
+
+<span class="cm">// Maps -- text-keyed, object-literal-flavored</span>
+<span class="kw">map[int]</span> npcHealths = { <span class="str">'npc1'</span>: 10, <span class="str">'npc2'</span>: 15 }
+npcHealths[<span class="str">'npc1'</span>] = 30
+
+<span class="cm">// Threads -- isolated, message-passing, no shared mutable state</span>
+<span class="kw">thread</span> doubler {
+    <span class="kw">on</span> message(sender:<span class="kw">thread</span>, msg:<span class="kw">int</span>) { sender.reply(msg * 2) }
+}
+doubler.postMessage(21).callback(<span class="kw">void</span> (answer:<span class="kw">int</span>) =&gt; log(answer))
+
+<span class="cm">// Config straight from the environment, no extra library</span>
+<span class="kw">text</span> apiKey = environment.API_KEY</pre>
+  </div>
+</section>
+
+<section id="benchmarks">
+  <div class="wrap">
+    <h2>How it compares</h2>
+    <p class="section-intro">
+      Festina, Rust, Go, and Bun on the same small equivalent-logic
+      benchmarks. Not a claim that Festina is faster in general — see
+      <a href="benchmark.html">benchmark.md</a>
+      for methodology and the full, regularly-refreshed results.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>hello</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
+        </thead>
+        <tbody>
+          <tr class="row-festina"><td>Festina</td><td class="num">1.2 ms</td><td class="num">66.3 ms</td><td class="num">1.48 MB</td></tr>
+          <tr><td>Rust</td><td class="num">1.2 ms</td><td class="num">70.0 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">1.2 ms</td><td class="num">128.0 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">7.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <br>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>fib(32)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
+        </thead>
+        <tbody>
+          <tr class="row-festina"><td>Festina</td><td class="num">6.2 ms</td><td class="num">71.6 ms</td><td class="num">1.48 MB</td></tr>
+          <tr><td>Rust</td><td class="num">6.9 ms</td><td class="num">70.6 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">9.7 ms</td><td class="num">117.4 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">20.2 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <br>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>loop_sum (100M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
+        </thead>
+        <tbody>
+          <tr class="row-festina"><td>Festina</td><td class="num">370.8 ms</td><td class="num">89.0 ms</td><td class="num">1.48 MB</td></tr>
+          <tr><td>Rust</td><td class="num">444.0 ms</td><td class="num">70.2 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">368.9 ms</td><td class="num">122.6 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">7438.6 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <br>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>array_sum (2M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
+        </thead>
+        <tbody>
+          <tr class="row-festina"><td>Festina</td><td class="num">72.3 ms</td><td class="num">90.1 ms</td><td class="num">1.48 MB</td></tr>
+          <tr><td>Rust</td><td class="num">69.5 ms</td><td class="num">103.8 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">68.7 ms</td><td class="num">120.4 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">1866.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <br>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>string_concat (15K)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr>
+        </thead>
+        <tbody>
+          <tr class="row-festina"><td>Festina</td><td class="num">2.9 ms</td><td class="num">71.9 ms</td><td class="num">1.48 MB</td></tr>
+          <tr><td>Rust</td><td class="num">1.1 ms</td><td class="num">94.5 ms</td><td class="num">3.77 MB</td></tr>
+          <tr><td>Go</td><td class="num">29.7 ms</td><td class="num">128.0 ms</td><td class="num">2.11 MB</td></tr>
+          <tr><td>Bun</td><td class="num">10.0 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="canvas-highlight">
+      <div class="canvas-highlight-head">
+        <span class="canvas-stat">2.6x faster</span>
+        <h3>than an HTML &lt;canvas&gt;, drawing the same scene</h3>
+      </div>
+      <p class="section-intro" style="margin:0 0 16px;">
+        The one benchmark here that isn't against another language — it's
+        against the thing a 2D game would otherwise most likely be
+        written on. 20,000 filled rectangles and 20,000 filled circles,
+        both sides drawing offscreen into an 800×600 surface.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Canvas</th><th class="num">Frame (min)</th><th class="num">Frame (median)</th><th class="num">First frame</th></tr>
+          </thead>
+          <tbody>
+            <tr class="row-festina"><td>Festina (Cairo)</td><td class="num">37 ms</td><td class="num">39 ms</td><td class="num">24 ms</td></tr>
+            <tr><td>HTML &lt;canvas&gt; (Chromium/Skia)</td><td class="num">97 ms</td><td class="num">110 ms</td><td class="num">429 ms</td></tr>
+            <tr><td>MonoGame (software GL)</td><td class="num">252 ms</td><td class="num">270 ms</td><td class="num">181 ms</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="section-intro" style="margin:16px 0 0;">
+        Circles are drawn from a cached alpha mask per radius, stamped
+        rather than re-tessellated on every call — the reason Festina
+        stays ahead of the browser on this workload. Festina also wins
+        startup by more than an order of magnitude and wins on variance
+        — the browser's frame time swings between runs, while Festina's
+        two numbers sit right on top of each other, and for a frame
+        budget that's not a footnote.
+      </p>
+      <p class="section-intro" style="margin:12px 0 0; font-size:0.85rem;">
+        <strong>Read the MonoGame row with its caveat:</strong> MonoGame
+        is a GPU framework, measured here with no GPU present — its
+        graphics context is a software rasterizer doing in CPU cycles
+        what real hardware does for free. On actual GPU hardware these
+        40,000 sprites batch into a couple of draw calls and finish in
+        well under a millisecond. The row measures the headless,
+        no-GPU case (CI, a build server, a container), not GPU-accelerated
+        performance.
+      </p>
+    </div>
+
+    <h3 style="margin:32px 0 8px;">HTTP: Festina vs Rust vs Go vs Bun</h3>
+    <p class="section-intro">
+      Four servers answering the same two routes — <code>/</code> (plain
+      text) and <code>/json</code> — load-tested with
+      <a href="https://github.com/wg/wrk">wrk</a>. All four are held to
+      the same connection-handling logic: single-threaded, one
+      connection at a time. Festina's HTTP server works this way
+      natively (see <a href="api.html#http-limitations">HTTP
+      Limitations</a>), and the Rust/Go servers here are hand-rolled raw
+      sockets matching it rather than <code>hyper</code>'s or
+      <code>net/http</code>'s own multi-threaded defaults. Every
+      response closes the connection, matched uniformly across all
+      four: Rust's and Go's raw-socket servers close by default,
+      Bun's server sets <code>Connection: close</code> explicitly to
+      opt out of its own native keep-alive, and since Festina supports
+      HTTP/1.1 keep-alive by default (see
+      <a href="api.html#http-keep-alive">Keep-alive</a>), the load
+      generator itself sends an explicit <code>Connection: close</code>
+      request header against all four servers uniformly, which Festina
+      honors per-request the same way any other client's explicit
+      close request would be.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>plaintext (/)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr>
+        </thead>
+        <tbody>
+          <tr class="row-festina"><td>Festina</td><td class="num">43,652</td><td class="num">1.05 ms</td><td class="num">4.25 MB/s</td></tr>
+          <tr><td>Rust</td><td class="num">63,513</td><td class="num">0.69 ms</td><td class="num">5.88 MB/s</td></tr>
+          <tr><td>Go</td><td class="num">35,457</td><td class="num">1.30 ms</td><td class="num">3.28 MB/s</td></tr>
+          <tr><td>Bun</td><td class="num">41,798</td><td class="num">1.09 ms</td><td class="num">5.34 MB/s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <br>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>json (/json)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr>
+        </thead>
+        <tbody>
+          <tr class="row-festina"><td>Festina</td><td class="num">41,482</td><td class="num">1.33 ms</td><td class="num">4.83 MB/s</td></tr>
+          <tr><td>Rust</td><td class="num">59,877</td><td class="num">0.73 ms</td><td class="num">6.68 MB/s</td></tr>
+          <tr><td>Go</td><td class="num">35,441</td><td class="num">1.27 ms</td><td class="num">3.95 MB/s</td></tr>
+          <tr><td>Bun</td><td class="num">39,580</td><td class="num">1.15 ms</td><td class="num">5.81 MB/s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="section-intro" style="margin-top:16px;">
+      Festina clears Go on both routes and lands right around Bun's own
+      number, with Rust ahead of all three — read that as "at matching
+      connection-handling logic," not as a claim about what
+      <code>hyper</code>/<code>axum</code> or <code>net/http</code>
+      would report with their own concurrency and keep-alive defaults
+      turned on, or about Bun's own native <code>Bun.serve()</code>. The
+      <code>/json</code> route runs Festina's request struct through the
+      same JSON-via-<code>.toText()</code> path every other container
+      response already uses, so the gap between the two routes reflects
+      that serialization cost rather than connection handling. Numbers
+      are one client machine talking to one server process on the same
+      machine — no network hop, no TLS — the same disclaimer every other
+      benchmark on this page carries.
+    </p>
+
+    <p class="section-intro" style="margin-top:20px;">
+      Short version: Festina holds its own against Rust and Go on
+      compute-bound native code and lands right at them on
+      allocation-heavy work too, comfortably outruns a JIT on cold
+      single-shot execution, sits second on <code>string_concat</code>
+      — ahead of both Go and Bun and within ~2.4x of Rust's
+      spare-capacity-reusing <code>String</code>, the one gap here that's
+      genuinely algorithmic, not an allocator artifact — and clears Go
+      on HTTP throughput too, landing right around Bun's own number,
+      with Rust's raw-socket implementation ahead of all three.
+    </p>
+  </div>
+</section>
+
+<section id="status">
+  <div class="wrap">
+    <h2>Project status</h2>
+    <div class="status-line">
+      <span class="dot"></span>
+      <span><strong>2301 tests, 0 failures.</strong> Under active development, but not vaporware.</span>
+    </div>
+    <p class="section-intro">
+      The compiler frontend, LLVM codegen backend, and native C runtime are
+      real and tested. Every <code>claude.md</code> language construct this
+      project has committed to is implemented end to end, not just parsed.
+      That includes a leak stress suite —
+      <a href="https://github.com/uraikus/festina/blob/main/scripts/leak_stress.sh">scripts/leak_stress.sh</a>
+      runs mixed churn programs plus one isolation program per data type
+      under AddressSanitizer and LeakSanitizer, because "the
+      answers are right" and "nothing accumulates while producing them"
+      are different claims. Native builds on Linux, macOS, and Windows,
+      plus cross-compiling to
+      <a href="wasm.html">wasm32-wasi</a>,
+      are all supported today. See
+      <a href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">tests/CONTRACT.md</a>
+      for exactly what's covered, and
+      <a href="todo.html">todo.md</a>
+      for what's next.
+    </p>
+  </div>
+</section>
+
+<section id="docs">
+  <div class="wrap">
+    <h2>Documentation</h2>
+    <div class="table-wrap">
+      <table class="docs-table">
+        <tbody>
+          <tr><td><a href="api.html">API reference</a></td><td>Full browsable language & standard library docs</td></tr>
+          <tr><td><a href="examples.html">Code examples</a></td><td>A proxy, SQLite over WebSocket, a CAPTCHA endpoint, a weather app</td></tr>
+          <tr><td><a href="setup.html">setup.md</a></td><td>Setup & dependencies</td></tr>
+          <tr><td><a href="macos.html">macos.md</a></td><td>macOS port</td></tr>
+          <tr><td><a href="windows.html">windows.md</a></td><td>Windows port</td></tr>
+          <tr><td><a href="wasm.html">wasm.md</a></td><td>WebAssembly (wasm32-wasi)</td></tr>
+          <tr><td><a href="wasm-browser.html">Browser client</a></td><td>Running a compiled .wasm in a browser tab</td></tr>
+          <tr><td><a href="security.html">security.md</a></td><td>Security posture</td></tr>
+          <tr><td><a href="benchmark.html">benchmark.md</a></td><td>Benchmarks vs. Rust/Go/Bun</td></tr>
+          <tr><td><a href="todo.html">todo.md</a></td><td>Roadmap</td></tr>
+          <tr><td><a href="changelog.html">CHANGELOG.md</a></td><td>Version history</td></tr>
+          <tr><td><a href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">tests/CONTRACT.md</a></td><td>Full spec-compliance test suite</td></tr>
+          <tr><td><a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a></td><td>Language specification</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="philosophy">
+  <div class="wrap">
+    <h2>Design philosophy</h2>
+    <p class="section-intro">Festina intentionally favors:</p>
+    <ul class="philosophy">
+      <li>Performance over flexibility</li>
+      <li>Static typing over runtime inference</li>
+      <li>Simple language rules over extensive syntax</li>
+      <li>Compile-time work over runtime work</li>
+      <li>Native representations over unnecessary abstraction</li>
+      <li>Familiar syntax without dynamic-language semantics</li>
+    </ul>
+    <p class="section-intro" style="margin-top:16px;">
+      Festina is not a scripting language with a compiler bolted on — it's
+      a compiled, statically typed language designed from the start for
+      native performance, that happens to keep its syntax approachable.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <p class="motto">Native performance, familiar syntax, nothing bolted on.</p>
+  <nav>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+    <a href="https://github.com/uraikus/festina/blob/main/LICENSE">MIT License</a>
+    <a href="api.html">API Reference</a>
+    <a href="examples.html">Code examples</a>
+    <a href="#docs">Docs</a>
+  </nav>
+  <p><b>Copyright Festina <span id="year">2026</span></b></p>
+</footer>
+
+<script>
+  'use strict';
+  var menu = document.getElementById('menu');
+  var links = document.getElementById('links');
+  if (menu) {
+    menu.onclick = function () {
+      if (links.hasAttribute('data-expanded')) {
+        links.removeAttribute('data-expanded');
+      } else {
+        links.setAttribute('data-expanded', '');
+      }
+    };
+  }
+  var year = document.getElementById('year');
+  if (year) year.textContent = new Date().getFullYear();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Changelog — Festina</title>
+<meta name="description" content="Version history for Festina, starting from 0.1.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%237c1f1b'/%3E%3Crect x='4' y='4' width='56' height='56' fill='none' stroke='%2393731f' stroke-width='2'/%3E%3Ctext x='33' y='49' text-anchor='middle' font-family='Georgia, Times New Roman, serif' font-style='italic' font-weight='700' font-size='42' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
+<link rel="canonical" href="https://festina.archtelos.com/changelog.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Festina">
+<meta property="og:title" content="Changelog — Festina">
+<meta property="og:description" content="Version history for Festina, starting from 0.1.">
+<meta property="og:url" content="https://festina.archtelos.com/changelog.html">
+<meta property="og:image" content="https://festina.archtelos.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Changelog — Festina">
+<meta name="twitter:description" content="Version history for Festina, starting from 0.1.">
+<meta name="twitter:image" content="https://festina.archtelos.com/og-image.png">
+<meta name="theme-color" content="#7c1f1b">
+<meta name="color-scheme" content="light">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,440;0,9..144,560;1,9..144,440&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="examples.html">Examples</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#v0-44">0.44 — 2026-09-02</a>
+        <a href="#v0-43">0.43 — 2026-09-02</a>
+        <a href="#v0-42">0.42 — 2026-09-02</a>
+        <a href="#v0-41">0.41 — 2026-09-02</a>
+        <a href="#v0-40">0.40 — 2026-09-01</a>
+        <a href="#v0-39">0.39 — 2026-09-01</a>
+        <a href="#v0-38">0.38 — 2026-09-01</a>
+        <a href="#v0-37">0.37 — 2026-09-01</a>
+        <a href="#v0-36">0.36 — 2026-09-01</a>
+        <a href="#v0-35">0.35 — 2026-09-01</a>
+        <a href="#v0-34">0.34 — 2026-09-01</a>
+        <a href="#v0-33">0.33 — 2026-09-01</a>
+        <a href="#v0-32">0.32 — 2026-09-01</a>
+        <a href="#v0-31">0.31 — 2026-09-01</a>
+        <a href="#v0-30">0.30 — 2026-09-01</a>
+        <a href="#v0-29">0.29 — 2026-09-01</a>
+        <a href="#v0-28">0.28 — 2026-09-01</a>
+        <a href="#v0-27">0.27 — 2026-09-01</a>
+        <a href="#v0-26">0.26 — 2026-09-01</a>
+        <a href="#v0-25">0.25 — 2026-09-01</a>
+        <a href="#v0-24">0.24 — 2026-09-01</a>
+        <a href="#v0-23">0.23 — 2026-09-01</a>
+        <a href="#v0-22">0.22 — 2026-09-01</a>
+        <a href="#v0-21">0.21 — 2026-09-01</a>
+        <a href="#v0-20">0.20 — 2026-09-01</a>
+        <a href="#v0-19">0.19 — 2026-09-01</a>
+        <a href="#v0-18">0.18 — 2026-09-01</a>
+        <a href="#v0-17">0.17 — 2026-09-01</a>
+        <a href="#v0-16">0.16 — 2026-09-01</a>
+        <a href="#v0-15">0.15 — 2026-09-01</a>
+        <a href="#v0-14">0.14 — 2026-08-31</a>
+        <a href="#v0-13">0.13 — 2026-08-31</a>
+        <a href="#v0-12">0.12 — 2026-08-31</a>
+        <a href="#v0-11">0.11 — 2026-08-31</a>
+        <a href="#v0-10">0.10 — 2026-08-31</a>
+        <a href="#v0-9">0.9 — 2026-08-31</a>
+        <a href="#v0-8">0.8 — 2026-08-31</a>
+        <a href="#v0-7">0.7 — 2026-08-29</a>
+        <a href="#v0-6">0.6 — 2026-08-29</a>
+        <a href="#v0-5">0.5 — 2026-08-27</a>
+        <a href="#v0-4">0.4 — 2026-08-27</a>
+        <a href="#v0-3-1">0.3.1 — 2026-08-27</a>
+        <a href="#v0-3">0.3 — 2026-08-27</a>
+        <a href="#v0-2-3">0.2.3 — 2026-08-27</a>
+        <a href="#v0-2-2">0.2.2 — 2026-08-27</a>
+        <a href="#v0-2-1">0.2.1 — 2026-08-26</a>
+        <a href="#v0-2">0.2 — 2026-08-26</a>
+        <a href="#v0-1">0.1 — 2026-08-26</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Changelog</p>
+      <h1 class="page-title">Version history</h1>
+      <p class="lede">
+        All notable changes to Festina, starting from version 0.1.
+        Versions follow <code>major.minor</code> (a
+        <code>major.minor.patch</code> form is used if a patch-only
+        release is ever needed); dates are in <code>YYYY-MM-DD</code>.
+      </p>
+      <p class="lede">
+        This changelog starts from the point version tracking was
+        introduced — it is not a reconstruction of the project's
+        earlier history. The full round-by-round design and
+        implementation record predating 0.1 lives in
+        <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>.
+      </p>
+
+      <section class="doc-section" id="v0-44">
+        <h2><span class="version-badge">0.44</span><span class="version-date">2026-09-02</span> <a class="anchor" href="#v0-44">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>drawImage</code> accepts an <code>img?</code> source.</strong> Every form of the canvas <code>drawImage(...)</code> and of <code>img.drawImage(...)</code> takes a manually-managed <code>img?</code> where it says <code>img</code> — compositing only reads the source for the duration of the call and keeps no reference, so nothing changes hands. A layer painted by a worker thread can now be drawn straight onto the canvas with no <code>clip()</code> copy first. This is the one read-only exception to <code>T?</code> being a distinct type; assignment and every other call site are unchanged.</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong>Building a string one piece at a time is O(n), not O(n²).</strong> <code>s = `${s}...`</code> and <code>s = s + ...</code> (any number of further pieces: literals, other variables, plain field reads) now grow <code>s</code>'s own buffer in place with a compiler-tracked length instead of copying the whole string into a fresh buffer on every step. The <code>string_concat</code> benchmark's 15,000 appends move a few kilobytes instead of ~112 MB. Nothing observable changes: the pattern is only taken when <code>s</code> is a plain text variable, the pieces cannot run user code, and <code>s</code> appears exactly once, at the front.</li>
+          <li><strong>A <code>.wasm</code> that never touches a database is 31 KB, not 1.47 MB.</strong> The wasm32-wasi link now uses link-time optimization across the program and the core runtime and strips the sysroot libc's debug sections. The vendored SQLite was kept alive only by <code>main()</code>'s closing <code>festina_db_close()</code> on a null handle — that call is no longer emitted for a program with no <code>table</code>/<code>sqlite()</code>, and the linker drops all of SQLite. A program that does use a database still gets all of it (about 1.1 MB). Smaller modules also load faster. See <a href="wasm.html#binary-size">wasm.md's "Binary size"</a>.</li>
+          <li><strong>Solid shapes are drawn without a rasterizer.</strong> An opaque flat-colour <code>drawRect</code>/<code>drawCircle</code>/<code>drawPixel</code> at an integer position (no <code>fillAlpha</code> below 1, gradient, border, scale or rotation) is written straight into the pixels, on the canvas and on an <code>img</code> alike; circles come from a per-radius coverage mask Cairo rasterizes once, blended with pixman's own arithmetic so the result is byte-identical to before. The canvas benchmark's 40,000-shape frame went from 35 ms to 7 ms; the layered-canvas benchmark's four <code>img?</code> layers from 84 ms to 8 ms on one thread. Everything outside that contract still goes through Cairo unchanged. <code>FESTINA_NO_DIRECT_FILL=1</code> switches the direct path off.</li>
+          <li><strong>Fresh image surfaces are faulted in when created</strong>, not one page at a time on first touch — the reason four threads painting four new <code>img?</code> layers ran no faster than one (first-touch page faults serialize across a process's threads). The layered benchmark's four-thread run went from 62 ms to 7 ms.</li>
+          <li><code>img.clip()</code>, <code>saveCanvas()</code>-to-<code>img</code> and <code>img.resize()</code> copy their source with Cairo's SOURCE operator instead of blending it OVER a transparent surface: the same pixels, a straight copy.</li>
+          <li>The per-call colour form of <code>drawCircle</code> now produces exactly the same pixels as the <code>fillStyle()</code> form (it used to tessellate where the plain form stamped a cached mask, 1/255 apart on a few edge pixels at larger radii).</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-43">
+        <h2><span class="version-badge">0.43</span><span class="version-date">2026-09-02</span> <a class="anchor" href="#v0-43">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>A compiled <code>.wasm</code> runs in a browser tab.</strong> <code>runtime/wasm/</code> ships a dependency-free WASI Preview 1 host of this project's own (<code>festina_wasi_browser.js</code>), a Web Worker that runs a program on it, and <code>browser.html?wasm=program.wasm</code>, the smallest page that does — stdout/stderr stream into the page and <code>window.festinaResult</code> holds the exit code, output and every file the program wrote to its in-memory sandbox. <code>node runtime/wasm/run_wasi_js.mjs</code> runs the same host outside a browser. Tested through the host under Node and in headless Chromium (files, directories, SQLite, timers, <code>argv</code>, exit codes). See <a href="wasm.html#in-a-browser">wasm.md's "In a browser"</a>.</li>
+          <li><strong>The Windows CI job drives a real window</strong>: a new test finds the compiled program's Win32 window and posts mouse, keyboard, resize and close messages to it, asserting every input handler's output.</li>
+          <li><strong>A browser-side wasm benchmark.</strong> <code>benchmarks/<wbr>run_wasm_browser_benchmarks.py</code> runs the five wasm.md programs, compiled from Festina, C and Go, inside headless Chromium on the project's own WASI host, timing compile, instantiate and run separately with <code>performance.now()</code> inside the worker. Results are in <a href="wasm.html#browser-benchmarks">wasm.md's "In a browser: Festina vs C vs Go"</a>.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong><code>try</code>/<code>catch</code>/<code>throw</code> works on macOS, and no longer crashes after a catch on Windows.</strong> A <code>try</code> is a direct call to libc's own <code>setjmp</code> now and a <code>throw</code> is libc's <code>longjmp</code>, replacing LLVM's SjLj intrinsics — which have no AArch64 lowering (macOS rejected <code>try</code> outright) and a broken x86_64 Windows one (the catch ran, then every local read as garbage). wasm32-wasi is the one target left without it (wasi-libc has no setjmp/longjmp). AddressSanitizer can instrument a <code>try</code>/<code>catch</code> program now, too.</li>
+          <li>On Windows, a program whose only listening port belongs to a <code>thread</code> no longer exits the moment its top-level code finishes (<code>WSAPoll</code> rejects an empty fd set where POSIX <code>poll</code> sleeps).</li>
+          <li>On Windows, <code>blob.append()</code> is an atomic append (<code>FILE_APPEND_DATA</code>), so two threads appending to one file no longer overwrite each other's bytes.</li>
+          <li>The Windows CI job is green: the four remaining failures were tests assuming <code>/bin/sh</code>, <code>/bin/echo</code> or <code>apt</code> exist, fixed in the tests.</li>
+          <li><strong>A <code>throw</code> no longer leaks the locals of the functions it unwinds through.</strong> A function that merely called something which eventually threw — no <code>try</code> or <code>throw</code> of its own — used to skip its scope-exit cleanup entirely (the one documented leak of the try/throw mechanism). In a program containing a <code>try</code>, every managed local is now registered on the runtime's per-thread cleanup stack as it is bound, and every call site's owning argument temporaries for the duration of the call; a <code>throw</code> releases everything above the catching <code>try</code>, newest first. 0 bytes leaked under AddressSanitizer and Valgrind through three frames, every kind of local, a rethrow and a JSON failure. A program with no <code>try</code> is unchanged; one with a <code>try</code> pays about 8 ns per managed local binding.</li>
+          <li>The JSON nesting cap is the parser's own (1000 levels) rather than a side effect of the cleanup stack's size: <code>JSON nested too deeply (more than 1000 levels)</code>.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #235-#238</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-42">
+        <h2><span class="version-badge">0.42</span><span class="version-date">2026-09-02</span> <a class="anchor" href="#v0-42">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>An <code>img</code> is now a self-contained drawing target</strong> (<a href="https://github.com/uraikus/festina/issues/93">uraikus/festina#93</a>) — three groups of methods mirroring the canvas calls name-for-name, each touching only the image it is called on (so they work from a worker thread too):
+            <ul class="changes">
+              <li><strong>A per-image transform and state stack:</strong> <code>img.translate(dx, dy)</code>, <code>img.rotate(degrees)</code>, <code>img.scale(sx, sy)</code>, <code>img.resetTransform()</code>, <code>img.saveState()</code>, <code>img.restoreState()</code>. Identity from creation, independent of the canvas's transform, applied to everything drawn, cleared or composited onto that image. The stack holds the image's transform only; style state stays with the canvas's <code>saveState()</code>.</li>
+              <li><strong>Clearing to transparent:</strong> <code>img.clear()</code>, <code>img.clearRect(x, y, w, h)</code>, <code>img.clearCircle(x, y, r)</code>, <code>img.clearPixel(x, y)</code> — alpha 0, so a later draw underneath shows through. <code>clear()</code> ignores the transform like <code>clearCanvas()</code>; the region forms honour it.</li>
+              <li><strong>Compositing:</strong> <code>img.drawImage(src, x, y)</code> and <code>img.drawImage(src, x, y, w, h)</code> — through the destination's transform, honouring <code>fillAlpha</code>; drawing an image onto itself copies it first.</li>
+            </ul>
+            A layer can now be painted in place — a rotated brush stroke, an eraser, a tiled background, a swayed sprite stamp — instead of being bounced through the canvas (<code>clearCanvas</code>, <code>drawImage</code> in, draw, <code>saveCanvas</code>, <code>clip</code>) at two window-sized copies per stamp.
+          </li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>The per-call colour forms (<code>drawRect(..., color[, border])</code>, <code>drawCircle(..., color[, border])</code>, <code>drawPixel(..., color)</code>, canvas and <code>img</code> alike) no longer write the global fill/border state around each call — a data race when a worker thread painted its own layer with them while main drew anything with a colour of its own. Same results, computed locally.</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li>api.md's Images table lists every <code>img</code> method (including the <code>getPixelColor</code> row it was missing and <code>drawCircle</code>'s colour forms), with a new "An image as a layer" section; <code>examples/layers.f</code> uses <code>.clear()</code> and a per-image transform for its HUD layer.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #234</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-41">
+        <h2><span class="version-badge">0.41</span><span class="version-date">2026-09-02</span> <a class="anchor" href="#v0-41">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong><code>.toStruct()</code>/<code>.toArr()</code> work again under <code>--target=wasm32-wasi</code> and on macOS, and their error path works again on Windows.</strong> 0.36's partial-parse leak fix put a <code>setjmp</code> catch frame inside every generated JSON parsing function, which made any program that parses JSON a "uses <code>try</code>" program — rejected outright on the two targets with no SjLj lowering, and silently broken on Windows (the catch never ran). The parsing functions now register what they are building on a per-thread <em>cleanup stack</em> in the runtime, which <code>throw</code> unwinds on its way to the catching <code>try</code>: plain portable C, no <code>setjmp</code>, and the per-call overhead 0.36 added is essentially gone (100k-object parse benchmark: median 233 → 225 ms; 223 ms before 0.36).</li>
+          <li>A duplicate <code>text</code> key whose second value fails to parse (<code>{"name":"a","name":5}</code> inside a <code>try</code>) no longer double-frees the first value.</li>
+          <li>Trailing data after a complete JSON value (<code>'{"id":1} extra'</code> inside a <code>try</code>) no longer leaks the parsed value.</li>
+          <li>A self-referencing struct nested pathologically deep (hundreds of thousands of <code>{"next":</code> levels — reachable through <code>req.toStruct()</code> on a network body) now throws <code>JSON nested too deeply</code> instead of overflowing the C stack.</li>
+          <li><strong>Windows: the HTTP runtime compiles again.</strong> <code>&lt;pthread.h&gt;</code> was only included on POSIX while a mutex added in 0.25 used it on every platform; every <code>openPort()</code> program failed to build on Windows.</li>
+          <li>Windows: <code>festina compile --target=wasm32-wasi tool.wasm.f</code> no longer names its output <code>tool.wasm.exe</code>.</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li>CI on <code>main</code> had been failing on all three platforms; besides the fixes above, the Linux job now installs <code>x11-apps</code>/<code>x11-utils</code> (four real-pixel tests needed <code>xwd</code>/<code>xprop</code>), the Linux-only <code>/proc</code> check and the POSIX-signal tests skip cleanly on the platforms that lack them, and one test that asserted the value of a field read through a freed struct (undefined behavior) now asserts the documented contract, <code>c == null</code>.</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li>api.md: what <code>free</code> promises (the binding reads <code>null</code>) versus what it does not (a field read through the freed binding), the JSON cleanup-stack design and its Valgrind coverage, <code>drain()</code> in every Threads method list; wasm.md/macos.md: JSON parsing is unaffected by the <code>try</code> gate; stale runtime/todo/contract wording refreshed.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #233</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-40">
+        <h2><span class="version-badge">0.40</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-40">#</a></h2>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong><code>NAME.drain()</code>'s bookkeeping no longer costs the worker an extra mutex round trip per message.</strong> The "finished dispatching" flag is now cleared inside the lock acquisition the worker already makes when it looks for its next message, and the wake-up broadcast is skipped entirely unless a <code>drain()</code> is actually waiting — a program that never calls <code>drain()</code> pays one predictable branch per message and nothing else. Measured on a 400,000-message fire-and-forget program: min 208 → 171 ms, median 300 → 225 ms.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><code>drain()</code> on a thread that stops while the call is blocked can no longer sleep forever — <code>alive</code> is part of the wait predicate and a stopping thread wakes any waiter on its way out. (Not reachable from Festina code today, where only the main program can call either <code>drain()</code> or <code>kill()</code> and never concurrently; kept correct rather than relied on.)</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li><code>drain()</code> waits for the thread's own side effects, not for a reply's <code>.callback(fn)</code> to run on main — spelled out in api.md, with a test pinning the order.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #232</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-39">
+        <h2><span class="version-badge">0.39</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-39">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>NAME.drain()</code></strong> blocks until a thread's own inbound queue is fully processed, then returns with the thread still running. The deliberate opposite of <code>kill()</code>'s own discard-don't-wait choice — exists specifically so <code>on close()</code>/<code>on exit(code:int)</code> can fire off a final <code>postMessage</code> (e.g. a database write on a thread with its own <code>DatabaseURL</code>) and be sure it landed before the teardown that follows a window closing or a graceful shutdown would otherwise discard it, unprocessed, exactly like <code>kill()</code> already does. Same main-only shape as <code>kill()</code>/<code>live()</code>/<code>isAlive()</code>, including <code>pool[i].drain()</code>. See <a href="api.html#thread-lifecycle">api.md</a>.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #231</a> (<a href="https://github.com/uraikus/festina/issues/91">uraikus/festina#91</a>).</p>
+      </section>
+
+      <section class="doc-section" id="v0-38">
+        <h2><span class="version-badge">0.38</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-38">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>A thread's second-ever <code>.reply()</code> was silently dropped.</strong> A worker's reply/<code>.callback()</code> mechanism delivered successfully only the first time, for that handle's entire process lifetime — every reply after that from the same sender was silently discarded, no error. Root cause: removing the last entry from a sender's own pending-callback list left its tail pointer dangling, corrupting the very next registration (a real use-after-free write) so it became unreachable from the list's own head. Fixed by tracking the previous node explicitly during removal and correcting the tail pointer whenever the removed node was it. api.md's own "reply at most once per message" documentation needed no change — it already described the intended behavior; the runtime just wasn't providing it.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #230</a> (<a href="https://github.com/uraikus/festina/issues/89">uraikus/festina#89</a>, <a href="https://github.com/uraikus/festina/issues/90">#90</a>).</p>
+      </section>
+
+      <section class="doc-section" id="v0-37">
+        <h2><span class="version-badge">0.37</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-37">#</a></h2>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li><strong>api.md reorganized.</strong> Three sections that had drifted far from their own topic (an artifact of being documented in whatever order they were built rather than the order a reader looks for them) moved to where they belong: "Single-value queries"/"JSON and full-text search" into <code>Built-in SQLite</code>, "Growing arrays"/"Sorting" into <code>Arrays</code>, and <code>Imports</code> up near the top, right after the compilation pipeline. No headings renamed, so every existing anchor (including external links from this changelog) still resolves. Checked the whole file for stale language left over from this session's earlier removals/fixes — none found.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #229</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-36">
+        <h2><span class="version-badge">0.36</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-36">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong><code>toStruct()</code>/<code>toArr()</code>'s partial-parse-failure leak.</strong> A JSON value that failed to parse partway through being built — a struct's third field turning out to be the wrong type, having already parsed the first two; an array's fourth element failing, having already collected three — used to leak whatever was already built for that one call. Every generated from-JSON parsing function now installs its own local <code>try</code>/<code>catch</code> around its own build loop, and the <code>.toStruct()</code>/<code>.toArr()</code> call site does the same for its own cursor and receiver text. Verified leak-free under Valgrind across a flat struct, a nested struct field, an array, a <code>map[T]</code> field, a self-referencing struct, and malformed JSON syntax itself.</li>
+        </ul>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>scripts/valgrind_stress.sh</code> + <code>tests/<wbr>valgrind_stress/</code>: a permanent home for stress programs that use <code>try</code>/<code>throw</code>, which cannot run under the existing AddressSanitizer-based <code>scripts/leak_stress.sh</code> in this environment.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #223</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-35">
+        <h2><span class="version-badge">0.35</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-35">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong><code>.callback(fn)</code> now fires on MAIN's own OS thread for a send addressed to main.</strong> A worker's own bare <code>postMessage(x).callback(fn)</code> (always addressed to main) used to have <code>fn</code> fire back on the SENDING worker's own OS thread once main replied — a real cross-thread-isolation hazard. It's now marshaled onto main, the same mechanism <code>blob</code>/<code>img</code>/<code>aud</code>'s own <code>.callback()</code> already uses. A worker messaging ANOTHER worker directly is unaffected — <code>fn</code> still fires on the sending worker's own thread there.</li>
+          <li><strong>A previously-latent data race in the async-io worker pool's own outstanding-job counter</strong>, exposed by the fix above the first time that path was ever exercised from a thread other than main.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #222</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-34">
+        <h2><span class="version-badge">0.34</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-34">#</a></h2>
+
+        <h3>Removed</h3>
+        <ul class="changes">
+          <li><strong><code>exec(args, callback)</code></strong> — the non-blocking form. <code>exec(args)</code> (blocking) is unaffected. The callback always ran on main's own OS thread regardless of which thread dispatched it — a real cross-thread-isolation hazard for a language whose whole thread story is "no shared mutable state to race on" — so it's gone rather than documented around.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #221</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-33">
+        <h2><span class="version-badge">0.33</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-33">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>thread NAME[] { ... }</code></strong> — empty brackets, no literal size — sizes the pool itself: <code>os.cpu_count()</code> (read on the machine compiling the program) minus every other thread the program declares, floored at 1. <code>thread NAME { ... }</code> (no brackets at all) is unchanged, still a singleton. Two auto-sized pools in the same program each get the full remaining budget rather than splitting it. See <a href="api.html#thread-pools">api.md</a>.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #220</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-32">
+        <h2><span class="version-badge">0.32</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-32">#</a></h2>
+
+        <h3>Removed</h3>
+        <ul class="changes">
+          <li><strong><code>sqliteInt()</code>, <code>sqliteFloat()</code>, and <code>sqliteText()</code>.</strong> <code>sqlite()</code> itself, <code>table</code>, and <code>DatabaseURL</code> are unaffected. These three existed to read a single value (like a <code>count(*)</code>) without declaring a <code>table</code> (which creates a real table) just to hold it — but a <code>struct</code> used as a query target creates no real table either, so <code>arr[SomeStruct] x = sqlite('SELECT count(*) AS n FROM ...')</code> already gives the identical schema-free round trip through <code>sqlite()</code>'s own one path. Calling any of the three now fails with the same "no such function" error any other unrecognized name gets. See <a href="api.html#single-value-queries">api.md</a>.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #219</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-31">
+        <h2><span class="version-badge">0.31</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-31">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>An out-of-range thread-pool index no longer registers a dead callback.</strong> <code>pool[99].postMessage(x).callback(fn)</code> registered <code>fn</code> before the bounds check, so it could never fire and its slot was never reclaimed. The whole expression is a clean no-op now.</li>
+          <li><strong><code>.reply()</code> with no message in flight</strong> (a second reply to one message, or a <code>thread</code> value stashed in a struct/array/map and replied to later) silently dropped the reply and leaked its payload. It now releases the payload and delivers nothing. Every other path that can drop a reply — including one still queued when its target is killed — releases it correctly too.</li>
+          <li><strong>Error messages naming a thread type</strong> printed the compiler's own internal repr (<code>ThreadType(None)</code>) instead of <code>thread</code>. <code>log()</code> and template interpolation of a thread value now give the same specific "has no text form" error <code>img</code>/<code>aud</code> already did, and the "thread has no field X" error no longer suggests a method that doesn't exist on a thread value.</li>
+          <li>A broken intra-document link in api.md (<code>#http--websocket-servers</code>).</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong>Thread messaging is faster.</strong> The pending-callback list appends instead of prepending, turning the ordinary in-order reply case from O(N^2) into an O(1) lookup (measured on the identical program built both ways: 0.06s → 0.04s at 5,000 in-flight sends, 0.92s → 0.47s at 20,000), and a worker now takes its inbound mutex once per message instead of twice.</li>
+          <li><strong>api.md's Threads section reorganized</strong> into ten subsections with working cross-references, plus newly documented behavior: reply at most once per message, <code>kill()</code> drops pending callbacks, a thread value has no text form, and a pool compiles its body once per instance (a compiled-size cost worth knowing before picking a large <code>N</code>).</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #218</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-30">
+        <h2><span class="version-badge">0.30</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-30">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>t.reply(response)</code> / <code>NAME.postMessage(x).callback(fn)</code></strong> — a general request/response mechanism on top of thread messaging. A thread's (or main's) reply type is fixed by its first <code>.reply(...)</code> call; every <code>postMessage(x)</code> call site targeting a receiver with a reply type must chain <code>.callback(fn)</code> to receive it, or it's a compile error. <code>.reply()</code> never triggers <code>on message</code> on the receiving end — it's a separate delivery path straight to <code>fn</code>, which runs back on whichever OS thread originally sent the message.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong><code>festina_thread_kill</code>'s leftover-message cleanup was type-confused</strong> for a queued <code>giveRequest</code> hand-off — it called the wrong release function on the wrong struct shape. Now kind-aware; a killed thread's own pending <code>.callback(fn)</code> registrations are also freed (never invoked) so a later <code>live()</code> respawn can't inherit stale ones.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #217</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-29">
+        <h2><span class="version-badge">0.29</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-29">#</a></h2>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong><code>worker:thread</code> (the <code>on message(worker:thread, msg:T)</code> parameter) is never <code>null</code> any more.</strong> When main is the sender, <code>worker</code> is now a real, singleton <code>thread</code> value — check the new <code>.main:bool</code> field to tell it apart from an ordinary worker's own handle. Comparing a <code>thread</code> value against <code>null</code> is now a compile error naming <code>.main</code> as the replacement. This is Phase 1 of a larger messaging redesign; <code>.reply()</code>/<code>.callback()</code> and the removal of <code>sqlite()</code> are separate, later changes.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #216</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-28">
+        <h2><span class="version-badge">0.28</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-28">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>examples/threaded_http_server.f</code></strong> and <strong><code>benchmarks/http_threaded/</code></strong> — a real example and a <code>wrk</code>-based benchmark showing <code>thread pool[N]</code> + <code>NAME.giveRequest(r)</code> computing genuine per-request CPU-bound work across more than one OS thread at once, with a single-threaded baseline for comparison. See <a href="benchmark.html#http-threaded">benchmark.md's new "HTTP: single-threaded vs. thread pool" section</a> for measured numbers.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>A <code>thread pool[N]</code> can no longer declare its own <code>DatabaseURL</code>.</strong> Every instance in a pool shares one declared body, so this would have meant <code>N</code> independent, uncoordinated sqlite connections into the identical literal file at once — now a compile error naming the fix.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #215</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-27">
+        <h2><span class="version-badge">0.27</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-27">#</a></h2>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong>Docs/tests/release consolidation for the <code>thread</code> extensions plan</strong> (thread pools, thread-private functions, wider builtin access, private per-thread HTTP contexts, live connection hand-off — 0.22 through 0.26). Audited api.md's Threads/HTTP sections end to end; clarified the "Sendable types" paragraph's own wording now that a live <code>http</code> request can be handed off (not cloned, not sent through <code>postMessage</code>) via <code>giveRequest</code>. Full, unfiltered <code>scripts/leak_stress.sh</code> and <code>scripts/thread_tsan_stress.sh</code> runs (every stress program, not just this plan's own additions) both clean.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #214</a>.</p>
+      </section>
+
+      <section class="doc-section" id="v0-26">
+        <h2><span class="version-badge">0.26</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-26">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>Live connection hand-off: <code>NAME.giveRequest(r)</code>.</strong> The main program, having accepted a live request on its own port, may hand it directly to a thread — that thread's own <code>on request</code> fires for it, on the connection's own live socket. Legal only from main, only onto a thread that has declared its own <code>on request</code>, and only for a manually-managed <code>http?</code> value (reusing <code>T?</code> rather than a new compile-time move-checker). First cut: plain (non-TLS) connections only.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #213</a> for the full design, including a real ThreadSanitizer-caught data race found and fixed during this phase's own verification.</p>
+      </section>
+
+      <section class="doc-section" id="v0-25">
+        <h2><span class="version-badge">0.25</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-25">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>Private per-thread HTTP context.</strong> A <code>thread { }</code> may now declare <code>on request(req:http)</code><wbr>/<code>on upgrade(s:socket)</code><wbr>/<code>on socketMessage(s:socket, msg:blob)</code><wbr>/<code>on socketClose(s:socket)</code> — the identical four handlers the main program's own top-level HTTP/WebSocket support already has — and, once it has declared at least one, call <code>openPort()</code><wbr>/<code>closePort()</code><wbr>/<code>openSecurePort()</code>. This gives the thread a fully private connection table and listener set, never shared with the main program's own HTTP context or with any other thread's, so a program can serve real, concurrent traffic on more than one port from more than one OS thread with no coordination needed between them. The blocking http client form (<code>req.send()</code> with zero arguments) also works from inside a thread body, targeting any other context's port; a thread must never target its own listener from inside that same thread (a documented, structural deadlock, not a bug) — see <a href="api.html#thread-http">api.md's new "A thread's own HTTP context" section</a>.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #212</a> for the full design, including the <code>__thread</code> conversion of <code>festina_runtime_http.c</code>'s own connection/listener/handler state and a real leak this phase's own sanitizer verification caught and fixed.</p>
+      </section>
+
+      <section class="doc-section" id="v0-24">
+        <h2><span class="version-badge">0.24</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-24">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>Wider builtin access inside a <code>thread { }</code> body.</strong> <code>regex()</code>, <code>mkdir()</code>, and <code>ls()</code> are now callable from inside a thread's own handlers and private funcs, alongside the blocking, 1-argument <code>exec(args)</code>. Each is safe with zero runtime changes: <code>regex()</code>'s memoization slot is a per-call-site codegen global, never shared between threads; <code>mkdir()</code>/<code>ls()</code> are thin, purely local POSIX wrappers; <code>exec(args)</code>'s <code>fork()</code>/<code>execvp()</code>/<code>waitpid()</code> only ever touches the calling thread. The non-blocking, 2-argument <code>exec(args, callback)</code> form stays rejected inside a thread body — its callback always runs on the main program's own OS thread regardless of which thread dispatched it, a genuine cross-thread isolation violation if allowed.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #211</a> for the full design, including how this was verified against the actual C runtime rather than assumed from names alone.</p>
+      </section>
+
+      <section class="doc-section" id="v0-23">
+        <h2><span class="version-badge">0.23</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-23">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong>Thread-private helper functions.</strong> A <code>func</code> declared directly in a <code>thread { }</code> body's own top level (a sibling of its state vars/<code>on load</code>/<code>on message</code>/<code>on exit</code>) is now callable from that one thread's own handlers and other private funcs, with direct read/write access to that thread's own state. Two private funcs may call each other regardless of declaration order. An ordinary top-level <code>func</code> remains completely uncallable from inside a thread body, unchanged. Each thread pool instance gets its own independent copy of every private func, closing over that one instance's own state.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #210</a> for the full design.</p>
+      </section>
+
+      <section class="doc-section" id="v0-22">
+        <h2><span class="version-badge">0.22</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-22">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><strong><code>thread NAME[N] { ... }</code> — thread pools.</strong> Declares <code>N</code> fully independent instances of the same thread body, each its own OS thread, private state, and inbound queue. Addressed with <code>NAME[i]</code> (any <code>int</code> expression) everywhere a singleton thread's own bare <code>NAME</code> would be used — <code>pool[i].postMessage(x)</code><wbr>/<code>.kill()</code><wbr>/<code>.live(callback)</code><wbr>/<code>.isAlive()</code> all work identically to the singleton form, just per-instance. An out-of-range index is a silent no-op, matching <code>NAME.isAlive()</code>'s own established "test, don't fail" convention rather than crashing or raising.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #209</a> for the full design.</p>
+      </section>
+
+      <section class="doc-section" id="v0-21">
+        <h2><span class="version-badge">0.21</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-21">#</a></h2>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong><code>thread</code> messaging is now a single, unified model</strong> — replaces per-thread <code>NAME.onMessage(callback)</code> registration with one global top-level <code>on message(worker:thread, msg:T)</code> handler that declares its own message type directly. A thread's own inbound handler now uses the identical <code>(worker:thread, msg:T)</code> shape (previously <code>on message(p:T)</code>); <code>worker</code> identifies the sender and is <code>null</code> when the message was sent by the main program. Threads may now message each other directly via <code>NAME.postMessage(x)</code> from inside another thread's own body (lifecycle control — <code>kill()</code>/<code>live()</code>/<code>isAlive()</code> — remains main-program-only). <strong>Breaking:</strong> any program using <code>NAME.onMessage(...)</code> or a thread's old single-parameter <code>on message(p:T)</code> needs updating to the new form.</li>
+          <li><strong>The top-level WebSocket frame handler is renamed from <code>on message(s:socket, msg:blob)</code> to <code>on socketMessage(s:socket, msg:blob)</code></strong> — frees the <code>on message</code> name for the unified messaging model above; behavior is unchanged, only the name. <strong>Breaking:</strong> update any <code>on message(s:socket, ...)</code> declaration to <code>on socketMessage</code>.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #208</a> for the full design and migration notes.</p>
+      </section>
+
+      <section class="doc-section" id="v0-20">
+        <h2><span class="version-badge">0.20</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-20">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>A <code>thread</code> with its own <code>DatabaseURL</code> now closes its private sqlite handle on <code>kill()</code></strong> — previously, a <code>kill()</code>/<code>live()</code> cycle reopened a fresh handle every time without closing the old one (a real, small, per-cycle leak: one <code>sqlite3*</code> plus an open fd). Confirmed via a real LeakSanitizer report before the fix and a clean one after (<code>tests/<wbr>stress/<wbr>thread_db_kill_live_churn.f</code>). See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #207</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-19">
+        <h2><span class="version-badge">0.19</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-19">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong><code>.toStruct(T)</code>/<code>.toArr(T)</code> now decode <code>\u</code> unicode escapes</strong> — previously threw <code>"... not yet supported"</code> on any JSON string containing a <code>\uXXXX</code> escape, including a UTF-16 surrogate pair (astral-plane codepoints); raw, un-escaped UTF-8 bytes were always fine, but a producer that specifically <code>\u</code>-escaped non-ASCII text could never be parsed. Now decodes both BMP codepoints and surrogate pairs into their real UTF-8 encoding, with a clear, catchable throw for malformed input (an unpaired surrogate, invalid hex, a truncated escape). See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #206</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-18">
+        <h2><span class="version-badge">0.18</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-18">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>A real heap-use-after-free</strong>: assigning an ordinary, automatically-managed struct value into a manually-managed (<code>T?</code>) enum binding (<code>enum Shape = Circle; Shape? shape; ...; shape = c</code> for an existing <code>Circle c</code>) compiled without error and left <code>shape</code> dangling once <code>c</code> went out of scope and its own automatic release freed it — <code>check_assignable</code>'s enum member-coercion rule never accounted for <code>manually_managed</code>. Now correctly rejected as a type mismatch; a <em>fresh</em> member value (<code>Shape? shape = makeCircle()</code>) is unaffected.</li>
+          <li>A manually-managed <code>blob?</code>/<code>regex?</code> thread-message parameter's own method calls (<code>p.write(...)</code>, <code>p.test(...)</code>) inside <code>on message</code> could fail to compile, or compile to invalid LLVM IR — a handful of exact-equality type checks in codegen.py (predating <code>T?</code>) never accounted for the flag, and <code>regex</code>/<code>http</code>/<code>socket</code> were never taught that a manually-managed instance can now reach code paths an ordinary one never could. Fixed; see <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #205</a>.</li>
+        </ul>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li>Real per-type test coverage for a manually-managed value crossing a <code>thread</code> boundary — <code>arr[T]</code><wbr>/<code>map[T]</code><wbr>/<code>enum</code><wbr>/<code>img</code><wbr>/<code>blob</code><wbr>/<code>aud</code><wbr>/<code>regex</code><wbr>/<code>url</code> each get a dedicated compile-and-run round-trip proof (<code>tests/<wbr>test_manually_managed.py<wbr>::TestThreadReferenceSharingPerType</code>), alongside struct's own existing one.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-17">
+        <h2><span class="version-badge">0.17</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-17">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>A manually-managed (<code>T?</code>) declaration's own initializer can now be a <strong>fresh construction</strong> of the matching plain type — a <code>regex</code>/<code>arr[T]</code>/<code>map[T]</code> literal, a <code>regex()</code> call, or any function call at all (including a struct-returning factory function). Previously <code>regex? r = /pattern/</code>, <code>arr[int]? xs = [1, 2, 3]</code>, and <code>Circle? c = makeCircle()</code> were all compile errors, since a fresh literal or a call's own return value always infers as the plain, unflagged type and <code>T?</code>/<code>T</code> are genuinely non-interchangeable. Safe because a freshly-constructed value has no other binding referencing it yet — reading an <em>existing</em> plain binding into a <code>T?</code> position is still, correctly, rejected. See <a href="api.html#t-manually-managed-values">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-16">
+        <h2><span class="version-badge">0.16</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-16">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>postMessage</code>/<code>on message</code> now share the raw reference for a manually-managed (<code>T?</code>) value crossing a <code>thread</code> boundary, instead of deep-cloning it like every other value type — a mutation made on one side is visible on the other, since it's the identical underlying value, not a copy. Sound because nothing on either side's automatic bookkeeping ever touches a manually-managed value's refcount, so there is nothing for two threads to race on.</li>
+          <li>A manually-managed parameter can now be <code>free</code>d — it was never "borrowed" the way an ordinary parameter is, since nothing auto-manages it on either side of a call.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #203</a> for the full design and implementation record.</p>
+      </section>
+
+      <section class="doc-section" id="v0-15">
+        <h2><span class="version-badge">0.15</span><span class="version-date">2026-09-01</span> <a class="anchor" href="#v0-15">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>T?</code> — a trailing <code>?</code> after a type at a variable/parameter declaration opts that one binding out of automatic memory management entirely (no retain on alias, no release at scope exit or reassignment). <code>free</code>/<code>delete</code> work unchanged and become the <em>only</em> release it ever gets. A genuinely distinct type from <code>T</code> (mirroring <code>amor arr[T]</code>'s own relationship to plain <code>arr[T]</code>) — no implicit decay either direction. Applies to struct/<code>arr[T]</code><wbr>/<code>map[T]</code><wbr>/<code>enum</code><wbr>/<code>blob</code><wbr>/<code>img</code><wbr>/<code>aud</code><wbr>/<code>http</code><wbr>/<code>socket</code><wbr>/<code>url</code><wbr>/<code>regex</code>; accepted but inert on <code>int</code><wbr>/<code>float</code><wbr>/<code>bool</code><wbr>/<code>text</code><wbr>/<code>color</code><wbr>/<code>font</code><wbr>/<code>table</code>. <code>arr[T?]</code>, a <code>T?</code> struct field, a <code>T?</code> return type, and <code>const T? x</code> are all compile errors this round. See <a href="api.html#t-manually-managed-values">api.md</a>.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>A user-defined function with a manually-managed parameter (<code>func f(p:Circle?)</code>) was permanently uncallable — the call-site argument check re-derived the parameter's type without its own <code>?</code>, rejecting the one argument type that could ever match it.</li>
+          <li><code>blob?</code>/<code>img?</code>/<code>aud?</code> failed to parse at all, misrouted into the unrelated anonymous <code>.callback()</code> form.</li>
+          <li><code>.test()</code><wbr>/<code>.play()</code><wbr>/<code>.playLoop()</code><wbr>/<code>.stop()</code><wbr>/<code>.isPlaying()</code><wbr>/<code>.send()</code><wbr>/<code>.clip()</code><wbr>/<code>.resize()</code><wbr>/<code>.getPixelColor()</code><wbr>/<code>.save()</code><wbr>/<code>.saveCopy()</code> and the <code>text -&gt; blob</code> coercion stopped recognizing a manually-managed receiver of the matching type, via several pre-existing exact-equality type checks never meant to distinguish more than one shape of blob/regex/img/aud/http/socket.</li>
+          <li>A grammar-ambiguity disambiguation helper (<code>Circle? c</code> vs. a bare ternary statement) used an absolute token index where a relative offset was passed in, silently misrouting a <code>T?</code> declaration found anywhere but the very first statement of a file.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #202</a> for the full design and implementation record. Crossing a <code>thread</code> boundary with a manually-managed value (<code>on message</code>/<code>postMessage</code>) is not yet supported — planned follow-up work, not a permanent restriction.</p>
+      </section>
+
+      <section class="doc-section" id="v0-14">
+        <h2><span class="version-badge">0.14</span><span class="version-date">2026-08-31</span> <a class="anchor" href="#v0-14">#</a></h2>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li>Final consolidation pass closing out <code>thread NAME { ... }</code> (claude.md #195-#201): api.md's own "Threads" section no longer calls itself "an early phase" and now documents the thread-private-helper-function restriction it was missing; <code>todo.md</code> gains three previously-untracked, already-true open items (singleton threads, no thread-private helper functions, a thread's own sqlite handle not explicitly closed on <code>kill()</code>); <code>README.md</code>'s own stale top-level test count corrected. No functional changes. See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #201</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-13">
+        <h2><span class="version-badge">0.13</span><span class="version-date">2026-08-31</span> <a class="anchor" href="#v0-13">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>Documented that a <code>thread</code>'s own <code>on exit(code:int)</code> always receives <code>code</code> <code>0</code> — including when torn down by main-thread death — never the process's own real exit code. Not a behavior change (this is what the runtime already did); found and clarified while verifying <code>thread</code> process-exit interaction end to end. See <a href="api.html#threads">api.md</a> and <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #200</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-12">
+        <h2><span class="version-badge">0.12</span><span class="version-date">2026-08-31</span> <a class="anchor" href="#v0-12">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li>A <code>thread</code>'s own first statement may be <code>DatabaseURL = '&lt;literal&gt;'</code>, giving it a private SQLite handle — never shared with the main program or any other thread — so it may call <code>sqlite()</code><wbr>/<code>sqliteInt()</code><wbr>/<code>sqliteFloat()</code><wbr>/<code>sqliteText()</code> (a thread that didn't declare one still may not). A compile-time check rejects two contexts (a thread and the main program, or two threads) that would resolve to the same database file, main program's own default included. See <a href="api.html#threads">api.md</a> and <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #199</a>.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>A real (if narrow) data race, found while building the above: the media-decoder registration in <code>main()</code>'s own prologue used to run after every declared <code>thread</code> was already spawned, and the literal-SQL prepared-statement cache (claude.md #113) had no synchronization at all — both harmless as long as only the main thread ever queried SQLite, which per-thread <code>DatabaseURL</code> is what first breaks. Fixed before either was ever reachable; verified race-free under ThreadSanitizer.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-11">
+        <h2><span class="version-badge">0.11</span><span class="version-date">2026-08-31</span> <a class="anchor" href="#v0-11">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>thread</code>'s own message types widen to include <code>blob</code>/<code>img</code>/<code>aud</code>/<code>url</code> — each deep-cloned (never shared) across the boundary, the same guarantee <code>struct</code>/<code>arr[T]</code>/<code>map[T]</code>/<code>enum</code> already got. Drawing/clip/resize/pixel methods on an <code>img</code> value (e.g. <code>pic.drawRect(...)</code>) work from inside a thread body, verified race-free under ThreadSanitizer. See <a href="api.html#threads">api.md</a> and <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #198</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-10">
+        <h2><span class="version-badge">0.10</span><span class="version-date">2026-08-31</span> <a class="anchor" href="#v0-10">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>thread</code>'s own message types widen to <code>struct</code>/<code>arr[T]</code>/<code>map[T]</code>/<code>enum</code> — each deep-cloned (never shared) across the boundary, built recursively from any mix of <code>int</code>/<code>float</code>/<code>bool</code>/<code>text</code>/<code>color</code>/<code>font</code>. A self-referencing (cyclic) <code>struct</code>/<code>arr[T]</code>/<code>map[T]</code> type is rejected with a clear error, not a hang; <code>blob</code>/<code>img</code>/<code>aud</code>/<code>url</code> message types remain not yet implemented. See <a href="api.html#threads">api.md</a> and <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #197</a>.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>A fresh, with-initializer <code>enum</code>-typed local variable — <code>Choice c = someExpr</code> declared directly inside a loop or function body, as opposed to reassigning an already-declared one — was never freed at scope exit, leaking its own box (and, for a boxed <code>text</code> member, that buffer too) on every declaration. The identical gap is fixed for <code>http</code>/<code>socket</code>/<code>url</code>-typed locals, found by the same audit.</li>
+          <li><code>NAME.postMessage(x)</code>, when <code>x</code> coerces into a compound message type (e.g. a <code>text</code> literal posted against an <code>enum</code> inbound type), no longer frees the coerced result with the wrong release function.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-9">
+        <h2><span class="version-badge">0.9</span><span class="version-date">2026-08-31</span> <a class="anchor" href="#v0-9">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>thread NAME { ... }</code>: an isolated background worker with its own OS thread, its own private state, and message queues to and from the main program. <code>on load()</code><wbr>/<code>on message(p:T)</code><wbr>/<code>on exit(code:int)</code> handlers; <code>NAME.postMessage(x)</code><wbr>/<code>NAME.onMessage(callback)</code> for message passing (<code>int</code>/<code>float</code>/<code>bool</code>/<code>text</code> today); <code>NAME.kill()</code><wbr>/<code>NAME.live(callback)</code><wbr>/<code>NAME.isAlive()</code> for lifecycle control. Every message crossing the boundary is a deep, independent copy — no two threads ever share a mutable value. A thread's own body can see only its own state/locals, function names, and type names, never a global variable/constant or an ordinary top-level function call. See <a href="api.html#threads">api.md</a> and <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #195</a>/<a href="https://github.com/uraikus/festina/blob/main/claude.md">#196</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-8">
+        <h2><span class="version-badge">0.8</span><span class="version-date">2026-08-31</span> <a class="anchor" href="#v0-8">#</a></h2>
+
+        <h3>Security</h3>
+        <ul class="changes">
+          <li>The HTTP server no longer hangs or aborts on two malformed inputs reachable from a single unauthenticated request: a chunked <code>chunk-size</code> near 2^64 (which overflowed size arithmetic into an infinite buffer-growth loop) and a WebSocket frame declaring a ~16-exabyte payload (which reached a failing <code>malloc</code> that aborted the process). Both are now rejected against the existing 8MB cap. The chunked-decoder fix also protects the <code>req.send()</code> client parsing a hostile server's response.</li>
+          <li><code>.toStruct()</code> no longer overflows the stack on deeply nested JSON in an unknown field (reachable via <code>req.toStruct()</code> on a network body); nesting past 1000 levels now throws the same catchable error every other malformed input does.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>A value assigned to a global (or otherwise escaping) only inside a <code>try</code> or <code>catch</code> body is no longer freed while still referenced — escape analysis didn't look inside try/catch bodies, so such a value was stack-allocated and reclaimed at scope exit (a use-after-free).</li>
+          <li>A refcounted local (array, map, struct, text) declared before a <code>try</code> that throws is no longer double-freed. A throw caught in the same function freed that local, and the normal scope exit after the catch freed it again (glibc aborted with "double free detected").</li>
+          <li>The two branches of a <code>?:</code> are now required to have the same type; a mismatch (e.g. <code>c ? 'text' : someBlob</code>) used to compile and render garbage at runtime. <code>null</code> is still allowed in either branch.</li>
+          <li><code>&amp;&amp;</code> and <code>||</code> now require bool operands, matching <code>if</code>/<code>while</code> conditions; <code>1 &amp;&amp; 2</code> used to compile and print <code>null</code>.</li>
+          <li>A <code>?:</code> with a <code>null</code> branch (<code>c ? 1 : null</code>, <code>c ? null : 7</code>) now compiles — it produced invalid IR or crashed the compiler before.</li>
+          <li>Passing a text literal or template to an <code>img</code>/<code>blob</code>/<code>aud</code> parameter (<code>show(`sprite${n}.png`)</code>) no longer corrupts the heap or leaks the loaded handle — the argument coercion mishandled the freshly minted handle's ownership.</li>
+          <li>An <code>arr[blob]</code>, <code>arr[img]</code>, or <code>arr[aud]</code> no longer leaks its elements when the array is released — element handles were freed as a plain buffer with no per-element release.</li>
+          <li><code>.push()</code>/<code>.unshift()</code>/<code>.indexOf()</code> of a path string into an <code>arr[blob]</code>/<code>arr[img]</code>/<code>arr[aud]</code> no longer leaks the loaded handle.</li>
+          <li>Interpolating a freshly built container into a template (<code>`${make()}`</code>, <code>`${[1,2,3]}`</code>) no longer leaks the container — only the rendered text was being freed.</li>
+          <li>Integer fields in <code>.toStruct()</code> keep full 64-bit precision. They were parsed through a <code>double</code>, silently corrupting any value past 2^53 — and <code>INT64_MAX</code> in particular read back as <code>null</code>.</li>
+          <li>A finite float equal to nearly <code>DBL_MAX</code> renders as its own value in JSON output instead of <code>null</code> (the NaN/Infinity guard used a literal slightly below <code>DBL_MAX</code>).</li>
+          <li><code>img.getPixelColor()</code> on a JPEG-loaded image returns the real color instead of <code>null</code> for every pixel (JPEG surfaces store no alpha channel; the reader had treated the unused byte as alpha 0).</li>
+          <li>A malformed WAV file (sample-rate 0) is now a normal load failure instead of cascading into a shutdown of all other playing audio with a misleading "no audio device" error.</li>
+          <li>Several catchable-error paths no longer leak: a failed <code>fetch</code> response (up to 8MB per failed request, once per retry), an invalid <code>parseURL</code> port (~5 allocations per call), and a corrupt JPEG decode (its decoded surface, via a <code>setjmp</code>-clobbered local).</li>
+          <li>Long-running loops that declare locals (a struct, an array, any variable) no longer overflow the stack. Codegen emitted each <code>alloca</code> at its declaration site — inside the loop body — so every iteration permanently grew the stack until the function returned; a loop declaring a six-field struct segfaulted at roughly 150,000–300,000 iterations with flat heap usage. Every static alloca is now hoisted to its function's entry block: one slot per declaration, reused each iteration (verified to 3,000,000 iterations). Locals are still re-zeroed at their declaration site every iteration, so behavior is otherwise unchanged.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #191</a> for the full diagnosis.</p>
+      </section>
+
+      <section class="doc-section" id="v0-7">
+        <h2><span class="version-badge">0.7</span><span class="version-date">2026-08-29</span> <a class="anchor" href="#v0-7">#</a></h2>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><code>.toText()</code> JSON-style rendering (<code>log()</code>/template interpolation of a struct, table row, <code>arr[T]</code>, or <code>map[T]</code>, and explicit <code>.toText()</code> calls on any of them) is faster, with no change in output. Every compile-time-known literal the renderer appends (JSON punctuation, a struct field's own baked <code>"name":</code> key) now skips a runtime <code>strlen()</code> rescan of a length the compiler already knew, and string escaping now bulk-copies runs of bytes that don't need escaping instead of handling one byte at a time. Measured ~2.5x faster (~215ms → ~85ms median over 5 runs) on a 100,000-iteration text-heavy struct-rendering benchmark.</li>
+        </ul>
+        <p class="muted">See <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #190</a> for the full measurement methodology.</p>
+      </section>
+
+      <section class="doc-section" id="v0-6">
+        <h2><span class="version-badge">0.6</span><span class="version-date">2026-08-29</span> <a class="anchor" href="#v0-6">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>getPixelColor(x, y)</code>: reads one pixel back off the canvas as a <code>color</code> — <code>null</code> for a coordinate outside the canvas, or a fully transparent pixel. Correctly undoes Cairo's premultiplied alpha, so a pixel painted under <code>fillAlpha</code> reads back as the color that was actually painted, not one darkened by the alpha in effect at the time.</li>
+          <li><code>img.getPixelColor(x, y)</code>: the same, reading an <code>img</code>'s own surface.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><code>color == null</code> (and <code>!=</code>) generated invalid LLVM IR and failed to compile at all, for any program that tried it — entirely independent of the above. <code>color</code> is an <code>i64</code>-shaped value, and the bare <code>null</code> literal was routed through the "null" <em>pointer</em> keyword unconditionally. Now resolves to <code>color</code>'s own existing <code>-1</code>/'none' sentinel, the same value an uninitialized <code>color</code> already reads as. See <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-5">
+        <h2><span class="version-badge">0.5</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-5">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>Math.floorDiv(a, b)</code>: integer division rounding toward negative infinity (unlike <code>/</code>'s own truncate-toward-zero), for tile/grid calculations that previously needed <code>Math.floor(a / b)</code> spelled out by hand.</li>
+          <li><code>blankImage(w, h)</code>: a fresh, fully-transparent <code>img</code> at a given size, with no existing image or canvas needed to derive it from.</li>
+          <li><code>row.rowid</code>: a table row's own SQLite identity, read-only — only populated when the query's own SQL explicitly selects <code>rowid</code>.</li>
+          <li><code>drawRect</code>/<code>drawCircle</code> (and their <code>img</code>-method equivalents) accept a further optional trailing <code>borderColor</code> argument, after the fill color — overrides it for that one call only. <code>drawCircle</code> also gains the fill-only override it previously lacked entirely.</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li>Clarified that the canvas's own real alpha channel is only real off-screen — a transparent region reads back as opaque white once <code>render()</code> puts it on screen, even though the same content saved via <code>saveCanvas()</code> still carries its real alpha. See <a href="api.html#types">api.md</a> and <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-4">
+        <h2><span class="version-badge">0.4</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-4">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>arr[T].sort(cmpFn)</code>: an in-place, stable, comparator-based sort — <code>cmpFn:func[T,T]:int</code>, JavaScript's/C <code>qsort()</code>'s own convention. See <a href="api.html#sorting-sortcmpfn">api.md</a>.</li>
+          <li><code>drawImage(img, x, y, w, h)</code>: scales the whole image to fit a <code>w</code>×<code>h</code> box, without mutating the source image the way <code>img.resize()</code> does.</li>
+          <li><code>drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)</code>: the full canvas-style form — a source rect cut out of the image, scaled into a destination rect. See <a href="api.html#graphics">api.md</a>.</li>
+          <li><code>map[T].keys()</code>/<code>map[T].values()</code>: a plain, independent snapshot array (<code>arr[text]</code>/<code>arr[T]</code>), no callback needed — sidesteps <code>.forEach()</code>'s bare/no-closures callback restriction for the common "collect entries matching a condition" case.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-3-1">
+        <h2><span class="version-badge">0.3.1</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-3-1">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><code>fillAlpha</code> had no effect on <code>drawImage</code> — two images drawn back to back under different <code>fillAlpha</code> values came out pixel-for-pixel identical. <code>drawImage</code> now respects it, blending the image into whatever's underneath exactly like every other draw call. See <a href="api.html#gradients-and-transparency">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-3">
+        <h2><span class="version-badge">0.3</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-3">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>on mouseWheelUp(x:int, y:int)</code>/<code>on mouseWheelDown(x:int, y:int)</code>: scroll wheel events, split by direction. Fixes a real pre-existing bug on X11/Linux where scrolling the wheel silently also fired a spurious <code>mouseDown</code>+<code>mouseUp</code> pair.</li>
+          <li><code>devicePixelRatio:float</code>: a read-only global reporting the display's pixel density (<code>1.0</code> normally, ~<code>2.0</code> on Retina/HiDPI).</li>
+          <li><code>showCursor()</code>/<code>hideCursor()</code>: toggle the mouse cursor's visibility over the canvas.</li>
+          <li>Real right-click and middle-click support on macOS and Windows — previously only the left button worked on either platform.</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li><strong>Breaking:</strong> <code>on mouseDown</code>/<code>on mouseUp</code> now require a third argument, <code>button:int</code> — <code>on mouseDown(x:int, y:int, button:int)</code>. <code>1</code> = left, <code>2</code> = middle, <code>3</code> = right, <code>8</code> = back, <code>9</code> = forward. <code>on mouse</code> (continuous movement) is unaffected. See <a href="api.html#mouse-events">api.md</a> and <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-2-3">
+        <h2><span class="version-badge">0.2.3</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-2-3">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>enterFullscreen()</code>/<code>exitFullscreen()</code>: toggle true OS fullscreen on the graphics window. See <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li>The graphics window is now fully decorated — a title bar and the OS's normal minimize/maximize/close controls, resizable by dragging an edge — instead of the previous borderless, canvas-only look.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-2-2">
+        <h2><span class="version-badge">0.2.2</span><span class="version-date">2026-08-27</span> <a class="anchor" href="#v0-2-2">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>A program calling <code>setClientWidth</code>/<code>setClientHeight</code> near the top of its own boot sequence briefly opened a real, on-screen window at the hardcoded 800×600 default before correcting itself, since the window used to open (and its size reset back to that default) before the program's own top-level code ever ran. The window now opens lazily, after any such call has already taken effect, directly at the requested size. See <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-2-1">
+        <h2><span class="version-badge">0.2.1</span><span class="version-date">2026-08-26</span> <a class="anchor" href="#v0-2-1">#</a></h2>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li>The macOS and Windows windowing backends could present stale or blank pixel content — most visibly, <code>img.clip()</code> (including the <code>saveCanvas().clip(...)</code> idiom) reliably showing the clipped region only on its first use in a process. Both backends now flush the surface before reading its pixels directly, as Cairo's own API requires.</li>
+          <li>Assigning a field on a manually-declared table row (not obtained from a query) segfaulted. A table row is a borrowed handle onto one row of a query result, not an independently constructible value — declaring one with no initializer is now a clear compile-time error, pointing at <code>struct</code> as the way to build a value by hand (see <a href="api.html#structs-as-query-targets">api.md</a>).</li>
+        </ul>
+
+        <h3>Documentation</h3>
+        <ul class="changes">
+          <li>Clarified that <code>on ...</code> event handlers are active as soon as they're declared, regardless of position in the file — the same hoisting <code>func</code> declarations already get. See <a href="api.html#graphics">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-2">
+        <h2><span class="version-badge">0.2</span><span class="version-date">2026-08-26</span> <a class="anchor" href="#v0-2">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li><code>exec(args, callback)</code>: a non-blocking counterpart to <code>exec(args)</code>. Dispatches the same spawn to a background worker thread and returns immediately; <code>callback:func[int]:void</code> receives the real exit code once the child process exits. See <a href="api.html#running-other-programs">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="v0-1">
+        <h2><span class="version-badge">0.1</span><span class="version-date">2026-08-26</span> <a class="anchor" href="#v0-1">#</a></h2>
+
+        <h3>Added</h3>
+        <ul class="changes">
+          <li>Version tracking: <code>festina.__version__</code>, and <code>festina --version</code> on the CLI.</li>
+          <li>This changelog.</li>
+        </ul>
+
+        <h3>Changed</h3>
+        <ul class="changes">
+          <li>Project documentation (<code>README.md</code>, <code>api.md</code>, and every other <code>.md</code> file except <code>claude.md</code> and <code>tests/CONTRACT.md</code>) rewritten to describe the software as it stands today, rather than narrating how it got there.</li>
+        </ul>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="todo.html">
+          <span class="label">← Previous</span>
+          Roadmap
+        </a>
+        <a class="next" href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">
+          <span class="label">Next →</span>
+          tests/CONTRACT.md
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="doc.js"></script>
+
+</body>
+</html>

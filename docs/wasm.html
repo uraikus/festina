@@ -1,0 +1,645 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebAssembly — Festina</title>
+<meta name="description" content="Cross-compiling Festina to wasm32-wasi: design, setup, limitations, and benchmarks.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%237c1f1b'/%3E%3Crect x='4' y='4' width='56' height='56' fill='none' stroke='%2393731f' stroke-width='2'/%3E%3Ctext x='33' y='49' text-anchor='middle' font-family='Georgia, Times New Roman, serif' font-style='italic' font-weight='700' font-size='42' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
+<link rel="canonical" href="https://festina.archtelos.com/wasm.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Festina">
+<meta property="og:title" content="WebAssembly — Festina">
+<meta property="og:description" content="Cross-compiling Festina to wasm32-wasi: design, setup, limitations, and benchmarks.">
+<meta property="og:url" content="https://festina.archtelos.com/wasm.html">
+<meta property="og:image" content="https://festina.archtelos.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="WebAssembly — Festina">
+<meta name="twitter:description" content="Cross-compiling Festina to wasm32-wasi: design, setup, limitations, and benchmarks.">
+<meta name="twitter:image" content="https://festina.archtelos.com/og-image.png">
+<meta name="theme-color" content="#7c1f1b">
+<meta name="color-scheme" content="light">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,440;0,9..144,560;1,9..144,440&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="examples.html">Examples</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#why-wasi">Why wasm32-wasi, not bare wasm32</a>
+        <a href="#design">Design</a>
+        <a class="sub" href="#binary-size">Binary size</a>
+        <a class="sub" href="#pointer-width">Pointer width</a>
+        <a class="sub" href="#main-entry-point">The main entry point</a>
+        <a class="sub" href="#raw-ir-not-c">Why the entry bridge is raw IR, not C</a>
+        <a href="#wasm-setup">Setup</a>
+        <a href="#usage">Usage</a>
+        <a href="#in-a-browser">In a browser</a>
+        <a href="#limitations">Limitations</a>
+        <a href="#benchmarks">Benchmarks</a>
+        <a class="sub" href="#benchmark-methodology">Benchmark methodology</a>
+        <a class="sub" href="#browser-benchmarks">In a browser: Festina vs C vs Go</a>
+        <a class="sub" href="#reading-these-numbers">Reading these numbers</a>
+        <a href="#testing">Testing</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Platform support</p>
+      <h1 class="page-title">WebAssembly (wasm32-wasi)</h1>
+      <p class="lede">
+        <strong>Implemented and tested.</strong>
+        <code>festina compile --target=wasm32-wasi</code> and
+        <code>festina run --target=wasm32-wasi</code> cross-compile a
+        Festina program to a standalone <code>wasm32-wasi</code> binary
+        — arithmetic, control flow, functions, structs,
+        <code>arr</code>/<code>map</code>, <code>text</code>,
+        <code>regex</code>, and <code>table</code>/<code>sqlite()</code>
+        (SQLite itself, vendored, compiled for wasm32-wasi — see
+        <a href="https://github.com/uraikus/festina/blob/main/runtime/wasm/README.md">runtime/wasm/README.md</a>)
+        all work, verified by real compiles and real executions, not
+        just a clean link. <code>festina doctor</code> reports whether
+        this machine's toolchain can build one; the <code>linux</code>
+        CI job installs that toolchain and Node and actually runs a
+        compiled <code>.wasm</code> example on every push.
+      </p>
+      <p class="lede">
+        <strong>What's out of scope, on purpose:</strong> graphics and
+        audio (WASI has no display server or audio device model at
+        all — not "not yet", genuinely absent) — see
+        <a href="#limitations">Limitations</a> below for the full
+        accounting. A compiled <code>.wasm</code> runs in a browser tab
+        too, on this project's own WASI host — see
+        <a href="#in-a-browser">In a browser</a>.
+      </p>
+
+      <section class="doc-section" id="why-wasi">
+        <h2>Why wasm32-wasi, not bare wasm32 <a class="anchor" href="#why-wasi">#</a></h2>
+        <p>
+          Two wasm targets exist in LLVM/clang:
+          <code>wasm32-unknown-unknown</code> (no libc, no syscalls —
+          every I/O call needs hand-written JS glue supplied by
+          whatever embeds the module) and <code>wasm32-wasi</code>
+          (WASI Preview 1 — a real libc, via
+          <a href="https://github.com/WebAssembly/wasi-libc">wasi-libc</a>,
+          sitting on top of a small, capability-based syscall
+          interface). Festina's core runtime
+          (<code>festina_runtime.c</code>) is ordinary POSIX C — file
+          I/O, <code>clock_gettime</code>, <code>regex.h</code>,
+          SQLite's own VFS layer — none of which
+          <code>wasm32-unknown-unknown</code> provides any answer for
+          at all. <code>wasm32-wasi</code> is the only target where the
+          <em>existing</em> runtime source compiles with zero changes:
+          the whole core translation unit compiles against wasi-libc
+          unmodified. The codegen and linking work this target needs
+          (below) is real, but narrow — a 32-bit pointer-width fix and
+          a one-line entry-point bridge, not a rewrite of how Festina
+          generates code.
+        </p>
+      </section>
+
+      <section class="doc-section" id="design">
+        <h2>Design <a class="anchor" href="#design">#</a></h2>
+        <p>
+          <strong>Compiling:</strong> <code>_compile_via_wasm</code> in
+          <code>festina/cli.py</code> hands the same LLVM IR text every
+          other target's <code>_compile_via_clang_ir_frontend</code>
+          fallback path already produces straight to
+          <code>clang --target=wasm32-wasi -O2 -flto</code>, linked
+          against three object files
+          (<code>_wasm_runtime_objects</code>):
+        </p>
+        <ol>
+          <li><strong><code>festina_runtime.c</code></strong>, compiled against the vendored <code>runtime/wasm/sqlite3.h</code> instead of a system one — core, the same translation unit every native target uses. Compiled to LLVM bitcode (<code>-flto</code>) so the link optimizes across the program/runtime boundary — see <a href="#binary-size">Binary size</a> below for why that matters.</li>
+          <li><strong><code>runtime/wasm/sqlite3.c</code></strong> — SQLite's own single-file amalgamation build, vendored because the core runtime's table/<code>sqlite()</code> support is compiled against sqlite3 symbols and there is no system <code>libsqlite3</code> for <code>wasm32-wasi</code> to link against at all — see <a href="https://github.com/uraikus/festina/blob/main/runtime/wasm/README.md">runtime/wasm/README.md</a> for exactly why vendoring it (something this project doesn't do for native targets, which link the system's own libsqlite3) is the only option here. A plain <code>-O2</code> object, not bitcode: it is the one translation unit whose ~20-second compile the object cache exists to amortize, and the linker drops every function of it from a program that never touches a database (below).</li>
+          <li><strong><code>runtime/festina_runtime_wasm_entry.ll</code></strong> — a small entry-point bridge, see <a href="#main-entry-point">below</a> and <a href="#raw-ir-not-c">below</a>.</li>
+        </ol>
+
+        <h3 id="binary-size">Binary size <a class="anchor" href="#binary-size">#</a></h3>
+        <p class="muted">
+          A <code>.wasm</code> for a program that never declares a
+          <code>table</code> or calls <code>sqlite()</code> is about
+          <strong>31 KB</strong> (<code>hello</code>); one that does is
+          about 1.1 MB, almost all of it SQLite. Two things made the
+          first number possible, both found by measuring a 1.47 MB
+          <code>hello.wasm</code>:
+        </p>
+        <ul>
+          <li><strong>SQLite is dead-code eliminated when nothing uses it.</strong> <code>wasm-ld</code> drops unreferenced functions by default, but the whole ~1 MB of SQLite was kept alive by exactly one reference: <code>main()</code>'s closing <code>festina_db_close()</code> on a database handle that is null for every such program. The linker cannot see through a call into a separately compiled object, so it kept the call, the function, and everything SQLite it reached. With the core runtime as bitcode and <code>-flto</code> on the link, that call folds away; codegen now also omits it outright for a program with no database, so the result does not hinge on the optimizer.</li>
+          <li><strong>No DWARF.</strong> The sysroot's own <code>libc.a</code> ships with debug sections, and they were being copied into every output — 375 KB that nothing reads. The link passes <code>--strip-debug</code>, which removes them but keeps the <code>name</code> section, so a browser's stack trace still names the wasm function it was in.</li>
+        </ul>
+        <p class="muted">
+          A smaller module also loads faster: Node (and a browser)
+          compiles the whole module before the first instruction runs,
+          about 6 ms for the old 1.47 MB. The generated code itself
+          runs at the same speed either way. If a toolchain's
+          <code>wasm-ld</code> was built without LTO support the link
+          is retried without <code>-flto</code> (SQLite then stays
+          in), rather than failing over an optimization.
+        </p>
+        <p class="muted">
+          No libLLVM in-process object-emission path is used for wasm
+          at all (unlike native, where it's the fast path when
+          available) — this project has not verified libLLVM can emit
+          wasm32 objects directly, so <code>clang</code> itself always
+          does the compiling, the same "hand clang the .ll text"
+          fallback native already has, just unconditional here rather
+          than a fallback.
+        </p>
+        <p class="muted">
+          <strong>Running:</strong> a <code>.wasm</code> file isn't
+          something any OS execs directly. <code>festina run
+          --target=wasm32-wasi</code> and the benchmark runner both
+          execute a compiled binary through
+          <a href="https://github.com/uraikus/festina/blob/main/runtime/wasm/run_wasi.mjs">runtime/wasm/run_wasi.mjs</a>,
+          a small script built on Node's own built-in
+          <code>node:wasi</code> module (Node is already a listed
+          <a href="setup.html">setup.md</a> dependency for running the
+          compiler frontend itself from a checkout, so this adds no
+          <em>new</em> dependency for that path — though a packaged
+          <code>festina</code> binary user does need Node specifically
+          installed to run a <code>.wasm</code> it produces). The
+          invoking shell's own working directory is passed through as
+          a WASI "preopen", mapped to the wasm program's own
+          <code>/</code> — this is what lets
+          <code>table</code>/<code>sqlite()</code>, <code>blob</code>,
+          <code>mkdir</code>/<code>ls</code> do real file I/O inside
+          the sandbox, resolving relative paths against the same
+          directory a native compiled binary already would.
+        </p>
+
+        <h3 id="pointer-width">Pointer width <a class="anchor" href="#pointer-width">#</a></h3>
+        <p class="muted">
+          Every native target Festina supports is 64-bit;
+          <code>wasm32-wasi</code>'s libc has a 32-bit
+          <code>size_t</code>, and LLVM requires an external
+          <code>declare</code> to match its call sites exactly, with no
+          implicit truncation. <code>CodeGen.__init__</code> takes a
+          <code>target</code> parameter and tracks
+          <code>self.pointer_bits</code> (32 for
+          <code>wasm32-wasi</code>, 64 everywhere else); three helpers
+          (<code>_size_arg</code>, <code>_emit_calloc</code>,
+          <code>_emit_malloc</code>) either pass a size straight
+          through (64-bit targets — a byte-identical no-op there) or
+          emit a <code>trunc i64 ... to i32</code> first for the
+          <code>calloc</code>/<code>malloc</code> call-site ABI
+          boundary specifically. Every other <code>i64</code>/pointer
+          conversion elsewhere in codegen.py
+          (<code>ptrtoint</code>/<code>inttoptr</code>) is genuinely
+          safe across pointer widths in LLVM and needs no
+          target-specific handling.
+        </p>
+
+        <h3 id="main-entry-point">The main entry point <a class="anchor" href="#main-entry-point">#</a></h3>
+        <p class="muted">
+          wasi-libc's own <code>_start</code> doesn't call a function
+          literally named <code>main</code> — ordinary C compilation
+          silently renames a user's <code>main</code> to
+          <code>__main_void</code> (a no-arg <code>main</code>) or
+          <code>__main_argc_argv</code> (an argc/argv-taking
+          <code>main</code>) via macro machinery in the C frontend
+          before the compiler ever sees it. Festina's codegen emits raw
+          LLVM IR text directly (<code>_emit_main_and_entry</code>),
+          which never goes through that renaming, so the literal
+          <code>define i32 @main(...)</code> it always emits links
+          clean on every native target (where <code>main</code> really
+          is the expected symbol) but needs a bridge for wasm32-wasi: a
+          small object,
+          <a href="https://github.com/uraikus/festina/blob/main/runtime/festina_runtime_wasm_entry.ll">runtime/festina_runtime_wasm_entry.ll</a>,
+          linked only for the wasm build, that calls the real
+          <code>main</code> under its own name and re-exports the
+          result as <code>__main_argc_argv</code>. <code>main</code>'s
+          own signature is <code>(i32 %argc, ptr %argv)</code> — the
+          real C ABI entry point on every native target already — so
+          the bridge's argument list follows along unchanged.
+        </p>
+
+        <h3 id="raw-ir-not-c">Why the entry bridge is raw IR, not C <a class="anchor" href="#raw-ir-not-c">#</a></h3>
+        <p class="muted">
+          A C version of the bridge above (<code>extern int main(int,
+          char **); int __main_argc_argv(int argc, char **argv) {
+          return main(argc, argv); }</code>) compiles and links without
+          error, but hangs at runtime: the same C-frontend macro that
+          renames a <em>defined</em> <code>int main(int, char**)</code>
+          to <code>__main_argc_argv</code> for <code>wasm32-wasi</code>
+          also rewrites <em>any reference</em> to the literal identifier
+          <code>main</code> in a translation unit compiled for that
+          target — including an <code>extern</code> declaration and a
+          call built from it. A C bridge's own <code>return main(argc,
+          argv)</code> gets silently rewritten to <code>return
+          __main_argc_argv(argc, argv)</code> — calling itself, not
+          Festina's real <code>main</code> (visible directly in the
+          object's own relocation record:
+          <code>R_WASM_FUNCTION_INDEX_LEB __main_argc_argv+0</code> at
+          the call site, not a reference to <code>main</code> at all).
+          At <code>-O0</code> this produces genuine infinite recursion;
+          at <code>-O2</code> the same self-call becomes a silent
+          infinite loop — indistinguishable from a hang, no error at
+          all.
+        </p>
+        <p class="muted">
+          Writing the bridge as raw LLVM IR text
+          (<code>festina_runtime_wasm_entry.ll</code>, not
+          <code>.c</code>) avoids this entirely: it bypasses the C
+          frontend (and its renaming macro), so <code>declare i32
+          @main(i32, ptr)</code> there can only ever mean the real
+          external symbol — confirmed via relocation inspection
+          (<code>U main</code>, not <code>U __main_argc_argv</code>)
+          and via actual execution (correct exit code, correct
+          <code>argv</code>, no hang). The alternative of renaming
+          codegen's own generated <code>main</code> symbol was rejected
+          for the same reason the bridge itself exists: it would make
+          codegen target-aware for something that's really wasi-libc's
+          own linking convention, not a property of the generated
+          program.
+        </p>
+      </section>
+
+      <section class="doc-section" id="wasm-setup">
+        <h2>Setup <a class="anchor" href="#wasm-setup">#</a></h2>
+        <p>
+          <code>festina doctor</code> reports whether this machine can
+          build for <code>wasm32-wasi</code> (optional, like
+          graphics/audio — a compiler that can't cross-compile to wasm
+          is still a fully working compiler for everything else). On
+          Debian/Ubuntu:
+        </p>
+        <pre class="code"><span class="mut">$</span> apt install wasi-libc libclang-rt-18-dev-wasm32</pre>
+        <p class="muted">
+          (the compiler-rt package name is tied to your installed
+          clang's own version — substitute accordingly, e.g.
+          <code>libclang-rt-19-dev-wasm32</code> for clang 19). Once
+          both are installed, plain <code>clang
+          --target=wasm32-wasi</code> auto-discovers wasi-libc's
+          headers/libs at their standard
+          <code>/usr/include/wasm32-wasi</code> and
+          <code>/usr/lib/wasm32-wasi</code> locations — no manual
+          <code>-I</code>/<code>-L</code>/<code>--sysroot</code> flags.
+          <code>doctor</code>'s own check is a real functional probe
+          (compiling a trivial program with that exact flag), not a
+          guess at install paths, so it stays accurate across distros
+          where those paths differ. Running a compiled
+          <code>.wasm</code> needs Node.js on PATH, for its built-in
+          WASI host.
+        </p>
+      </section>
+
+      <section class="doc-section" id="usage">
+        <h2>Usage <a class="anchor" href="#usage">#</a></h2>
+        <pre class="code"><span class="mut">$</span> festina compile --target=wasm32-wasi program.f -o program.wasm
+<span class="mut">$</span> node runtime/wasm/run_wasi.mjs program.wasm .        <span class="cm"># "." = the preopened directory</span>
+
+<span class="cm"># or, compile-and-run in one step, same as native `festina run`:</span>
+<span class="mut">$</span> festina run --target=wasm32-wasi program.f</pre>
+        <p class="muted">
+          <code>--cc</code> must resolve to <code>clang</code>
+          specifically for a wasm build (checked, with a clear error) —
+          only clang can target <code>wasm32-wasi</code> at all; the
+          gcc/cc fallback native builds have doesn't apply here.
+        </p>
+      </section>
+
+      <section class="doc-section" id="in-a-browser">
+        <h2>In a browser <a class="anchor" href="#in-a-browser">#</a></h2>
+        <p>
+          A browser has no built-in WASI host, so <code>runtime/wasm/</code>
+          ships one: <code>festina_wasi_browser.js</code>, a
+          dependency-free ES module implementing WASI Preview 1 —
+          every import a compiled Festina program names — over an
+          in-memory filesystem, with <code>/</code> preopened exactly
+          as <code>run_wasi.mjs</code> preopens a real directory.
+          <code>browser.html</code> is the smallest page that uses it:
+          serve the directory over HTTP (module workers can't load from
+          <code>file://</code>) and open
+        </p>
+        <pre class="code">browser.html?wasm=program.wasm</pre>
+        <p>
+          The program runs in a Web Worker
+          (<code>festina_wasi_worker.js</code>), so a Festina program's
+          synchronous <code>main()</code> and its timer loop never
+          block the page; stdout/stderr stream into the page as they
+          are written, and when the program exits
+          <code>window.festinaResult</code> holds
+          <code>{code, stdout, stderr, files}</code> — <code>files</code>
+          being every file the program left in its sandbox, as bytes.
+          <code>window.festinaRun(url, {files: {...}})</code> runs
+          another program on demand, seeding its filesystem. Timers
+          (<code>poll_oneoff</code>) sleep with <code>Atomics.wait</code>
+          when the page is cross-origin isolated (COOP/COEP headers)
+          and otherwise spin inside the worker.
+        </p>
+        <p class="muted">
+          The same host runs under Node without a browser —
+          <code>node runtime/wasm/run_wasi_js.mjs program.wasm &lt;preopen-dir&gt;</code>,
+          the directory loaded into the in-memory filesystem first and
+          written back afterwards — which is how the host itself is
+          tested independently of any browser.
+          <code>tests/test_wasm_browser.py</code> covers both: files,
+          directories, SQLite's own database file, timers,
+          <code>argv</code>, exit codes and stderr through the host
+          under Node, and the page itself in headless Chromium through
+          Playwright (the <code>linux</code> CI job installs it; the
+          tests skip cleanly where it is absent).
+        </p>
+        <p class="muted">
+          Not covered by the host, because WASI itself has none:
+          anything in <a href="#limitations">Limitations</a> below. And
+          it is a host for <em>this project's</em> programs, not a
+          general WASI polyfill — a <code>.wasm</code> that imports
+          something no Festina program does gets <code>ENOSYS</code>
+          back.
+        </p>
+        <p>
+          For the client-side code itself — a worked custom-page
+          example beyond <code>browser.html</code>, feeding files in
+          and reading them back, arguments/environment variables, and
+          the full <code>FestinaWasi</code>/worker API — see
+          <a href="wasm-browser.html">Browser client</a>.
+        </p>
+      </section>
+
+      <section class="doc-section" id="limitations">
+        <h2>Limitations <a class="anchor" href="#limitations">#</a></h2>
+        <p>
+          WASI genuinely has no answer for either of these — not a
+          "not yet", the way macOS/Windows graphics and audio are gated
+          pending real-hardware verification
+          (<a href="macos.html">macos.md</a>,
+          <a href="windows.html">windows.md</a>). Both fail at compile
+          time, before any of the real work (compiling the vendored
+          SQLite amalgamation, linking) happens:
+        </p>
+        <ul>
+          <li><strong>Graphics</strong> — <code>drawRect</code><wbr>/<code>drawCircle</code><wbr>/<code>drawText</code><wbr>/<code>img</code><wbr>/<code>render()</code>, mouse and key events, <code>on mouseDown</code>/<code>on key</code>/... — WASI has no display server or windowing model of any kind.</li>
+          <li><strong>Audio</strong> — <code>aud</code>, <code>play()</code><wbr>/<code>playLoop()</code><wbr>/<code>stopAudioPlayer()</code><wbr>/<code>isAudioPlayerPlaying()</code> — WASI has no audio device model of any kind.</li>
+          <li><strong><code>exec()</code></strong> — WASI has no process model to spawn into at all: no fork/exec/spawn of any kind.</li>
+          <li><strong><code>openPort()</code>/<code>on request</code>/<code>on upgrade</code>/<code>on message</code>/<code>on socketClose</code></strong> — WASI Preview 1 has no listening-socket support of any kind.</li>
+          <li><strong><code>openSecurePort()</code></strong> — needs everything <code>openPort()</code> needs plus mbedTLS, so it's rejected for the identical reason.</li>
+          <li><strong><code>try</code>/<code>catch</code>/<code>throw</code></strong> — wasi-libc has no setjmp/longjmp at all (they need WebAssembly exception handling, which this project's plain wasm32-wasi build doesn't use), and a <code>try</code> is a direct call to libc's <code>setjmp</code>. <code>.toStruct()</code>/<code>.toArr()</code> are <em>not</em> affected — their cleanup is plain runtime C, not a catch frame: they compile and run here, and a parse failure ends the program the way any uncaught <code>throw</code> does, since there is no <code>try</code> to catch it.</li>
+        </ul>
+        <p>A few more things worth knowing, that aren't compile-time errors:</p>
+        <ul>
+          <li><strong><code>argv</code> always comes back as a single element.</strong> <code>argv</code> works under wasm32-wasi — WASI has its own real argc/argv, and <code>main</code>'s bridge forwards it the same way it does natively — but <code>run_wasi.mjs</code> hardcodes WASI's own <code>args</code> to <code>[wasmPath]</code> and nothing else, so <code>argv.length</code> is always <code>1</code> for anything run through this project's own runner. A different WASI host that supplies real extra arguments would see them show up in <code>argv</code> correctly; this is <code>run_wasi.mjs</code>'s own limitation, not a language one.</li>
+          <li><strong>Filesystem access is sandboxed to one preopened directory</strong>, WASI's own capability model (<code>runtime/wasm/run_wasi.mjs</code>'s own top comment) — <code>blob</code>, <code>mkdir</code>, <code>ls</code>, and SQLite's own file all resolve against whatever directory the host granted (the invoking shell's cwd, for both <code>festina run --target=wasm32-wasi</code> and the benchmark runner), not the whole real filesystem the way a native binary can see.</li>
+          <li><strong>No ASan/LeakSanitizer coverage for this target.</strong> The rest of this project verifies its memory management with real ASan/LeakSanitizer runs (<code>scripts/leak_stress.sh</code>, <code>tests/test_leak_stress.py</code>); whether sanitizer builds work at all under <code>wasm32-wasi</code> has not been investigated (macOS's own sanitizer tier is out of scope too, for an unrelated reason — LeakSanitizer is unreliable on darwin). This target's own memory-management codegen is instead verified by running real programs end-to-end and checking correct output, not by a sanitizer run.</li>
+          <li><strong>Static linking is the only linking there is.</strong> There's no dynamic-vs-static sqlite3 choice to make for wasm — the vendored amalgamation is always compiled in.</li>
+          <li><strong>Two WASI hosts, one contract.</strong> Every benchmark here runs a compiled <code>.wasm</code> through Node's <code>node:wasi</code> module; the <a href="#in-a-browser">browser host</a> is this project's own JavaScript and is tested to the same behaviour (files, timers, exit codes) under Node and in headless Chromium. Its filesystem is in memory: nothing a program writes in a tab touches the real disk unless the page saves <code>festinaResult.files</code> somewhere itself.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="benchmarks">
+        <h2>Benchmarks <a class="anchor" href="#benchmarks">#</a></h2>
+        <p>
+          The same five programs
+          <a href="benchmark.html">benchmark.md</a> already tracks
+          natively (<code>hello</code><wbr>/<code>fib</code><wbr>/<code>loop_sum</code><wbr>/<code>array_sum</code><wbr>/<code>string_concat</code>
+          — see that page for what each one measures and why), each
+          also implemented in C (<code>benchmarks/*.c</code>) and
+          reused as-is for Go (<code>benchmarks/*.go</code>), all three
+          cross-compiled to <code>wasm32-wasi</code> and run through
+          the <em>identical</em> WASI host
+          (<code>runtime/wasm/run_wasi.mjs</code>/<code>node:wasi</code>)
+          — so these numbers measure each language's generated code
+          and Node's WASI syscall overhead identically, not three
+          different WASI runtimes' own differing overhead. Every
+          language's wasm output is checked to produce byte-identical
+          stdout to its own native build before any run is trusted
+          (<code>hello</code>→<code>hello</code>,
+          <code>fib</code>→<code>2178309</code>,
+          <code>loop_sum</code>→<code>828998288</code>,
+          <code>array_sum</code>→<code>707863693</code>,
+          <code>string_concat</code>→15,000 <code>x</code>s — all three
+          languages agree, natively and under wasm).
+        </p>
+        <p class="muted">
+          Rust is not included here (unlike benchmark.md's native
+          table): rustc dropped <code>wasm32-wasi</code> as a target
+          name (superseded by <code>wasm32-wasip1</code>, which needs
+          the separate <code>rustup target add wasm32-wasip1</code>
+          component, not otherwise needed by this project). C stands in
+          as the systems-language wasm comparison instead; Go uses its
+          own stable <code>GOOS=wasip1 GOARCH=wasm</code> support (Go
+          1.21+) — not <code>GOOS=js GOARCH=wasm</code>, which targets
+          the browser's own different, incompatible ABI, not WASI.
+        </p>
+
+        <h3 id="benchmark-methodology">Benchmark methodology <a class="anchor" href="#benchmark-methodology">#</a></h3>
+        <p class="muted">
+          Same shape as benchmark.md's own native methodology: 1
+          untimed warmup build/run, then the <em>minimum</em> of 7
+          timed runs, for both build and run time.
+          <code>.wasm</code> file size stands in for benchmark.md's
+          "binary size". Reproduce locally:
+        </p>
+        <pre class="code"><span class="mut">$</span> python3 benchmarks/run_wasm_benchmarks.py               <span class="cm"># print results</span>
+<span class="mut">$</span> python3 benchmarks/run_wasm_benchmarks.py --update-doc   <span class="cm"># regenerate this file's tables</span>
+
+<span class="mut">$</span> python3 benchmarks/run_wasm_browser_benchmarks.py               <span class="cm"># the same programs inside Chromium</span>
+<span class="mut">$</span> python3 benchmarks/run_wasm_browser_benchmarks.py --update-doc  <span class="cm"># (needs Playwright + its Chromium)</span></pre>
+        <p class="muted">
+          Needs a wasm32-wasi-capable clang (see
+          <a href="#wasm-setup">Setup</a> above), Go 1.21+, and
+          Node.js; a missing toolchain is skipped with a note rather
+          than failing the run, same spirit as
+          <code>run_benchmarks.py</code>.
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>hello (wasm32-wasi)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">50.1 ms</td><td class="num">100.3 ms</td><td class="num">31.7 KB</td></tr>
+              <tr><td>C</td><td class="num">47.1 ms</td><td class="num">88.4 ms</td><td class="num">45.8 KB</td></tr>
+              <tr><td>Go</td><td class="num">73.5 ms</td><td class="num">163.4 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>fib (wasm32-wasi)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">59.6 ms</td><td class="num">120.0 ms</td><td class="num">31.6 KB</td></tr>
+              <tr><td>C</td><td class="num">60.7 ms</td><td class="num">92.9 ms</td><td class="num">92.1 KB</td></tr>
+              <tr><td>Go</td><td class="num">111.0 ms</td><td class="num">177.6 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>loop_sum (wasm32-wasi)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">807.9 ms</td><td class="num">115.1 ms</td><td class="num">31.6 KB</td></tr>
+              <tr><td>C</td><td class="num">832.0 ms</td><td class="num">92.2 ms</td><td class="num">92.1 KB</td></tr>
+              <tr><td>Go</td><td class="num">979.3 ms</td><td class="num">162.9 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>array_sum (wasm32-wasi)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">194.0 ms</td><td class="num">132.4 ms</td><td class="num">31.8 KB</td></tr>
+              <tr><td>C</td><td class="num">217.7 ms</td><td class="num">90.0 ms</td><td class="num">92.2 KB</td></tr>
+              <tr><td>Go</td><td class="num">277.8 ms</td><td class="num">155.0 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>string_concat (wasm32-wasi)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">51.0 ms</td><td class="num">139.8 ms</td><td class="num">33.8 KB</td></tr>
+              <tr><td>C</td><td class="num">53.2 ms</td><td class="num">92.3 ms</td><td class="num">93.8 KB</td></tr>
+              <tr><td>Go</td><td class="num">122.5 ms</td><td class="num">167.3 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="browser-benchmarks">In a browser: Festina vs C vs Go <a class="anchor" href="#browser-benchmarks">#</a></h3>
+        <p class="muted">
+          The same five programs, run inside headless Chromium on this
+          project's own browser WASI host
+          (<code>runtime/wasm/festina_wasi_browser.js</code>) instead
+          of Node's — see
+          <a href="https://github.com/uraikus/festina/blob/main/benchmarks/run_wasm_browser_benchmarks.py">run_wasm_browser_benchmarks.py</a>
+          for exactly what is timed. Every number is measured with
+          <code>performance.now()</code> inside the worker, so the
+          browser's own launch cost is in none of them; see
+          <a href="#benchmark-methodology">Benchmark methodology</a>
+          above for the runs/min/median rule.
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>hello (Chromium)</th><th class="num">Run (min)</th><th class="num">Run (median)</th><th class="num">Compile+instantiate (min)</th><th class="num">Total (min)</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">0.1 ms</td><td class="num">0.1 ms</td><td class="num">0.4 ms</td><td class="num">0.6 ms</td><td class="num">31.7 KB</td></tr>
+              <tr><td>C</td><td class="num">0.0 ms</td><td class="num">0.0 ms</td><td class="num">0.2 ms</td><td class="num">0.2 ms</td><td class="num">45.8 KB</td></tr>
+              <tr><td>Go</td><td class="num">2.0 ms</td><td class="num">2.3 ms</td><td class="num">6.9 ms</td><td class="num">9.4 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>fib (Chromium)</th><th class="num">Run (min)</th><th class="num">Run (median)</th><th class="num">Compile+instantiate (min)</th><th class="num">Total (min)</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">5.1 ms</td><td class="num">7.7 ms</td><td class="num">0.4 ms</td><td class="num">5.7 ms</td><td class="num">31.6 KB</td></tr>
+              <tr><td>C</td><td class="num">4.6 ms</td><td class="num">4.8 ms</td><td class="num">0.3 ms</td><td class="num">5.0 ms</td><td class="num">92.1 KB</td></tr>
+              <tr><td>Go</td><td class="num">37.9 ms</td><td class="num">40.6 ms</td><td class="num">6.8 ms</td><td class="num">45.8 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>loop_sum (Chromium)</th><th class="num">Run (min)</th><th class="num">Run (median)</th><th class="num">Compile+instantiate (min)</th><th class="num">Total (min)</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">483.6 ms</td><td class="num">484.8 ms</td><td class="num">0.6 ms</td><td class="num">484.2 ms</td><td class="num">31.6 KB</td></tr>
+              <tr><td>C</td><td class="num">485.3 ms</td><td class="num">488.1 ms</td><td class="num">0.5 ms</td><td class="num">486.0 ms</td><td class="num">92.1 KB</td></tr>
+              <tr><td>Go</td><td class="num">459.0 ms</td><td class="num">462.5 ms</td><td class="num">6.9 ms</td><td class="num">465.9 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>array_sum (Chromium)</th><th class="num">Run (min)</th><th class="num">Run (median)</th><th class="num">Compile+instantiate (min)</th><th class="num">Total (min)</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">81.7 ms</td><td class="num">82.2 ms</td><td class="num">0.5 ms</td><td class="num">82.3 ms</td><td class="num">31.8 KB</td></tr>
+              <tr><td>C</td><td class="num">91.1 ms</td><td class="num">91.5 ms</td><td class="num">0.5 ms</td><td class="num">91.6 ms</td><td class="num">92.2 KB</td></tr>
+              <tr><td>Go</td><td class="num">115.5 ms</td><td class="num">118.9 ms</td><td class="num">7.4 ms</td><td class="num">124.3 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>string_concat (Chromium)</th><th class="num">Run (min)</th><th class="num">Run (median)</th><th class="num">Compile+instantiate (min)</th><th class="num">Total (min)</th><th class="num">.wasm size</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">0.2 ms</td><td class="num">0.3 ms</td><td class="num">0.4 ms</td><td class="num">0.6 ms</td><td class="num">33.8 KB</td></tr>
+              <tr><td>C</td><td class="num">1.6 ms</td><td class="num">2.0 ms</td><td class="num">0.3 ms</td><td class="num">2.0 ms</td><td class="num">93.8 KB</td></tr>
+              <tr><td>Go</td><td class="num">31.8 ms</td><td class="num">35.9 ms</td><td class="num">7.7 ms</td><td class="num">39.8 ms</td><td class="num">2.31 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="reading-these-numbers">Reading these numbers <a class="anchor" href="#reading-these-numbers">#</a></h3>
+        <p class="muted">
+          Not a claim that Festina beats C or Go at wasm — this exists
+          to catch regressions and track progress over time, the same
+          disclaimer benchmark.md itself leads with. What the numbers
+          above actually show:
+        </p>
+        <ul>
+          <li><strong>Festina is within a few percent of hand-written C</strong> on <code>fib</code> (both dominated by call overhead, not allocation) and <code>loop_sum</code> (pure arithmetic, all three languages converge to the same ~910ms, suggesting Node's WASI dispatch overhead — not code quality — is the floor on a loop this tight).</li>
+          <li><strong>Festina's <code>.wasm</code> is smaller than C's on these five programs</strong> — since the linker changes documented in <a href="#binary-size">Binary size</a> above, the vendored SQLite is dead-code eliminated from any program that never touches a database, and the sysroot's debug sections are stripped; before that every Festina binary carried all 1.47 MB of it unconditionally, the way native binaries still statically link libsqlite3. Go's runtime — goroutine scheduler, GC — ships in every binary regardless of whether a given program uses any of it.</li>
+          <li><strong>Where the gap to native comes from.</strong> Against <a href="benchmark.html">benchmark.md</a>'s native table, <code>hello</code> under wasm is ~50 ms against 1.4 ms — but ~30 ms of that is Node's own startup and another ~18 ms is importing <code>node:wasi</code> and instantiating any module at all (C's 46 KB <code>hello</code> measures the same), so it is the host, not the program. On the compute benchmarks the remaining ratio is what V8's wasm tier is known for: <code>loop_sum</code> 1.5x native, <code>fib</code> and <code>array_sum</code> about 2x (every memory access is bounds-checked, calls are dearer). <code>string_concat</code> used to be the outlier at ~5x its native time once startup was subtracted: the benchmark was O(n²) copying — 15,000 concatenations of a string growing to 15,000 characters, ~112 MB through <code>memcpy</code> — and a wasm <code>memcpy</code> is a compiled loop, not the SIMD one glibc has, so the same copies simply cost more. That pattern now compiles as an in-place append instead (see <a href="api.html#building-a-string-piece-by-piece">Building a string piece by piece</a>), so the copying is gone on every target and the wasm run sits a few milliseconds above the host's own floor. Link-time optimization across the program/runtime boundary was measured too and changes none of these by more than noise; the wins from it are all size.</li>
+          <li><strong>Go is consistently the slowest of the three to start</strong> (<code>hello</code>), most visible on the smallest program, where there's no real work to amortize a heavier runtime-init cost against.</li>
+          <li><strong><code>array_sum</code> is the one case where Festina's own generated code measurably outran hand-written C</strong> in the run that produced the table above — plausible (Festina's escape analysis keeps this benchmark's array off the heap entirely, same as the C version's plain stack array; the two are closer in shape than the numbers might suggest, and re-runs should be expected to vary), but treat any close call between two of these as noise, not a verdict, the same caveat benchmark.md's own native table gives <code>array_sum</code>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="testing">
+        <h2>Testing <a class="anchor" href="#testing">#</a></h2>
+        <p class="muted">
+          <code>tests/test_wasm.py</code> plus the
+          <code>compile_and_run_wasm</code> fixture
+          (<code>tests/conftest.py</code>) — real compiles and real
+          executions through <code>run_wasi.mjs</code>, not just
+          checking that codegen produces plausible IR:
+          arithmetic/control flow/recursion, heap-allocated
+          <code>arr</code>/<code>map</code> (exercising the 32-bit
+          pointer-width codegen path end to end, not just at link
+          time), structs, <code>table</code>/<code>sqlite()</code>
+          against the vendored amalgamation, <code>regex</code>,
+          string concatenation, exit code propagation, the
+          graphics/audio compile-time rejections, and
+          <code>festina doctor</code>'s own WASM check. Skips cleanly
+          (not a failure) on a machine without a working wasm32-wasi
+          clang or without Node — except under
+          <code>FESTINA_STRICT_DEPS=1</code> (the Linux CI job), where
+          that skip becomes a hard failure instead, the same
+          discipline every other optional tier in this suite already
+          has.
+        </p>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="windows.html">
+          <span class="label">← Previous</span>
+          Windows
+        </a>
+        <a class="next" href="wasm-browser.html">
+          <span class="label">Next →</span>
+          Browser client
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="doc.js"></script>
+
+
+</body>
+</html>

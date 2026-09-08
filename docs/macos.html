@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>macOS — Festina</title>
+<meta name="description" content="Native macOS support: toolchain, audio, graphics, packaging, and what's gated on real-hardware confirmation.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%237c1f1b'/%3E%3Crect x='4' y='4' width='56' height='56' fill='none' stroke='%2393731f' stroke-width='2'/%3E%3Ctext x='33' y='49' text-anchor='middle' font-family='Georgia, Times New Roman, serif' font-style='italic' font-weight='700' font-size='42' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
+<link rel="canonical" href="https://festina.archtelos.com/macos.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Festina">
+<meta property="og:title" content="macOS — Festina">
+<meta property="og:description" content="Native macOS support: toolchain, audio, graphics, packaging, and what's gated on real-hardware confirmation.">
+<meta property="og:url" content="https://festina.archtelos.com/macos.html">
+<meta property="og:image" content="https://festina.archtelos.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="macOS — Festina">
+<meta name="twitter:description" content="Native macOS support: toolchain, audio, graphics, packaging, and what's gated on real-hardware confirmation.">
+<meta name="twitter:image" content="https://festina.archtelos.com/og-image.png">
+<meta name="theme-color" content="#7c1f1b">
+<meta name="color-scheme" content="light">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,440;0,9..144,560;1,9..144,440&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="examples.html">Examples</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#try-catch-throw-unavailable">try/catch/throw works</a>
+        <a href="#gated-on-real-hardware">Gated on real hardware</a>
+        <a href="#porting-surface">Porting surface</a>
+        <a href="#toolchain">Toolchain</a>
+        <a href="#audio">Audio</a>
+        <a href="#graphics">Graphics</a>
+        <a href="#packaging">Packaging</a>
+        <a href="#shared-with-windows">Shared with Windows</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Platform support</p>
+      <h1 class="page-title">macOS</h1>
+      <p class="lede">
+        Native builds work today: toolchain, compiler, audio,
+        graphics, and packaging are all built and CI-verified on Apple
+        Silicon (<code>macos-14</code> GitHub Actions, on every push).
+        What's gated on real-hardware confirmation, and what's a
+        genuine, permanent limitation, are covered below.
+      </p>
+
+      <section class="doc-section" id="try-catch-throw-unavailable">
+        <h2><code>try</code>/<code>catch</code>/<code>throw</code> works (since 0.43) <a class="anchor" href="#try-catch-throw-unavailable">#</a></h2>
+        <p>
+          Earlier versions rejected <code>try</code>/<code>catch</code>/<code>throw</code>
+          outright on darwin: generated code called LLVM's SjLj
+          intrinsics, which have no lowering for AArch64
+          (<code>arm64-apple-macos14</code> — every current Mac and
+          every macOS CI runner). A <code>try</code> is a direct call
+          to libc's own <code>_setjmp</code> now, and a
+          <code>throw</code> is libc's <code>longjmp</code>, which
+          Darwin has always had — the CI job runs a real caught throw
+          (<code>tests/<wbr>test_platform.py<wbr>::TestOnMacOS<wbr>::test_try_catch_works</code>).
+          Nothing about <code>try</code>/<code>catch</code> is gated or
+          macOS-specific any more; see
+          <a href="api.html#try-catch-throw">api.md</a> for the feature
+          itself.
+        </p>
+      </section>
+
+      <section class="doc-section" id="gated-on-real-hardware">
+        <h2>What's gated on real hardware <a class="anchor" href="#gated-on-real-hardware">#</a></h2>
+        <p>
+          Audio playback, windowed mouse/keyboard/window behavior, and
+          <code>openPort()</code>/HTTP each stay behind an explicit
+          opt-in environment variable until confirmed on real Mac
+          hardware:
+        </p>
+        <ul>
+          <li><code>FESTINA_ENABLE_MACOS_AUDIO=1</code> — audio playback (AudioQueue)</li>
+          <li><code>FESTINA_ENABLE_MACOS_GRAPHICS=1</code> — windowed graphics (native Cocoa)</li>
+          <li><code>FESTINA_ENABLE_MACOS_HTTP=1</code> — <code>openPort()</code>/<code>on request</code>/<code>on upgrade</code>/<code>on message</code>/<code>on socketClose</code> (plain POSIX sockets, nothing Linux-specific about them, but not yet run against real macOS hardware) — see <a href="api.html#http-and-websocket-servers">api.md</a></li>
+        </ul>
+        <p class="muted">
+          Everything about each of these compiles and type-checks
+          against real platform headers (AudioToolbox/AppKit/Cocoa) on
+          every CI push; only actually opening a device/window/socket
+          on real hardware is unconfirmed. Offscreen drawing
+          (<code>saveCanvas</code>, no open window) and packaging need
+          no gate at all and work today.
+        </p>
+      </section>
+
+      <section class="doc-section" id="porting-surface">
+        <h2>Porting surface <a class="anchor" href="#porting-surface">#</a></h2>
+        <p>
+          The compiler is pure Python, the generated IR is
+          target-neutral, and the platform-specific API surface of the
+          runtime is small and precisely bounded:
+        </p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>Windowing/events</td><td>20 X11 calls + 2 <code>cairo_xlib_*</code> — <code>festina_runtime_graphics.c</code></td></tr>
+            <tr><td>Audio device</td><td>6 ALSA calls (<code>snd_pcm_open/set_params/writei/recover/close</code>, <code>snd_strerror</code>) — <code>festina_runtime_audio.c</code></td></tr>
+            <tr><td>Core runtime</td><td>none — POSIX only (<code>regex.h</code>, <code>clock_gettime</code>, <code>select</code>, pthread), all in macOS libc — <code>festina_runtime.c</code></td></tr>
+          </table>
+        </div>
+        <p class="muted">
+          Everything else the runtime leans on is portable and
+          Homebrew-packaged: Cairo (drawing), libjpeg, libmpg123,
+          sqlite3 (macOS even ships it).
+        </p>
+      </section>
+
+      <section class="doc-section" id="toolchain">
+        <h2>Toolchain <a class="anchor" href="#toolchain">#</a></h2>
+        <ul>
+          <li><strong><code>festina/llvm_backend.py</code> finds Homebrew's libLLVM</strong> at its keg-only install path (<code>/opt<wbr>/homebrew<wbr>/opt<wbr>/llvm<wbr>/lib<wbr>/libLLVM.dylib</code> on arm64, <code>/usr<wbr>/local<wbr>/opt<wbr>/llvm<wbr>/lib<wbr>/libLLVM.dylib</code> on x86_64) — <code>ctypes.util.find_library("LLVM")</code> alone doesn't see it there. The clang fallback works too: Apple clang (Xcode ≥ 15, the floor) accepts the generated <code>.ll</code> directly, including its opaque-<code>ptr</code> IR.</li>
+          <li><strong>SQLite links statically when possible.</strong> <code>festina/cli.py</code> probes the explicit archive path (<code>pkg-config --variable=libdir sqlite3</code> + <code>/libsqlite3.a</code>, which Homebrew's sqlite provides) rather than the <code>-Wl,-Bstatic/-Bdynamic</code> flags ld64 rejects; falls back to <code>-lsqlite3</code> (the OS-shipped dylib) otherwise.</li>
+          <li><strong><code>festina doctor</code></strong> reports macOS-specific install hints: on darwin, compiling an audio program without <code>FESTINA_ENABLE_MACOS_AUDIO=1</code> fails with a message naming the gate (<code>_check_feature_supported</code>) rather than a pkg-config error naming a library macOS doesn't have.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="audio">
+        <h2>Audio <a class="anchor" href="#audio">#</a></h2>
+        <p>
+          AudioQueue (AudioToolbox, plain C) sits behind a 3-function
+          device seam the portable pool/decoding/channel logic in
+          <code>festina_runtime_audio.c</code> calls through:
+        </p>
+        <ul>
+          <li><code>festina_pcm_open(channels, rate) → handle-or-error</code></li>
+          <li><code>festina_pcm_write(handle, frames, count) → ok</code> (blocking)</li>
+          <li><code>festina_pcm_close(handle)</code></li>
+        </ul>
+        <p class="muted">
+          N preallocated buffers plus a counting semaphore reproduce
+          blocking-push exactly: <code>write</code> copies frames into
+          a free buffer, enqueues it, and blocks on the semaphore when
+          all buffers are in flight; the completion callback posts it.
+          Per-channel queues mirror Linux's per-channel handles
+          one-to-one. Link flags add <code>-framework AudioToolbox</code>;
+          the <code>alsa</code> pkg-config package is dropped on darwin
+          (<code>libmpg123</code> is kept for MP3 decoding). For CI,
+          where there's no real audio device,
+          <code>FESTINA_AUDIO_NULL=1</code> makes
+          <code>festina_pcm_*</code> a timed sink at the shim level.
+        </p>
+      </section>
+
+      <section class="doc-section" id="graphics">
+        <h2>Graphics <a class="anchor" href="#graphics">#</a></h2>
+        <p>
+          The graphics translation unit is mostly portable already: all
+          drawing (rects, circles, text, paths, transforms, gradients,
+          images, clips, resizes, <code>saveCanvas</code>) targets an
+          offscreen Cairo image surface, and libjpeg decoding is
+          platform-free. Only the windowing layer is platform-specific,
+          behind <code>runtime/festina_runtime_window.h</code>:
+        </p>
+        <ul>
+          <li><code>festina_window_open(width, height, title)</code> / <code>festina_window_close(void)</code></li>
+          <li><code>festina_window_present(cairo_surface_t *backing)</code> — hand the offscreen backing surface to the platform to blit</li>
+          <li><code>festina_window_events_wait(double timeout_seconds)</code> — block for at most one OS-native event, bounded by the next timer deadline</li>
+          <li><code>festina_window_events_drain(...)</code> — pump every pending OS event as a normalized <code>MOUSE_DOWN</code><wbr>/<code>MOUSE_UP</code><wbr>/<code>MOUSE_MOVE</code><wbr>/<code>KEY_DOWN</code><wbr>/<code>KEY_UP</code><wbr>/<code>RESIZE</code><wbr>/<code>CLOSE</code> event</li>
+        </ul>
+        <p class="muted">
+          macOS implements this in
+          <code>festina_runtime_window_mac.m</code> (Objective-C, a
+          separate translation unit, linked <code>-framework Cocoa</code>):
+          an <code>NSWindow</code> plus an <code>NSView</code> whose
+          <code>drawRect:</code> blits the Cairo image surface via
+          <code>CGImage</code> (<code>CAIRO_FORMAT_ARGB32</code> maps
+          exactly onto
+          <code>kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst</code>
+          on any little-endian Mac). No XQuartz, no X11 of any kind.
+        </p>
+        <p>Three things worth knowing about the Cocoa backend specifically:</p>
+        <ul>
+          <li><strong>Event loop.</strong> Cocoa requires UI on the main thread and prefers owning the loop; Festina's model (top-level code runs, then <code>festina_run_event_loop()</code> blocks on the main thread) is compatible. <code>festina_window_events_wait</code> peeks with <code>nextEventMatchingMask:<wbr>untilDate:<wbr>...dequeue:<wbr>NO</code> (the timeout carries the timer deadline, the same role <code>select</code>'s timeout plays on Linux); <code>festina_window_events_drain</code> fully pumps the queue into a small ring buffer that window/view delegate callbacks (resize, close) also push into, then drains it through the caller's handler. Timers keep firing from the same loop, unchanged.</li>
+          <li><strong>Key names match Linux's.</strong> <code>on keyDown(key:text)</code> reports the same names on both platforms — Cocoa's characters/keyCodes are mapped through a small keyCode table onto the shared vocabulary pinned in <code>runtime/festina_key_names.h</code> (guarded by <code>tests<wbr>/test_platform.py<wbr>::TestKeyNameVocabulary</code>). Autorepeat maps cleanly onto NSEvent's <code>isARepeat</code>.</li>
+          <li><strong>No Xvfb equivalent exists for macOS CI runners</strong>, so windowed end-to-end tests (real mouse/keyboard dispatch) are Linux-CI-only; macOS CI covers the full offscreen suite plus a compile-only Cocoa type-check against real AppKit/Foundation/CoreGraphics headers. See <a href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">tests/CONTRACT.md</a> for the exact split.</li>
+        </ul>
+        <p class="muted">
+          A Festina program only hits the
+          <code>FESTINA_ENABLE_MACOS_GRAPHICS</code> gate if it would
+          actually open a window (declares <code>render()</code> or
+          any window event handler); an offscreen-only program
+          (<code>saveCanvas</code>, no <code>render()</code>) is never
+          gated on any platform.
+        </p>
+      </section>
+
+      <section class="doc-section" id="packaging">
+        <h2>Packaging <a class="anchor" href="#packaging">#</a></h2>
+        <p>
+          <code>scripts/package_compiler.sh</code> produces a Mach-O
+          binary via PyInstaller and ad-hoc codesigns it
+          (<code>codesign -s -</code>, guarded on <code>uname -s</code>
+          and on <code>codesign</code> being on PATH) so Gatekeeper
+          allows local runs with no prompt — a self-signature, not an
+          identity; it doesn't make the binary trusted on anyone else's
+          machine. Full Developer-ID signing and notarization is a
+          distribution decision deliberately out of scope until there's
+          an actual distribution channel. The <code>macos-14</code> CI
+          job runs this script for real on every push (Apple Silicon
+          runners, so that step <em>is</em> the arm64 build) and
+          smoke-tests the result (compiles and runs
+          <code>examples/hello.f</code>). Universal binaries are a
+          non-goal — arm64 ships; x86_64 without Rosetta is
+          build-from-source. See <a href="setup.html">setup.md</a> for
+          the exact brew line and PATH requirements.
+        </p>
+      </section>
+
+      <section class="doc-section" id="shared-with-windows">
+        <h2>Shared with Windows <a class="anchor" href="#shared-with-windows">#</a></h2>
+        <p>The intersection with <a href="windows.html">windows.md</a>:</p>
+        <ol>
+          <li><strong>The audio device seam</strong> (<code>festina_pcm_open/write/close</code>), with each platform providing its own blocking-push primitive (a counting semaphore for AudioQueue, a condition variable for waveOut, a blocking write on Linux/ALSA).</li>
+          <li><strong>The windowing seam</strong> (<code>festina_window_open<wbr>/close<wbr>/present<wbr>/events_wait<wbr>/events_drain</code> + normalized events, <code>runtime/festina_runtime_window.h</code>) — Linux (X11), macOS (Cocoa), and Windows (Win32) all implement it; <code>present</code> always takes the Cairo <em>image surface</em> (an xlib surface / CGImage / DIB is each platform's own blit of that one thing), and redraw-on-expose is each backend's own job rather than a seam-level event.</li>
+          <li><strong>The key-name vocabulary</strong> — <code>runtime/festina_key_names.h</code>, guarded by <code>tests<wbr>/test_platform.py<wbr>::TestKeyNameVocabulary</code>.</li>
+          <li><strong>The <code>FESTINA_AUDIO_NULL</code> test shim</strong> at the device seam, for CI with no real audio device.</li>
+          <li><strong>The headless CI tier definition</strong> — which suites run with no display/audio device; all three OS jobs use the same selection.</li>
+          <li><strong>The sanitizer tier</strong>: LeakSanitizer is not reliably available on darwin/arm64, so the leak-stress tier stays Linux-only; memory-model verification runs strongest there.</li>
+          <li><strong>Per-platform structure</strong>, filled in per port: <code>_RUNTIME_FEATURES</code> (pkgs/link flags/sources by OS), <code>_find_libllvm</code> candidate paths, <code>_default_output_name</code>, <code>_static_sqlite_attempt</code>, <code>festina doctor</code>'s hint table, and <code>package_compiler.sh</code>'s release matrix.</li>
+          <li><strong>Cross-platform contract tests</strong> that run everywhere — binary-fidelity round trips, forward-slash path handling (<code>tests<wbr>/test_platform.py<wbr>::TestBinaryFidelity</code>), plus the per-OS <code>TestOnMacOS</code>/<code>TestOnWindows</code> suites.</li>
+        </ol>
+        <p class="muted">
+          Not shared: the regex gap and <code>.exe</code> mechanics are
+          Windows-only, the ld64 sqlite probe is macOS-only, and
+          Cocoa's run-loop inversion has no Win32 counterpart.
+        </p>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="setup.html">
+          <span class="label">← Previous</span>
+          Setup &amp; dependencies
+        </a>
+        <a class="next" href="windows.html">
+          <span class="label">Next →</span>
+          Windows
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="doc.js"></script>
+
+
+</body>
+</html>

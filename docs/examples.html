@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code examples — Festina</title>
+<meta name="description" content="Four short, complete Festina programs -- a reverse proxy, a SQLite database exposed over WebSocket, a CAPTCHA image endpoint, and a desktop weather app -- each benchmarked and measured for code length against Go, Rust, and Bun.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%237c1f1b'/%3E%3Crect x='4' y='4' width='56' height='56' fill='none' stroke='%2393731f' stroke-width='2'/%3E%3Ctext x='33' y='49' text-anchor='middle' font-family='Georgia, Times New Roman, serif' font-style='italic' font-weight='700' font-size='42' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
+<link rel="canonical" href="https://festina.archtelos.com/examples.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Festina">
+<meta property="og:title" content="Code examples — Festina">
+<meta property="og:description" content="Four short, complete Festina programs -- a reverse proxy, a SQLite database exposed over WebSocket, a CAPTCHA image endpoint, and a desktop weather app -- each benchmarked and measured for code length against Go, Rust, and Bun.">
+<meta property="og:url" content="https://festina.archtelos.com/examples.html">
+<meta property="og:image" content="https://festina.archtelos.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Code examples — Festina">
+<meta name="twitter:description" content="Four short, complete Festina programs -- a reverse proxy, a SQLite database exposed over WebSocket, a CAPTCHA image endpoint, and a desktop weather app -- each benchmarked and measured for code length against Go, Rust, and Bun.">
+<meta name="twitter:image" content="https://festina.archtelos.com/og-image.png">
+<meta name="theme-color" content="#7c1f1b">
+<meta name="color-scheme" content="light">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,440;0,9..144,560;1,9..144,440&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#at-a-glance">At a glance</a>
+        <a class="sub" href="#benchmark-methodology">Benchmark methodology</a>
+        <a href="#reverse-proxy">A reverse proxy</a>
+        <a class="sub" href="#reverse-proxy-benchmark">Benchmark</a>
+        <a href="#sqlite-over-websocket">SQLite behind a WebSocket</a>
+        <a class="sub" href="#sqlite-over-websocket-benchmark">Benchmark</a>
+        <a href="#captcha-image">A CAPTCHA-style image endpoint</a>
+        <a class="sub" href="#captcha-image-benchmark">Benchmark</a>
+        <a href="#weather-desktop-app">A desktop weather app</a>
+        <a class="sub" href="#weather-desktop-app-benchmark">Benchmark</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Cookbook</p>
+      <h1 class="page-title">Code examples</h1>
+      <p class="lede">
+        Four short, complete programs, each built entirely out of
+        features documented in <a href="api.html">api.md</a> — no
+        external libraries, no framework, nothing installed beyond the
+        <code>festina</code> compiler itself. Every snippet below is
+        the whole program (or close to it); compile and run any of
+        them with:
+      </p>
+      <p class="lede">
+        Three of the four are also benchmarked and measured for code
+        length against real Go, Rust, and Bun implementations of the
+        same program — see <a href="#at-a-glance">At a glance</a> below
+        for the summary, or each example's own "Benchmark" subsection
+        for the full numbers.
+      </p>
+      <pre class="code"><span class="mut">$</span> festina compile example.f -o example &amp;&amp; ./example</pre>
+
+      <section class="doc-section" id="at-a-glance">
+        <h2>At a glance <a class="anchor" href="#at-a-glance">#</a></h2>
+        <p>
+          Each of the first three examples below (the reverse proxy,
+          the SQLite-over-WebSocket server, and the CAPTCHA endpoint —
+          all genuinely equivalent-scope programs) is also benchmarked
+          against real Go, Rust, and Bun implementations, and measured
+          for code length. Averaged across those three:
+        </p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>Throughput</td><td><strong>~2.3x</strong> the Go/Rust/Bun average (geometric mean — see <a href="#benchmark-methodology">Benchmark methodology</a> for why a geometric, not arithmetic, mean) — but this varies enormously by workload: <strong>14.5x</strong> ahead on the SQLite example (a default-configuration difference, not a language one — see <a href="#sqlite-over-websocket-benchmark">that section</a>), <strong>1.2x</strong> ahead on the CPU/image-bound CAPTCHA endpoint, and <strong>0.66x</strong> (i.e. still behind, though closer than a single-threaded version got) on the reverse proxy, using the <a href="#reverse-proxy">multi-threaded version</a> below.</td></tr>
+            <tr><td>Code length</td><td>Roughly a wash — averaging the three examples' own percentage differences puts Festina at about <strong>1% longer</strong> than the Go/Rust/Bun mean, not shorter. One large win (43% shorter on the SQLite example) is offset by one large loss (the multi-threaded proxy is the longest of the four here, not the shortest — see <a href="#reverse-proxy-benchmark">that section</a>); the two don't net out the same way if compared by raw total lines instead of by percentage per example — see each section below for the exact counts.</td></tr>
+          </table>
+        </div>
+        <p class="muted">
+          The fourth example, the desktop weather app, is deliberately
+          left out of both averages above: Festina's version is a full
+          windowed app (it needs no extra library for that — see
+          <a href="api.html#graphics">api.md's Graphics section</a>),
+          while none of Go, Rust, or Bun ship a built-in canvas, so a
+          fair equivalent there is fetch-and-parse logic only, not a
+          full app. That comparison — narrower in scope, and noted as
+          such — is in its own section below.
+        </p>
+
+        <h3 id="benchmark-methodology">Benchmark methodology <a class="anchor" href="#benchmark-methodology">#</a></h3>
+        <p class="muted">
+          Each language uses its own normal toolchain and a realistic,
+          idiomatic library choice for the job — matching
+          <a href="benchmark.html#methodology">benchmark.md</a>'s own
+          rule — not a hand-rolled minimal server built purely to look
+          small: Go's <code>net/http</code> (stdlib), Rust's
+          <code>tiny_http</code>/<code>axum</code> depending on what the
+          example needs, and Bun's native <code>Bun.serve()</code>. HTTP
+          examples are load-tested with a small dedicated Go client (20
+          concurrent connections, 5 seconds, 1 second of untimed warmup
+          first); the WebSocket example uses an equivalent Python
+          <code>asyncio</code> client sending one message and awaiting
+          one reply per round trip. Binary sizes are release/stripped
+          builds (<code>festina compile</code>; Go's
+          <code>-ldflags="-s -w"</code>; Rust's
+          <code>profile.release.strip = true</code>; Bun's
+          <code>bun build --compile</code>, which embeds the whole Bun
+          runtime — see each section for what that means for its own
+          binary size). Every program's full source was actually
+          compiled and run to produce these numbers, the same
+          verify-before-publish rule every benchmark on this site
+          follows; none of this is estimated. As with every benchmark
+          on this site: not a claim that Festina beats Go, Rust, or Bun
+          in general — real-world performance depends on what's
+          actually being written — this exists to show what a genuinely
+          equivalent program costs in each language, in both code and
+          runtime, for these specific small, realistic tasks.
+        </p>
+      </section>
+
+      <section class="doc-section" id="reverse-proxy">
+        <h2>A reverse proxy <a class="anchor" href="#reverse-proxy">#</a></h2>
+        <p>
+          <code>openPort()</code> and outbound
+          <code>req.send()</code> are the same
+          <a href="api.html#http-type"><code>http</code> value</a>
+          on both ends, so forwarding one request into another is just
+          building a second <code>http</code> literal from the first
+          and sending it on. A single <code>on request</code> handler
+          services one connection at a time (see
+          <a href="benchmark.html#http-benchmark">benchmark.md</a>),
+          and every request here blocks on its own outbound call to
+          the upstream — so this version spreads that wait across a
+          <a href="api.html#thread-pools">pool</a> of worker threads
+          instead, each with its own private
+          <a href="api.html#thread-http">HTTP
+          context</a>, fed by <code>main</code> handing off every
+          accepted connection with
+          <a href="api.html#thread-giverequest"><code>giveRequest</code></a>:
+        </p>
+        <pre class="code"><span class="kw">int</span> WORKER_COUNT = <span class="num">4</span>
+
+<span class="kw">thread</span> workers[<span class="num">4</span>] {
+    <span class="kw">text</span> UPSTREAM = <span class="str">'http://127.0.0.1:9000'</span>
+
+    <span class="kw">on</span> request(req:http) {
+        <span class="kw">url</span> u = parseURL(req.url)
+        <span class="kw">http</span> upstream = {
+            <span class="str">'url'</span>: <span class="str">`${UPSTREAM}${u.pathname}`</span>,
+            <span class="str">'method'</span>: req.method,
+            <span class="str">'headers'</span>: req.headers,
+            <span class="str">'body'</span>: req.toBlob()
+        }
+        <span class="kw">try</span> {
+            upstream.send()
+            req.send({
+                <span class="str">'code'</span>: upstream.code,
+                <span class="str">'headers'</span>: upstream.headers,
+                <span class="str">'body'</span>: upstream.toBlob()
+            })
+        } <span class="kw">catch</span> (error:<span class="kw">text</span>) {
+            req.send({<span class="str">'code'</span>: <span class="num">502</span>, <span class="str">'body'</span>: <span class="str">`bad gateway: ${error}`</span>})
+        }
+    }
+}
+
+<span class="kw">int</span> nextWorker = <span class="num">0</span>
+
+<span class="kw">on</span> request(req:<span class="kw">http</span>?) {
+    workers[nextWorker].giveRequest(req)
+    nextWorker = (nextWorker + <span class="num">1</span>) % WORKER_COUNT
+}
+
+openPort(<span class="num">8080</span>)</pre>
+        <p class="muted">
+          <code>req.send()</code> called with zero arguments is the
+          <a href="api.html#http-client">client form</a> of the exact
+          method the server side uses to answer a request — it blocks
+          until the upstream responds, then overwrites
+          <code>upstream.code</code>/<code>.headers</code>/its own body
+          in place, which is what gets relayed back below. A genuine
+          network failure (upstream down, DNS failure, timeout) throws,
+          caught here and turned into a <code>502</code> instead of
+          hanging the client. <code>main</code>'s own <code>on
+          request</code> must declare <code>req:http?</code> (a
+          <a href="api.html#t-manually-managed-values">manually-managed
+          value</a>) for <code>giveRequest</code> to accept it — an
+          ordinary auto-managed <code>req:http</code> is rejected, since
+          main's own cleanup would otherwise race the worker that just
+          received it. This is still deliberately minimal — no
+          <code>Host</code>/<code>Connection</code> header rewriting,
+          no path allow-list — but every request really is proxied
+          through, headers and body included, now with up to 4 of them
+          genuinely in flight at once.
+        </p>
+
+        <h3 id="reverse-proxy-benchmark">Benchmark <a class="anchor" href="#reverse-proxy-benchmark">#</a></h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Reverse proxy</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Binary size</th><th class="num">Lines</th></tr></thead>
+            <tbody>
+              <tr><td>Festina (4 worker threads)</td><td class="num">5,715</td><td class="num">8.72 ms</td><td class="num">1.6 MB</td><td class="num">34</td></tr>
+              <tr><td>Go (<code>net/http</code>)</td><td class="num">7,173</td><td class="num">6.97 ms</td><td class="num">6.0 MB</td><td class="num">17</td></tr>
+              <tr><td>Rust (<code>tiny_http</code> + <code>ureq</code>)</td><td class="num">4,547</td><td class="num">10.98 ms</td><td class="num">2.8 MB</td><td class="num">26</td></tr>
+              <tr><td>Bun (<code>Bun.serve</code> + <code>fetch</code>)</td><td class="num">14,120</td><td class="num">3.54 ms</td><td class="num">99.3 MB</td><td class="num">21</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">
+          <strong>4 worker threads over the single-threaded version
+          above: +29% throughput</strong> (5,715 req/s vs. a clean
+          4,425 req/s measured the same way — see
+          <a href="#reverse-proxy">the code above</a>), from spreading
+          the blocking wait on <code>upstream.send()</code> across
+          workers instead of queuing every connection behind one. It's
+          still behind Go's and Bun's own defaults, though: both
+          spread incoming connections across multiple OS threads or an
+          event loop <em>without being asked</em>, and under 20
+          concurrent connections that default concurrency wins outright
+          regardless of per-request logic. Rust's single-threaded
+          <code>tiny_http</code> server sits closer to where Festina's
+          own single-threaded version was. The cost of closing most of
+          that gap is real, though: at 34 lines this is now the
+          <em>longest</em> of the four, not the shortest — Go and Bun
+          get their concurrency for free from the runtime, so nothing
+          in their own source above changed at all. Bun's 99.3 MB
+          binary is almost entirely the bundled Bun runtime (see
+          <a href="#weather-desktop-app-benchmark">below</a>) — its
+          proxy logic itself is a handful of lines.
+        </p>
+      </section>
+
+      <section class="doc-section" id="sqlite-over-websocket">
+        <h2>SQLite behind a WebSocket <a class="anchor" href="#sqlite-over-websocket">#</a></h2>
+        <p>
+          <code>table</code> already means "a struct that's also
+          backed by SQLite" (see
+          <a href="api.html#built-in-sqlite">api.md</a>), and
+          <code>req.upgrade()</code> turns an
+          <a href="api.html#websocket">HTTP connection into a
+          WebSocket</a> one — put the two together and any WebSocket
+          client (a browser, another Festina program acting as a
+          plain client, a one-line script in whatever language) can
+          write to, and read back from, a database it never opens
+          directly:
+        </p>
+        <pre class="code"><span class="kw">struct</span> Reading {
+    sensor:<span class="kw">text</span>
+    value:<span class="kw">float</span>
+}
+
+<span class="kw">table</span> Readings {
+    sensor:<span class="kw">text</span>
+    value:<span class="kw">float</span>
+}
+
+openPort(<span class="num">9090</span>)
+
+<span class="kw">on</span> request(req:http) {
+    <span class="kw">if</span> parseURL(req.url).pathname == <span class="str">'/db'</span> {
+        req.upgrade()
+        <span class="kw">return</span>
+    }
+    req.ok()
+}
+
+<span class="kw">on</span> upgrade(s:socket) {
+    log(<span class="str">'data source connected'</span>)
+}
+
+<span class="kw">on</span> socketMessage(s:socket, msg:blob) {
+    Reading r = msg.toText().toStruct(Reading)
+    sqlite(<span class="str">'INSERT INTO Readings (sensor, value) VALUES (?, ?)'</span>, [r.sensor, r.value])
+    <span class="kw">arr[Readings]</span> recent = sqlite(<span class="str">'SELECT rowid, sensor, value FROM Readings ORDER BY rowid DESC LIMIT 10'</span>)
+    s.send(recent)                <span class="cm">// arr[T] renders as JSON, the same as an http body</span>
+}
+
+<span class="kw">on</span> socketClose(s:socket) {
+    log(<span class="str">'data source disconnected'</span>)
+}</pre>
+        <p class="muted">
+          A message in is expected to be a JSON object shaped like
+          <code>{"sensor": "temp-1", "value": 21.4}</code> —
+          <code>msg.toText().toStruct(Reading)</code> parses it straight
+          into that shape (see
+          <a href="api.html#json-parsing">.toStruct() / .toArr()</a>);
+          every unknown key is skipped, every missing one keeps its
+          zero value, so a slightly-off payload never crashes the
+          connection. <code>req.send()</code>'s
+          <a href="api.html#http-client">client form</a> is Festina's
+          only outbound HTTP call — there's no outbound WebSocket
+          client here, so "another server" reaches this database by
+          connecting <em>in</em>, the same way a browser tab would.
+        </p>
+
+        <h3 id="sqlite-over-websocket-benchmark">Benchmark <a class="anchor" href="#sqlite-over-websocket-benchmark">#</a></h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>SQLite over WebSocket</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Binary size</th><th class="num">Lines</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">10,772</td><td class="num">1.84 ms</td><td class="num">1.6 MB</td><td class="num">33</td></tr>
+              <tr><td>Go (<code>nhooyr.io/websocket</code> + <code>modernc.org/sqlite</code>)</td><td class="num">735</td><td class="num">26.96 ms</td><td class="num">10.2 MB</td><td class="num">67</td></tr>
+              <tr><td>Rust (<code>axum</code> + <code>rusqlite</code>)</td><td class="num">698</td><td class="num">28.36 ms</td><td class="num">3.5 MB</td><td class="num">77</td></tr>
+              <tr><td>Bun (<code>Bun.serve</code> + <code>bun:sqlite</code>, both built in)</td><td class="num">795</td><td class="num">24.89 ms</td><td class="num">99.3 MB</td><td class="num">30</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">
+          <strong>This gap is a default-configuration difference, not
+          a language one.</strong> Every <code>sqlite()</code> database
+          in Festina opens in WAL mode with <code>synchronous=NORMAL</code>
+          automatically (see
+          <a href="api.html#query-performance">api.md's "Query
+          performance"</a> — measured there at 20,000 inserts dropping
+          from 16.7s to 0.3s from this exact change). None of the three
+          competitor libraries above default to it: each one insert-then-
+          fsyncs on SQLite's own out-of-the-box rollback-journal
+          settings, which is what caps all three within a fairly narrow
+          band around 700-800 req/s here regardless of language —
+          adding the same two <code>PRAGMA</code> statements to any of
+          them would close most of this gap. Bun's built-in
+          <code>bun:sqlite</code> needs no separate crate/package at
+          all, which is why it's the shortest of the three competitors
+          despite doing the same work as the other two.
+        </p>
+      </section>
+
+      <section class="doc-section" id="captcha-image">
+        <h2>A CAPTCHA-style image endpoint <a class="anchor" href="#captcha-image">#</a></h2>
+        <p>
+          <code>blankImage()</code> and the
+          <a href="api.html#images">per-image drawing calls</a> work
+          with no window and no display (see
+          <a href="api.html#graphics">api.md's Graphics section</a>) —
+          exactly what an HTTP handler needs, since it never has a
+          screen to put anything on in the first place:
+        </p>
+        <pre class="code"><span class="kw">text</span> CHARS = <span class="str">'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'</span>
+<span class="kw">int</span> CHARS_LEN = CHARS.split(<span class="str">''</span>).length   <span class="cm">// text has no .length -- split() by code point does</span>
+<span class="kw">int</span> CODE_LEN = <span class="num">5</span>
+
+<span class="kw">text func</span> randomCode(n:<span class="kw">int</span>) {
+    <span class="kw">text</span> code = <span class="str">''</span>
+    <span class="kw">for</span> <span class="kw">int</span> i = <span class="num">0</span>, i &lt; n, i++ {
+        <span class="kw">int</span> idx = Math.floor(Math.random() * CHARS_LEN)
+        code = <span class="str">`${code}${CHARS[idx]}`</span>
+    }
+    <span class="kw">return</span> code
+}
+
+<span class="kw">color</span> bg = <span class="str">'#eef1f5'</span>
+<span class="kw">color</span> ink = <span class="str">'#2b3542'</span>
+<span class="kw">font</span> captchaFont = <span class="str">'bold 28px sans-serif'</span>
+
+openPort(<span class="num">8080</span>)
+
+<span class="kw">on</span> request(req:http) {
+    <span class="kw">if</span> parseURL(req.url).pathname != <span class="str">'/captcha'</span> {
+        req.ok()
+        <span class="kw">return</span>
+    }
+
+    <span class="kw">text</span> code = randomCode(CODE_LEN)
+    <span class="kw">img</span> canvas = blankImage(<span class="num">160</span>, <span class="num">60</span>)
+    canvas.drawRect(<span class="num">0</span>, <span class="num">0</span>, <span class="num">160</span>, <span class="num">60</span>, bg)
+
+    <span class="kw">for</span> <span class="kw">int</span> i = <span class="num">0</span>, i &lt; <span class="num">40</span>, i++ {         <span class="cm">// speckled noise</span>
+        <span class="kw">int</span> shade = <span class="num">180</span> + Math.floor(Math.random() * <span class="num">40</span>)
+        fillStyle(shade, shade, shade)
+        canvas.drawPixel(Math.floor(Math.random() * <span class="num">160</span>), Math.floor(Math.random() * <span class="num">60</span>))
+    }
+
+    fillStyle(ink)
+    changeFont(captchaFont)
+    <span class="kw">for</span> <span class="kw">int</span> i = <span class="num">0</span>, i &lt; CODE_LEN, i++ {      <span class="cm">// jittered glyphs</span>
+        <span class="kw">int</span> y = <span class="num">40</span> + Math.round((Math.random() - <span class="num">0.5</span>) * <span class="num">12</span>)
+        canvas.drawText(code[i], <span class="num">15</span> + i * <span class="num">26</span>, y)
+    }
+
+    <span class="cm">// A real deployment would stash `code` somewhere keyed to this</span>
+    <span class="cm">// visitor -- a `table` row, or s.state on an upgraded socket --</span>
+    <span class="cm">// to check the answer against later. Omitted to keep this short.</span>
+    req.send({<span class="str">'headers'</span>: {<span class="str">'content-type'</span>: <span class="str">'image/png'</span>}, <span class="str">'body'</span>: canvas})
+}</pre>
+        <p class="muted">
+          Nothing here is Cairo or libpng called by hand —
+          <code>drawRect</code>/<code>drawPixel</code>/<code>drawText</code>
+          are the same three calls
+          <a href="api.html#graphics">every canvas program uses</a>,
+          just aimed at a fresh off-screen <code>img</code> instead of
+          an on-screen one. Sending it back is one line:
+          an <code>img</code> is a legal <code>http</code> body (see
+          <a href="api.html#http-type">the http type</a>), sent as its
+          own encoded bytes — PNG here, since it was built rather than
+          loaded from a file (see <a href="api.html#images">Images</a>).
+          <code>Math.random()</code> is seeded from the clock, which is
+          fine for visual noise and glyph jitter — it is explicitly
+          <strong>not</strong> suitable for anything where the code
+          itself needs to be unguessable.
+        </p>
+
+        <h3 id="captcha-image-benchmark">Benchmark <a class="anchor" href="#captcha-image-benchmark">#</a></h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>CAPTCHA endpoint</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Binary size</th><th class="num">Lines</th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">1,367</td><td class="num">14.61 ms</td><td class="num">1.7 MB</td><td class="num">46</td></tr>
+              <tr><td>Go (<code>image</code>/<code>png</code> + <code>x/image/font/basicfont</code>)</td><td class="num">2,013</td><td class="num">9.93 ms</td><td class="num">5.9 MB</td><td class="num">62</td></tr>
+              <tr><td>Rust (<code>tiny_http</code> + <code>image</code>/<code>imageproc</code> + <code>ab_glyph</code>)</td><td class="num">569</td><td class="num">35.02 ms</td><td class="num">6.3 MB</td><td class="num">54</td></tr>
+              <tr><td>Bun (<code>Bun.serve</code> + <code>@napi-rs/canvas</code>)</td><td class="num">738</td><td class="num">27.00 ms</td><td class="num">163.6 MB</td><td class="num">44</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">
+          Unlike the other two examples, this one is CPU-bound (pixel
+          fills plus glyph rasterization), not connection-handling-bound
+          — which is why Festina's single-threaded server doesn't cost
+          it here the way it did for the plain proxy above. Go's
+          <code>basicfont</code> is a tiny built-in bitmap font (no font
+          file, no antialiasing) — the fastest of the four but the
+          roughest-looking output; Rust's and Bun's routes both
+          rasterize a real antialiased TrueType font per glyph, closer
+          to what Festina's own <code>drawText</code> does, and pay
+          more per request for it. Bun's 163.6 MB binary is the Bun
+          runtime plus <code>@napi-rs/canvas</code>'s own bundled native
+          image library.
+        </p>
+      </section>
+
+      <section class="doc-section" id="weather-desktop-app">
+        <h2>A desktop weather app <a class="anchor" href="#weather-desktop-app">#</a></h2>
+        <p>
+          A window, a background HTTP request, and a redraw once it
+          answers — <code>callback</code> mode keeps the outbound
+          request from freezing the window while it waits (see
+          <a href="api.html#http-client">Making outbound requests</a>),
+          and <code>setInterval</code> repeats it. Open-Meteo's forecast
+          API needs no key, so this is the whole program:
+        </p>
+        <pre class="code"><span class="kw">struct</span> Current {
+    temperature_2m:<span class="kw">float</span>
+    wind_speed_10m:<span class="kw">float</span>
+}
+<span class="kw">struct</span> Weather {
+    current:Current
+}
+
+<span class="kw">float</span> temp = <span class="num">0.0</span>
+<span class="kw">float</span> wind = <span class="num">0.0</span>
+<span class="kw">bool</span> loaded = <span class="kw">false</span>
+
+<span class="kw">color</span> bg = <span class="str">'#1e2a38'</span>
+<span class="kw">color</span> ink = <span class="str">'#f1f6fb'</span>
+<span class="kw">font</span> bigFont = <span class="str">'bold 48px sans-serif'</span>
+<span class="kw">font</span> smallFont = <span class="str">'16px sans-serif'</span>
+
+<span class="kw">void func</span> draw() {
+    fillStyle(bg)
+    drawRect(<span class="num">0</span>, <span class="num">0</span>, <span class="num">320</span>, <span class="num">180</span>)
+    fillStyle(ink)
+    changeFont(smallFont)
+    drawText(<span class="str">'Berlin'</span>, <span class="num">20</span>, <span class="num">30</span>)
+    changeFont(bigFont)
+    drawText(loaded ? <span class="str">`${Math.round(temp)}°C`</span> : <span class="str">'…'</span>, <span class="num">20</span>, <span class="num">100</span>)
+    changeFont(smallFont)
+    drawText(loaded ? <span class="str">`wind ${Math.round(wind)} km/h`</span> : <span class="str">''</span>, <span class="num">20</span>, <span class="num">150</span>)
+    render()
+}
+
+<span class="kw">void func</span> onWeather(r:http) {
+    <span class="kw">if</span> r.code == <span class="kw">null</span> {
+        log(<span class="str">`weather request failed: ${r.toText()}`</span>)
+        <span class="kw">return</span>
+    }
+    Weather w = r.toText().toStruct(Weather)
+    temp = w.current.temperature_2m
+    wind = w.current.wind_speed_10m
+    loaded = <span class="kw">true</span>
+    draw()
+}
+
+<span class="kw">void func</span> fetchWeather() {
+    <span class="kw">http</span> {<span class="str">'url'</span>: <span class="str">'https://api.open-meteo.com/v1/forecast?latitude=52.52&amp;longitude=13.41&amp;current=temperature_2m,wind_speed_10m'</span>, <span class="str">'method'</span>: <span class="str">'GET'</span>, <span class="str">'callback'</span>: onWeather}
+}
+
+setClientWidth(<span class="num">320</span>)
+setClientHeight(<span class="num">180</span>)
+draw()
+fetchWeather()
+setInterval(fetchWeather, <span class="num">600000</span>)   <span class="cm">// refresh every 10 minutes</span></pre>
+        <p class="muted">
+          <code>draw()</code> runs once immediately (showing
+          "<code>…</code>" until the first response lands) and again
+          from inside <code>onWeather</code>, so the window is never
+          left blank. In callback mode a network failure never throws
+          — it leaves <code>r.code</code> <code>null</code> and
+          <code>r.toText()</code> holding the failure message instead,
+          which is what <code>onWeather</code> checks first. The
+          <code>struct</code>s only need the fields this program
+          actually reads; every other field Open-Meteo's response
+          contains is silently ignored by
+          <a href="api.html#json-parsing"><code>.toStruct()</code></a>.
+          One easy-to-miss detail: <code>method</code> defaults to an
+          <em>empty</em> <code>text</code>, not <code>'GET'</code> — a
+          real server reads the resulting blank method off the request
+          line and rejects it, so an outbound <code>GET</code> always
+          needs <code>'method': 'GET'</code> spelled out.
+        </p>
+
+        <h3 id="weather-desktop-app-benchmark">Benchmark <a class="anchor" href="#weather-desktop-app-benchmark">#</a></h3>
+        <p class="muted">
+          <strong>Narrower in scope than the three benchmarks above,
+          on purpose — excluded from the page's averages for it.</strong>
+          Festina's row below is the full windowed app shown above,
+          binary and all; none of Go, Rust, or Bun ship a canvas/window
+          API the way Festina's runtime does (see
+          <a href="api.html#graphics">api.md</a>), so building one would
+          mean pulling in each ecosystem's own separate GUI toolkit —
+          not really about the language at that point. What every
+          language <em>does</em> have built in is an HTTP client and a
+          JSON parser, so that's what's measured here: fetch the same
+          local mock endpoint and parse its response into the two
+          numbers the app displays, timed as the minimum of three runs
+          of 200 sequential calls each (matching
+          <a href="benchmark.html#methodology">benchmark.md</a>'s own
+          "minimum of N runs" rule) — no concurrency, since this is a
+          single desktop app making one request at a time, not a
+          server answering many.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Weather app</th><th class="num">Time per fetch+parse</th><th class="num">Binary size</th><th class="num">Lines</th></tr></thead>
+            <tbody>
+              <tr><td>Festina (full windowed app)</td><td class="num">0.300 ms</td><td class="num">1.7 MB</td><td class="num">50</td></tr>
+              <tr><td>Go (<code>net/http</code> + <code>encoding/json</code>, fetch+parse only)</td><td class="num">0.485 ms</td><td class="num">5.9 MB</td><td class="num">29</td></tr>
+              <tr><td>Rust (<code>reqwest</code> + <code>serde_json</code>, fetch+parse only)</td><td class="num">0.350 ms</td><td class="num">2.8 MB</td><td class="num">23</td></tr>
+              <tr><td>Bun (native <code>fetch</code>, fetch+parse only)</td><td class="num">0.446 ms</td><td class="num">99.3 MB</td><td class="num">8</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">
+          Read the line counts with the scope difference above in mind:
+          Bun's 8 lines are genuinely all it takes to fetch and parse
+          JSON (both are language built-ins), while Festina's 50 include
+          an entire window, a color scheme, two fonts, a draw function,
+          and a callback — a full app, not a script. Festina is still
+          the fastest of the four at the one piece of work being timed
+          here, fetch-plus-parse, but that is the narrower and less
+          interesting claim; the wider one — that Festina needed no
+          extra dependency at all to put the result on screen — doesn't
+          reduce to a single number.
+        </p>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="api.html">
+          <span class="label">← Previous</span>
+          API Reference
+        </a>
+        <a class="next" href="setup.html">
+          <span class="label">Next →</span>
+          Setup &amp; dependencies
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="doc.js"></script>
+
+</body>
+</html>

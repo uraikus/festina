@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap — Festina</title>
+<meta name="description" content="Open work for the Festina compiler, runtime, and standard library.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%237c1f1b'/%3E%3Crect x='4' y='4' width='56' height='56' fill='none' stroke='%2393731f' stroke-width='2'/%3E%3Ctext x='33' y='49' text-anchor='middle' font-family='Georgia, Times New Roman, serif' font-style='italic' font-weight='700' font-size='42' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
+<link rel="canonical" href="https://festina.archtelos.com/todo.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Festina">
+<meta property="og:title" content="Roadmap — Festina">
+<meta property="og:description" content="Open work for the Festina compiler, runtime, and standard library.">
+<meta property="og:url" content="https://festina.archtelos.com/todo.html">
+<meta property="og:image" content="https://festina.archtelos.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Roadmap — Festina">
+<meta name="twitter:description" content="Open work for the Festina compiler, runtime, and standard library.">
+<meta name="twitter:image" content="https://festina.archtelos.com/og-image.png">
+<meta name="theme-color" content="#7c1f1b">
+<meta name="color-scheme" content="light">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,440;0,9..144,560;1,9..144,440&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="examples.html">Examples</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#platforms">Platforms</a>
+        <a href="#language-standard-library">Language &amp; standard library</a>
+        <a href="#memory-model">Memory model</a>
+        <a href="#deliberate-behavior">Deliberate behavior</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Roadmap</p>
+      <h1 class="page-title">Open work</h1>
+      <p class="lede">
+        Open work only, shortest useful form. The reasoning behind every
+        closed item lives in
+        <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md</a>
+        (the numbered decision log) and
+        <a href="https://github.com/uraikus/festina/blob/main/tests/CONTRACT.md">tests/CONTRACT.md</a>
+        (what is verified, and how).
+      </p>
+
+      <section class="doc-section" id="platforms">
+        <h2>Platforms <a class="anchor" href="#platforms">#</a></h2>
+        <p>
+          Linux is the primary, fully verified target. macOS and
+          Windows builds exist, compile, and type-check against real
+          platform headers in CI — see <a href="macos.html">macos.md</a>
+          and <a href="windows.html">windows.md</a> for exactly what's
+          supported on each. What remains open:
+        </p>
+        <ul>
+          <li><strong>Audio playback on a real Mac and a real Windows machine, and windowed mouse/keyboard/window behavior on a real Mac.</strong> Each stays behind an explicit opt-in env var (<code>FESTINA_ENABLE_MACOS_AUDIO</code><wbr>/<code>_GRAPHICS</code>, <code>FESTINA_ENABLE_WINDOWS_AUDIO</code>) until confirmed on real hardware. Windows windowing needs no hardware: the CI job opens a real Win32 window and drives its mouse, keyboard, resize and close handlers itself (see <a href="windows.html">windows.md</a>).</li>
+        </ul>
+        <p class="muted">
+          Compiling to <code>wasm32-wasi</code> is supported and
+          CI-verified — see <a href="wasm.html">wasm.md</a> — and a
+          compiled <code>.wasm</code> runs in a browser tab on this
+          project's own WASI host (<code>runtime/wasm/browser.html</code>,
+          verified in headless Chromium on every push). Graphics/audio
+          are out of scope there permanently (WASI has no backend for
+          either); what remains open, not blocking:
+          AddressSanitizer/LeakSanitizer coverage for the target.
+        </p>
+      </section>
+
+      <section class="doc-section" id="language-standard-library">
+        <h2>Language &amp; standard library <a class="anchor" href="#language-standard-library">#</a></h2>
+        <ul>
+          <li><strong>Media formats</strong> stay PNG/JPEG + WAV/MP3, deliberately: each new format is a new system dependency for every machine that compiles a media-using program. Revisit only with a concrete need.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="memory-model">
+        <h2>Memory model <a class="anchor" href="#memory-model">#</a></h2>
+        <p>
+          Automatic reclamation is escape analysis plus reference
+          counting — every managed type
+          (<code>struct</code><wbr>/<code>arr[T]</code><wbr>/<code>map[T]</code><wbr>/<code>text</code><wbr>/<code>img</code><wbr>/<code>aud</code><wbr>/<code>regex</code><wbr>/<code>blob</code><wbr>/<code>http</code><wbr>/<code>url</code><wbr>/<code>socket</code>)
+          carries a refcount header, and reference cycles are collected
+          by trial deletion, with <code>free</code>/<code>delete</code>
+          as the manual override. What remains open:
+        </p>
+        <ul>
+          <li><strong>Cycle trials are synchronous and per-release</strong> — every still-referenced release of a cycle-capable type walks the value's reachable subgraph. Correct, and measured fast for ordinary object graphs (20k dropped 21-node cycles in ~34 ms), but a very large, heavily-aliased cyclic structure could feel it; the classic deferred-root buffer is the known optimization if a real program ever does.</li>
+          <li><strong>A table-row element off a call-result array leaks the array</strong> (<code>rows()[0]</code> where the elements are query rows). Rows have no refcount header — the array owns them outright — so the element cannot be retained past its container. Bind the array to a name first and it reclaims normally. The real fix is scoped: a per-table row-copy function is straightforward (it mirrors the existing per-table row-release function, using the already-existing <code>festina_text_own</code>/<code>festina_retain</code> primitives column-by-column), but it only closes the leak once paired with genuine scope-exit ownership tracking for <code>TableType</code> locals generally — the same "always owned once bound, always released at scope exit" symmetry <code>text</code> itself needed six dedicated, individually-verified rounds to get right. A real fix is that size, not a quick patch.</li>
+          <li><strong>Text globals are not freed at process exit</strong> — deliberate: they are reachable until exit, LeakSanitizer agrees, and freeing them would be exit-time busywork.</li>
+          <li><strong>A <code>throw</code> out of a runtime-driven callback</strong> (<code>.forEach(fn)</code>, <code>.sort(cmp)</code>, a timer) crosses the runtime's own C frame on the way to the catching <code>try</code>. Festina-side locals are released (the general "intermediate frame" leak that used to be listed here is closed — see <a href="api.html#try-catch-throw">api.md</a>); whatever that C frame itself held mid-operation — <code>qsort</code>'s scratch buffer, an iteration cursor — is not. Error-path-only, bounded per throw.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="deliberate-behavior">
+        <h2>Deliberate behavior (documented, not planned work) <a class="anchor" href="#deliberate-behavior">#</a></h2>
+        <ul>
+          <li><strong>Array indexing is not bounds-checked</strong> — a performance choice, see <a href="api.html#indexing-is-not-bounds-checked">api.md</a>.</li>
+          <li><strong><code>keyDown</code> auto-repeats while held</strong> (that is how text entry works); a held key still fires exactly one <code>keyUp</code>. Track held keys yourself for edge-triggered input.</li>
+          <li><strong><code>regex(pattern, flags)</code> is memoized per call site</strong> — the runtime compares the actual pattern+flags against the site's last compilation, so a repeated pattern costs what a literal does (~24x cheaper than recompiling) and a changed one recompiles. One site <em>alternating</em> patterns still recompiles per change — see <a href="api.html#literals-vs-regex-function">api.md</a>.</li>
+        </ul>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="benchmark.html">
+          <span class="label">← Previous</span>
+          Benchmarks
+        </a>
+        <a class="next" href="changelog.html">
+          <span class="label">Next →</span>
+          Changelog
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="doc.js"></script>
+
+
+</body>
+</html>

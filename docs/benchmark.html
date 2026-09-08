@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarks — Festina</title>
+<meta name="description" content="Festina vs. Rust, Go, and Bun on process startup, compute, allocation, string concatenation, canvas drawing, and HTTP throughput.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%237c1f1b'/%3E%3Crect x='4' y='4' width='56' height='56' fill='none' stroke='%2393731f' stroke-width='2'/%3E%3Ctext x='33' y='49' text-anchor='middle' font-family='Georgia, Times New Roman, serif' font-style='italic' font-weight='700' font-size='42' fill='%23f1e8d2'%3Ef%3C/text%3E%3C/svg%3E">
+<link rel="canonical" href="https://festina.archtelos.com/benchmark.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Festina">
+<meta property="og:title" content="Benchmarks — Festina">
+<meta property="og:description" content="Festina vs. Rust, Go, and Bun on process startup, compute, allocation, string concatenation, canvas drawing, and HTTP throughput.">
+<meta property="og:url" content="https://festina.archtelos.com/benchmark.html">
+<meta property="og:image" content="https://festina.archtelos.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Benchmarks — Festina">
+<meta name="twitter:description" content="Festina vs. Rust, Go, and Bun on process startup, compute, allocation, string concatenation, canvas drawing, and HTTP throughput.">
+<meta name="twitter:image" content="https://festina.archtelos.com/og-image.png">
+<meta name="theme-color" content="#7c1f1b">
+<meta name="color-scheme" content="light">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,440;0,9..144,560;1,9..144,440&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="doc.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div style="display:flex; align-items:center; gap:8px;">
+    <button class="menu-btn" id="menuBtn" aria-label="Toggle navigation">☰ Menu</button>
+    <a class="brand" href="index.html"><span class="mark">f</span> Festina <span class="sep">/ Docs</span></a>
+  </div>
+  <div class="topbar-links">
+    <a class="hide-narrow" href="index.html#docs">All docs</a>
+    <a href="examples.html">Examples</a>
+    <a href="https://github.com/uraikus/festina">GitHub</a>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="backdrop"></div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <input class="search-box" id="navFilter" type="text" placeholder="Filter on this page…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <nav class="toc" id="toc">
+      <div class="nav-group">
+        <a href="#methodology">Methodology</a>
+        <a href="#results">Results</a>
+        <a href="#reading-these-numbers">Reading these numbers</a>
+        <a href="#canvas">Canvas vs HTML canvas / MonoGame</a>
+        <a href="#http-benchmark">HTTP vs Rust/Go/Bun</a>
+        <a class="sub" href="#http-reading-these-numbers">Reading these numbers</a>
+        <a href="#http-threaded">HTTP: single-threaded vs. pool</a>
+        <a class="sub" href="#http-threaded-reading">Reading these numbers</a>
+        <a href="#layered-canvas">Layered canvas: threads vs Worker</a>
+      </div>
+    </nav>
+  </aside>
+
+  <main>
+    <div class="content-wrap">
+      <p class="page-kicker">Benchmarks</p>
+      <h1 class="page-title">Festina vs. Rust, Go, and Bun</h1>
+      <p class="lede">
+        How Festina compares to Rust, Go, and Bun on a handful of
+        small, equivalent-logic programs, and to a browser's
+        <code>&lt;canvas&gt;</code> and MonoGame on 2D drawing. Not a
+        claim that Festina is faster than any of these languages in
+        general — a compiled language's real-world performance
+        depends heavily on what's actually being written and how
+        mature its optimizer/runtime is, and Festina's is young. This
+        exists to catch regressions and track progress over time, run
+        against the same few workloads on every change that plausibly
+        affects performance (codegen, runtime, or the standard
+        library), not as a marketing claim.
+      </p>
+      <p class="lede">
+        These same five programs are also benchmarked cross-compiled
+        to <code>wasm32-wasi</code> (against C and Go, also compiled
+        to wasm) — see <a href="wasm.html#benchmarks">wasm.md</a>.
+      </p>
+
+      <section class="doc-section" id="methodology">
+        <h2>Methodology <a class="anchor" href="#methodology">#</a></h2>
+        <p>
+          Five programs, each implemented equivalently in Festina,
+          Rust, Go, and Bun (source in
+          <a href="https://github.com/uraikus/festina/tree/main/benchmarks">benchmarks/</a>),
+          plus a sixth comparing Festina's canvas against a browser's
+          and MonoGame's — see <a href="#canvas">Canvas</a> at the
+          end:
+        </p>
+        <div class="table-wrap">
+          <table class="sig-table">
+            <tr><td>hello</td><td>Process startup + runtime init cost — compile, print one line, exit. Directly reflects <a href="security.html#slim-binaries">the binary-slimming work</a>: fewer dynamically linked libraries means less for the dynamic linker to resolve before <code>main()</code> even runs.</td></tr>
+            <tr><td>fib</td><td>Recursive function-call overhead and raw compute throughput — naive recursive <code>fib(32)</code> (no memoization), ~7 million calls. Deliberately not reducible to a closed form by an optimizer (unlike a linear sum), so this actually measures generated-code quality, not the compiler's algebra.</td></tr>
+            <tr><td>loop_sum</td><td>Tight-loop / branch-free arithmetic throughput — a 100,000,000-iteration polynomial-hash accumulation (<code>total = (total * 1000003 + i) % 1000000007</code>), each iteration depending on the last so it can't be folded into a closed-form constant either — a plain running-sum version of this loop optimizes away entirely, running in ~2ms regardless of iteration count.</td></tr>
+            <tr><td>array_sum</td><td>Allocation-heavy throughput — 2,000,000 iterations, each building a fresh 8-element <code>arr[int]</code> literal (never escaping, so Festina reclaims it at that iteration's own scope-exit — see <a href="todo.html#memory-model">todo.md</a>) and summing its elements into a running total. Directly exercises automatic memory management: every iteration is a genuine allocate-fill-read cycle, not just arithmetic. Each element's value depends on the <em>previous</em> iteration's own running total, the same closed-form-resistance trick <code>loop_sum</code> already uses. The hot loop lives inside a <code>void func run(...)</code>, not bare top-level code — escape analysis only ever analyzes a function/handler's own body, never the top-level statement sequence.</td></tr>
+            <tr><td>string_concat</td><td>String-heavy throughput — 15,000 iterations of repeated concatenation (<code>`${s}x`</code>/<code>s = s + "x"</code>), <code>s</code> growing by one character each time. Written as the textbook O(n²) naive-concatenation pattern; Festina now compiles that exact shape as an in-place append onto <code>s</code>'s own buffer (amortized O(1) each), so its row now measures that path rather than a quadratic copy.</td></tr>
+          </table>
+        </div>
+        <p class="muted">
+          Each language uses its own normal toolchain and optimization
+          settings (<code>festina program.f -o program</code>,
+          <code>rustc -O</code>, <code>go build</code>, <code>bun
+          run</code> — Bun has no separate build step, it's a JIT).
+          All four are checked to produce byte-identical stdout before
+          a run is trusted.
+        </p>
+        <p class="muted">
+          Every benchmark is timed with 1 untimed warmup run (page
+          cache, dynamic linker resolution, ...) followed by 7 timed
+          runs, keeping the <em>minimum</em> — the standard way to
+          reduce OS scheduling noise without pulling in a dedicated
+          benchmarking tool. Binary size is the compiled executable's
+          size on disk (n/a for Bun, which ships no separate binary).
+        </p>
+        <p class="muted">
+          Build time gets one untimed throwaway build per toolchain
+          before any timed one, for the same reason each program gets
+          an untimed warmup run — without it, the first benchmark in
+          the list would absorb the whole toolchain's own cold-start
+          cost and report a build time several times every other
+          program's own.
+        </p>
+        <p><strong>Reproduce locally:</strong></p>
+        <pre class="code"><span class="mut">$</span> python3 benchmarks/run_benchmarks.py               <span class="cm"># print results</span>
+<span class="mut">$</span> python3 benchmarks/run_benchmarks.py --update-doc   <span class="cm"># regenerate this file's table</span>
+
+<span class="mut">$</span> python3 benchmarks/canvas/run_canvas_benchmark.py             <span class="cm"># the canvas comparison</span>
+<span class="mut">$</span> python3 benchmarks/canvas/run_canvas_benchmark.py --update-doc
+
+<span class="cm"># The MonoGame side needs a .NET SDK and, on first run, network access</span>
+<span class="cm"># to restore its NuGet package; without either it is skipped with a note</span>
+<span class="cm"># rather than failing the run.</span>
+
+<span class="mut">$</span> python3 benchmarks/http/run_http_benchmarks.py                <span class="cm"># the HTTP server comparison</span>
+<span class="mut">$</span> python3 benchmarks/http/run_http_benchmarks.py --update-doc
+
+<span class="cm"># Needs `wrk` on PATH (not a project dependency -- apt/brew install wrk).</span></pre>
+        <p class="muted">
+          The runner skips any language toolchain not installed rather
+          than failing — see <a href="setup.html">setup.md</a> for
+          what each one needs.
+        </p>
+      </section>
+
+      <section class="doc-section" id="results">
+        <h2>Results <a class="anchor" href="#results">#</a></h2>
+        <p class="muted">Last run: 2026-09-03 on this machine — absolute numbers vary by hardware, relative ordering is the point.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>hello</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">1.6 ms</td><td class="num">80.0 ms</td><td class="num">1.49 MB</td></tr>
+              <tr><td>Rust</td><td class="num">1.9 ms</td><td class="num">97.8 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">1.3 ms</td><td class="num">189.2 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">12.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>fib(32)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">8.0 ms</td><td class="num">84.5 ms</td><td class="num">1.49 MB</td></tr>
+              <tr><td>Rust</td><td class="num">8.5 ms</td><td class="num">107.8 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">14.7 ms</td><td class="num">190.3 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">31.5 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>loop_sum (100M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">524.2 ms</td><td class="num">86.0 ms</td><td class="num">1.49 MB</td></tr>
+              <tr><td>Rust</td><td class="num">530.9 ms</td><td class="num">101.9 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">464.6 ms</td><td class="num">189.1 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">9109.4 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>array_sum (2M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">93.7 ms</td><td class="num">108.7 ms</td><td class="num">1.49 MB</td></tr>
+              <tr><td>Rust</td><td class="num">90.9 ms</td><td class="num">203.2 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">89.6 ms</td><td class="num">182.7 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">2456.0 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>string_concat (15K)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">1.9 ms</td><td class="num">84.5 ms</td><td class="num">1.49 MB</td></tr>
+              <tr><td>Rust</td><td class="num">1.7 ms</td><td class="num">123.8 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">38.9 ms</td><td class="num">181.5 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">14.2 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="doc-section" id="reading-these-numbers">
+        <h2>Reading these numbers <a class="anchor" href="#reading-these-numbers">#</a></h2>
+        <ul>
+          <li><strong><code>hello</code></strong> is dominated by process startup, not language performance — a graphics/audio-free Festina binary (see <a href="security.html#slim-binaries">security.md</a>) dynamically links only libc/libm (plus libz, a transitive dependency of the statically-linked sqlite3), the same ballpark as Go's or Rust's own small dynamic dependency lists here; a graphics- or audio-using Festina program would show up slower purely from the extra shared libraries the dynamic linker has to resolve at startup (<code>libcairo</code>/<code>libX11</code>/<code>libasound</code> and their own transitive dependencies).</li>
+          <li><strong><code>fib</code></strong> and <strong><code>loop_sum</code></strong> are closer to an apples-to-apples compiled-code comparison — Rust and Go both compile through mature, years-optimized backends (LLVM and Go's own <code>gc</code>, respectively); Festina also compiles through LLVM (see <a href="api.html#compilation-pipeline">api.md</a>) but is a much younger frontend with far less codegen-level tuning, so a gap here reflects the compiler's maturity, not a ceiling in the language design. Bun's JIT has to warm up during the run itself, which a single-shot benchmark like this doesn't isolate from the actual computation — a longer-running workload would tell a different story for Bun specifically.</li>
+          <li><strong><code>array_sum</code></strong> lands close to Rust/Go rather than behind them: the per-iteration <code>arr[int]</code> literal provably never escapes its own iteration, so Festina stack-allocates its header the same way a non-escaping struct local does, leaving only the growable data buffer's own <code>malloc</code> (a truly general growable buffer isn't safe to give a fixed-size <code>alloca</code>). The remaining, small gap is ordinary codegen-maturity noise, not an allocation-strategy gap.</li>
+          <li><strong><code>string_concat</code></strong> is where Festina's <code>text</code> ownership model shows up directly. A text binding's buffer is exclusively its own, so <code>s = `${s}x`</code> is an assignment that is about to free the very buffer it is copying from — and Festina's compiler now treats it as what it is: an append onto <code>s</code>'s own buffer, grown in place with a length the compiler tracks, amortized O(1) per step instead of a fresh copy of the whole string. That is the same idea Rust's <code>String</code> <code>+</code> uses (reusing the left operand's spare capacity, like <code>Vec</code>), which is why the two now land together; before this change Festina did the full O(n²) copy and sat about 2.4x behind Rust. Go's <code>+</code> on immutable strings has no spare capacity to grow into, which is why it does the quadratic copy; Bun's V8 backend uses rope/cons-string representations internally, deferring the copy until the string is actually read, which is why it avoids the blowup despite naive-looking source. None of this is a bug in any of the four — it's exactly the kind of language/runtime difference this benchmark exists to surface.</li>
+          <li><strong>The canvas comparison</strong> (below) is the one benchmark here that isn't against another <em>language</em>. It's against the thing a 2D game would otherwise most likely be written on: an HTML <code>&lt;canvas&gt;</code>. Circles dominate frame cost, because Cairo tessellates every arc afresh — Festina caches one alpha mask per radius and stamps it thereafter (the same trick a glyph cache uses), which is most of why the frame stays fast. Festina also wins startup by more than an order of magnitude and wins on variance, which for a frame budget is not a footnote.</li>
+          <li><strong>MonoGame</strong> joins the canvas comparison as a third side, and its number is the one on this page most likely to be quoted out of context. It is a GPU framework running here with no GPU, on Mesa's software rasterizer; on real hardware it would batch these 40,000 sprites into a couple of draw calls and beat everything else on this page by orders of magnitude. The row is worth having because headless rendering with no GPU is a real situation — CI, a build server, a container — and it is worth reading only with that sentence attached.</li>
+          <li>These five are intentionally small, fast benchmarks so they can be re-run on every change worth checking, not a comprehensive suite (no concurrency, no realistic mixed workload). I/O has its own section below — see <a href="#http-benchmark">HTTP</a>.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="canvas">
+        <h2>Canvas: Festina vs an HTML <code>&lt;canvas&gt;</code> vs MonoGame <a class="anchor" href="#canvas">#</a></h2>
+        <p class="muted">Last run: 2026-09-02 on this machine. Chromium 141.0.7390.37.</p>
+        <p>
+          20,000 filled rectangles and 20,000 filled circles, fill
+          colour changed between every shape, into an 800x600 surface.
+          Both sides draw <strong>offscreen</strong>, both time their
+          own draw loop with their own monotonic clock, and the
+          browser is forced to rasterize inside the timed region. All
+          three of those matter and all three are easy to get wrong —
+          see
+          <a href="https://github.com/uraikus/festina/blob/main/benchmarks/canvas/run_canvas_benchmark.py">run_canvas_benchmark.py</a>,
+          which documents what each one cost when it was measured the
+          other way.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Canvas</th><th class="num">Frame (min)</th><th class="num">Frame (median)</th><th class="num">First frame</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">7 ms</td><td class="num">8 ms</td><td class="num">21 ms</td></tr>
+              <tr><td>HTML &lt;canvas&gt; (Chromium/Skia)</td><td class="num">65 ms</td><td class="num">67 ms</td><td class="num">258 ms</td></tr>
+              <tr><td>MonoGame (software GL)</td><td class="num">172 ms</td><td class="num">188 ms</td><td class="num">162 ms</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          <strong>Read the MonoGame row with its caveat.</strong>
+          MonoGame is a GPU framework, and this machine has no GPU —
+          its GL context is Mesa's <code>llvmpipe</code>, a software
+          implementation of the whole graphics pipeline. It is
+          therefore paying in software for vertex transform,
+          rasterization setup and per-pixel texture sampling that real
+          hardware does for free. On an actual GPU these 40,000
+          sprites batch into a couple of draw calls and finish in well
+          under a millisecond — which no CPU rasterizer on this page
+          can approach. What this row measures is the headless, no-GPU
+          case (CI, a build server, a container), and nothing else.
+          It is also by far the noisiest row: <code>llvmpipe</code> is
+          multithreaded and so is far more exposed to whatever else
+          the machine is doing than single-threaded Cairo. Consecutive
+          runs of the same binary measured 173, 180, 193, 285 and 498
+          ms. The runner launches the process five times and keeps the
+          best, which lands near the floor most of the time — but
+          treat this number as "a few hundred milliseconds," not as a
+          figure precise to the millisecond the way the other two rows
+          are.
+        </div>
+        <p>On this workload <strong>Festina draws it 9.3x faster</strong>.</p>
+        <p class="muted">
+          That took two changes, and finding each took measuring rather
+          than guessing. The first version of this benchmark had
+          Festina 1.4x <strong>slower</strong>, and the obvious culprit
+          — a fresh Cairo context per draw call — turned out to account
+          for 4 ms of 90. Splitting the frame by shape type found the
+          real one immediately: 20,000 rectangles cost 10 ms and
+          20,000 circles cost 76 ms, because <code>cairo_arc</code> +
+          <code>cairo_fill</code> tessellates the curve into Beziers
+          and scan-converts a general polygon every single time.
+          Rasterizing each radius once into an alpha mask and stamping
+          it thereafter — what a glyph cache does — took circles to
+          20 ms and the frame from 90 ms to 31 ms (see
+          <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #104</a>),
+          leaving 11 ms of rectangles and 20 ms of circles.
+        </p>
+        <p class="muted">
+          The second change noticed that neither of those needs a
+          rasterizer at all. An opaque flat-colour rectangle at integer
+          coordinates covers whole pixels, so its result is the colour
+          written into each of them; an opaque circle's per-pixel
+          coverage is the same for every circle of that radius, so
+          Cairo rasterizes it once and the runtime blends it by hand
+          thereafter with pixman's own 8-bit arithmetic. Every such
+          call now writes straight into the ARGB32 pixels — no
+          context, path, compositor dispatch or pixman call per shape —
+          and the pixels are byte-identical to what Cairo's mask stamp
+          produced (verified by drawing the same scene both ways, not
+          by eye). That took 20,000 rectangles from 11 ms to 2 ms and
+          20,000 circles from 20 ms to 6 ms. Setting the fill colour
+          20,000 times is still too cheap to measure. Anything the
+          contract does not cover — a translucent fill, a gradient, a
+          border, a scaled or rotated canvas — still goes through
+          Cairo exactly as before.
+        </p>
+        <p class="muted">
+          Two things are worth reading alongside the headline. The
+          browser's frame time is far noisier — 65 ms at best against
+          a 67 ms median here, and the median moves by 20+ ms between
+          runs of this same script, while Festina's two numbers (7
+          and 8 ms) sit on top of each other. For a frame budget,
+          predictability is not a footnote. And getting to the
+          <em>first</em> frame differs by more than an order of
+          magnitude in the same direction, because one side starts a
+          process and the other starts a browser.
+        </p>
+        <p class="muted">
+          Both outputs were compared cell-by-cell over a 16x16 grid to
+          confirm they drew the same scene — worst per-channel
+          difference 0.2 out of 255. Not byte-for-byte: Cairo and Skia
+          disagree about antialiasing on every curve, and demanding
+          identical bytes would only prove the two rasterizers are the
+          same program. The check has earned itself twice now: once
+          catching a bug in this very script that left one side
+          comparing a blank canvas, and again catching itself comparing
+          raw RGB without accounting for alpha — Festina's own offscreen
+          canvas starts transparent (<a href="api.html#gradients-and-transparency">api.md's
+          own "a fresh or cleared canvas is transparent, not
+          white"</a>), so a background pixel neither side actually drew
+          on read as black here against the browser harness's own
+          opaque white fill, which the comparison mistook for a real
+          rendering difference until it started compositing both sides
+          onto the same white background first.
+        </p>
+      </section>
+
+      <section class="doc-section" id="http-benchmark">
+        <h2>HTTP: Festina vs Rust vs Go vs Bun <a class="anchor" href="#http-benchmark">#</a></h2>
+        <p>
+          Four servers (source in
+          <a href="https://github.com/uraikus/festina/tree/main/benchmarks/http">benchmarks/http/</a>),
+          each answering the same two routes — <code>/</code> (a fixed
+          plaintext body) and <code>/json</code> (a small JSON body) —
+          load-tested with
+          <a href="https://github.com/wg/wrk">wrk</a> (not a project
+          dependency; installed separately, <code>apt install
+          wrk</code>/<code>brew install wrk</code>).
+        </p>
+        <p>
+          <strong>Equivalent logic, not equivalent idiom, the same
+          rule the five programs above already follow.</strong>
+          Festina's HTTP server (<code>festina_runtime_http.c</code>)
+          is deliberately single-threaded (one connection serviced at
+          a time). Rust's and Go's servers here are hand-rolled
+          raw-socket implementations with a single-threaded,
+          sequential accept loop — not <code>hyper</code>/<code>net/http</code>'s
+          own default (multi-threaded) servers, which would be
+          measuring a mature framework's concurrency model against
+          Festina's single-threaded one rather than the same
+          connection-handling logic in four languages. Bun is the one
+          exception: it uses <code>Bun.serve()</code>, its own native
+          HTTP implementation, since there is no reason to hand-roll
+          sockets in a runtime that ships a fast one already (the same
+          "each language uses its own normal toolchain" rule the
+          Methodology above states).
+        </p>
+        <p class="muted">
+          <strong>Every response closes the connection, matched
+          uniformly across all four servers.</strong> Rust's and Go's
+          raw-socket servers close by default; Bun's server sets
+          <code>Connection: close</code> explicitly, to opt out of its
+          own native keep-alive (which none of the raw-socket
+          languages here have an equivalent of). Festina supports
+          HTTP/1.1 keep-alive by default (see
+          <a href="api.html#http-keep-alive">Keep-alive</a>), so the
+          load generator itself sends the fix:
+          <code>run_http_benchmarks.py</code>'s own <code>wrk</code>
+          invocation sends an explicit <code>Connection: close</code>
+          request header uniformly against all four servers —
+          Rust/Go/Bun ignore it (they already always close), and
+          Festina's own documented behavior (an explicit client
+          <code>Connection: close</code> always forces it off,
+          per-request) makes it close too. This keeps the comparison
+          to exactly connection-accept + parse + respond, for all four
+          languages at once, with no per-language server code needed
+          to special-case it.
+        </p>
+        <p class="muted">
+          Each <code>wrk</code> run: 4 threads, 50 open connections, 5
+          seconds, against one route at a time (a JIT-inclined runtime
+          like Bun gets no separate warmup here — <code>wrk</code>'s
+          own 5-second window includes whatever warmup happens inside
+          it, the same "the timed window is the real number" approach
+          as the process-startup benchmarks above, since a resident
+          server process outlives any of them anyway).
+        </p>
+        <p><strong>Reproduce locally:</strong></p>
+        <pre class="code"><span class="mut">$</span> python3 benchmarks/http/run_http_benchmarks.py
+<span class="mut">$</span> python3 benchmarks/http/run_http_benchmarks.py --update-doc
+<span class="mut">$</span> python3 benchmarks/http/run_http_benchmarks.py --duration 10s --connections 100 --threads 8</pre>
+        <p class="muted">Last run: 2026-09-01 on this machine, <code>wrk -t4 -c50 -d5s</code> per route.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>plaintext (/)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">31,264</td><td class="num">1.46 ms</td><td class="num">3.04 MB/s</td></tr>
+              <tr><td>Rust</td><td class="num">47,327</td><td class="num">0.88 ms</td><td class="num">4.38 MB/s</td></tr>
+              <tr><td>Go</td><td class="num">26,873</td><td class="num">1.68 ms</td><td class="num">2.49 MB/s</td></tr>
+              <tr><td>Bun</td><td class="num">26,618</td><td class="num">1.73 ms</td><td class="num">3.40 MB/s</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>json (/json)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">31,353</td><td class="num">1.47 ms</td><td class="num">3.65 MB/s</td></tr>
+              <tr><td>Rust</td><td class="num">45,013</td><td class="num">0.93 ms</td><td class="num">5.02 MB/s</td></tr>
+              <tr><td>Go</td><td class="num">24,138</td><td class="num">1.87 ms</td><td class="num">2.69 MB/s</td></tr>
+              <tr><td>Bun</td><td class="num">26,725</td><td class="num">1.75 ms</td><td class="num">3.92 MB/s</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="http-reading-these-numbers">Reading these numbers <a class="anchor" href="#http-reading-these-numbers">#</a></h3>
+        <ul>
+          <li><strong><code>festina_http_send</code> coalesces the status line and headers into a single buffered <code>send()</code> call</strong>, rather than writing each piece separately — this matters with <code>TCP_NODELAY</code> set (Nagle's algorithm disabled for low latency), since each separate call would otherwise become its own TCP segment. Festina clears Go on both routes and lands right around Bun's own number, with Rust's raw-socket implementation ahead of all three.</li>
+          <li>This measures connection-accept + request-parse + respond throughput under load from one client machine talking to one server process on the same machine (no network hop, no TLS) — not a claim about production capacity, the same disclaimer every other benchmark on this page already carries.</li>
+          <li><strong><code>/json</code></strong> exercises more than <code>/</code>: Festina's route builds a struct and renders it through the same JSON-via-<code>.toText()</code> path every other container response already uses, not a hand-built string the way <code>/</code> sends one — so a gap between the two routes for Festina specifically reflects that serialization cost, not connection handling.</li>
+          <li>Rust's and Go's numbers here are <em>not</em> what those languages' idiomatic HTTP stacks would report — seeing "Rust is only Nx faster than Festina at HTTP" from this section should be read as "at matching, single-threaded connection handling," not as a claim about <code>hyper</code>/<code>axum</code> or <code>net/http</code> in general, which support keep-alive by default too but add a multi-threaded accept loop and years of tuning this comparison deliberately holds constant.</li>
+          <li>No WebSocket throughput benchmark exists yet — <code>on message</code> traffic has a very different shape (persistent connections, small frequent frames) from a request/response load test, and would need its own methodology rather than reusing <code>wrk</code>'s HTTP-request model.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="http-threaded">
+        <h2>HTTP: single-threaded vs. thread pool <a class="anchor" href="#http-threaded">#</a></h2>
+        <p>
+          The section above measures Festina's single HTTP event loop
+          against other languages' own single-threaded raw-socket
+          servers — a deliberately fair, apples-to-apples comparison.
+          This section instead compares Festina against
+          <strong>itself</strong>: what a
+          <code>thread pool[N] { on request(req:http) { ... } }</code>
+          (a <a href="api.html#thread-http">private per-thread HTTP
+          context</a>) plus <a href="api.html#thread-giverequest"><code>NAME.giveRequest(r)</code></a>
+          actually buys a program that does real CPU-bound work per
+          request, the pattern
+          <a href="https://github.com/uraikus/festina/blob/main/examples/threaded_http_server.f"><code>examples/threaded_http_server.f</code></a>
+          demonstrates.
+        </p>
+        <p>
+          Two servers (source in
+          <a href="https://github.com/uraikus/festina/tree/main/benchmarks/http_threaded">benchmarks/http_threaded/</a>),
+          both answering the same two routes — <code>/</code> (no work,
+          a control) and <code>/slow</code> (a
+          closed-form-resistant polynomial-hash loop, the same
+          technique <code>loop_sum.f</code> above uses, tuned to
+          ~2,000,000 iterations so a single request takes a few
+          milliseconds of real CPU time):
+        </p>
+        <ul>
+          <li><strong>single-threaded</strong> (<code>server_single.f</code>) does <code>/slow</code>'s own work directly in the one top-level <code>on request</code> handler, on Festina's single HTTP event-loop thread — every concurrent <code>/slow</code> request queues up behind whichever one is currently computing.</li>
+          <li><strong>thread pool[N]</strong> (<code>server_pool.f</code>, <code>N</code> = this machine's own CPU count by default) hands every <code>/slow</code> request off to the next of <code>N</code> worker threads via <code>giveRequest</code>, so up to <code>N</code> requests are genuinely computed in parallel, on <code>N</code> different CPU cores, before any of them respond. <code>/</code> is answered directly by main in both servers, unchanged — it's included to confirm the pool's own round-robin dispatch adds no meaningful overhead to a request that never needed handing off in the first place.</li>
+        </ul>
+        <p class="muted">
+          Each <code>wrk</code> run: 4 threads, 50 open connections, 5
+          seconds, against one route at a time — otherwise the
+          identical methodology the section above already uses (no
+          explicit <code>Connection: close</code> forcing here, since
+          both servers are the same language/runtime with the same
+          keep-alive behavior; there's no cross-language asymmetry to
+          correct for). Reproduce locally:
+        </p>
+        <pre class="code"><span class="mut">$</span> python3 benchmarks/http_threaded/run_http_threaded_benchmark.py
+<span class="mut">$</span> python3 benchmarks/http_threaded/run_http_threaded_benchmark.py --update-doc
+<span class="mut">$</span> python3 benchmarks/http_threaded/run_http_threaded_benchmark.py --pool-size 8 --duration 10s</pre>
+
+        <p class="muted">Last run: 2026-09-01 on this machine (4 CPUs), <code>wrk -t4 -c50 -d5s</code> per route, pool size 4.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>no work, control (/)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr></thead>
+            <tbody>
+              <tr><td>single-threaded</td><td class="num">74,673</td><td class="num">0.66 ms</td><td class="num">8.19 MB/s</td></tr>
+              <tr class="row-festina"><td>thread pool[4]</td><td class="num">49,093</td><td class="num">1.03 ms</td><td class="num">5.38 MB/s</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>CPU-bound work (/slow)</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Transfer/sec</th></tr></thead>
+            <tbody>
+              <tr><td>single-threaded</td><td class="num">92</td><td class="num">491.28 ms</td><td class="num">0.01 MB/s</td></tr>
+              <tr class="row-festina"><td>thread pool[4]</td><td class="num">256</td><td class="num">185.33 ms</td><td class="num">0.03 MB/s</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><code>/slow</code> speedup from the pool: <strong>2.77x</strong> (pool size 4, this machine has 4 CPUs).</p>
+
+        <h3 id="http-threaded-reading">Reading these numbers <a class="anchor" href="#http-threaded-reading">#</a></h3>
+        <ul>
+          <li><strong><code>/</code> (no work) should perform about the same on both servers</strong> — neither variant's own connection-accept/parse/respond path changed at all; only whether <code>/slow</code>'s own CPU-bound work is serialized or parallelized did. A meaningful gap here would mean the pool's own round-robin dispatch itself is expensive, not that the pool is "working" — it shouldn't be, since <code>/</code> never goes through <code>giveRequest</code> in either server.</li>
+          <li><strong><code>/slow</code>'s own speedup is bounded by real CPU core count, not <code>N</code></strong> — a pool bigger than the machine's own core count just adds contention, not more genuine parallelism; <code>--pool-size</code> defaults to <code>os.cpu_count()</code> for exactly this reason.</li>
+          <li><strong>Every handed-off request pays a small, real hand-off latency</strong> — a receive-only worker thread's own combined loop polls on a bounded timeout (<code>FESTINA_THREAD_HTTP_POLL_MS</code>, 20ms) rather than waking instantly the way a dedicated OS thread blocked on <code>accept()</code> would, so under <em>low</em> concurrency (one request at a time, nothing else queued) a handed-off request can be slightly <em>slower</em> end-to-end than the single-threaded baseline answering it directly — the pool's own advantage only shows up once there's more concurrent CPU-bound work than one thread can get through serially, which is exactly what these numbers measure.</li>
+          <li>This is a same-machine, same-process-family comparison (no network hop) measuring exactly one thing — how much a real, additional workload on the SAME hardware benefits from being spread across more than one of Festina's own execution threads — not a general claim about optimal pool sizing for a production workload, which depends heavily on how CPU-bound (vs. I/O-bound) the real work actually is.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="layered-canvas">
+        <h2>Layered canvas: multi-threaded Festina vs a browser's Worker + OffscreenCanvas <a class="anchor" href="#layered-canvas">#</a></h2>
+        <p class="muted">Last run: 2026-09-03 on this machine (4 logical CPUs). Chromium 141.0.7390.37.</p>
+        <p>
+          Four independent layers — a sparse sky, a band of hill
+          texture, a band of ground texture, and a full-canvas
+          foreground particle scatter — 40,000 draw calls total into an
+          800x600 surface, the same order of magnitude as the
+          single-threaded canvas benchmark's own 40,000 above. Both
+          multi-threaded runs hand each layer to its own worker (a real
+          OS thread on the Festina side, a real Worker on the browser
+          side) and get it back with <strong>no per-pixel copy across
+          the boundary</strong> — an <code>img?</code>
+          (<a href="api.html#t-manually-managed-values">api.md</a>)
+          shares its reference across <code>postMessage</code> instead
+          of cloning it, and a Worker's
+          <code>transferToImageBitmap()</code> is a genuine ownership
+          transfer, not a copy. Compositing the finished layers onto
+          one final surface IS a real per-pixel blend on both sides
+          (the canvas <code>drawImage()</code> on each, which takes an
+          <code>img?</code> layer directly on the Festina side) and
+          both runs time it, not just the parallel drawing — see
+          <a href="https://github.com/uraikus/festina/blob/main/benchmarks/layered_canvas/run_layered_canvas_benchmark.py">run_layered_canvas_benchmark.py</a>
+          for the rest of what makes this comparison fair, the same
+          three rules the canvas benchmark's own runner already
+          established.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Layered canvas</th><th class="num">Single-threaded</th><th class="num">4 threads/Workers</th><th class="num">Speedup</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina (img?)</td><td class="num">11 ms (median 11 ms)</td><td class="num">6 ms (median 6 ms)</td><td class="num">1.83x</td></tr>
+              <tr><td>Browser (Skia, OffscreenCanvas)</td><td class="num">73 ms (median 80 ms)</td><td class="num">56 ms (median 57 ms)</td><td class="num">1.30x</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>On this workload, both multi-threaded, <strong>Festina's threads draw it 9.4x faster</strong>.</p>
+        <p class="muted">
+          Two outputs were checked, not one. Festina's multi-threaded
+          run was compared against its OWN single-threaded run
+          <strong>byte-for-byte</strong> — Cairo is deterministic, so
+          any difference at all would mean four threads racing to
+          paint four different <code>img?</code> buffers corrupted
+          something; there wasn't one. Festina's multi-threaded output
+          was then compared against the browser's, over the same
+          tolerant 16x16 grid the canvas benchmark's own runner uses
+          (Cairo and Skia disagree about antialiasing on every circle,
+          so exact bytes would only prove the two rasterizers are the
+          same program) — same scene both times.
+        </p>
+        <p class="muted">
+          Read the speedup column with the workload's own shape in
+          mind. The four layers are NOT equal-sized
+          (8,000/9,000/11,000/12,000 draws), so four threads finish in
+          roughly however long the heaviest layer takes, not in a
+          quarter of the single-threaded time — this measures what
+          four genuinely independent, unevenly-loaded workers buy on
+          real hardware, not an idealized 4x. And on the Festina side
+          the parallel part is now small: after the direct-fill
+          optimization above the 40,000 draw calls take about 4 ms on
+          one thread, so the serial work both runs share — clearing
+          the canvas and compositing four full-surface layers onto it
+          — is a real fraction of either number, and no amount of
+          threading touches it. (Before <code>drawImage()</code>
+          accepted an <code>img?</code> source directly, each layer
+          also had to be <code>clip()</code>-copied into a plain
+          <code>img</code> first — four 1.92 MB copies per frame, as
+          much time as all the drawing.)
+        </p>
+        <p class="muted">
+          When this benchmark was first written, Festina drew it in
+          84 ms single-threaded and 62 ms with four threads, and the
+          browser's Workers were 1.2x faster than Festina's threads.
+          Measuring where those 62 ms went found two things. Circles
+          onto an <code>img</code> were tessellated by Cairo on every
+          call, 32–40 ms per layer; they are now stamped from a cached
+          per-radius coverage mask, blended directly into the pixels,
+          and byte-identical. And the four threads were not running in
+          parallel at all: each painted a freshly allocated 1.92 MB
+          surface, and the page faults that materialize fresh memory
+          on first touch serialize across threads inside one process,
+          so four threads' worth of faults took four threads' worth of
+          time — every layer finished in the 11–12 ms a single thread
+          needed for all four. Surfaces are now faulted in when
+          created (one <code>madvise</code> on Linux), which took the
+          four-thread draw from 12 ms to 3.4 ms in an isolated
+          reproduction and is what the table above reflects.
+        </p>
+      </section>
+
+      <div class="prevnext">
+        <a class="prev" href="security.html">
+          <span class="label">← Previous</span>
+          Security
+        </a>
+        <a class="next" href="todo.html">
+          <span class="label">Next →</span>
+          Roadmap
+        </a>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="doc.js"></script>
+
+
+</body>
+</html>
