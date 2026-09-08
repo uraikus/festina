@@ -97,28 +97,31 @@
         </p>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Language</th><th class="num">Speed</th><th class="num">Binary size</th><th class="num">Code size</th></tr></thead>
+            <thead><tr><th>Language</th><th class="num">Speed<br><span style="font-weight:400; opacity:0.65; font-size:0.8em;">(bigger is better)</span></th><th class="num">Binary size<br><span style="font-weight:400; opacity:0.65; font-size:0.8em;">(smaller is better)</span></th><th class="num">Code size<br><span style="font-weight:400; opacity:0.65; font-size:0.8em;">(smaller is better)</span></th></tr></thead>
             <tbody>
-              <tr><td>Festina</td><td class="num">175%</td><td class="num">5%</td><td class="num">91%</td></tr>
-              <tr><td>Rust</td><td class="num">42%</td><td class="num">12%</td><td class="num">123%</td></tr>
-              <tr><td>Go</td><td class="num">95%</td><td class="num">24%</td><td class="num">108%</td></tr>
-              <tr><td>Bun</td><td class="num">88%</td><td class="num">359%</td><td class="num">79%</td></tr>
+              <tr><td>Festina</td><td class="num">105%</td><td class="num">5%</td><td class="num">90%</td></tr>
+              <tr><td>Rust</td><td class="num">71%</td><td class="num">12%</td><td class="num">123%</td></tr>
+              <tr><td>Go</td><td class="num">105%</td><td class="num">24%</td><td class="num">108%</td></tr>
+              <tr><td>Bun</td><td class="num">119%</td><td class="num">359%</td><td class="num">79%</td></tr>
             </tbody>
           </table>
         </div>
         <p class="muted">
-          Read the direction of "better" per column: for
-          <strong>Speed</strong>, above 100% means faster than the
-          four-language average; for <strong>Binary size</strong> and
-          <strong>Code size</strong>, <em>below</em> 100% means smaller
-          — a language that were exactly average on every benchmark
-          would show 100% in every cell. Festina's 175% speed average
-          is almost entirely one outlier (14.5x on the SQLite example —
-          see <a href="#sqlite-over-websocket-benchmark">that
-          section</a> for why); Bun's 359% binary size is
-          <code>bun build --compile</code> embedding its entire runtime
-          into every standalone binary (see
-          <a href="#weather-desktop-app-benchmark">below</a>); no
+          Read the direction of "better" per column (also marked in
+          each header above): for <strong>Speed</strong>, above 100%
+          means faster than the four-language average; for
+          <strong>Binary size</strong> and <strong>Code size</strong>,
+          <em>below</em> 100% means smaller — a language that were
+          exactly average on every benchmark would show 100% in every
+          cell. All four SQLite implementations here use the identical
+          <code>PRAGMA journal_mode=WAL</code>/<code>synchronous=NORMAL</code>
+          settings Festina defaults to (see
+          <a href="#sqlite-over-websocket-benchmark">that section</a>) —
+          without that, the comparison would mostly be measuring who
+          remembered to set two pragmas, not the languages themselves.
+          Bun's 359% binary size is <code>bun build --compile</code>
+          embedding its entire runtime into every standalone binary
+          (see <a href="#weather-desktop-app-benchmark">below</a>); no
           language is a clean sweep on code size, each lands within
           about a quarter of the four-way average in either direction.
           See each section below for the actual measurements these
@@ -341,30 +344,37 @@ openPort(<span class="num">9090</span>)
           <table>
             <thead><tr><th>SQLite over WebSocket</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Binary size</th><th class="num">Lines</th></tr></thead>
             <tbody>
-              <tr><td>Festina</td><td class="num">10,772</td><td class="num">1.84 ms</td><td class="num">1.6 MB</td><td class="num">33</td></tr>
-              <tr><td>Go (<code>nhooyr.io/websocket</code> + <code>modernc.org/sqlite</code>)</td><td class="num">735</td><td class="num">26.96 ms</td><td class="num">10.2 MB</td><td class="num">67</td></tr>
-              <tr><td>Rust (<code>axum</code> + <code>rusqlite</code>)</td><td class="num">698</td><td class="num">28.36 ms</td><td class="num">3.5 MB</td><td class="num">77</td></tr>
-              <tr><td>Bun (<code>Bun.serve</code> + <code>bun:sqlite</code>, both built in)</td><td class="num">795</td><td class="num">24.89 ms</td><td class="num">99.3 MB</td><td class="num">30</td></tr>
+              <tr><td>Festina</td><td class="num">21,934</td><td class="num">0.91 ms</td><td class="num">1.6 MB</td><td class="num">33</td></tr>
+              <tr><td>Go (<code>nhooyr.io/websocket</code> + <code>modernc.org/sqlite</code>)</td><td class="num">9,914</td><td class="num">2.01 ms</td><td class="num">10.2 MB</td><td class="num">69</td></tr>
+              <tr><td>Rust (<code>axum</code> + <code>rusqlite</code>)</td><td class="num">19,660</td><td class="num">1.01 ms</td><td class="num">3.5 MB</td><td class="num">79</td></tr>
+              <tr><td>Bun (<code>Bun.serve</code> + <code>bun:sqlite</code>, both built in)</td><td class="num">21,089</td><td class="num">0.94 ms</td><td class="num">99.3 MB</td><td class="num">32</td></tr>
             </tbody>
           </table>
         </div>
         <p class="muted">
-          <strong>This gap is a default-configuration difference, not
-          a language one.</strong> Every <code>sqlite()</code> database
-          in Festina opens in WAL mode with <code>synchronous=NORMAL</code>
-          automatically (see
+          <strong>All four use the identical <code>PRAGMA
+          journal_mode=WAL</code>/<code>synchronous=NORMAL</code>
+          settings.</strong> Every <code>sqlite()</code> database in
+          Festina opens this way automatically (see
           <a href="api.html#query-performance">api.md's "Query
           performance"</a> — measured there at 20,000 inserts dropping
-          from 16.7s to 0.3s from this exact change). None of the three
-          competitor libraries above default to it: each one insert-then-
-          fsyncs on SQLite's own out-of-the-box rollback-journal
-          settings, which is what caps all three within a fairly narrow
-          band around 700-800 req/s here regardless of language —
-          adding the same two <code>PRAGMA</code> statements to any of
-          them would close most of this gap. Bun's built-in
-          <code>bun:sqlite</code> needs no separate crate/package at
-          all, which is why it's the shortest of the three competitors
-          despite doing the same work as the other two.
+          from 16.7s to 0.3s from this exact change); none of the three
+          competitor libraries default to it, so the same two
+          <code>PRAGMA</code> statements were added to each of their
+          setup code by hand for this comparison — without them, this
+          table would mostly be measuring who remembered to set two
+          pragmas, not the languages themselves. With that controlled
+          for, three of the four land within about 10% of each other
+          (Festina, Rust, and Bun all comfortably clear 19,000 req/s);
+          Go is the outlier here, and not because of WAL — its
+          <code>database/sql</code> driver overhead plus
+          <code>modernc.org/sqlite</code> being a pure-Go
+          reimplementation of SQLite (no C library, no cgo, which is
+          exactly why it's easy to cross-compile with) trades raw speed
+          for that convenience. Bun's built-in <code>bun:sqlite</code>
+          needs no separate package at all, which is why it's the
+          shortest of the three competitors despite doing the same work
+          as the other two.
         </p>
       </section>
 
