@@ -126,6 +126,12 @@
           <li><strong><code>pool.giveRequest(r)</code> — no index — same auto-selection as <code>postMessage</code>.</strong> Hands the live connection to whichever instance is idle right now, falling back to round-robin, exactly like bare <code>postMessage</code> above.</li>
           <li><strong><code>on request use NAME</code>.</strong> Sugar for <code>on request(req:http?) { NAME.giveRequest(req) }</code> — <code>NAME</code> can be a singleton thread or a pool (in which case the bare, auto-selecting <code>giveRequest</code> above applies). Desugars entirely at parse time; <code>use</code> is not a reserved word anywhere else. Every other pool method still requires an index.</li>
           <li><strong><code>drawImage</code> accepts an <code>img?</code> source.</strong> Every form of the canvas <code>drawImage(...)</code> and of <code>img.drawImage(...)</code> takes a manually-managed <code>img?</code> where it says <code>img</code> — compositing only reads the source for the duration of the call and keeps no reference, so nothing changes hands. A layer painted by a worker thread can now be drawn straight onto the canvas with no <code>clip()</code> copy first. This is the one read-only exception to <code>T?</code> being a distinct type; assignment and every other call site are unchanged.</li>
+          <li><strong><code>req.send()</code> reuses a keep-alive connection to the same host:port</strong> instead of opening a fresh one every call (plain <code>http://</code>, POSIX only). One small connection cache per OS thread, no locking needed; entirely transparent otherwise, including a dead reused connection being silently replaced rather than surfaced as a request failure.</li>
+        </ul>
+
+        <h3>Fixed</h3>
+        <ul class="changes">
+          <li><strong>A copied <code>headers</code> map no longer duplicates <code>Host</code>/<code>Content-Length</code>/<code>Connection</code>/<code>Transfer-Encoding</code> on the wire.</strong> These four are always computed by this runtime itself; forwarding a real request's own <code>req.headers</code> into an outbound request, or a real response's own <code>headers</code> back out (<code>res.headers = upstream.headers</code> — a reverse proxy's most natural shape), used to append the caller's copy on top of the runtime's own, producing the same header name twice. A strict server (Go's <code>net/http</code>) hard-rejects a request with two <code>Host</code> lines outright.</li>
         </ul>
 
         <h3>Changed</h3>

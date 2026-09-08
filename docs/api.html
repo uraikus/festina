@@ -2861,6 +2861,50 @@ log(req.toText())</pre>
           about the zero-argument form is "used up" after the first
           call.
         </p>
+        <p>
+          <strong><code>Host</code>/<code>Content-Length</code>/<code>Connection</code>/<code>Transfer-Encoding</code>
+          in <code>headers</code> are always yours, never the
+          wire's.</strong> These four are always computed by this
+          runtime itself — <code>Host</code> from <code>req.url</code>'s
+          own hostname, <code>Content-Length</code> from the real body
+          length, <code>Connection</code>/<code>Transfer-Encoding</code>
+          from this runtime's own framing — so a value of any of the
+          four sitting in <code>headers</code> (however it got there —
+          a literal map, or <code>req.headers</code>/a response's own
+          <code>headers</code> copied straight in, a reverse proxy's
+          most natural shape) is simply never written to the wire; only
+          this runtime's own value is. This matters most exactly where
+          it's easiest to trip over: forwarding a REAL request's own
+          <code>req.headers</code> into an outbound one
+          (<code>'headers': req.headers</code>) already carries the
+          ORIGINAL <code>Host</code>, and forwarding a REAL response's
+          own <code>headers</code> back out
+          (<code>res.headers = upstream.headers</code>) already carries
+          its <code>Content-Length</code>/<code>Connection</code> —
+          sending those through unfiltered used to produce a request or
+          response with the SAME header name twice, which a strict
+          server (Go's <code>net/http</code>, which hard-rejects a
+          request with two <code>Host</code> lines) refuses outright.
+        </p>
+        <p class="muted">
+          <strong>Same-host requests reuse a connection instead of
+          opening a fresh one every time</strong> (plain
+          <code>http://</code>, POSIX only — an <code>https://</code>
+          request and any request on Windows still opens fresh every
+          call, a documented, narrower-scoped v1). One small connection
+          cache per OS thread (no locking needed: nothing else on this
+          runtime's own thread-isolation model ever touches another
+          thread's own outbound connections), so a loop of
+          <code>req.send()</code> calls to the same host:port — the
+          exact shape a reverse proxy's own upstream calls take — pays
+          a real TCP handshake only on the first call, not on every
+          one. Entirely transparent: <code>req.send()</code>'s own
+          behavior and return value are unaffected either way, and a
+          connection that's died while sitting idle (the peer closed
+          it, a hard network error) is detected and silently replaced
+          with a fresh one, never surfaced as a failure of the request
+          that happened to find it stale.
+        </p>
 
         <h3 id="non-blocking-requests">Non-blocking requests: callback <a class="anchor" href="#non-blocking-requests">#</a></h3>
         <p>
