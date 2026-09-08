@@ -92,8 +92,8 @@
         </p>
         <div class="table-wrap">
           <table class="sig-table">
-            <tr><td>Throughput</td><td><strong>~2.0x</strong> the Go/Rust/Bun average (geometric mean — see <a href="#benchmark-methodology">Benchmark methodology</a> for why a geometric, not arithmetic, mean) — but this varies enormously by workload: <strong>14.5x</strong> ahead on the SQLite example (a default-configuration difference, not a language one — see <a href="#sqlite-over-websocket-benchmark">that section</a>), <strong>1.2x</strong> ahead on the CPU/image-bound CAPTCHA endpoint, and <strong>0.45x</strong> (i.e. behind) on the plain reverse proxy, where Festina's deliberately single-threaded HTTP server is outrun by Go's and Bun's multi-threaded/event-loop runtimes.</td></tr>
-            <tr><td>Code length</td><td>About <strong>24% shorter</strong> on average than the mean of the same three Go/Rust/Bun programs (97 total lines for Festina vs. a 133-line competitor average) — see each section below for the exact counts.</td></tr>
+            <tr><td>Throughput</td><td><strong>~2.3x</strong> the Go/Rust/Bun average (geometric mean — see <a href="#benchmark-methodology">Benchmark methodology</a> for why a geometric, not arithmetic, mean) — but this varies enormously by workload: <strong>14.5x</strong> ahead on the SQLite example (a default-configuration difference, not a language one — see <a href="#sqlite-over-websocket-benchmark">that section</a>), <strong>1.2x</strong> ahead on the CPU/image-bound CAPTCHA endpoint, and <strong>0.66x</strong> (i.e. still behind, though closer than a single-threaded version got) on the reverse proxy, using the <a href="#reverse-proxy">multi-threaded version</a> below.</td></tr>
+            <tr><td>Code length</td><td>Roughly a wash — averaging the three examples' own percentage differences puts Festina at about <strong>1% longer</strong> than the Go/Rust/Bun mean, not shorter. One large win (43% shorter on the SQLite example) is offset by one large loss (the multi-threaded proxy is the longest of the four here, not the shortest — see <a href="#reverse-proxy-benchmark">that section</a>); the two don't net out the same way if compared by raw total lines instead of by percentage per example — see each section below for the exact counts.</td></tr>
           </table>
         </div>
         <p class="muted">
@@ -146,31 +146,52 @@
           <a href="api.html#http-type"><code>http</code> value</a>
           on both ends, so forwarding one request into another is just
           building a second <code>http</code> literal from the first
-          and sending it on:
+          and sending it on. A single <code>on request</code> handler
+          services one connection at a time (see
+          <a href="benchmark.html#http-benchmark">benchmark.md</a>),
+          and every request here blocks on its own outbound call to
+          the upstream — so this version spreads that wait across a
+          <a href="api.html#thread-pools">pool</a> of worker threads
+          instead, each with its own private
+          <a href="api.html#thread-http">HTTP
+          context</a>, fed by <code>main</code> handing off every
+          accepted connection with
+          <a href="api.html#thread-giverequest"><code>giveRequest</code></a>:
         </p>
-        <pre class="code"><span class="kw">text</span> UPSTREAM = <span class="str">'http://127.0.0.1:9000'</span>
+        <pre class="code"><span class="kw">int</span> WORKER_COUNT = <span class="num">4</span>
 
-openPort(<span class="num">8080</span>)
+<span class="kw">thread</span> workers[<span class="num">4</span>] {
+    <span class="kw">text</span> UPSTREAM = <span class="str">'http://127.0.0.1:9000'</span>
 
-<span class="kw">on</span> request(req:http) {
-    <span class="kw">url</span> u = parseURL(req.url)
-    <span class="kw">http</span> upstream = {
-        <span class="str">'url'</span>: <span class="str">`${UPSTREAM}${u.pathname}`</span>,
-        <span class="str">'method'</span>: req.method,
-        <span class="str">'headers'</span>: req.headers,
-        <span class="str">'body'</span>: req.toBlob()
+    <span class="kw">on</span> request(req:http) {
+        <span class="kw">url</span> u = parseURL(req.url)
+        <span class="kw">http</span> upstream = {
+            <span class="str">'url'</span>: <span class="str">`${UPSTREAM}${u.pathname}`</span>,
+            <span class="str">'method'</span>: req.method,
+            <span class="str">'headers'</span>: req.headers,
+            <span class="str">'body'</span>: req.toBlob()
+        }
+        <span class="kw">try</span> {
+            upstream.send()
+            req.send({
+                <span class="str">'code'</span>: upstream.code,
+                <span class="str">'headers'</span>: upstream.headers,
+                <span class="str">'body'</span>: upstream.toBlob()
+            })
+        } <span class="kw">catch</span> (error:<span class="kw">text</span>) {
+            req.send({<span class="str">'code'</span>: <span class="num">502</span>, <span class="str">'body'</span>: <span class="str">`bad gateway: ${error}`</span>})
+        }
     }
-    <span class="kw">try</span> {
-        upstream.send()
-        req.send({
-            <span class="str">'code'</span>: upstream.code,
-            <span class="str">'headers'</span>: upstream.headers,
-            <span class="str">'body'</span>: upstream.toBlob()
-        })
-    } <span class="kw">catch</span> (error:<span class="kw">text</span>) {
-        req.send({<span class="str">'code'</span>: <span class="num">502</span>, <span class="str">'body'</span>: <span class="str">`bad gateway: ${error}`</span>})
-    }
-}</pre>
+}
+
+<span class="kw">int</span> nextWorker = <span class="num">0</span>
+
+<span class="kw">on</span> request(req:<span class="kw">http</span>?) {
+    workers[nextWorker].giveRequest(req)
+    nextWorker = (nextWorker + <span class="num">1</span>) % WORKER_COUNT
+}
+
+openPort(<span class="num">8080</span>)</pre>
         <p class="muted">
           <code>req.send()</code> called with zero arguments is the
           <a href="api.html#http-client">client form</a> of the exact
@@ -180,10 +201,17 @@ openPort(<span class="num">8080</span>)
           in place, which is what gets relayed back below. A genuine
           network failure (upstream down, DNS failure, timeout) throws,
           caught here and turned into a <code>502</code> instead of
-          hanging the client. This is deliberately minimal — no
+          hanging the client. <code>main</code>'s own <code>on
+          request</code> must declare <code>req:http?</code> (a
+          <a href="api.html#t-manually-managed-values">manually-managed
+          value</a>) for <code>giveRequest</code> to accept it — an
+          ordinary auto-managed <code>req:http</code> is rejected, since
+          main's own cleanup would otherwise race the worker that just
+          received it. This is still deliberately minimal — no
           <code>Host</code>/<code>Connection</code> header rewriting,
           no path allow-list — but every request really is proxied
-          through, headers and body included, in about a dozen lines.
+          through, headers and body included, now with up to 4 of them
+          genuinely in flight at once.
         </p>
 
         <h3 id="reverse-proxy-benchmark">Benchmark <a class="anchor" href="#reverse-proxy-benchmark">#</a></h3>
@@ -191,7 +219,7 @@ openPort(<span class="num">8080</span>)
           <table>
             <thead><tr><th>Reverse proxy</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Binary size</th><th class="num">Lines</th></tr></thead>
             <tbody>
-              <tr><td>Festina</td><td class="num">3,896</td><td class="num">12.82 ms</td><td class="num">1.6 MB</td><td class="num">18</td></tr>
+              <tr><td>Festina (4 worker threads)</td><td class="num">5,715</td><td class="num">8.72 ms</td><td class="num">1.6 MB</td><td class="num">34</td></tr>
               <tr><td>Go (<code>net/http</code>)</td><td class="num">7,173</td><td class="num">6.97 ms</td><td class="num">6.0 MB</td><td class="num">17</td></tr>
               <tr><td>Rust (<code>tiny_http</code> + <code>ureq</code>)</td><td class="num">4,547</td><td class="num">10.98 ms</td><td class="num">2.8 MB</td><td class="num">26</td></tr>
               <tr><td>Bun (<code>Bun.serve</code> + <code>fetch</code>)</td><td class="num">14,120</td><td class="num">3.54 ms</td><td class="num">99.3 MB</td><td class="num">21</td></tr>
@@ -199,15 +227,23 @@ openPort(<span class="num">8080</span>)
           </table>
         </div>
         <p class="muted">
-          The one example here where Festina is behind, not ahead: its
-          HTTP server handles one connection at a time by design (see
-          <a href="benchmark.html#http-benchmark">benchmark.md</a>),
-          while Go's <code>net/http</code> and Bun's <code>Bun.serve</code>
-          both spread incoming connections across multiple OS threads or
-          an event loop by default — under 20 concurrent connections
-          that concurrency wins outright, regardless of per-request
-          logic. Rust's single-threaded <code>tiny_http</code> server
-          sits closer to Festina for the same reason. Bun's 99.3 MB
+          <strong>4 worker threads over the single-threaded version
+          above: +29% throughput</strong> (5,715 req/s vs. a clean
+          4,425 req/s measured the same way — see
+          <a href="#reverse-proxy">the code above</a>), from spreading
+          the blocking wait on <code>upstream.send()</code> across
+          workers instead of queuing every connection behind one. It's
+          still behind Go's and Bun's own defaults, though: both
+          spread incoming connections across multiple OS threads or an
+          event loop <em>without being asked</em>, and under 20
+          concurrent connections that default concurrency wins outright
+          regardless of per-request logic. Rust's single-threaded
+          <code>tiny_http</code> server sits closer to where Festina's
+          own single-threaded version was. The cost of closing most of
+          that gap is real, though: at 34 lines this is now the
+          <em>longest</em> of the four, not the shortest — Go and Bun
+          get their concurrency for free from the runtime, so nothing
+          in their own source above changed at all. Bun's 99.3 MB
           binary is almost entirely the bundled Bun runtime (see
           <a href="#weather-desktop-app-benchmark">below</a>) — its
           proxy logic itself is a handful of lines.
