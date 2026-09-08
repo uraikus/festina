@@ -13445,7 +13445,34 @@ class CodeGen:
                 # file's own top-of-conversion note on why this is
                 # what keeps the two translation units independently
                 # linkable).
-                if tinfo.get("has_http_context"):
+                #
+                # claude.md #248: widened from `has_http_context` alone
+                # to `has_http_context or self.uses_http` -- a thread
+                # that only ever calls `.send()` (an outbound-only
+                # client, no `on request`/`openPort()` of its own) now
+                # gets this wired too, purely so its own teardown call
+                # reaches festina_thread_http_teardown (which now also
+                # closes that thread's own pooled outbound connections,
+                # see that function's own comment) when it's killed --
+                # nothing else in this runtime will ever free those.
+                # service_pass/give_request_deliver stay `null` for
+                # such a thread: passing the real
+                # festina_thread_http_service_pass would move it onto
+                # the bounded-poll dispatch loop
+                # (festina_thread_main's own `if (h->http_service_pass)`
+                # branch) even though it never accepts a connection of
+                # its own, trading its efficient indefinite condvar
+                # wait for a needless poll every
+                # FESTINA_THREAD_HTTP_POLL_MS forever -- a real
+                # regression, not a harmless no-op, so it's `null`
+                # instead. self.uses_http is already relied on this
+                # early elsewhere in this same function (the combined-
+                # loop gate a few dozen lines above), so it's already
+                # guaranteed final here too.
+                if tinfo.get("has_http_context") or self.uses_http:
+                    has_ctx = tinfo.get("has_http_context")
+                    service_pass_ptr = "@festina_thread_http_service_pass" if has_ctx else "null"
+                    give_request_ptr = "@festina_thread_deliver_given_request" if has_ctx else "null"
                     # claude.md #213 (Phase 5): the third hook,
                     # festina_thread_deliver_given_request -- wired the
                     # identical unconditional way as the other two
@@ -13458,8 +13485,8 @@ class CodeGen:
                     # thread that did declare one).
                     main_lines.append(
                         f"  call void @festina_thread_set_http_context(ptr %__thread_{tname}, "
-                        f"ptr @festina_thread_http_service_pass, ptr @festina_thread_http_teardown, "
-                        f"ptr @festina_thread_deliver_given_request)")
+                        f"ptr {service_pass_ptr}, ptr @festina_thread_http_teardown, "
+                        f"ptr {give_request_ptr})")
                 main_lines.append(f"  call void @festina_thread_spawn(ptr %__thread_{tname})")
         # self.uses_sqlite/self.uses_graphics are only reliably set by
         # this point because every function body (self.func_defs) and

@@ -18506,3 +18506,227 @@ class TestOnRequestUseSugar:
         # expected), not silently accepted.
         with pytest.raises(errors.CompileError):
             parser.parse("thread w { on load() { } }\non upgrade use w\n", filename="main.f")
+
+
+class TestOutboundHeaderForwarding:
+    """claude.md #247: forwarding a copied headers map (`req.headers`
+    on the way OUT, or `upstream.headers` on the way BACK) used to
+    duplicate whatever this runtime already computes for itself --
+    Host on an outbound request, Content-Length/Connection on either
+    side -- found by reproducing docs/examples.html's own reverse-proxy
+    example against a real RFC-7230-strict upstream (Go's net/http,
+    which hard-rejects a request with two Host headers). Both
+    directions verified here with Festina on both ends: a hand-built
+    headers map deliberately setting all three names to garbage values
+    proves the RUNTIME's own values win, not the caller's."""
+
+    def test_a_hand_built_host_content_length_and_connection_header_are_all_overridden(
+            self, compile_and_run):
+        # claude.md #247/#248: MAIN echoes back exactly the Host/
+        # Connection it actually received; if festina_write_extra_
+        # header still appended the caller's own copies on top of this
+        # runtime's, the SECOND (correct) `Host:`/`Connection:` line
+        # would already have taken effect and been overwritten by the
+        # bogus one that follows it in the raw header block -- catching
+        # a regression here even though this program is Festina-to-
+        # Festina (lenient about duplicate lines, unlike Go). `client`
+        # (not main) makes the hand-built-header request -- main's own
+        # `openPort()` is a synchronous, blocking syscall in main's own
+        # top-level code, so by the time `client`'s `on message` can
+        # possibly run at all (spawned, AND a message posted to it,
+        # both strictly after that call in program order), the
+        # listener is already guaranteed up; the reverse shape (main
+        # itself connecting to a THREAD's own just-`openPort()`-ed
+        # listener, opened asynchronously in that thread's own
+        # `on load()`) has no such guarantee and isn't used here.
+        source = """
+        int done = 0
+
+        on request(req:http) {
+            text h = req.headers['host']
+            text c = req.headers['connection']
+            req.send({'code': 200, 'body': `host=${h} connection=${c}`})
+        }
+
+        on message(worker:thread, msg:text) {
+            log(msg)
+            done = 1
+            close(0)
+        }
+
+        thread client {
+            on message(sender:thread, msg:int) {
+                http out = {
+                    'url': 'http://127.0.0.1:18310/',
+                    'method': 'GET',
+                    'headers': {
+                        'host': 'evil.example.com',
+                        'connection': 'close',
+                        'content-length': '999'
+                    }
+                }
+                out.send()
+                postMessage(`${out.code} ${out.toText()}`)
+            }
+        }
+
+        openPort(18310)
+        client.postMessage(1)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "200" in result.stdout
+        # festina_http_send_client's own Host header is just the
+        # hostname (no :port) -- unrelated to this test's own subject,
+        # matched as-is rather than asserting a :18310 this runtime
+        # never actually writes.
+        assert "host=127.0.0.1 " in result.stdout
+        # claude.md #248: poolable (plain HTTP, POSIX) always asks for
+        # keep-alive now -- a hand-built 'connection': 'close' in the
+        # caller's own map is exactly the kind of override this test
+        # exists to prove loses.
+        assert "connection=keep-alive" in result.stdout
+        assert "evil.example.com" not in result.stdout
+
+    def test_a_proxied_response_does_not_duplicate_content_length_or_connection(
+            self, compile_and_run_server):
+        # claude.md #247: the SERVER-side half -- `res.headers =
+        # upstream.headers` (docs/examples.html's own reverse-proxy
+        # pattern) forwards a REAL response's own Content-Length/
+        # Connection straight back out. A real external client (the
+        # test's own http_get, via Python's http.client) parsing a
+        # response with two Content-Length or two Connection lines
+        # would already be a good sign something's wrong even before
+        # checking values -- http.client raises on structurally
+        # invalid headers for exactly this shape, so simply getting a
+        # clean, correct response back is the proof.
+        source = """
+        thread upstream {
+            on load() { openPort(18311) }
+            on request(req:http) {
+                req.send({'code': 200, 'body': 'from upstream'})
+            }
+        }
+
+        on request(req:http?) {
+            http out = {'url': 'http://127.0.0.1:18311/', 'method': 'GET'}
+            out.send()
+            req.send({'code': out.code, 'headers': out.headers, 'body': out.toBlob()})
+        }
+
+        openPort(__PORT__)
+        """
+        server = compile_and_run_server(source)
+        status, headers, body = server.http_get("/")
+        assert status == 200
+        assert body == b"from upstream"
+        # http.client folds repeated header lines into one comma-joined
+        # value rather than raising -- so the length is this test's own
+        # positive proof there's exactly one Content-Length line, not
+        # two glued together with a comma.
+        assert headers.get("Content-Length") == str(len(b"from upstream"))
+
+
+class TestOutboundConnectionReuse:
+    """claude.md #248: `req.send()` reuses a keep-alive connection to
+    the same host:port instead of opening a fresh one every call
+    (POSIX, plain HTTP -- see festina_client_pool_take's own doc
+    comment in festina_runtime_http.c for the full scope note). The
+    mechanism itself -- the `connect()` count actually dropping to one
+    -- is verified directly with `strace` (this entry's own writeup)
+    and at volume under scripts/leak_stress.sh/thread_tsan_stress.sh
+    (tests/stress/http_client_pool_churn.f,
+    tests/stress/http_client_pool_kill_live_churn.f); these tests are
+    the fast, always-on half: behavioral correctness under real,
+    repeated reuse, every CI run."""
+
+    def test_many_sequential_requests_to_the_same_upstream_all_succeed(
+            self, compile_and_run):
+        # claude.md #248: `client` (a thread), not main, makes the 50
+        # sequential requests -- main owns the port with a synchronous,
+        # blocking `openPort()` in its own top-level code, so by the
+        # time `client` can possibly run at all the listener is already
+        # guaranteed up (see the class's own sibling test above for the
+        # full reasoning on why the reverse shape isn't used).
+        source = """
+        int served = 0
+
+        on request(req:http) {
+            served = served + 1
+            req.send({'code': 200, 'body': `reply ${served}`})
+        }
+
+        on message(worker:thread, msg:int) {
+            log('failures:')
+            log(msg)
+            close(0)
+        }
+
+        thread client {
+            on message(sender:thread, msg:int) {
+                int TOTAL = 50
+                int i = 0
+                int failures = 0
+                while i < TOTAL {
+                    http req = {'url': 'http://127.0.0.1:18312/', 'method': 'GET'}
+                    req.send()
+                    i = i + 1
+                    text want = `reply ${i}`
+                    if req.code != 200 || req.toText() != want {
+                        failures = failures + 1
+                        log('mismatch:')
+                        log(req.toText())
+                    }
+                }
+                postMessage(failures)
+            }
+        }
+
+        openPort(18312)
+        client.postMessage(1)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "failures:\n0" in result.stdout
+
+    def test_a_killed_client_only_threads_pool_does_not_break_the_next_incarnation(
+            self, compile_and_run):
+        # claude.md #248: the behavioral half of what
+        # http_client_pool_kill_live_churn.f proves is leak-free under
+        # ASan -- `worker` declares no `on request`/`openPort()` of its
+        # own (a pure outbound client, the shape codegen.py's widened
+        # `has_http_context or self.uses_http` condition exists for),
+        # killed and respawned mid-pool-usage, with a fresh, correct
+        # request still succeeding afterward.
+        source = """
+        thread upstream {
+            on load() { openPort(18313) }
+            on request(req:http) {
+                req.send({'code': 200, 'body': 'ok'})
+            }
+        }
+
+        thread worker {
+            on load() {
+                int i = 0
+                while i < 5 {
+                    http req = {'url': 'http://127.0.0.1:18313/', 'method': 'GET'}
+                    req.send()
+                    i = i + 1
+                }
+            }
+        }
+
+        worker.kill()
+        worker.live(void (ok:bool) => log(''))
+
+        http req = {'url': 'http://127.0.0.1:18313/', 'method': 'GET'}
+        req.send()
+        log(req.code)
+        log(req.toText())
+        close(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "200" in result.stdout
+        assert "ok" in result.stdout

@@ -2554,6 +2554,39 @@ independent request (using whatever `url`/`method`/`headers`/body it
 currently holds, response overwrite and all) — nothing about the zero-
 argument form is "used up" after the first call.
 
+**`Host`/`Content-Length`/`Connection`/`Transfer-Encoding` in `headers`
+are always yours, never the wire's.** These four are always computed by
+this runtime itself — `Host` from `req.url`'s own hostname,
+`Content-Length` from the real body length, `Connection`/
+`Transfer-Encoding` from this runtime's own framing — so a value of any
+of the four sitting in `headers` (however it got there — a literal
+map, or `req.headers`/a response's own `headers` copied straight in, a
+reverse proxy's most natural shape) is simply never written to the
+wire; only this runtime's own value is. This matters most exactly
+where it's easiest to trip over: forwarding a REAL request's own
+`req.headers` into an outbound one (`'headers': req.headers`) already
+carries the ORIGINAL `Host`, and forwarding a REAL response's own
+`headers` back out (`res.headers = upstream.headers`) already carries
+its `Content-Length`/`Connection` — sending those through unfiltered
+used to produce a request or response with the SAME header name
+twice, which a strict server (Go's `net/http`, which hard-rejects a
+request with two `Host` lines) refuses outright.
+
+**Same-host requests reuse a connection instead of opening a fresh one
+every time** (plain `http://`, POSIX only — an `https://` request and
+any request on Windows still opens fresh every call, a documented,
+narrower-scoped v1). One small connection cache per OS thread (no
+locking needed: nothing else on this runtime's own thread-isolation
+model ever touches another thread's own outbound connections), so a
+loop of `req.send()` calls to the same host:port — the exact shape a
+reverse proxy's own upstream calls take — pays a real TCP handshake
+only on the first call, not on every one. Entirely transparent:
+`req.send()`'s own behavior and return value are unaffected either
+way, and a connection that's died while sitting idle (the peer closed
+it, a hard network error) is detected and silently replaced with a
+fresh one, never surfaced as a failure of the request that happened to
+find it stale.
+
 ### Non-blocking requests: `callback`
 
 Give the literal a `callback` and `req.send()` returns **immediately**
