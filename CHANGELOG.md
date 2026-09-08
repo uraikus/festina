@@ -41,6 +41,23 @@ round-by-round design and implementation record predating 0.1 lives in
   only). One small connection cache per OS thread, no locking needed;
   entirely transparent otherwise, including a dead reused connection
   being silently replaced rather than surfaced as a request failure.
+- **`text.charCodeAt(i)` and `int.toChar()`.** `charCodeAt` reads the
+  Unicode scalar value of the `i`-th UTF-8 code point (not byte, and
+  not a UTF-16 code unit the way JavaScript's own `charCodeAt`
+  sometimes is — matching how `s[i]` already indexes by code point);
+  `toChar` is the inverse, UTF-8 encoding a code point into a
+  one-character `text`. Both follow `s[i]`'s own "test, don't fail"
+  rule: an out-of-range/negative `charCodeAt` index, or a `toChar`
+  code point with no valid encoding (negative, above `0x10FFFF`, or in
+  the UTF-16 surrogate range `0xD800`–`0xDFFF`), answers `null` rather
+  than crashing.
+- **`festina update`.** Pulls the latest source into this
+  installation's own git checkout and fast-forwards to it (`git fetch`
+  + `git merge --ff-only`) — there's no separate release pipeline, the
+  running `festina` *is* this checkout. Refuses, with no changes made,
+  on a dirty working tree, a detached `HEAD`, genuinely diverged
+  history, or an installation that isn't a git checkout at all (e.g. a
+  packaged binary) — it never force-resets over local work.
 
 ### Fixed
 

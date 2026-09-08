@@ -3352,6 +3352,34 @@ def analyze(program, filename="<string>"):
             # runtime failure.
             if callee.prop == "toInt" and not expr.args and infer(callee.obj, scope) == _TEXT:
                 return _INT
+            # claude.md #249: text.charCodeAt(i:int) -> int -- the
+            # Unicode CODE POINT at code-point index i (the same unit
+            # text[i] already uses), null for i<0 or past the last
+            # code point, mirroring text[i]'s own answer to the
+            # identical question.
+            if callee.prop == "charCodeAt" and infer(callee.obj, scope) == _TEXT:
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"charCodeAt() expects exactly 1 argument, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                arg_type = infer(expr.args[0], scope)
+                if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                    raise CompileError(
+                        f"charCodeAt() expects an int argument, found {types_mod.type_name(arg_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return _INT
+            # claude.md #249: int.toChar() -> text -- the inverse of
+            # charCodeAt(): UTF-8 encodes this int as a single Unicode
+            # code point's own one-character text, null for a code
+            # point with no valid UTF-8 encoding (see
+            # festina_int_to_char's own doc comment for the exact
+            # rejected ranges).
+            if callee.prop == "toChar" and not expr.args and infer(callee.obj, scope) == _INT:
+                return _TEXT
             # int/float/bool.toText() -> text -- an explicit spelling of
             # the same stringification template interpolation already
             # does implicitly for these three types (see codegen.py's

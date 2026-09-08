@@ -1843,6 +1843,94 @@ char *festina_text_char_at(const char *s, int64_t index) {
     return NULL;  /* index >= the text's own code point count */
 }
 
+/* text.charCodeAt(i) -> the Unicode CODE POINT (not a UTF-16 code
+ * unit the way JS's own charCodeAt reads one half of a surrogate pair
+ * for anything outside the Basic Multilingual Plane) at the i-th
+ * character -- the identical "index means the i-th code point" unit
+ * text[i]/split('') already established just above, decoded straight
+ * from the same UTF-8 bytes that walk already locates rather than
+ * building a substring first and parsing it back out. festina_null_int()
+ * for a negative or past-the-end index, mirroring festina_text_char_at's
+ * own NULL answer to the identical question -- see that function's own
+ * doc comment for why this is a separate walk rather than a shared one
+ * (this one decodes a codepoint where that one copies bytes). */
+int64_t festina_text_char_code_at(const char *s, int64_t index) {
+    if (!s) s = "";
+    if (index < 0) return festina_null_int();
+    const unsigned char *c = (const unsigned char *)s;
+    int64_t i = 0;
+    while (*c) {
+        const unsigned char *start = c;
+        c++;
+        while ((*c & 0xC0) == 0x80) c++;
+        if (i == index) {
+            size_t len = (size_t)(c - start);
+            switch (len) {
+                case 1:
+                    return start[0];
+                case 2:
+                    return ((int64_t)(start[0] & 0x1F) << 6)
+                         | (start[1] & 0x3F);
+                case 3:
+                    return ((int64_t)(start[0] & 0x0F) << 12)
+                         | ((int64_t)(start[1] & 0x3F) << 6)
+                         | (start[2] & 0x3F);
+                default:
+                    return ((int64_t)(start[0] & 0x07) << 18)
+                         | ((int64_t)(start[1] & 0x3F) << 12)
+                         | ((int64_t)(start[2] & 0x3F) << 6)
+                         | (start[3] & 0x3F);
+            }
+        }
+        i++;
+    }
+    return festina_null_int();  /* index >= the text's own code point count */
+}
+
+/* int.toChar() -> text -- the inverse of charCodeAt(): UTF-8 encodes
+ * one Unicode code point into its own single-character text (the
+ * identical 1-4-byte encoding festina_json_parse_string's own \u
+ * escape handling already uses for the same job, just not factored
+ * out into a shared helper -- that one writes directly into a
+ * growing JSON-string buffer mid-parse, this one always produces a
+ * fresh, freestanding text, different enough call shapes that
+ * sharing would cost more clarity than it saves). NULL (this
+ * runtime's own text-typed "no value" answer, exactly like an out-
+ * of-range text[i]/charCodeAt already give) for a code point with no
+ * valid UTF-8 encoding: negative, past the last real Unicode scalar
+ * value (0x10FFFF), or inside the UTF-16 surrogate range
+ * (0xD800-0xDFFF) -- those are reserved for surrogate PAIRS in
+ * UTF-16 and are never a real character on their own. */
+char *festina_int_to_char(int64_t cp) {
+    if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return NULL;
+    unsigned char buf[4];
+    size_t n;
+    if (cp < 0x80) {
+        buf[0] = (unsigned char)cp;
+        n = 1;
+    } else if (cp < 0x800) {
+        buf[0] = (unsigned char)(0xC0 | (cp >> 6));
+        buf[1] = (unsigned char)(0x80 | (cp & 0x3F));
+        n = 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (unsigned char)(0xE0 | (cp >> 12));
+        buf[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (unsigned char)(0x80 | (cp & 0x3F));
+        n = 3;
+    } else {
+        buf[0] = (unsigned char)(0xF0 | (cp >> 18));
+        buf[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[3] = (unsigned char)(0x80 | (cp & 0x3F));
+        n = 4;
+    }
+    char *out = malloc(n + 1);
+    if (!out) festina_fail("out of memory in int.toChar()");
+    memcpy(out, buf, n);
+    out[n] = '\0';
+    return out;
+}
+
 /* ---- claude.md #150: argv ---- */
 
 void *festina_argv_array(int argc, char **argv) {

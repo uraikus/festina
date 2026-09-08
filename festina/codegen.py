@@ -1762,6 +1762,9 @@ class CodeGen:
             # claude.md #150: text.toInt()/text[i], argv, exec().
             "declare i64 @festina_text_to_int(ptr)",
             "declare ptr @festina_text_char_at(ptr, i64)",
+            # claude.md #249: text.charCodeAt(i)/int.toChar().
+            "declare i64 @festina_text_char_code_at(ptr, i64)",
+            "declare ptr @festina_int_to_char(i64)",
             "declare ptr @festina_argv_array(i32, ptr)",
             "declare i64 @festina_process_exec(ptr)",
             "declare i64 @strlen(ptr)",
@@ -11766,6 +11769,33 @@ class CodeGen:
                     lines.append(f"  {out} = call i64 @festina_text_to_int(ptr {val})")
                     self._free_text_temp(callee.obj, val, vtype, lines)
                     return out, INT
+            # claude.md #249: text.charCodeAt(i) -> int -- the Unicode
+            # code point at code-point index i, mirroring text[i]'s own
+            # receiver-freeing shape (the int argument itself needs no
+            # freeing, unlike a text/regex one -- see .match()'s own
+            # shape just below for that comparison).
+            if callee.prop == "charCodeAt":
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == TEXT:
+                    idx_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call i64 @festina_text_char_code_at(ptr {val}, i64 {idx_val})")
+                    self._free_text_temp(callee.obj, val, vtype, lines)
+                    return out, INT
+            # claude.md #249: int.toChar() -> text -- the inverse of
+            # charCodeAt(); the result is a fresh, exclusively-owned
+            # one-character buffer (festina_int_to_char always mallocs
+            # its own), so this is marked minted exactly like
+            # text[i]'s own festina_text_char_at result just above --
+            # see that call site's own comment for what that buys.
+            if callee.prop == "toChar" and not expr.args:
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == INT:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call ptr @festina_int_to_char(i64 {val})")
+                    self._minted_values.add(id(expr))
+                    return out, TEXT
             # int/float/bool.toText() -> text -- an explicit spelling of
             # exactly the stringification template interpolation already
             # does under the hood (_to_text, shared with _emit_template),

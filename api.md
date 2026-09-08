@@ -8,7 +8,7 @@ spec this compiler is built against, see [`claude.md`](claude.md).
 
 ## CLI
 
-Four subcommands (`festina/cli.py`), not a single bare `festina file.f`
+Five subcommands (`festina/cli.py`), not a single bare `festina file.f`
 — that would leave `festina run` (which executes the compiled result)
 ambiguous with `festina compile` (which never does) without inventing a
 flag to distinguish them:
@@ -19,6 +19,7 @@ flag to distinguish them:
 | `festina run entry.f` | Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the *compiled program's own* exit code, so `festina run x.f && ...` composes the same way `go run`/`cargo run` do. The temp binary is always cleaned up afterward. `--target=wasm32-wasi` runs the compiled `.wasm` through Node's built-in WASI support instead of executing it directly. |
 | `festina doctor` | Checks every dependency the compiler itself needs (a C compiler, `pkg-config`, sqlite3/cairo-xlib/alsa dev headers, `libLLVM`) and reports what's missing and how to install it — the same install hints a real compile failure would give, just checked proactively instead of only on failure. Also reports whether `festina` itself is resolvable on `PATH`, and if not, exactly how to add it (the checkout's `bin/` directory, or a packaged binary — see [setup.md](setup.md)). Exits 0 if every *required* dependency is present — graphics/audio are optional, since a compiler that can't build a graphics program is still a fully working compiler for everything else (see [security.md](security.md#slim-binaries)). |
 | `festina doctor --fix` | Same report, then actually fixes what it found instead of leaving the printed hint for a human to act on by hand: installs whatever dependencies are missing (required and optional both) via the detected package manager — `apt` on Linux, Homebrew on macOS, MSYS2's `pacman` on Windows — and, if `festina` itself isn't resolving on `PATH`, adds it (a symlink for a packaged binary, an `export PATH=...` line appended to `~/.bashrc`/`~/.zshrc` for a checkout, `setx` on Windows). Prints the exact command/change first and asks for confirmation (`--yes`/`-y` skips that, for every prompt this can raise); refuses to guess for any other package manager, overwrite something unrelated already on disk, or run non-interactively without `--yes`, rather than doing nothing or making a change nobody agreed to. The exit code reflects the dependency side only — not being on `PATH` has never been a required check. |
+| `festina update` | Pulls the latest source into this installation's own git checkout and fast-forwards to it (`git fetch` + `git merge --ff-only`) — there's no separate release pipeline or package to fetch (install.sh's own approach), the running `festina` *is* this checkout, so updating it is exactly this. Refuses, with a clear message and no changes made, when the working tree has uncommitted changes, when HEAD is detached, or when local history has genuinely diverged from origin (never force-resets over local work the way install.sh's own first-time bootstrap does — that runs against a fresh clone with nothing to lose, this runs against a checkout someone may actually be living in). Not available for a packaged (PyInstaller) binary, which has no source tree of its own to pull into. |
 | `festina help` | Prints this same command list. |
 
 ```bash
@@ -414,6 +415,30 @@ this is always bounds-checked: an out-of-range or negative index
 answers `null` rather than reading past the buffer. Read-only —
 `s[0] = 'x'` is a compile-time error, the same way `environment.NAME =
 ...` is.
+
+### charCodeAt() and toChar()
+
+```festina
+int fortyTwo = 42
+text char = fortyTwo.toChar()          // '*'
+int numberAgain = char.charCodeAt(0)   // 42
+
+log('a'.charCodeAt(0))    // 97
+log(42.toChar())          // '*'
+log('café'.charCodeAt(3)) // 233 -- the 'é', by code point, not byte
+log(233.toChar())         // 'é'
+```
+
+`text.charCodeAt(i)` reads the Unicode scalar value of the `i`-th
+**code point** (not byte, and not a UTF-16 code unit the way
+JavaScript's own `charCodeAt` sometimes is — Festina's text indexing is
+code-point-based everywhere, and this matches `s[i]`/`.length`).
+`int.toChar()` is the inverse: it UTF-8 encodes a code point into a
+one-character `text`. Both follow the same "test, don't fail" rule as
+`s[i]`: an out-of-range or negative index into `charCodeAt` answers
+`null`, and a code point `toChar()` can't represent — negative, above
+`0x10FFFF`, or inside the UTF-16 surrogate range `0xD800`–`0xDFFF` —
+answers `null` rather than crashing.
 
 ## Logging and rendering
 

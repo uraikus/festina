@@ -605,3 +605,106 @@ class TestMainDispatch:
         src.write_text("int x = 'nope'")
         assert cli_mod.main(["compile", str(src), "--cc", cc]) == 1
         assert "error" in capsys.readouterr().err
+
+
+def _run_git(*args, cwd):
+    import subprocess
+    result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    assert result.returncode == 0, f"git {' '.join(args)} failed: {result.stderr}"
+    return result.stdout
+
+
+def _make_origin_and_clone(tmp_path):
+    """claude.md #249: a real, throwaway origin+clone pair, on disk, for
+    `festina update` (festina.cli._run_update) to actually operate on --
+    real `git` subprocesses throughout, not mocked, the same "test real
+    behavior, not a stand-in for it" discipline this whole test suite
+    already follows for the compiler itself. Returns (origin_dir,
+    clone_dir); the clone starts checked out on the SAME commit as
+    origin (nothing to update yet) -- each test advances origin (or the
+    clone itself) however its own scenario needs."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _run_git("init", "-q", "-b", "main", cwd=origin)
+    _run_git("config", "user.email", "test@example.com", cwd=origin)
+    _run_git("config", "user.name", "Test", cwd=origin)
+    (origin / "file.txt").write_text("v1\n")
+    _run_git("add", "-A", cwd=origin)
+    _run_git("commit", "-q", "-m", "initial", cwd=origin)
+
+    clone = tmp_path / "clone"
+    _run_git("clone", "-q", str(origin), str(clone), cwd=tmp_path)
+    _run_git("config", "user.email", "test@example.com", cwd=clone)
+    _run_git("config", "user.name", "Test", cwd=clone)
+    return origin, clone
+
+
+class TestUpdate:
+    """`festina update` -- festina.cli._run_update: fast-forwards THIS
+    checkout (wherever _data_root() resolves to) to its origin remote's
+    current branch tip, refusing (never guessing, never discarding)
+    when the working tree is dirty or history has genuinely diverged."""
+
+    def test_fast_forwards_a_clean_checkout(self, cli_mod, tmp_path, monkeypatch, capsys):
+        origin, clone = _make_origin_and_clone(tmp_path)
+        (origin / "file.txt").write_text("v2\n")
+        _run_git("commit", "-a", "-q", "-m", "advance origin", cwd=origin)
+
+        monkeypatch.setattr(cli_mod, "_data_root", lambda: str(clone))
+        assert cli_mod._run_update() == 0
+        assert (clone / "file.txt").read_text() == "v2\n"
+        assert "up to date" in capsys.readouterr().out
+
+    def test_refuses_a_dirty_working_tree(self, cli_mod, tmp_path, monkeypatch, capsys):
+        origin, clone = _make_origin_and_clone(tmp_path)
+        (origin / "file.txt").write_text("v2\n")
+        _run_git("commit", "-a", "-q", "-m", "advance origin", cwd=origin)
+        (clone / "file.txt").write_text("locally edited, uncommitted\n")
+
+        monkeypatch.setattr(cli_mod, "_data_root", lambda: str(clone))
+        assert cli_mod._run_update() == 1
+        assert "uncommitted changes" in capsys.readouterr().err
+        # Refused -- the local edit is exactly as it was, never touched.
+        assert (clone / "file.txt").read_text() == "locally edited, uncommitted\n"
+
+    def test_refuses_diverged_history_without_discarding_anything(
+            self, cli_mod, tmp_path, monkeypatch, capsys):
+        origin, clone = _make_origin_and_clone(tmp_path)
+        (origin / "file.txt").write_text("v2-from-origin\n")
+        _run_git("commit", "-a", "-q", "-m", "advance origin", cwd=origin)
+        (clone / "local.txt").write_text("a local commit of my own\n")
+        _run_git("add", "-A", cwd=clone)
+        _run_git("commit", "-q", "-m", "local work", cwd=clone)
+        local_tip = _run_git("rev-parse", "HEAD", cwd=clone).strip()
+
+        monkeypatch.setattr(cli_mod, "_data_root", lambda: str(clone))
+        assert cli_mod._run_update() != 0
+        assert "diverged" in capsys.readouterr().err
+        # Refused -- the local commit is still there, HEAD never moved.
+        assert _run_git("rev-parse", "HEAD", cwd=clone).strip() == local_tip
+        assert (clone / "local.txt").exists()
+
+    def test_refuses_a_detached_head(self, cli_mod, tmp_path, monkeypatch, capsys):
+        origin, clone = _make_origin_and_clone(tmp_path)
+        head = _run_git("rev-parse", "HEAD", cwd=clone).strip()
+        _run_git("checkout", "-q", head, cwd=clone)  # detach
+
+        monkeypatch.setattr(cli_mod, "_data_root", lambda: str(clone))
+        assert cli_mod._run_update() == 1
+        assert "detached HEAD" in capsys.readouterr().err
+
+    def test_refuses_a_non_git_installation(self, cli_mod, tmp_path, monkeypatch, capsys):
+        not_a_repo = tmp_path / "not_a_repo"
+        not_a_repo.mkdir()
+        monkeypatch.setattr(cli_mod, "_data_root", lambda: str(not_a_repo))
+        assert cli_mod._run_update() == 1
+        assert "isn't a git checkout" in capsys.readouterr().err
+
+    def test_update_subcommand_through_main(self, cli_mod, tmp_path, monkeypatch, capsys):
+        origin, clone = _make_origin_and_clone(tmp_path)
+        (origin / "file.txt").write_text("v2\n")
+        _run_git("commit", "-a", "-q", "-m", "advance origin", cwd=origin)
+
+        monkeypatch.setattr(cli_mod, "_data_root", lambda: str(clone))
+        assert cli_mod.main(["update"]) == 0
+        assert (clone / "file.txt").read_text() == "v2\n"

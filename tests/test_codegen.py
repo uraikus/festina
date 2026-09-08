@@ -16271,6 +16271,91 @@ class TestTextIndexing:
         assert result.stdout == "abcdef\n"
 
 
+class TestCharCodeAtAndToChar:
+    """claude.md #249: text.charCodeAt(i:int):int and int.toChar():text
+    -- charCodeAt reads the Unicode CODE POINT at CODE POINT index i,
+    the same unit text[i]/split('') already use (not a UTF-16 code
+    unit the way JS's own charCodeAt works, which would read half of a
+    surrogate pair for anything outside the Basic Multilingual Plane);
+    toChar() is its exact inverse, UTF-8 encoding one code point back
+    into its own one-character text. Both null (never a crash) on an
+    invalid question -- an out-of-range/negative index, or a code
+    point with no valid UTF-8 encoding -- mirroring text[i]'s own
+    "test, don't fail" answer to the identical shape of question."""
+
+    def test_a_middle_character(self, compile_and_run):
+        result = compile_and_run("log('hello'.charCodeAt(1))")
+        assert result.returncode == 0
+        assert result.stdout == "101\n"  # 'e'
+
+    def test_round_trips_through_toChar(self, compile_and_run):
+        source = """
+        int fortyTwo = 42
+        text char = fortyTwo.toChar()
+        int numberAgain = char.charCodeAt(0)
+        log(char)
+        log(numberAgain == fortyTwo)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "*\n" + "true\n"
+
+    def test_a_literal_int_toChar(self, compile_and_run):
+        result = compile_and_run("log(42.toChar())")
+        assert result.returncode == 0
+        assert result.stdout == "*\n"
+
+    def test_multibyte_utf8_codepoint_not_byte(self, compile_and_run):
+        # 'café' -- 'é' is U+00E9 (233), a 2-byte UTF-8 sequence at
+        # CODE POINT index 3 (not byte offset 3, which would land
+        # mid-character) -- the identical unit
+        # TestTextIndexing::test_multibyte_utf8_is_indexed_by_codepoint_not_byte
+        # already pins for plain text[i].
+        result = compile_and_run("log('café'.charCodeAt(3))\nlog(233.toChar())")
+        assert result.returncode == 0
+        assert result.stdout == "233\né\n"
+
+    def test_out_of_range_index_is_null_not_a_crash(self, compile_and_run):
+        source = """
+        text s = 'hi'
+        log(s.charCodeAt(100) == null)
+        log(s.charCodeAt(-1) == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+    def test_invalid_codepoints_toChar_is_null_not_a_crash(self, compile_and_run):
+        source = """
+        log((-1).toChar() == null)
+        log(1114112.toChar() == null)
+        log(55296.toChar() == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\ntrue\n"
+
+    def test_a_dynamic_receiver_and_index_go_through_the_runtime_path(self, compile_and_run):
+        source = """
+        text func makeText() { return 'ab' + 'cd' }
+        int func idx() { return 1 + 1 }
+        log(makeText().charCodeAt(idx()))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "99\n"  # 'c'
+
+    def test_wrong_arg_count_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("log('hi'.charCodeAt())")
+        with pytest.raises(errors.CompileError, match="charCodeAt"):
+            semantic.analyze(program)
+
+    def test_wrong_arg_type_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("log('hi'.charCodeAt('x'))")
+        with pytest.raises(errors.CompileError, match="charCodeAt"):
+            semantic.analyze(program)
+
+
 class TestEnums:
     """claude.md #176: enum + typeof end to end -- both representations
     (pure-struct self-tagging, mixed heap-boxed), typeof, coercion,

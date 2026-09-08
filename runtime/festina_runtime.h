@@ -219,6 +219,19 @@ void *festina_ls(const char *path);
 int64_t festina_text_to_int(const char *s);
 char *festina_text_char_at(const char *s, int64_t index);
 
+/* claude.md #249: text.charCodeAt(i) -> int (the Unicode CODE POINT at
+ * the i-th character, the same code-point unit text[i] already uses --
+ * NOT a UTF-16 code unit the way JS's own charCodeAt reads one half of
+ * a surrogate pair for anything outside the Basic Multilingual Plane;
+ * null for i<0 or past the last code point, mirroring text[i]'s own
+ * answer to the identical question) and its inverse, int.toChar() ->
+ * text (UTF-8 encodes one code point into its own single-character
+ * text; null for a code point with no valid UTF-8 encoding -- negative,
+ * past 0x10FFFF, or inside the reserved UTF-16 surrogate range
+ * 0xD800-0xDFFF). */
+int64_t festina_text_char_code_at(const char *s, int64_t index);
+char *festina_int_to_char(int64_t cp);
+
 /* claude.md #150: argv -- builds a fresh refcounted arr[text] (the same
  * shape festina_text_split's own pieces-array does) from the argc/argv
  * a compiled program's own `main` received; called once, in main()'s
