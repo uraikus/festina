@@ -651,4 +651,21 @@ class TestLeakStress:
             # selecting giveRequest path above gets exercised too, not
             # just the indexed form).
             "thread_use_request_churn.f",
+            # claude.md #248: req.send()'s new outbound keep-alive
+            # connection pool -- four separate driver threads, each
+            # with its own private `__thread` pool, all hammering the
+            # same upstream host:port concurrently at volume. A leak in
+            # a pool slot's own strdup'd host string, or a double-close
+            # of a reused fd, would show up here.
+            "http_client_pool_churn.f",
+            # claude.md #248: the leak-freedom half of the SAME
+            # feature that only a sanitizer run can confirm -- a pure
+            # OUTBOUND-client thread (no on request/openPort of its
+            # own) killed and respawned repeatedly, mid-pool-usage.
+            # Before codegen.py's widened has_http_context or
+            # self.uses_http condition, a client-only thread got no
+            # teardown hook wired at all, so its own pooled
+            # connections' strdup'd host strings would leak on every
+            # single kill().
+            "http_client_pool_kill_live_churn.f",
         }

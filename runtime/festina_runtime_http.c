@@ -2713,11 +2713,37 @@ void festina_thread_http_service_pass(int timeout_ms) {
  * queued is discarded, not drained first" tradeoff for the exact same
  * reason: a thread being killed is not the whole process shutting
  * down gracefully. */
+#ifndef _WIN32
+/* claude.md #248: forward-declared -- the real definition lives down
+ * in the client-side section, alongside the rest of the outbound
+ * connection pool it tears down; festina_thread_http_teardown (right
+ * below) is this pool's one cleanup call site and is defined earlier
+ * in the file than that section. */
+static void festina_client_pool_teardown(void);
+#endif
+
 void festina_thread_http_teardown(void) {
     festina_close_all_listeners();
     for (int64_t i = 0; i < g_conn_count; i++) {
         if (g_conns[i].alive) festina_conn_teardown(&g_conns[i]);
     }
+    /* claude.md #248: this thread's own outbound connection pool
+     * (festina_http_send_client's client-side cache, populated
+     * whenever THIS thread reused a keep-alive connection to some
+     * upstream) -- same "nothing else will ever close these once this
+     * thread's own `__thread` storage is gone" reasoning as every
+     * other close/free in this function, just for a resource this
+     * thread might hold even if it never accepted a single inbound
+     * connection at all (a pure outbound-`.send()` thread still gets
+     * this call -- see this function's own wider wiring in
+     * codegen.py). A no-op on a thread whose pool was never
+     * populated. POSIX only, matching the pool itself -- see
+     * festina_client_pool_take's own doc comment for why; there is
+     * nothing to tear down on Windows since festina_http_send_client
+     * never pools a connection there in the first place. */
+#ifndef _WIN32
+    festina_client_pool_teardown();
+#endif
     /* claude.md #212: unlike every other function in this file, THIS
      * one has to actually free the top-level tables themselves
      * (g_conns/g_conn_free_slots/g_conn_index/g_listeners/g_poll_fds/
@@ -3130,8 +3156,52 @@ char *festina_http_to_text(void *payload) {
  * right after) only ever touches ITS OWN copy. */
 static __thread FestinaSendBuf *g_http_send_header_buf = NULL;
 
+/* claude.md #247: This runtime always writes its own Host (client requests only,
+ * festina_http_send_client)/Content-Length/Connection -- computed from
+ * the real body length and the real connection state, never from
+ * whatever a program's own headers map happens to hold. Forwarding one
+ * of these four names again out of that map, unfiltered, used to
+ * produce a second, conflicting header line alongside the runtime's
+ * own -- found by reproducing examples.html's own reverse-proxy
+ * example against a real, RFC-7230-strict upstream (Go's net/http):
+ * `res.headers = upstream.headers` (server side) and
+ * `'headers': req.headers` (client side) are exactly this pattern --
+ * copying a REAL request/response's own headers map straight into a
+ * new one -- and both directions already carry one of these four
+ * names by construction (Host on the way in, Content-Length/Connection
+ * on the way back from any real server). A duplicate `Host:` is a hard
+ * 400 for a strict server (RFC 7230 SS5.4: a server MUST reject a
+ * request with more than one Host header); duplicate Content-Length/
+ * Connection/Transfer-Encoding lines are exactly the kind of ambiguity
+ * that HTTP request/response smuggling exploits, which is also why
+ * Transfer-Encoding is filtered even though this runtime never forwards
+ * a chunked body itself on either of these two paths (see
+ * festina_http_send_client's own "no chunked transfer-encoding either
+ * direction" note) -- a stray `Transfer-Encoding: chunked` line copied
+ * from an upstream response, with a body that was never actually
+ * re-chunked, would mislabel a plain body as chunked to whatever reads
+ * this response next. Matches how a real HTTP client (Fetch's own
+ * "forbidden header name" list; a reverse proxy conventionally
+ * stripping hop-by-hop headers per RFC 7230 SS6.1) already treats these
+ * same names -- not a proxy-only special case, since a HAND-WRITTEN
+ * `{'content-length': '999'}` in a `req.send(...)`/`.send()` headers
+ * map was already silently wrong before this fix even outside any
+ * proxying at all, for the identical reason: this runtime, not the
+ * caller, is the only correct source for these four. Case-insensitive
+ * (`strcasecmp`, matching festina_headers_get's own comparison) even
+ * though every key THIS runtime's own parser produces is already
+ * lowercased (festina_headers_add) -- a map built by hand in Festina
+ * source is under no such constraint. */
+static int festina_is_runtime_managed_header(const char *key) {
+    return strcasecmp(key, "host") == 0
+        || strcasecmp(key, "content-length") == 0
+        || strcasecmp(key, "connection") == 0
+        || strcasecmp(key, "transfer-encoding") == 0;
+}
+
 static void festina_write_extra_header(int64_t value, const char *key) {
     if (!g_http_send_header_buf) return;
+    if (festina_is_runtime_managed_header(key)) return;
     const char *header_value = (const char *)(intptr_t)value;
     festina_sendbuf_append(g_http_send_header_buf, key, strlen(key));
     FESTINA_APPEND_LIT(g_http_send_header_buf, ": ");
@@ -3250,6 +3320,122 @@ static long festina_client_send_all(FestinaClientTransport *t, const void *data,
     return 1;
 }
 
+/* claude.md #248: outbound keep-alive connection reuse -- found while
+ * investigating why a Festina reverse proxy (docs/examples.html) was
+ * ~1.5x slower than an equivalent Bun proxy even after #247's own
+ * header-forwarding fix closed the correctness gap: `strace` on the
+ * running proxy showed one `connect()` per proxied request, 1:1 -- this
+ * function always opened a brand-new TCP connection to the upstream and
+ * closed it again after a single request/response, where Bun's `fetch()`
+ * keeps a persistent pool to the same origin by default. A controlled
+ * `wrk` run against the same upstream showed reusing connections is
+ * ~2.9x the throughput of reconnecting every time on this machine --
+ * the single largest lever available for closing that gap.
+ *
+ * Scope, deliberately narrow, mirroring two direct precedents already
+ * in this file (the async client pool's own "POSIX only for now" --
+ * claude.md #163 -- and giveRequest's own "first cut: plain
+ * connections only" -- claude.md #213): POSIX only, and plain HTTP
+ * only -- an `https://` request is completely unaffected by anything
+ * below (still opens fresh, still sends `Connection: close`, still
+ * reads to EOF via festina_client_read_all just below). TLS session
+ * reuse is a real, separate, harder problem -- the mbedTLS state
+ * (g_tls_client_*) would need its own liveness/reuse story on top of
+ * the raw fd's -- and is left as a documented next step rather than
+ * folded in here.
+ *
+ * One connection cache PER OS THREAD (`__thread`, not a shared global),
+ * for the same reason every other piece of this thread's own HTTP
+ * state already is (g_conns et al., just above): each thread that
+ * calls `req.send()` does so strictly sequentially on its own thread
+ * (this runtime's own single-threaded-per-context design,
+ * festina_runtime.h's top comment), so no entry here is ever touched
+ * from two threads at once -- reuse needs zero new locking. A small
+ * fixed-size, round-robin-evicted array (not a hash map) -- a thread
+ * fanning outbound requests out to more than a handful of distinct
+ * hosts at once is not the shape this is for; it is exactly the shape
+ * of a single-upstream reverse proxy. */
+#ifndef _WIN32
+#define FESTINA_CLIENT_POOL_SIZE 8
+
+typedef struct {
+    char *host;  /* malloc'd (strdup); NULL means this slot is empty */
+    int port;
+    FestinaSocket fd;
+} FestinaClientPoolSlot;
+
+static __thread FestinaClientPoolSlot g_client_pool[FESTINA_CLIENT_POOL_SIZE];
+static __thread int g_client_pool_cursor = 0;
+
+/* Finds a pooled connection to `host:port`, confirms it's still
+ * genuinely alive, and hands it back via `*out_fd` -- or returns 0 (no
+ * change to `*out_fd`) if there is no cached entry, or the one that
+ * was cached has since died. Liveness is checked with a non-blocking
+ * MSG_PEEK: an idle-but-alive keep-alive connection has nothing to
+ * read yet, so recv() correctly reports EWOULDBLOCK/EAGAIN -- that is
+ * the ONLY outcome this treats as "still good." Anything else --
+ * `0` (the peer closed it while it sat idle, the ordinary and expected
+ * way a keep-alive connection eventually ends), a hard error, or even
+ * an unsolicited byte actually arriving (a genuinely unexpected shape
+ * for an idle HTTP/1.1 connection, and not one worth trying to
+ * carefully recover into the next request's own read) -- is treated as
+ * dead: the fd is closed right here and the slot freed, and the caller
+ * falls back to its own ordinary fresh-connect path exactly as if
+ * nothing had ever been cached for this host at all. */
+static int festina_client_pool_take(const char *host, int port, FestinaSocket *out_fd) {
+    for (int i = 0; i < FESTINA_CLIENT_POOL_SIZE; i++) {
+        FestinaClientPoolSlot *s = &g_client_pool[i];
+        if (!s->host || s->port != port || strcmp(s->host, host) != 0) continue;
+        char peek;
+        ssize_t r = recv(s->fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+        free(s->host);
+        s->host = NULL;
+        if (r < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
+            *out_fd = s->fd;
+            return 1;
+        }
+        festina_close_fd(s->fd);
+        return 0;
+    }
+    return 0;
+}
+
+/* Stores `fd` (a connection just confirmed reusable -- see
+ * festina_http_send_client's own use of this) for a later
+ * festina_client_pool_take against the same host:port. Round-robin
+ * eviction, not LRU -- simpler, and with only FESTINA_CLIENT_POOL_SIZE
+ * slots per thread the difference is noise: whichever slot
+ * g_client_pool_cursor currently names is reused, closing whatever
+ * connection (to any host) happened to be sitting there first. */
+static void festina_client_pool_put(const char *host, int port, FestinaSocket fd) {
+    FestinaClientPoolSlot *s = &g_client_pool[g_client_pool_cursor];
+    g_client_pool_cursor = (g_client_pool_cursor + 1) % FESTINA_CLIENT_POOL_SIZE;
+    if (s->host) { free(s->host); festina_close_fd(s->fd); }
+    s->host = strdup(host);
+    if (!s->host) festina_fail("out of memory pooling an outbound http connection");
+    s->port = port;
+    s->fd = fd;
+}
+
+/* Closes every connection this thread's own pool is still holding --
+ * called from festina_thread_http_teardown (below) so a killed
+ * thread's own pooled fds don't outlive it the same way its listeners/
+ * accepted connections already don't (that function's own comment).
+ * Main's own pool needs no such call: it lives for the process, the
+ * same "no GC yet, process exit tears everything down" convention
+ * every other main-thread `__thread` table in this file already
+ * follows. */
+static void festina_client_pool_teardown(void) {
+    for (int i = 0; i < FESTINA_CLIENT_POOL_SIZE; i++) {
+        if (g_client_pool[i].host) {
+            free(g_client_pool[i].host);
+            g_client_pool[i].host = NULL;
+            festina_close_fd(g_client_pool[i].fd);
+        }
+    }
+}
+#endif /* !_WIN32 */
+
 /* Reads until the peer closes (or a hard error), growing `*buf`/`*len`
  * as needed -- the client side has no Content-Length to trust ahead
  * of time the way the request-line parser does (claude.md #151's own
@@ -3257,7 +3443,10 @@ static long festina_client_send_all(FestinaClientTransport *t, const void *data,
  * simply reads everything the server sends and the header parser
  * below finds Content-Length inside it afterward. Bounded by the same
  * FESTINA_HTTP_MAX_BUFFER cap the server side already enforces, for
- * the identical "a hostile or broken peer streaming forever" reason. */
+ * the identical "a hostile or broken peer streaming forever" reason.
+ * Still used for every TLS response and, on Windows, every response --
+ * see festina_client_read_response just below for the one that
+ * replaced this for plain HTTP on POSIX, and why. */
 static void festina_client_read_all(FestinaClientTransport *t, uint8_t **buf, size_t *len) {
     size_t cap = 8192;
     *buf = malloc(cap);
@@ -3291,6 +3480,175 @@ static void festina_client_read_all(FestinaClientTransport *t, uint8_t **buf, si
         *len += (size_t)n;
     }
 }
+
+#ifndef _WIN32
+/* claude.md #248: scans [hdr_start, hdr_end) -- a raw, not-yet-parsed
+ * block of "Name: value\r\n" lines -- for exactly the three names
+ * festina_client_read_response needs to know EARLY, while bytes are
+ * still arriving, in order to know when a response is complete and
+ * whether the connection it arrived on may be pooled. Deliberately NOT
+ * shared with festina_parse_http_response's own header loop just below
+ * (which lowercases every name and builds the actual, user-visible
+ * headers map) -- that one stays the single, untouched source of truth
+ * for the real response; this one only ever looks at three names and
+ * throws its own scratch away once it has them. */
+static void festina_client_scan_head(const char *hdr_start, const char *hdr_end,
+                                     int64_t *out_content_length, int *out_chunked,
+                                     int *out_explicit_close) {
+    *out_content_length = -1;
+    *out_chunked = 0;
+    *out_explicit_close = 0;
+    const char *line = hdr_start;
+    while (line < hdr_end) {
+        const char *line_end = memchr(line, '\n', (size_t)(hdr_end - line));
+        if (!line_end) line_end = hdr_end;
+        const char *trimmed_end = line_end;
+        if (trimmed_end > line && trimmed_end[-1] == '\r') trimmed_end--;
+        const char *colon = memchr(line, ':', (size_t)(trimmed_end - line));
+        if (colon) {
+            size_t name_len = (size_t)(colon - line);
+            const char *value_start = colon + 1;
+            while (value_start < trimmed_end && *value_start == ' ') value_start++;
+            size_t value_len = (size_t)(trimmed_end - value_start);
+            if (name_len == 14 && strncasecmp(line, "content-length", 14) == 0) {
+                char tmp[32];
+                size_t n = value_len < sizeof(tmp) - 1 ? value_len : sizeof(tmp) - 1;
+                memcpy(tmp, value_start, n);
+                tmp[n] = '\0';
+                *out_content_length = strtoll(tmp, NULL, 10);
+            } else if (name_len == 17 && strncasecmp(line, "transfer-encoding", 17) == 0) {
+                if (value_len == 7 && strncasecmp(value_start, "chunked", 7) == 0) *out_chunked = 1;
+            } else if (name_len == 10 && strncasecmp(line, "connection", 10) == 0) {
+                if (value_len == 5 && strncasecmp(value_start, "close", 5) == 0) *out_explicit_close = 1;
+            }
+        }
+        line = line_end + 1;
+    }
+}
+
+/* claude.md #248: festina_client_read_all's own counterpart for plain
+ * HTTP on POSIX -- reads one recv() at a time, same growth strategy,
+ * but STOPS the moment a complete response has arrived instead of
+ * always waiting for the peer to close. Stopping early is what makes
+ * connection reuse possible at all: with festina_client_read_all's
+ * always-read-to-EOF behavior, a genuinely persistent connection would
+ * simply hang here for the full 30s SO_RCVTIMEO on every request,
+ * since a peer that intends to keep the connection open never sends
+ * the EOF that loop waits for.
+ *
+ * Falls back to reading to EOF (still correct, just not poolable) when
+ * the body length can't be determined ahead of time -- no
+ * Content-Length and not chunked, the one shape a real response is
+ * allowed to take on a connection the PEER intends to close itself
+ * (RFC 7230 SS6.3: omitting both is how a server signals "read until I
+ * close"). `*out_reusable` comes back 0 whenever that fallback fires,
+ * whenever the response said `Connection: close`, or whenever the
+ * status line itself is HTTP/1.0 (this runtime's client always SENDS
+ * 1.1, but a legacy 1.0 upstream isn't obligated to honor a keep-alive
+ * request just because it didn't say `close` back -- the same
+ * default-to-close asymmetry festina_try_parse_request already applies
+ * to an INBOUND 1.0 request, mirrored here for the outbound side). */
+static void festina_client_read_response(FestinaClientTransport *t, uint8_t **buf, size_t *len,
+                                         int *out_reusable) {
+    size_t cap = 8192;
+    *buf = malloc(cap);
+    if (!*buf) festina_fail("out of memory reading an http response");
+    *len = 0;
+    *out_reusable = 0;
+
+    size_t header_scan_pos = 0;
+    const char *hdr_end = NULL; /* start of the "\r\n\r\n" once found */
+    int64_t content_length = -1;
+    int is_chunked = 0;
+    int explicit_close = 0;
+    int is_http_1_0 = 0;
+    size_t chunk_scan_pos = 0;
+    uint8_t *chunk_body = NULL;
+    size_t chunk_body_len = 0, chunk_body_cap = 0;
+
+    for (;;) {
+        if (*len + 4096 > cap) {
+            cap *= 2;
+            if (cap > FESTINA_HTTP_MAX_BUFFER) cap = FESTINA_HTTP_MAX_BUFFER;
+            uint8_t *grown = realloc(*buf, cap);
+            if (!grown) festina_fail("out of memory reading an http response");
+            *buf = grown;
+        }
+        if (*len >= (size_t)FESTINA_HTTP_MAX_BUFFER) break;
+
+        long n;
+        if (t->tls) {
+            n = g_tls_client_recv(t->tls, *buf + *len, (int64_t)(cap - *len));
+            if (n == -1) continue;
+            if (n <= 0) break;
+        } else {
+            ssize_t r = recv(t->fd, (char *)(*buf + *len), (int)(cap - *len), 0);
+            if (r < 0) {
+                if (festina_socket_was_interrupted()) continue;
+                break;
+            }
+            if (r == 0) break;
+            n = r;
+        }
+        *len += (size_t)n;
+
+        if (!hdr_end) {
+            /* claude.md #155's own resumable-scan trick (see
+             * festina_try_parse_request), applied here for the
+             * identical reason: avoid rescanning already-scanned bytes
+             * on every recv() while a large header block trickles in. */
+            size_t scan_start = header_scan_pos > 3 ? header_scan_pos - 3 : 0;
+            for (size_t i = scan_start; i + 3 < *len; i++) {
+                if ((*buf)[i] == '\r' && (*buf)[i + 1] == '\n'
+                        && (*buf)[i + 2] == '\r' && (*buf)[i + 3] == '\n') {
+                    hdr_end = (const char *)*buf + i;
+                    break;
+                }
+            }
+            if (!hdr_end) { header_scan_pos = *len; continue; }
+
+            is_http_1_0 = (*len >= 8 && memcmp(*buf, "HTTP/1.0", 8) == 0);
+            const char *hdr_line_start = memchr((const char *)*buf, '\n',
+                                                (size_t)(hdr_end - (const char *)*buf));
+            hdr_line_start = hdr_line_start ? hdr_line_start + 1 : (const char *)*buf;
+            festina_client_scan_head(hdr_line_start, hdr_end, &content_length,
+                                     &is_chunked, &explicit_close);
+            if (is_chunked) chunk_scan_pos = (size_t)(hdr_end - (const char *)*buf) + 4;
+        }
+
+        if (is_chunked) {
+            int ok;
+            int done = festina_chunk_decode_step(*buf, *len, &chunk_scan_pos,
+                                                 &chunk_body, &chunk_body_len,
+                                                 &chunk_body_cap, &ok);
+            if (!ok || done) {
+                free(chunk_body); /* only its own `done`/`ok` signal was
+                                    * needed here -- the real body comes
+                                    * from festina_parse_http_response's
+                                    * own separate, one-shot decode of
+                                    * the complete buffer just below. */
+                *out_reusable = ok && !explicit_close && !is_http_1_0;
+                return;
+            }
+            continue;
+        }
+
+        if (content_length >= 0) {
+            size_t body_start = (size_t)(hdr_end - (const char *)*buf) + 4;
+            size_t have_body = *len > body_start ? *len - body_start : 0;
+            if (have_body >= (size_t)content_length) {
+                *out_reusable = !explicit_close && !is_http_1_0;
+                return;
+            }
+            continue;
+        }
+        /* Head found but the body length still isn't determinable --
+         * keep reading to EOF, same as festina_client_read_all; the
+         * loop's own `break` below (peer closed, or a hard read error)
+         * is what ends it. out_reusable stays 0. */
+    }
+}
+#endif /* !_WIN32 */
 
 /* Parses "METHOD-less" -- an HTTP RESPONSE -- status line + headers +
  * body out of the raw bytes festina_client_read_all collected, into
@@ -3419,152 +3777,224 @@ void festina_http_send_client(void *payload) {
     int is_tls = strcmp(protocol, "https:") == 0;
     int port = (port_field != FESTINA_NULL_INT) ? (int)port_field : (is_tls ? 443 : 80);
 
-    struct addrinfo hints, *addr_result = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
-    int gai_rc = getaddrinfo(hostname, port_str, &hints, &addr_result);
-    if (gai_rc != 0 || !addr_result) {
-        char msg[300];
-        snprintf(msg, sizeof(msg), "fetch: could not resolve '%s'", hostname);
-        free(protocol); free(hostname); free(pathname);
-        festina_release_url(url);
-        festina_throw(festina_text_own(msg));
-        return; /* unreachable */
-    }
-
-    FestinaSocket fd = FESTINA_INVALID_SOCKET;
-    for (struct addrinfo *ai = addr_result; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd == FESTINA_INVALID_SOCKET) continue;
-        if (connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
-        festina_close_fd(fd);
-        fd = FESTINA_INVALID_SOCKET;
-    }
-    freeaddrinfo(addr_result);
-    if (fd == FESTINA_INVALID_SOCKET) {
-        char msg[300];
-        snprintf(msg, sizeof(msg), "fetch: could not connect to '%s:%d'", hostname, port);
-        free(protocol); free(hostname); free(pathname);
-        festina_release_url(url);
-        festina_throw(festina_text_own(msg));
-        return; /* unreachable */
-    }
-    /* claude.md #162: a blocking client socket, deliberately -- fetch()/
-     * req.send() blocks the whole single-threaded program until it
-     * completes, the same already-established "a slow on request
-     * handler delays every other connection" tradeoff this runtime's
-     * own design already accepts (see festina_runtime.h's top
-     * comment), extended here to "a slow fetch() blocks everything
-     * else too." A finite timeout still matters -- an unresponsive
-     * server must not hang the program forever. */
-#ifdef _WIN32
-    DWORD timeout_ms = 30000;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+    /* claude.md #248: `poolable` is this whole function's one switch
+     * between the old always-fresh-connect/read-to-EOF behavior and
+     * the new pooled one -- see festina_client_pool_take's own doc
+     * comment for exactly why it's POSIX-and-plain-HTTP only. false
+     * here makes every new branch below a no-op, so an https:// call
+     * (or any call at all on Windows) takes the identical path this
+     * function always has. */
+#ifndef _WIN32
+    int poolable = !is_tls;
 #else
-    struct timeval timeout_tv = { 30, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout_tv, sizeof(timeout_tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout_tv, sizeof(timeout_tv));
+    int poolable = 0;
+#endif
+    FestinaSocket fd = FESTINA_INVALID_SOCKET;
+    int from_pool = 0;
+#ifndef _WIN32
+    if (poolable) from_pool = festina_client_pool_take(hostname, port, &fd);
 #endif
 
-    FestinaClientTransport transport;
-    transport.fd = fd;
-    transport.tls = NULL;
-    if (is_tls) {
-        if (!g_tls_client_connect) {
-            festina_close_fd(fd);
-            free(protocol); free(hostname); free(pathname);
-            festina_release_url(url);
-            festina_throw(festina_text_own(
-                "fetch: this program was not compiled with TLS support "
-                "(this shouldn't happen -- an https:// URL always links it)"));
-            return; /* unreachable */
+    /* claude.md #248: a small retry loop, not a straight-line function
+     * any more -- `fd` may already be a REUSED connection on the first
+     * pass (from_pool=1, nothing to connect); the only way back into
+     * this loop a second time is a failed WRITE on that reused
+     * connection (see the `!ok` branch below), which forces exactly
+     * one fresh connect-and-retry before this is treated as a real
+     * failure. Every throw path below still frees protocol/hostname/
+     * pathname/url and returns, unchanged from before this entry. */
+    int fresh_connect_attempted = 0;
+    for (;;) {
+        if (fd == FESTINA_INVALID_SOCKET) {
+            fresh_connect_attempted = 1;
+            struct addrinfo hints, *addr_result = NULL;
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            char port_str[16];
+            snprintf(port_str, sizeof(port_str), "%d", port);
+            int gai_rc = getaddrinfo(hostname, port_str, &hints, &addr_result);
+            if (gai_rc != 0 || !addr_result) {
+                char msg[300];
+                snprintf(msg, sizeof(msg), "fetch: could not resolve '%s'", hostname);
+                free(protocol); free(hostname); free(pathname);
+                festina_release_url(url);
+                festina_throw(festina_text_own(msg));
+                return; /* unreachable */
+            }
+            for (struct addrinfo *ai = addr_result; ai; ai = ai->ai_next) {
+                fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+                if (fd == FESTINA_INVALID_SOCKET) continue;
+                if (connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+                festina_close_fd(fd);
+                fd = FESTINA_INVALID_SOCKET;
+            }
+            freeaddrinfo(addr_result);
+            if (fd == FESTINA_INVALID_SOCKET) {
+                char msg[300];
+                snprintf(msg, sizeof(msg), "fetch: could not connect to '%s:%d'", hostname, port);
+                free(protocol); free(hostname); free(pathname);
+                festina_release_url(url);
+                festina_throw(festina_text_own(msg));
+                return; /* unreachable */
+            }
+            /* claude.md #162: a blocking client socket, deliberately --
+             * fetch()/req.send() blocks the whole single-threaded
+             * program until it completes, the same already-established
+             * "a slow on request handler delays every other
+             * connection" tradeoff this runtime's own design already
+             * accepts (see festina_runtime.h's top comment), extended
+             * here to "a slow fetch() blocks everything else too." A
+             * finite timeout still matters -- an unresponsive server
+             * must not hang the program forever. Set once, on a freshly
+             * connected fd -- a REUSED one already carries these from
+             * when it was first connected. */
+#ifdef _WIN32
+            DWORD timeout_ms = 30000;
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+#else
+            struct timeval timeout_tv = { 30, 0 };
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout_tv, sizeof(timeout_tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout_tv, sizeof(timeout_tv));
+#endif
         }
-        transport.tls = g_tls_client_connect((int)fd, hostname);
-        if (!transport.tls) {
+
+        FestinaClientTransport transport;
+        transport.fd = fd;
+        transport.tls = NULL;
+        if (is_tls) {
+            if (!g_tls_client_connect) {
+                festina_close_fd(fd);
+                free(protocol); free(hostname); free(pathname);
+                festina_release_url(url);
+                festina_throw(festina_text_own(
+                    "fetch: this program was not compiled with TLS support "
+                    "(this shouldn't happen -- an https:// URL always links it)"));
+                return; /* unreachable */
+            }
+            transport.tls = g_tls_client_connect((int)fd, hostname);
+            if (!transport.tls) {
+                festina_close_fd(fd);
+                char msg[300];
+                snprintf(msg, sizeof(msg), "fetch: TLS handshake with '%s' failed", hostname);
+                free(protocol); free(hostname); free(pathname);
+                festina_release_url(url);
+                festina_throw(festina_text_own(msg));
+                return; /* unreachable */
+            }
+        }
+
+        char stack_storage[512];
+        FestinaSendBuf buf;
+        festina_sendbuf_init(&buf, stack_storage, sizeof(stack_storage));
+        festina_sendbuf_append(&buf, v->method, strlen(v->method));
+        FESTINA_APPEND_LIT(&buf, " ");
+        festina_sendbuf_append(&buf, pathname, strlen(pathname));
+        FESTINA_APPEND_LIT(&buf, " HTTP/1.1\r\nHost: ");
+        festina_sendbuf_append(&buf, hostname, strlen(hostname));
+        FESTINA_APPEND_LIT(&buf, "\r\n");
+        FestinaMapBlock *hblock = (FestinaMapBlock *)((char *)v->headers - sizeof(int64_t));
+        g_http_send_header_buf = &buf;
+        festina_map_for_each(hblock->entries, hblock->capacity, festina_write_extra_header);
+        g_http_send_header_buf = NULL;
+        char cl_line[64];
+        int cl_len = snprintf(cl_line, sizeof(cl_line), "Content-Length: %lld\r\n",
+                              (long long)(v->body_len > 0 ? v->body_len : 0));
+        if (cl_len > 0) festina_sendbuf_append(&buf, cl_line, (size_t)cl_len);
+        /* claude.md #248: only ever ASKS for keep-alive when this
+         * connection is actually eligible to be pooled -- an https://
+         * request (or any request on Windows) still sends `close`
+         * exactly as before, unchanged. */
+        if (poolable) {
+            FESTINA_APPEND_LIT(&buf, "Connection: keep-alive\r\n\r\n");
+        } else {
+            FESTINA_APPEND_LIT(&buf, "Connection: close\r\n\r\n");
+        }
+
+        int ok = festina_client_send_all(&transport, buf.data, buf.len);
+        if (ok && v->body_len > 0 && v->body) {
+            ok = festina_client_send_all(&transport, v->body, (size_t)v->body_len);
+        }
+        festina_sendbuf_free(&buf);
+
+        if (!ok) {
+            if (transport.tls) g_tls_client_close(transport.tls);
             festina_close_fd(fd);
+            if (from_pool && !fresh_connect_attempted) {
+                /* claude.md #248: a pooled connection that looked alive
+                 * at take-time (festina_client_pool_take's own
+                 * MSG_PEEK liveness check) can still die in the narrow
+                 * window between that check and this write -- an
+                 * ordinary, expected race for any keep-alive pool, not
+                 * a bug. One retry against a genuinely fresh
+                 * connection before this counts as a real failure. */
+                from_pool = 0;
+                fd = FESTINA_INVALID_SOCKET;
+                continue;
+            }
             char msg[300];
-            snprintf(msg, sizeof(msg), "fetch: TLS handshake with '%s' failed", hostname);
+            snprintf(msg, sizeof(msg), "fetch: writing the request to '%s' failed", hostname);
             free(protocol); free(hostname); free(pathname);
             festina_release_url(url);
             festina_throw(festina_text_own(msg));
             return; /* unreachable */
         }
-    }
 
-    char stack_storage[512];
-    FestinaSendBuf buf;
-    festina_sendbuf_init(&buf, stack_storage, sizeof(stack_storage));
-    festina_sendbuf_append(&buf, v->method, strlen(v->method));
-    FESTINA_APPEND_LIT(&buf, " ");
-    festina_sendbuf_append(&buf, pathname, strlen(pathname));
-    FESTINA_APPEND_LIT(&buf, " HTTP/1.1\r\nHost: ");
-    festina_sendbuf_append(&buf, hostname, strlen(hostname));
-    FESTINA_APPEND_LIT(&buf, "\r\n");
-    FestinaMapBlock *hblock = (FestinaMapBlock *)((char *)v->headers - sizeof(int64_t));
-    g_http_send_header_buf = &buf;
-    festina_map_for_each(hblock->entries, hblock->capacity, festina_write_extra_header);
-    g_http_send_header_buf = NULL;
-    char cl_line[64];
-    int cl_len = snprintf(cl_line, sizeof(cl_line), "Content-Length: %lld\r\n",
-                          (long long)(v->body_len > 0 ? v->body_len : 0));
-    if (cl_len > 0) festina_sendbuf_append(&buf, cl_line, (size_t)cl_len);
-    FESTINA_APPEND_LIT(&buf, "Connection: close\r\n\r\n");
+        uint8_t *resp_data = NULL;
+        size_t resp_len = 0;
+        int reusable = 0;
+#ifndef _WIN32
+        if (poolable) {
+            festina_client_read_response(&transport, &resp_data, &resp_len, &reusable);
+        } else
+#endif
+        {
+            festina_client_read_all(&transport, &resp_data, &resp_len);
+        }
 
-    int ok = festina_client_send_all(&transport, buf.data, buf.len);
-    if (ok && v->body_len > 0 && v->body) {
-        ok = festina_client_send_all(&transport, v->body, (size_t)v->body_len);
-    }
-    festina_sendbuf_free(&buf);
-
-    if (!ok) {
-        if (transport.tls) g_tls_client_close(transport.tls);
-        festina_close_fd(fd);
-        char msg[300];
-        snprintf(msg, sizeof(msg), "fetch: writing the request to '%s' failed", hostname);
+        if (reusable) {
+#ifndef _WIN32
+            /* claude.md #248: NOT closed -- ownership of `fd` moves
+             * into the pool for a later festina_client_pool_take
+             * against this same host:port. */
+            festina_client_pool_put(hostname, port, fd);
+#endif
+        } else {
+            if (transport.tls) g_tls_client_close(transport.tls);
+            festina_close_fd(fd);
+        }
         free(protocol); free(hostname); free(pathname);
         festina_release_url(url);
-        festina_throw(festina_text_own(msg));
-        return; /* unreachable */
+
+        int64_t new_code;
+        void *new_headers = NULL;
+        uint8_t *new_body = NULL;
+        int64_t new_body_len = 0;
+        /* claude.md #192: festina_parse_http_response now OWNS resp_data and
+         * frees it on every path (including its catchable throws), so there
+         * is no free here -- the previous free here was skipped by those
+         * throws, leaking the whole buffer per failed request. */
+        festina_parse_http_response(resp_data, resp_len, &new_code, &new_headers, &new_body, &new_body_len);
+
+        /* claude.md #162: url/method are left alone -- they still
+         * describe what was SENT. code/headers/body are overwritten with
+         * the response, freeing whatever v held before (the request's own
+         * headers/body, no longer needed once the request has actually
+         * gone out). */
+        v->code = new_code;
+        /* claude.md #167: festina_release_text_map, not the generic
+         * festina_release_map -- an http value's own headers map is always
+         * owned text (festina_build_headers_map/req.headers construction,
+         * or a user-built http literal's own map), see that function's own
+         * doc comment for the leak this fixes. */
+        festina_release_text_map(v->headers);
+        v->headers = new_headers;
+        free(v->body);
+        v->body = new_body;
+        v->body_len = new_body_len;
+        return;
     }
-
-    uint8_t *resp_data = NULL;
-    size_t resp_len = 0;
-    festina_client_read_all(&transport, &resp_data, &resp_len);
-    if (transport.tls) g_tls_client_close(transport.tls);
-    festina_close_fd(fd);
-    free(protocol); free(hostname); free(pathname);
-    festina_release_url(url);
-
-    int64_t new_code;
-    void *new_headers = NULL;
-    uint8_t *new_body = NULL;
-    int64_t new_body_len = 0;
-    /* claude.md #192: festina_parse_http_response now OWNS resp_data and
-     * frees it on every path (including its catchable throws), so there
-     * is no free here -- the previous free here was skipped by those
-     * throws, leaking the whole buffer per failed request. */
-    festina_parse_http_response(resp_data, resp_len, &new_code, &new_headers, &new_body, &new_body_len);
-
-    /* claude.md #162: url/method are left alone -- they still
-     * describe what was SENT. code/headers/body are overwritten with
-     * the response, freeing whatever v held before (the request's own
-     * headers/body, no longer needed once the request has actually
-     * gone out). */
-    v->code = new_code;
-    /* claude.md #167: festina_release_text_map, not the generic
-     * festina_release_map -- an http value's own headers map is always
-     * owned text (festina_build_headers_map/req.headers construction,
-     * or a user-built http literal's own map), see that function's own
-     * doc comment for the leak this fixes. */
-    festina_release_text_map(v->headers);
-    v->headers = new_headers;
-    free(v->body);
-    v->body = new_body;
-    v->body_len = new_body_len;
 }
 #undef FESTINA_APPEND_LIT
 

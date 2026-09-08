@@ -36,6 +36,23 @@ round-by-round design and implementation record predating 0.1 lives in
   onto the canvas with no `clip()` copy first. This is the one
   read-only exception to `T?` being a distinct type; assignment and
   every other call site are unchanged.
+- **`req.send()` reuses a keep-alive connection to the same host:port**
+  instead of opening a fresh one every call (plain `http://`, POSIX
+  only). One small connection cache per OS thread, no locking needed;
+  entirely transparent otherwise, including a dead reused connection
+  being silently replaced rather than surfaced as a request failure.
+
+### Fixed
+
+- **A copied `headers` map no longer duplicates `Host`/
+  `Content-Length`/`Connection`/`Transfer-Encoding` on the wire.**
+  These four are always computed by this runtime itself; forwarding a
+  real request's own `req.headers` into an outbound request, or a real
+  response's own `headers` back out (`res.headers = upstream.headers`
+  — a reverse proxy's most natural shape), used to append the
+  caller's copy on top of the runtime's own, producing the same header
+  name twice. A strict server (Go's `net/http`) hard-rejects a request
+  with two `Host` lines outright.
 
 ### Changed
 
