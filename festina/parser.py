@@ -752,6 +752,35 @@ class Parser:
     def parse_event_handler(self):
         t = self.eat("on")
         name_tok = self.eat("IDENT")
+        # claude.md #246: `on request use NAME` -- sugar for
+        # `on request(req:http?) { NAME.giveRequest(req) }`, the whole
+        # reason `giveRequest` exists (claude.md #213's own hand-off
+        # convention) written out by hand often enough to deserve a
+        # shorthand. `use` is not a reserved word anywhere else in this
+        # grammar (matching how `DatabaseURL` is recognized by name
+        # only inside a thread body, not reserved globally) -- checked
+        # here by VALUE, at this one position, only when the handler
+        # being declared is `request` specifically: this is a hand-off
+        # convention for exactly one event, not a general "alias any
+        # handler to a one-line body" mechanism nothing asked for.
+        # Desugars to a completely ordinary EventHandler AST node --
+        # every downstream consumer (duplicate-`on request` detection,
+        # declared_http_handlers tracking, giveRequest's own "target
+        # must have declared on request" check) stays unaware sugar was
+        # ever used, since there is nothing left by this point that
+        # looks different from the hand-written form.
+        if (name_tok.value == "request" and self.at("IDENT")
+                and self.peek().value == "use"):
+            self.eat("IDENT")  # 'use'
+            target_tok = self.eat("IDENT")
+            param = ast.Param("req", "http", manually_managed=True)
+            give = ast.ExprStmt(ast.Call(
+                ast.Member(ast.Identifier(target_tok.value, target_tok.line, target_tok.column),
+                          "giveRequest", False, target_tok.line, target_tok.column),
+                [ast.Identifier("req", target_tok.line, target_tok.column)],
+                target_tok.line, target_tok.column,
+            ))
+            return ast.EventHandler("request", [param], ast.Block([give]), t.line, t.column)
         self.eat("LPAREN")
         params = self.parse_typed_params()
         self.eat("RPAREN")
