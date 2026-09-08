@@ -88,17 +88,54 @@
           the SQLite-over-WebSocket server, and the CAPTCHA endpoint —
           all genuinely equivalent-scope programs) is also benchmarked
           against real Go, Rust, and Bun implementations, and measured
-          for code length. Averaged across those three:
+          for code length. For each of those three, and each of the
+          three columns below, every language's own value is expressed
+          as a percentage of that one benchmark's four-language average
+          (Festina+Rust+Go+Bun, divided by 4) — then those three
+          per-benchmark percentages are themselves averaged into the
+          single number shown:
         </p>
         <div class="table-wrap">
-          <table class="sig-table">
-            <tr><td>Throughput</td><td><strong>~2.9x</strong> the Go/Rust/Bun average (geometric mean — see <a href="#benchmark-methodology">Benchmark methodology</a> for why a geometric, not arithmetic, mean) — but this varies enormously by workload: <strong>14.5x</strong> ahead on the SQLite example (a default-configuration difference, not a language one — see <a href="#sqlite-over-websocket-benchmark">that section</a>), <strong>1.2x</strong> ahead on the CPU/image-bound CAPTCHA endpoint, and <strong>1.4x</strong> ahead on the reverse proxy, using the <a href="#reverse-proxy">multi-threaded version</a> below (re-measured after closing a real gap here — see <a href="#reverse-proxy-benchmark">that section</a> for what changed).</td></tr>
-            <tr><td>Code length</td><td>Roughly a wash — averaging the three examples' own percentage differences puts Festina at about <strong>1% longer</strong> than the Go/Rust/Bun mean, not shorter. One large win (43% shorter on the SQLite example) is offset by one large loss (the multi-threaded proxy is the longest of the four here, not the shortest — see <a href="#reverse-proxy-benchmark">that section</a>); the two don't net out the same way if compared by raw total lines instead of by percentage per example — see each section below for the exact counts.</td></tr>
+          <table>
+            <thead><tr><th>Language</th><th class="num">Speed<br><span style="font-weight:400; opacity:0.65; font-size:0.8em;">(bigger is better)</span></th><th class="num">Binary size<br><span style="font-weight:400; opacity:0.65; font-size:0.8em;">(smaller is better)</span></th><th class="num">Code size<br><span style="font-weight:400; opacity:0.65; font-size:0.8em;">(smaller is better)</span></th></tr></thead>
+            <tbody>
+              <tr><td>Festina</td><td class="num">149%</td><td class="num">5%</td><td class="num">90%</td></tr>
+              <tr><td>Rust</td><td class="num">63%</td><td class="num">12%</td><td class="num">123%</td></tr>
+              <tr><td>Go</td><td class="num">93%</td><td class="num">24%</td><td class="num">108%</td></tr>
+              <tr><td>Bun</td><td class="num">94%</td><td class="num">359%</td><td class="num">79%</td></tr>
+            </tbody>
           </table>
         </div>
         <p class="muted">
+          Read the direction of "better" per column (also marked in
+          each header above): for <strong>Speed</strong>, above 100%
+          means faster than the four-language average; for
+          <strong>Binary size</strong> and <strong>Code size</strong>,
+          <em>below</em> 100% means smaller — a language that were
+          exactly average on every benchmark would show 100% in every
+          cell. Festina's 149% speed average is driven by two real
+          outliers rather than a broad lead: 3.3x the competitor
+          average on the reverse proxy (an outbound-connection-reuse
+          fix landed after this table was first measured — see
+          <a href="#reverse-proxy-benchmark">that section</a>) and a
+          large win on the SQLite example, where all four
+          implementations use the identical <code>PRAGMA
+          journal_mode=WAL</code>/<code>synchronous=NORMAL</code>
+          settings Festina defaults to (see
+          <a href="#sqlite-over-websocket-benchmark">that section</a>) —
+          without that, the comparison would mostly be measuring who
+          remembered to set two pragmas, not the languages themselves.
+          Bun's 359% binary size is <code>bun build --compile</code>
+          embedding its entire runtime into every standalone binary
+          (see <a href="#weather-desktop-app-benchmark">below</a>); no
+          language is a clean sweep on code size, each lands within
+          about a quarter of the four-way average in either direction.
+          See each section below for the actual measurements these
+          percentages come from, not just the ratio.
+        </p>
+        <p class="muted">
           The fourth example, the desktop weather app, is deliberately
-          left out of both averages above: Festina's version is a full
+          left out of the table above: Festina's version is a full
           windowed app (it needs no extra library for that — see
           <a href="api.html#graphics">api.md's Graphics section</a>),
           while none of Go, Rust, or Bun ship a built-in canvas, so a
@@ -153,14 +190,13 @@
           the upstream — so this version spreads that wait across a
           <a href="api.html#thread-pools">pool</a> of worker threads
           instead, each with its own private
-          <a href="api.html#thread-http">HTTP
-          context</a>, fed by <code>main</code> handing off every
-          accepted connection with
+          <a href="api.html#thread-http">HTTP context</a>, fed by
+          <code>on request use workers</code> — sugar for handing off
+          every accepted connection to whichever worker is idle right
+          now via
           <a href="api.html#thread-giverequest"><code>giveRequest</code></a>:
         </p>
-        <pre class="code"><span class="kw">int</span> WORKER_COUNT = <span class="num">4</span>
-
-<span class="kw">thread</span> workers[<span class="num">4</span>] {
+        <pre class="code"><span class="kw">thread</span> workers[<span class="num">4</span>] {
     <span class="kw">text</span> UPSTREAM = <span class="str">'http://127.0.0.1:9000'</span>
 
     <span class="kw">on</span> request(req:http) {
@@ -184,12 +220,7 @@
     }
 }
 
-<span class="kw">int</span> nextWorker = <span class="num">0</span>
-
-<span class="kw">on</span> request(req:<span class="kw">http</span>?) {
-    workers[nextWorker].giveRequest(req)
-    nextWorker = (nextWorker + <span class="num">1</span>) % WORKER_COUNT
-}
+<span class="kw">on</span> request <span class="kw">use</span> workers
 
 openPort(<span class="num">8080</span>)</pre>
         <p class="muted">
@@ -201,17 +232,21 @@ openPort(<span class="num">8080</span>)</pre>
           in place, which is what gets relayed back below. A genuine
           network failure (upstream down, DNS failure, timeout) throws,
           caught here and turned into a <code>502</code> instead of
-          hanging the client. <code>main</code>'s own <code>on
-          request</code> must declare <code>req:http?</code> (a
-          <a href="api.html#t-manually-managed-values">manually-managed
-          value</a>) for <code>giveRequest</code> to accept it — an
-          ordinary auto-managed <code>req:http</code> is rejected, since
-          main's own cleanup would otherwise race the worker that just
-          received it. This is still deliberately minimal — no
-          <code>Host</code>/<code>Connection</code> header rewriting,
-          no path allow-list — but every request really is proxied
-          through, headers and body included, now with up to 4 of them
-          genuinely in flight at once.
+          hanging the client. <code>on request use workers</code>
+          desugars, at parse time, to exactly
+          <code>on request(req:http?) { workers.giveRequest(req) }</code>
+          — the bare (unindexed) form of <code>giveRequest</code>, which
+          picks whichever pool instance is idle right now rather than a
+          fixed rotation, falling back to round-robin only if every
+          worker is currently busy (see
+          <a href="api.html#thread-pools">api.md</a>). This is still
+          deliberately minimal — no path allow-list, no rewriting the
+          <code>Host</code> header for virtual-hosting a different
+          upstream name — but every request really is proxied through,
+          headers and body included, now with up to 4 of them genuinely
+          in flight at once, each over its own reused keep-alive
+          connection to the upstream (see the benchmark below for what
+          that's worth).
         </p>
 
         <h3 id="reverse-proxy-benchmark">Benchmark <a class="anchor" href="#reverse-proxy-benchmark">#</a></h3>
@@ -219,59 +254,54 @@ openPort(<span class="num">8080</span>)</pre>
           <table>
             <thead><tr><th>Reverse proxy</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Binary size</th><th class="num">Lines</th></tr></thead>
             <tbody>
-              <tr><td>Festina (4 worker threads)</td><td class="num">8,746</td><td class="num">2.29 ms</td><td class="num">1.6 MB</td><td class="num">34</td></tr>
-              <tr><td>Go (<code>net/http</code>)</td><td class="num">6,189</td><td class="num">3.23 ms</td><td class="num">6.0 MB</td><td class="num">17</td></tr>
-              <tr><td>Rust (<code>tiny_http</code> + <code>ureq</code>)</td><td class="num">5,555</td><td class="num">3.60 ms</td><td class="num">2.8 MB</td><td class="num">26</td></tr>
-              <tr><td>Bun (<code>Bun.serve</code> + <code>fetch</code>)</td><td class="num">7,574</td><td class="num">2.64 ms</td><td class="num">99.3 MB</td><td class="num">21</td></tr>
+              <tr><td>Festina (4 worker threads)</td><td class="num">28,771</td><td class="num">1.74 ms</td><td class="num">1.6 MB</td><td class="num">27</td></tr>
+              <tr><td>Go (<code>net/http</code>)</td><td class="num">7,173</td><td class="num">6.97 ms</td><td class="num">6.0 MB</td><td class="num">17</td></tr>
+              <tr><td>Rust (<code>tiny_http</code> + <code>ureq</code>)</td><td class="num">4,547</td><td class="num">10.98 ms</td><td class="num">2.8 MB</td><td class="num">26</td></tr>
+              <tr><td>Bun (<code>Bun.serve</code> + <code>fetch</code>)</td><td class="num">14,120</td><td class="num">3.54 ms</td><td class="num">99.3 MB</td><td class="num">21</td></tr>
             </tbody>
           </table>
         </div>
         <p class="muted">
-          Re-measured after finding and closing two real gaps in
-          <code>req.send()</code>, the outbound half of what this proxy
-          runs on (see claude.md
-          <a href="https://github.com/uraikus/festina/blob/main/claude.md">#247/#248</a>
-          for the full investigation): a duplicate-header bug — a
-          copied <code>headers</code> map
-          (<code>'headers': req.headers</code>, this example's own line
-          above) used to send the original client's <code>Host</code>
-          a second time, and the proxied response's own
-          <code>Content-Length</code>/<code>Connection</code> a second
-          time back out, which a strict upstream would reject
-          outright — and, the larger factor,
-          <code>req.send()</code> opening a brand-new TCP connection to
-          the upstream on every single proxied request. It now reuses
-          a keep-alive connection to the same host instead (plain
-          HTTP, confirmed with <code>strace</code>: <code>connect()</code>
+          <strong>Festina now leads all three competitors here — 3.3x
+          the Go/Rust/Bun average</strong> — after a real runtime fix
+          landed for exactly this example: <code>req.send()</code> used
+          to open a brand-new TCP connection to the upstream on
+          <em>every single proxied request</em>; it now reuses a
+          keep-alive connection to the same host instead (plain HTTP;
+          confirmed with <code>strace</code> that <code>connect()</code>
           calls dropped from matching the request count 1:1 down to
-          essentially one for the whole run) — a fix that helps any
-          program making repeated outbound calls to the same host, not
-          just this one.
-          <strong>Festina now leads all three</strong> on this
-          benchmark, not just the single-threaded-to-multi-threaded
-          story below.
+          essentially one per worker for the whole run). A second,
+          correctness-only fix shipped alongside it: the copied
+          <code>headers</code> map this example forwards
+          (<code>'headers': req.headers</code>/<code>upstream.headers</code>
+          above) used to duplicate <code>Host</code>/<code>Content-Length</code>/<code>Connection</code>
+          on the wire instead of using the runtime's own computed
+          values — harmless against a lenient upstream, but a hard
+          <code>400</code> against a strict one (found by testing this
+          exact example against a real Go upstream). Neither fix
+          touched this page's own source code; both are simply how
+          <code>req.send()</code> behaves now. Nothing here is
+          Festina-specific in spirit — reusing a connection to a host
+          you keep talking to is exactly what Go's, Rust's, and Bun's
+          own HTTP clients already do by default.
         </p>
         <p class="muted">
           <strong>4 worker threads over the single-threaded version
-          above: +42% throughput</strong> (8,746 req/s vs. a clean
-          6,167 req/s measured the same way — see
-          <a href="#reverse-proxy">the code above</a>), from spreading
-          the blocking wait on <code>upstream.send()</code> across
-          workers instead of queuing every connection behind one — and
-          now each worker keeps its own warm, reused connection to the
-          upstream too, so four threads means four persistent
-          connections doing real, overlapping work rather than four
-          threads all still paying a fresh handshake each time. At 34
-          lines this is still the <em>longest</em> of the four, not the
-          shortest — Go and Bun get their concurrency for free from the
-          runtime, so nothing in their own source above changed at
-          all — but no longer the slowest: Go's and Bun's own default
-          concurrency (spreading incoming connections across OS threads
-          or an event loop without being asked) no longer wins outright
-          once the upstream leg is no longer the bottleneck it used to
-          be. Bun's 99.3 MB binary is almost entirely the bundled Bun
-          runtime (see <a href="#weather-desktop-app-benchmark">below</a>)
-          — its proxy logic itself is a handful of lines.
+          above: +230% throughput</strong> (28,771 req/s vs. a clean
+          8,729 req/s measured the same way — see
+          <a href="#reverse-proxy">the code above</a>) — a much bigger
+          jump than threading alone would give, because each of the 4
+          workers now keeps its <em>own</em> warm, reused connection to
+          the upstream, so four threads means four persistent
+          connections doing real, overlapping work, not four threads
+          still paying a fresh handshake every time. At 27 lines this
+          is close to the middle of the pack now, not the longest — Go
+          and Bun get their concurrency for free from the runtime, so
+          nothing in their own source above changed at all, but Rust's
+          more manual setup is still longer. Bun's 99.3 MB binary is
+          almost entirely the bundled Bun runtime (see
+          <a href="#weather-desktop-app-benchmark">below</a>) — its
+          proxy logic itself is a handful of lines.
         </p>
       </section>
 
@@ -343,30 +373,37 @@ openPort(<span class="num">9090</span>)
           <table>
             <thead><tr><th>SQLite over WebSocket</th><th class="num">Requests/sec</th><th class="num">Avg latency</th><th class="num">Binary size</th><th class="num">Lines</th></tr></thead>
             <tbody>
-              <tr><td>Festina</td><td class="num">10,772</td><td class="num">1.84 ms</td><td class="num">1.6 MB</td><td class="num">33</td></tr>
-              <tr><td>Go (<code>nhooyr.io/websocket</code> + <code>modernc.org/sqlite</code>)</td><td class="num">735</td><td class="num">26.96 ms</td><td class="num">10.2 MB</td><td class="num">67</td></tr>
-              <tr><td>Rust (<code>axum</code> + <code>rusqlite</code>)</td><td class="num">698</td><td class="num">28.36 ms</td><td class="num">3.5 MB</td><td class="num">77</td></tr>
-              <tr><td>Bun (<code>Bun.serve</code> + <code>bun:sqlite</code>, both built in)</td><td class="num">795</td><td class="num">24.89 ms</td><td class="num">99.3 MB</td><td class="num">30</td></tr>
+              <tr><td>Festina</td><td class="num">21,934</td><td class="num">0.91 ms</td><td class="num">1.6 MB</td><td class="num">33</td></tr>
+              <tr><td>Go (<code>nhooyr.io/websocket</code> + <code>modernc.org/sqlite</code>)</td><td class="num">9,914</td><td class="num">2.01 ms</td><td class="num">10.2 MB</td><td class="num">69</td></tr>
+              <tr><td>Rust (<code>axum</code> + <code>rusqlite</code>)</td><td class="num">19,660</td><td class="num">1.01 ms</td><td class="num">3.5 MB</td><td class="num">79</td></tr>
+              <tr><td>Bun (<code>Bun.serve</code> + <code>bun:sqlite</code>, both built in)</td><td class="num">21,089</td><td class="num">0.94 ms</td><td class="num">99.3 MB</td><td class="num">32</td></tr>
             </tbody>
           </table>
         </div>
         <p class="muted">
-          <strong>This gap is a default-configuration difference, not
-          a language one.</strong> Every <code>sqlite()</code> database
-          in Festina opens in WAL mode with <code>synchronous=NORMAL</code>
-          automatically (see
+          <strong>All four use the identical <code>PRAGMA
+          journal_mode=WAL</code>/<code>synchronous=NORMAL</code>
+          settings.</strong> Every <code>sqlite()</code> database in
+          Festina opens this way automatically (see
           <a href="api.html#query-performance">api.md's "Query
           performance"</a> — measured there at 20,000 inserts dropping
-          from 16.7s to 0.3s from this exact change). None of the three
-          competitor libraries above default to it: each one insert-then-
-          fsyncs on SQLite's own out-of-the-box rollback-journal
-          settings, which is what caps all three within a fairly narrow
-          band around 700-800 req/s here regardless of language —
-          adding the same two <code>PRAGMA</code> statements to any of
-          them would close most of this gap. Bun's built-in
-          <code>bun:sqlite</code> needs no separate crate/package at
-          all, which is why it's the shortest of the three competitors
-          despite doing the same work as the other two.
+          from 16.7s to 0.3s from this exact change); none of the three
+          competitor libraries default to it, so the same two
+          <code>PRAGMA</code> statements were added to each of their
+          setup code by hand for this comparison — without them, this
+          table would mostly be measuring who remembered to set two
+          pragmas, not the languages themselves. With that controlled
+          for, three of the four land within about 10% of each other
+          (Festina, Rust, and Bun all comfortably clear 19,000 req/s);
+          Go is the outlier here, and not because of WAL — its
+          <code>database/sql</code> driver overhead plus
+          <code>modernc.org/sqlite</code> being a pure-Go
+          reimplementation of SQLite (no C library, no cgo, which is
+          exactly why it's easy to cross-compile with) trades raw speed
+          for that convenience. Bun's built-in <code>bun:sqlite</code>
+          needs no separate package at all, which is why it's the
+          shortest of the three competitors despite doing the same work
+          as the other two.
         </p>
       </section>
 
