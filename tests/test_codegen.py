@@ -523,6 +523,84 @@ class TestBlob:
             semantic.analyze(program)
 
 
+class TestReturnTextToHandleConversion:
+    """claude.md #251: `return <text-expr>` from a `blob`/`img`/`aud`
+    func -- the implicit text-to-handle load conversion at a RETURN
+    site specifically. Found leaking the intermediate text (a fresh
+    template-literal/concat result, never freed after
+    festina_blob_open/festina_load_image/festina_load_audio strdup'd
+    what they needed from it) while adding `.length`'s own stress-test
+    coverage; the fix was a one-line `source_expr=stmt.value` this
+    Return branch's own `_coerce` call was the sole exception to
+    passing (every other _coerce call site that can hit these three
+    conversions already threads its source expression through).
+    These are correctness tests -- leak-freedom itself is what
+    `scripts/leak_stress.sh` on `tests/stress/media_churn.f` (a
+    computed blob receiver returned this way) actually proves; not
+    re-proven here since an ordinary pytest run has no ASan under it.
+    """
+
+    def test_a_blob_func_returning_a_computed_path_works(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        source = f"""
+        blob func reload() {{ return '{path}' }}
+        log(reload().toText())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hello"
+
+    def test_a_blob_func_returning_a_template_literal_path_works(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        source = f"""
+        blob func reload(dir:text) {{ return `${{dir}}/data.txt` }}
+        log(reload('{tmp_path}').toText())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hello"
+
+    def test_a_blob_func_returning_a_bound_variable_still_works(self, compile_and_run, tmp_path):
+        # The other half of the same fix: `return p` (a bare local, an
+        # ALIASING source, not an owning one) must NOT be freed by the
+        # coercion itself -- ordinary scope-exit release still owns it.
+        # Getting this wrong the other way would double-free.
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        source = f"""
+        blob func reload() {{
+            text p = '{path}'
+            return p
+        }}
+        log(reload().toText())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hello"
+
+    def test_an_img_func_returning_a_computed_path_works(self, compile_and_run, tmp_path):
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "gradient.jpg")
+        source = """
+        img func loadTile(dir:text) { return `${dir}/gradient.jpg` }
+        log(loadTile('.').width > 0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_an_aud_func_returning_a_computed_path_works(self, compile_and_run, tmp_path):
+        shutil.copy(_MP3_FIXTURE, tmp_path / "tone.mp3")
+        source = """
+        aud func loadClip(dir:text) { return `${dir}/tone.mp3` }
+        log(loadClip('.').isPlaying())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+
 class TestStructs:
     """claude.md #27: structs are native in-memory objects with typed,
     assignable fields."""

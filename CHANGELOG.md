@@ -75,6 +75,14 @@ round-by-round design and implementation record predating 0.1 lives in
   caller's copy on top of the runtime's own, producing the same header
   name twice. A strict server (Go's `net/http`) hard-rejects a request
   with two `Host` lines outright.
+- **`return <text-expr>` from a `blob`/`img`/`aud` func no longer leaks
+  the intermediate text.** The implicit text-to-handle load conversion
+  at a `return` site (`blob func f() { return `path${x}` }`) passed
+  the fresh path text to `festina_blob_open`/`festina_load_image`/
+  `festina_load_audio` — all three copy what they need internally —
+  and never freed the original afterward. The ordinary `blob b =
+  <text-expr>` declaration form was unaffected; only a `return` of a
+  computed path was.
 
 ### Changed
 

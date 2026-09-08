@@ -13,19 +13,15 @@ table Asset {
 sqlite('DELETE FROM Asset')
 
 blob func reload(i:int) {
-    // Built as a local first, then returned, rather than
-    // `return `save_${i % 4}.dat`` directly -- a known, pre-existing,
-    // unrelated leak in this compiler's implicit text->blob
-    // conversion AT a return site (the intermediate text from the
-    // template literal is never freed after festina_blob_open copies
-    // its path; found via this very stress file while adding
-    // claude.md #251, confirmed via LLVM IR inspection, NOT fixed
-    // here -- out of scope for #251, noted in claude.md instead). The
-    // ordinary `blob b = <text-expr>` VarDecl conversion this uses
-    // instead is unaffected -- `save` right below already proves
-    // that shape leak-free.
-    blob b = `save_${i % 4}.dat`
-    return b
+    // claude.md #251: `return `save_${i % 4}.dat`` directly -- this
+    // exact line is what surfaced the return-site text->blob
+    // conversion leak fixed in the same entry (the intermediate
+    // template-literal text was never freed after festina_blob_open
+    // copied its path). Kept as the direct-return shape, not routed
+    // through a local, specifically so this loop keeps exercising the
+    // fixed path rather than only the VarDecl path `save` below
+    // already covered on its own.
+    return `save_${i % 4}.dat`
 }
 
 int total = 0

@@ -5303,7 +5303,21 @@ class CodeGen:
                 lines.append("  ret void")
             else:
                 val, vtype = self._emit_value_for(stmt.value, env, lines, return_type)
-                val = self._coerce(val, vtype, return_type, lines)
+                # claude.md #251: source_expr=stmt.value -- every OTHER
+                # _coerce call site that can hit the text->blob/img/aud
+                # load conversions just below threads its own source
+                # expression through so _free_text_temp can tell a fresh
+                # path (a template literal, a `+` concat, a call result)
+                # from a borrowed one (a plain variable) and free only
+                # the former. This call site was the one exception,
+                # always passing None -- which _is_owning_text_source
+                # treats as "not owning," so the text festina_blob_open/
+                # festina_load_image/festina_load_audio strdup'd from
+                # (all three copy internally) was silently never freed
+                # for `return <text-expr>` in a blob/img/aud func. Found
+                # via #251's own stress-test coverage, confirmed
+                # independent of `.length` before fixing here.
+                val = self._coerce(val, vtype, return_type, lines, source_expr=stmt.value)
                 # claude.md #77 (widened further): a struct being handed
                 # back to the caller gets the exact same owning/aliasing
                 # treatment _emit_local_retain_release already
