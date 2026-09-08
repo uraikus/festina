@@ -3093,7 +3093,22 @@ def analyze(program, filename="<string>"):
             if isinstance(pool_receiver, ast.Identifier) and pool_receiver.name in threads:
                 thread_name = pool_receiver.name
                 info = threads[thread_name]
-                if info.pool_size is not None and pool_index_expr is None:
+                # claude.md #245/#246: the two exceptions to "a pool
+                # must always be indexed" -- `pool.postMessage(x)` and
+                # `pool.giveRequest(r)`, both bare, both auto-select an
+                # idle instance at runtime instead of naming one (see
+                # _emit_thread_target_handle's own bare-pool branch;
+                # `giveRequest` reaches the identical branch through
+                # the identical resolution, so no codegen change was
+                # needed to extend it there too -- claude.md #246's own
+                # `on request use pool` sugar is what makes this the
+                # common case for a pool with its own `on request`).
+                # Every OTHER method still needs an index --
+                # kill/live/isAlive/drain are all genuinely about ONE
+                # specific instance's own lifecycle, with no
+                # "whichever one" reading that would make sense.
+                if (info.pool_size is not None and pool_index_expr is None
+                        and callee.prop not in ("postMessage", "giveRequest")):
                     raise CompileError(
                         f"thread pool '{thread_name}' must be indexed to call a "
                         f"method -- e.g. '{thread_name}[0].{callee.prop}(...)'",

@@ -13,6 +13,21 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Added
 
+- **`pool.postMessage(x)` — no index — auto-selects an idle instance.**
+  Routes to whichever pool instance currently has nothing queued and
+  isn't mid-handler, falling back to plain round-robin when every
+  instance is busy rather than ever blocking the caller. `.callback(fn)`
+  chains onto it exactly as it does on an indexed `pool[i].postMessage`.
+- **`pool.giveRequest(r)` — no index — same auto-selection as
+  `postMessage`.** Hands the live connection to whichever instance is
+  idle right now, falling back to round-robin, exactly like bare
+  `postMessage` above.
+- **`on request use NAME`.** Sugar for
+  `on request(req:http?) { NAME.giveRequest(req) }` — `NAME` can be a
+  singleton thread or a pool (in which case the bare, auto-selecting
+  `giveRequest` above applies). Desugars entirely at parse time; `use`
+  is not a reserved word anywhere else.
+  Every other pool method still requires an index.
 - **`drawImage` accepts an `img?` source.** Every form of the canvas
   `drawImage(...)` and of `img.drawImage(...)` takes a manually-managed
   `img?` where it says `img` — compositing only reads the source for

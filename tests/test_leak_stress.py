@@ -637,4 +637,18 @@ class TestLeakStress:
             # leak claude.md #157 documented. Only runnable under ASan
             # at all since claude.md #235 (libc setjmp/longjmp).
             "throw_unwind_churn.f",
+            # claude.md #245: pool.postMessage(x) with no index --
+            # main plus 3 feeder threads all auto-selecting against the
+            # SAME handles array and round-robin counter at once, 12,000
+            # messages total. A leak in festina_thread_pool_select's own
+            # handle resolution, or in the round-robin counter's global,
+            # would show up here.
+            "thread_pool_auto_churn.f",
+            # claude.md #246: on request use NAME -- the same real,
+            # concurrent, at-volume live-connection hand-off
+            # thread_giverequest_churn.f already covers, but through the
+            # parser sugar and targeting a pool (so the bare, auto-
+            # selecting giveRequest path above gets exercised too, not
+            # just the indexed form).
+            "thread_use_request_churn.f",
         }

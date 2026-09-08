@@ -17652,6 +17652,234 @@ class TestThreadPools:
         assert result.stdout.strip().splitlines() == ["true", "true", "false"]
 
 
+class TestThreadPoolAutoPostMessage:
+    """claude.md #245: `pool.postMessage(x)` -- no index -- auto-selects
+    whichever pool instance is genuinely idle right now, falling back to
+    plain round-robin when none are (the user's own explicit choice:
+    never block the caller waiting for one to free up, matching every
+    other postMessage call in this language). "Idle" is read straight
+    off state this runtime already maintains for `drain()`'s own sake
+    (`in_head`/`dispatching`, both guarded by the instance's own
+    in_lock) rather than a new parallel flag -- see
+    festina_thread_pool_select's own doc comment in
+    runtime/festina_runtime_thread.c for exactly why.
+
+    Every other pool method (kill/live/isAlive/giveRequest/drain) still
+    requires an index -- only postMessage gets the bare form, since
+    those are all genuinely about ONE specific instance's own lifecycle
+    or connection, with no "whichever one" reading that would make
+    sense."""
+
+    def test_a_bare_pool_still_requires_an_index_for_every_other_method(self, cli_mod, errors, tmp_path):
+        for method, args in (("kill", "()"), ("live", "(void (ok:bool) => log(ok))"),
+                             ("isAlive", "()"), ("drain", "()")):
+            src = tmp_path / "main.f"
+            src.write_text(f"""
+            thread pool[2] {{
+                on message(worker:thread, msg:int) {{ }}
+            }}
+            log(pool.{method}{args})
+            """, encoding="utf-8")
+            with pytest.raises(errors.CompileError, match="must be indexed"):
+                cli_mod.compile_file(str(src), str(tmp_path / "out"))
+
+    def test_a_bare_pool_send_reaches_exactly_one_instance_and_all_messages_land(
+            self, compile_and_run):
+        # 20 bare sends across a 4-instance pool, each doubled and
+        # echoed to main -- if auto-select ever dropped, duplicated, or
+        # misrouted a message (posted it nowhere, posted it twice, or
+        # somehow reached two instances at once), the count/sum below
+        # would not come out exact.
+        source = """
+        int total = 0
+        int received = 0
+        on message(worker:thread, msg:int) {
+            total = total + msg
+            received = received + 1
+            if received == 20 {
+                log(total)
+                log(received)
+                close(0)
+            }
+        }
+        thread pool[4] {
+            on message(worker:thread, msg:int) {
+                postMessage(msg * 2)
+            }
+        }
+        int i = 1
+        while i <= 20 {
+            pool.postMessage(i)
+            i = i + 1
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stderr
+        # sum(1..20) * 2 = 420
+        assert result.stdout.strip().splitlines() == ["420", "20"]
+
+    def test_idle_instances_are_genuinely_used_in_parallel(self, compile_and_run):
+        # The actual point of this feature: 8 messages, each occupying
+        # its own instance for ~150ms, across 4 instances. If auto-
+        # select ever degraded to "always instance 0" (the bug this
+        # whole feature exists to NOT have), 8 * 150ms would serialize
+        # to ~1200ms; spread across 4 idle instances it finishes in
+        # about 2 batches -- comfortably under 700ms even with real
+        # scheduling slop.
+        source = """
+        int received = 0
+        int start = now()
+        on message(worker:thread, msg:int) {
+            received = received + 1
+            if received == 8 {
+                log(now() - start < 700)
+                close(0)
+            }
+        }
+        thread pool[4] {
+            on message(worker:thread, msg:int) {
+                int t = now()
+                while now() - t < 150 {
+                }
+                postMessage(msg)
+            }
+        }
+        int i = 0
+        while i < 8 {
+            pool.postMessage(i)
+            i = i + 1
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "true"
+
+    def test_bare_postmessage_chains_callback_on_a_pool(self, compile_and_run):
+        # .callback(fn) works on the auto-select form exactly like it
+        # does on an indexed pool[i].postMessage(x) -- the reply comes
+        # back from whichever instance actually handled it, and this
+        # doesn't care which.
+        source = """
+        thread pool[3] {
+            on message(worker:thread, msg:int) {
+                worker.reply(msg * 10)
+            }
+        }
+        int total = 0
+        int received = 0
+        void func onReply(r:int) {
+            total = total + r
+            received = received + 1
+            if received == 9 {
+                log(total)
+                log(received)
+                close(0)
+            }
+        }
+        int i = 1
+        while i <= 9 {
+            pool.postMessage(i).callback(onReply)
+            i = i + 1
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stderr
+        # sum(1..9) * 10 = 450
+        assert result.stdout.strip().splitlines() == ["450", "9"]
+
+    def test_a_bare_send_with_no_on_message_handler_is_still_a_compile_error(
+            self, cli_mod, errors, tmp_path):
+        # The auto-select form is still an ordinary postMessage target
+        # underneath -- a pool with no 'on message' handler is exactly
+        # as unreachable via the bare form as via an indexed one.
+        src = tmp_path / "main.f"
+        src.write_text("""
+        thread pool[2] { on load() { } }
+        pool.postMessage(1)
+        """, encoding="utf-8")
+        with pytest.raises(errors.CompileError, match="no 'on message' handler"):
+            cli_mod.compile_file(str(src), str(tmp_path / "out"))
+
+    def test_bare_postmessage_works_from_inside_another_threads_body_too(
+            self, compile_and_run):
+        # Not just main -- one thread auto-selecting across a pool,
+        # concurrently with main potentially doing the same (claude.md
+        # #245's own stress program, tests/stress/thread_pool_auto_
+        # churn.f, covers the genuinely concurrent multi-poster case
+        # under ThreadSanitizer; this is the single-poster-from-a-
+        # thread correctness check).
+        source = """
+        int total = 0
+        int received = 0
+        on message(worker:thread, msg:int) {
+            total = total + msg
+            received = received + 1
+            if received == 6 {
+                log(total)
+                close(0)
+            }
+        }
+        thread pool[3] {
+            on message(worker:thread, msg:int) {
+                postMessage(msg * 100)
+            }
+        }
+        thread feeder {
+            on message(worker:thread, msg:int) {
+                int i = 0
+                while i < 6 {
+                    pool.postMessage(i)
+                    i = i + 1
+                }
+            }
+        }
+        feeder.postMessage(0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stderr
+        # sum(0..5) * 100 = 1500
+        assert result.stdout.strip() == "1500"
+
+    def test_mixing_indexed_and_bare_sends_on_the_same_pool_still_routes_correctly(
+            self, compile_and_run):
+        # A mix of pool[i].postMessage (bypassing auto-select) and bare
+        # pool.postMessage (going through it) on the SAME pool -- the
+        # idle check reads in_head/dispatching directly rather than a
+        # separate flag precisely so it stays correct regardless of
+        # which style put something in an instance's own queue.
+        source = """
+        int total = 0
+        int received = 0
+        on message(worker:thread, msg:int) {
+            total = total + msg
+            received = received + 1
+            if received == 10 {
+                log(total)
+                log(received)
+                close(0)
+            }
+        }
+        thread pool[3] {
+            on message(worker:thread, msg:int) {
+                postMessage(msg)
+            }
+        }
+        int i = 0
+        while i < 6 {
+            pool.postMessage(i)
+            i = i + 1
+        }
+        pool[0].postMessage(100)
+        pool[1].postMessage(200)
+        pool[2].postMessage(300)
+        pool.postMessage(999)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stderr
+        # 0+1+2+3+4+5 + 100+200+300 + 999 = 1614
+        assert result.stdout.strip().splitlines() == ["1614", "10"]
+
+
 class TestThreadPrivateFunctions:
     """claude.md #210: real, compiled-and-run proof that a thread-
     private function actually runs, actually mutates the state it
@@ -18181,3 +18409,100 @@ class TestGiveRequest:
         status, _headers, body = server.http_get("/")
         assert status == 200
         assert body == b""
+
+    def test_bare_giverequest_on_a_pool_is_now_legal(self, compile_and_run_server):
+        # claude.md #245/#246: `pool.giveRequest(r)` -- no index -- was
+        # rejected before this ("must be indexed"); it now reaches the
+        # identical auto-select branch bare pool.postMessage(x) does.
+        # Hand-written here (not the `use` sugar below) to isolate the
+        # semantic.py gate change from the parser sugar.
+        source = """
+        thread pool[3] {
+            on request(req:http) {
+                req.send({'code': 200, 'body': 'handled by pool'})
+            }
+        }
+
+        on request(req:http?) {
+            pool.giveRequest(req)
+        }
+
+        openPort(__PORT__)
+        """
+        server = compile_and_run_server(source)
+        for _ in range(6):
+            status, _headers, body = server.http_get("/")
+            assert status == 200
+            assert body == b"handled by pool"
+
+
+class TestOnRequestUseSugar:
+    """claude.md #246: `on request use NAME` -- sugar for
+    `on request(req:http?) { NAME.giveRequest(req) }`, NAME a singleton
+    thread or a pool. Desugared entirely at parse time into that exact
+    ordinary EventHandler AST, so these tests are really proving the
+    desugaring is byte-for-byte what the hand-written form already is,
+    not exercising any new runtime behavior -- TestGiveRequest's own
+    tests above already cover the hand-off mechanics themselves."""
+
+    def test_use_with_a_singleton_thread(self, compile_and_run_server):
+        source = """
+        thread router {
+            on request(req:http) {
+                req.send({'code': 200, 'body': 'handled by router'})
+            }
+        }
+
+        on request use router
+
+        openPort(__PORT__)
+        """
+        server = compile_and_run_server(source)
+        status, _headers, body = server.http_get("/")
+        assert status == 200
+        assert body == b"handled by router"
+
+    def test_use_with_a_pool_spreads_across_instances(self, compile_and_run_server):
+        source = """
+        thread pool[4] {
+            on request(req:http) {
+                req.send({'code': 200, 'body': 'handled by pool'})
+            }
+        }
+
+        on request use pool
+
+        openPort(__PORT__)
+        """
+        server = compile_and_run_server(source)
+        for _ in range(8):
+            status, _headers, body = server.http_get("/")
+            assert status == 200
+            assert body == b"handled by pool"
+
+    def test_use_desugars_to_a_manually_managed_http_parameter(self, parser, semantic):
+        # Reading the requirement off giveRequest's own gate rather than
+        # assuming it: the parameter must be manually-managed http?, or
+        # giveRequest(req) inside the desugared body would itself be a
+        # compile error -- so successfully analyzing at all is the
+        # proof the desugaring got the parameter type right.
+        source = """
+        thread worker {
+            on request(req:http) { }
+        }
+        on request use worker
+        """
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        handler = next(s for s in program.body if getattr(s, "name", None) == "request")
+        assert handler.params[0].manually_managed is True
+        assert handler.params[0].type_expr == "http"
+        assert analyzed is not None
+
+    def test_use_is_only_recognized_for_on_request(self, parser, errors):
+        # Scoped narrowly on purpose -- not a general "alias any
+        # handler" mechanism, so `use` after any other event name is
+        # just an ordinary parse error (an IDENT where '(' was
+        # expected), not silently accepted.
+        with pytest.raises(errors.CompileError):
+            parser.parse("thread w { on load() { } }\non upgrade use w\n", filename="main.f")

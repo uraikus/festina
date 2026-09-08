@@ -778,6 +778,61 @@ void festina_thread_spawn(FestinaThreadHandle *h) {
     }
 }
 
+/* claude.md #245 (uraikus/festina#... "auto-idle pool postMessage"):
+ * `pool.postMessage(x)` -- no index -- routes to whichever pool
+ * instance is genuinely idle right now, falling back to plain
+ * round-robin when none are.
+ *
+ * "Idle" is read directly off state this runtime already maintains
+ * for `drain()`'s own sake, under the same lock that already guards
+ * it, rather than adding a parallel `busy` flag that could drift out
+ * of sync with it: `in_head == NULL` (nothing queued -- set the
+ * instant festina_thread_post appends, in the POSTER's own thread, no
+ * lag) and `!dispatching` (not mid-handler -- claude.md #231/#232's
+ * own field, cleared the instant this worker goes looking for its
+ * next message). Together they are exactly "nothing outstanding for
+ * this instance," true from spawn (both start zero) until the moment
+ * something is actually posted to it, whether that arrived through
+ * this selector or through an ordinary indexed `pool[i].postMessage`
+ * on the very same pool -- so mixing both call styles on one pool
+ * still routes correctly.
+ *
+ * `handles` is the pool's own `[N x ptr]` compile-time array
+ * (_emit_thread_pool_decl) -- each element the address of one
+ * instance's own `handle_global`, exactly the double indirection the
+ * indexed-access codegen path already resolves with two loads; this
+ * does both loads itself, given the base array pointer and an index,
+ * so codegen only ever computes an index and asks for the handle. `k`
+ * scans forward from `start` (a round-robin cursor codegen advances
+ * atomically per call, so an all-idle pool still spreads load rather
+ * than favoring index 0 every time), wrapping via `% count`; the
+ * first idle instance found is returned immediately.
+ *
+ * Selecting is a READ, not a claim -- nothing here marks the chosen
+ * instance busy (that happens naturally the instant the caller's own
+ * subsequent festina_thread_post appends to its queue). Two posters
+ * racing to select at once can therefore both land on the same
+ * currently-idle instance while another sits idle a moment longer --
+ * a benign, self-correcting mis-balance under concurrent contention,
+ * accepted for the same reason the all-busy fallback below is plain
+ * round-robin rather than a blocking wait: this never stalls a
+ * caller, on purpose, matching every other postMessage call in this
+ * runtime. */
+void *festina_thread_pool_select(void ***handles, int64_t count, int64_t start) {
+    for (int64_t k = 0; k < count; k++) {
+        int64_t i = (start + k) % count;
+        FestinaThreadHandle *h = (FestinaThreadHandle *)*handles[i];
+        pthread_mutex_lock(&h->in_lock);
+        int idle = !h->in_head && !h->dispatching;
+        pthread_mutex_unlock(&h->in_lock);
+        if (idle) return h;
+    }
+    /* every instance has something outstanding: round-robin fallback,
+     * `start` itself -- never block the caller waiting for one to
+     * free up. */
+    return *handles[start];
+}
+
 void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload, int64_t txn_id) {
     FestinaThreadMsg *m = malloc(sizeof(*m));
     if (!m) festina_fail("out of memory posting a thread message");

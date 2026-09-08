@@ -1206,6 +1206,15 @@ int8_t festina_thread_is_main(void *handle);
  * argument (the `worker:thread` parameter every `on message` handler
  * now declares). */
 void festina_thread_post(FestinaThreadHandle *h, void *sender, void *payload, int64_t txn_id);
+/* claude.md #245: `pool.postMessage(x)` (no index) -- selects whichever
+ * of `count` pool instances (the pool's own `[N x ptr]` handle-address
+ * array, `handles`) is genuinely idle, scanning forward from `start`
+ * and wrapping; falls back to `*handles[start]` itself if none are.
+ * Returns the chosen FestinaThreadHandle*, as a bare `void *` matching
+ * how a handle already crosses this header everywhere else. See its
+ * own doc comment in festina_runtime_thread.c for exactly what "idle"
+ * means and why selecting never blocks. */
+void *festina_thread_pool_select(void ***handles, int64_t count, int64_t start);
 /* `postMessage(x)` called from INSIDE this thread's own body: enqueues
  * on h's own OUTBOUND queue instead -- drained on the MAIN thread only
  * (see festina_thread_drain below), never processed by the worker

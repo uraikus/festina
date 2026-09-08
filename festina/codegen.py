@@ -1639,6 +1639,9 @@ class CodeGen:
             # is chained (see _emit_bare_postmessage_send/_emit_named_
             # postmessage_send's own shared `txn_val` parameter).
             "declare void @festina_thread_post(ptr, ptr, ptr, i64)",
+            # claude.md #245: `pool.postMessage(x)` -- no index -- picks
+            # an idle instance, falling back to round-robin.
+            "declare ptr @festina_thread_pool_select(ptr, i64, i64)",
             "declare void @festina_thread_post_outbound(ptr, ptr, i64)",
             # claude.md #217: `.reply(T)` / `.postMessage(x).callback(fn)`.
             # alloc_txn_id mints a fresh, process-wide, monotonic id (one
@@ -3503,7 +3506,34 @@ class CodeGen:
         factored out."""
         end_label = None
         oob_pred = None
-        if pool_index_expr is not None:
+        if pool_index_expr is None and receiver.name in self.thread_pools:
+            # claude.md #245: the bare pool form -- `pool.postMessage(x)`,
+            # no index -- auto-selects an idle instance at runtime
+            # instead of naming one. `festina_thread_pool_select` does
+            # both loads the indexed path's own double indirection
+            # needs (array slot -> that instance's own handle_global's
+            # address -> its actual FestinaThreadHandle*), given only
+            # the array's base pointer and a starting index, so this
+            # emits nothing indexed-access itself doesn't already emit
+            # elsewhere in this same function -- just one counter bump
+            # to pick where the scan starts (round-robin fallback and
+            # spread-across-idle-instances in one, see the round-robin
+            # global's own comment in _emit_thread_pool_decl) and the
+            # one call. No bounds check needed (unlike an indexed
+            # access with a runtime int that might be out of range):
+            # `pool.postMessage(x)` always has somewhere to go.
+            pinfo = self.thread_pools[receiver.name]
+            inbound_type = pinfo["inbound_type"]
+            n = pinfo["pool_size"]
+            rr_old = self.tmp()
+            lines.append(f"  {rr_old} = atomicrmw add ptr {pinfo['rr_global']}, i64 1 monotonic")
+            start = self.tmp()
+            lines.append(f"  {start} = urem i64 {rr_old}, {n}")
+            handle = self.tmp()
+            lines.append(
+                f"  {handle} = call ptr @festina_thread_pool_select("
+                f"ptr {pinfo['handles_array_global']}, i64 {n}, i64 {start})")
+        elif pool_index_expr is not None:
             pinfo = self.thread_pools[receiver.name]
             inbound_type = pinfo["inbound_type"]
             n = pinfo["pool_size"]
@@ -4235,11 +4265,23 @@ class CodeGen:
         elems = ", ".join(f"ptr {g}" for g in handle_globals)
         self.extra_globals.append(
             f"{handles_array_global} = global [{decl.pool_size} x ptr] [{elems}]")
+        # claude.md #245: `pool.postMessage(x)` -- no index -- round-
+        # robins its STARTING point through this one plain i64 counter,
+        # so an all-idle pool still spreads load across instances
+        # rather than favoring index 0 on every call (see
+        # _emit_thread_target_handle's own bare-pool branch, and
+        # festina_thread_pool_select's doc comment for why the counter
+        # only ever picks a starting point, never a hard assignment).
+        # One counter per pool, not shared across pools -- unrelated
+        # pools' own call volumes have nothing to do with each other.
+        rr_global = f"@__festina_thread_pool_{decl.name}_rr"
+        self.extra_globals.append(f"{rr_global} = global i64 0")
         self.thread_pools[decl.name] = {
             "pool_size": decl.pool_size,
             "inbound_type": info.inbound_type,
             "handle_globals": handle_globals,
             "handles_array_global": handles_array_global,
+            "rr_global": rr_global,
         }
 
     def _emit_thread_on_load(self, thread_name, state_inits, on_load_decl, state_env, thread_ctx,

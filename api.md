@@ -3513,6 +3513,91 @@ error naming the fix — a pool must always be indexed. There is no
 `pool.length` — the size is whatever `N` the declaration itself used,
 known at every call site already.
 
+**`pool.postMessage(x)` — no index — routes to whichever instance is
+idle right now:**
+
+```festina
+thread pool[4] {
+    on message(worker:thread, msg:Job) {
+        process(msg)
+    }
+}
+pool.postMessage(job)      // whichever of the 4 instances is free
+```
+
+An instance is "idle" the moment it has nothing queued and isn't
+mid-handler, from the moment it's spawned until whatever it's given
+next finishes — the same window `drain()` already tracks. If every
+instance is currently busy, this falls back to plain round-robin
+rather than waiting for one to free up: `pool.postMessage(x)` never
+blocks its caller, matching every other `postMessage` call in this
+language. Selecting is a read, not a reservation, so two callers
+racing to send at the same moment can occasionally both land on the
+same instance while another sits idle a moment longer — harmless, and
+the price of never stalling. Mixing this with indexed
+`pool[i].postMessage(x)` on the same pool is fine; both feed the
+identical queues, so routing stays correct either way. `.callback(fn)`
+chains onto the bare form exactly as it does on an indexed one — the
+reply comes back from whichever instance actually handled it.
+
+**`pool.giveRequest(r)` — no index — same auto-selection:**
+
+```festina
+thread pool[3] {
+    on request(req:http) {
+        req.send({'code': 200, 'body': 'handled'})
+    }
+}
+on request(req:http?) {
+    pool.giveRequest(req)     // whichever of the 3 instances is free
+}
+```
+
+`giveRequest` is the other exception to "a pool must always be
+indexed" — it reaches the identical idle-or-round-robin selection
+`postMessage` uses above, for the identical reason: handing off a live
+connection to "whichever instance is free" is exactly as sensible as
+routing a message to one. Every OTHER pool method still requires an
+index — `pool.kill()`/`.live()`/`.isAlive()`/`.drain()` are each
+genuinely about one specific instance's own lifecycle, where
+"whichever one" has no sensible meaning; only `postMessage` and
+`giveRequest` get to pick.
+
+**`on request use NAME`** — shorthand for the hand-off pattern above.
+`NAME` can be a singleton thread or a pool:
+
+```festina
+thread router {
+    on request(req:http) { req.send({'code': 200, 'body': 'ok'}) }
+}
+on request use router
+```
+
+```festina
+thread pool[4] {
+    on request(req:http) { req.send({'code': 200, 'body': 'ok'}) }
+}
+on request use pool
+```
+
+Both desugar, at parse time, to exactly:
+
+```festina
+on request(req:http?) {
+    NAME.giveRequest(req)
+}
+```
+
+— a manually-managed `http?` parameter and a single `giveRequest`
+call, nothing more. `use` isn't a reserved word anywhere else; it's
+only recognized directly after `on request`, the same way
+`DatabaseURL` is only recognized by name inside a thread body. Because
+it's pure sugar, everything above about indexed vs. bare
+`giveRequest` still applies — `on request use pool` gets the
+auto-selecting bare form; write the handler out by hand with
+`pool[i].giveRequest(req)` if a specific instance is what's wanted
+instead.
+
 `N` is a compile-time literal because the body is **compiled once per
 instance** — each of the `N` instances gets its own independently named
 copy of every handler, private func and state variable. That's what
