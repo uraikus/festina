@@ -3873,6 +3873,90 @@ pool[3].postMessage(2)</pre>
           the declaration itself used, known at every call site
           already.
         </p>
+        <p>
+          <strong><code>pool.postMessage(x)</code> — no index — routes
+          to whichever instance is idle right now:</strong>
+        </p>
+        <pre class="code"><span class="kw">thread</span> pool[4] {
+    <span class="kw">on</span> message(worker:<span class="kw">thread</span>, msg:Job) {
+        process(msg)
+    }
+}
+pool.postMessage(job)      <span class="cm">// whichever of the 4 instances is free</span></pre>
+        <p class="muted">
+          An instance is "idle" the moment it has nothing queued and
+          isn't mid-handler, from the moment it's spawned until whatever
+          it's given next finishes — the same window <code>drain()</code>
+          already tracks. If every instance is currently busy, this
+          falls back to plain round-robin rather than waiting for one to
+          free up: <code>pool.postMessage(x)</code> never blocks its
+          caller, matching every other <code>postMessage</code> call in
+          this language. Selecting is a read, not a reservation, so two
+          callers racing to send at the same moment can occasionally
+          both land on the same instance while another sits idle a
+          moment longer — harmless, and the price of never stalling.
+          Mixing this with indexed <code>pool[i].postMessage(x)</code>
+          on the same pool is fine; both feed the identical queues, so
+          routing stays correct either way. <code>.callback(fn)</code>
+          chains onto the bare form exactly as it does on an indexed
+          one — the reply comes back from whichever instance actually
+          handled it.
+        </p>
+        <p>
+          <strong><code>pool.giveRequest(r)</code> — no index — same
+          auto-selection:</strong>
+        </p>
+        <pre class="code"><span class="kw">thread</span> pool[3] {
+    <span class="kw">on</span> request(req:http) {
+        req.send({<span class="str">'code'</span>: <span class="num">200</span>, <span class="str">'body'</span>: <span class="str">'handled'</span>})
+    }
+}
+<span class="kw">on</span> request(req:<span class="kw">http</span>?) {
+    pool.giveRequest(req)     <span class="cm">// whichever of the 3 instances is free</span>
+}</pre>
+        <p class="muted">
+          <code>giveRequest</code> is the other exception to "a pool
+          must always be indexed" — it reaches the identical
+          idle-or-round-robin selection <code>postMessage</code> uses
+          above, for the identical reason: handing off a live connection
+          to "whichever instance is free" is exactly as sensible as
+          routing a message to one. Every OTHER pool method still
+          requires an index — <code>pool.kill()</code><wbr>/<code>.live()</code><wbr>/<code>.isAlive()</code><wbr>/<code>.drain()</code>
+          are each genuinely about one specific instance's own
+          lifecycle, where "whichever one" has no sensible meaning; only
+          <code>postMessage</code> and <code>giveRequest</code> get to
+          pick.
+        </p>
+        <p>
+          <strong><code>on request use NAME</code></strong> — shorthand
+          for the hand-off pattern above. <code>NAME</code> can be a
+          singleton thread or a pool:
+        </p>
+        <pre class="code"><span class="kw">thread</span> router {
+    <span class="kw">on</span> request(req:http) { req.send({<span class="str">'code'</span>: <span class="num">200</span>, <span class="str">'body'</span>: <span class="str">'ok'</span>}) }
+}
+<span class="kw">on</span> request <span class="kw">use</span> router</pre>
+        <pre class="code"><span class="kw">thread</span> pool[4] {
+    <span class="kw">on</span> request(req:http) { req.send({<span class="str">'code'</span>: <span class="num">200</span>, <span class="str">'body'</span>: <span class="str">'ok'</span>}) }
+}
+<span class="kw">on</span> request <span class="kw">use</span> pool</pre>
+        <p class="muted">Both desugar, at parse time, to exactly:</p>
+        <pre class="code"><span class="kw">on</span> request(req:<span class="kw">http</span>?) {
+    NAME.giveRequest(req)
+}</pre>
+        <p class="muted">
+          — a manually-managed <code>http?</code> parameter and a single
+          <code>giveRequest</code> call, nothing more. <code>use</code>
+          isn't a reserved word anywhere else; it's only recognized
+          directly after <code>on request</code>, the same way
+          <code>DatabaseURL</code> is only recognized by name inside a
+          thread body. Because it's pure sugar, everything above about
+          indexed vs. bare <code>giveRequest</code> still applies —
+          <code>on request use pool</code> gets the auto-selecting bare
+          form; write the handler out by hand with
+          <code>pool[i].giveRequest(req)</code> if a specific instance is
+          what's wanted instead.
+        </p>
         <p class="muted">
           <code>N</code> is a compile-time literal because the body is
           <strong>compiled once per instance</strong> — each of the
