@@ -507,30 +507,6 @@ def _is_refcounted(t):
             or t == ASCII)
 
 
-def _bare_type(t):
-    """claude.md #257: the same type without its `?`. `T?` and `T`
-    differ only in indirection -- a `T?` binding's slot holds a POINTER
-    to a cell holding a T -- so reading one out yields a plain `T`
-    value, and this is what names that type."""
-    if t is not None and getattr(t, "manually_managed", False):
-        return dataclasses.replace(t, manually_managed=False)
-    return t
-
-
-def _is_cell_scalar(t):
-    """claude.md #257: true for a `?` binding whose cell holds a plain
-    scalar (`int?`/`float?`/`bool?`).
-
-    Scalars are where the cell model is purely ADDITIVE -- `?` used to
-    be accepted grammar with no type-level effect at all on them
-    (claude.md #202), so nothing existing can change behavior here.
-    text/ascii and the heap types are staged separately, since those
-    already had `?` semantics that the cell model redefines."""
-    return (isinstance(t, types_mod.PrimitiveType)
-            and t.manually_managed
-            and t.name in ("int", "float", "bool"))
-
-
 def _is_manually_managed(t):
     """claude.md #202: `T?` -- true exactly for a resolved type whose
     own `manually_managed` field (set by semantic.py's
@@ -5335,33 +5311,6 @@ class CodeGen:
                 env.define(stmt.name, slot, type_)
                 return
             llvm_ty = _llvm_type(type_)
-            if _is_cell_scalar(type_):
-                # claude.md #257: the slot holds a POINTER to a cell, and
-                # the value lives in the cell -- which is what lets two
-                # `?` bindings share one, so writing through either is
-                # visible through both.
-                slot = f"%{stmt.name}.{self._unique()}"
-                lines.append(f"  {slot} = alloca ptr")
-                if stmt.init is not None and self._is_cell_ref_expr(stmt.init, env):
-                    # `int? b = a` -- alias a's cell, allocate nothing.
-                    src_ref, _ = env.lookup(stmt.init.name)
-                    cell = self.tmp()
-                    lines.append(f"  {cell} = load ptr, ptr {src_ref}")
-                    lines.append(f"  store ptr {cell}, ptr {slot}")
-                else:
-                    # Anything else -- a literal, a plain binding, a call
-                    # result -- boxes a COPY of the value.
-                    if stmt.init is not None:
-                        val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
-                        val = self._coerce(val, vtype, _bare_type(type_), lines,
-                                           source_expr=stmt.init)
-                    else:
-                        val = self._zero_value(type_)
-                    cell = self._emit_cell_alloc(type_, val, lines)
-                    lines.append(f"  store ptr {cell}, ptr {slot}")
-                self._manually_managed_refs.add(slot)
-                env.define(stmt.name, slot, type_)
-                return
             slot = f"%{stmt.name}.{self._unique()}"
             lines.append(f"  {slot} = alloca {llvm_ty}")
             env.define(stmt.name, slot, type_)
@@ -6155,16 +6104,6 @@ class CodeGen:
             # that value is itself a pointer to the struct's storage
             # (see the VarDecl/global handling below), so a plain load
             # here is correct for every case, not just scalars.
-            if _is_cell_scalar(type_):
-                # claude.md #257: two loads -- the slot holds the cell
-                # pointer, the cell holds the value -- and the result is
-                # a plain `T`, since a value read out of a cell is no
-                # longer a reference to it.
-                cell = self.tmp()
-                out = self.tmp()
-                lines.append(f"  {cell} = load ptr, ptr {ref}")
-                lines.append(f"  {out} = load {_llvm_type(type_)}, ptr {cell}")
-                return out, _bare_type(type_)
             out = self.tmp()
             lines.append(f"  {out} = load {_llvm_type(type_)}, ptr {ref}")
             return out, type_
@@ -7537,31 +7476,6 @@ class CodeGen:
         out = self.tmp()
         lines.append(f"  {out} = call ptr @calloc({ir_ty} {count}, {ir_ty} {size})")
         return out
-
-    def _is_cell_ref_expr(self, expr, env):
-        """claude.md #257: true when `expr` is a bare identifier already
-        bound to a `?` binding -- the ONE form that aliases an existing
-        cell instead of boxing a fresh copy.
-
-        `int? b = a` shares a's cell (so `b++` is visible through `a`);
-        `int? b = <anything else>`, including a plain binding, boxes a
-        copy into a cell of its own and does not track its source. That
-        asymmetry is deliberate and is what makes a `?` safe to return
-        from a function: no cell can ever point at a stack slot."""
-        if not isinstance(expr, ast.Identifier):
-            return False
-        found = env.lookup(expr.name)
-        return found is not None and _is_manually_managed(found[1])
-
-    def _emit_cell_alloc(self, type_, value, lines):
-        """A fresh cell holding `value`. Manual lifetime: nothing frees
-        this except an explicit `free`, which is exactly what `?` has
-        always meant (claude.md #202)."""
-        llvm_ty = _llvm_type(type_)
-        size = 8 if llvm_ty != "i8" else 1
-        cell = self._emit_malloc(str(size), lines)
-        lines.append(f"  store {llvm_ty} {value}, ptr {cell}")
-        return cell
 
     def _emit_malloc(self, size_i64, lines):
         """malloc(size), narrowed the same way _emit_calloc's own
