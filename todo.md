@@ -32,16 +32,27 @@ blocking: AddressSanitizer/LeakSanitizer coverage for the target.
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
 - **Self-hosting-compiler ergonomics, roadmapped alongside `match`
-  (claude.md #252) but not started:**
+  (claude.md #252):** `match` and the lex/parse cache (#253) both
+  shipped; the cycle-collector item was measured, not built (#254, see
+  Memory model below). One item left, and reviewing it found its own
+  stated rationale doesn't hold up:
   - **A raw byte-buffer type** (a generalized, writable `blob`, or a
     new `bytes` type, with `[i] =` assignment and
-    `text.toBytes()`/`bytes.toText()` conversions at the boundary —
-    sketched in the same conversation as claude.md #251's own "what
-    would a raw byte implementation look like" answer). Full new-
-    primitive-type surface area, lexer through runtime. Only useful
-    once/if something wants to skip shelling out to clang on textual
-    LLVM IR, which the in-place string-append work (#243) already
-    makes cheap without it — not an obvious near-term need.
+    `text.toBytes()`/`bytes.toText()` conversions at the boundary).
+    Previously cited a claude.md #251 "sketch" as prior art — that
+    sketch does not exist; #251 is entirely about `.length`, unrelated.
+    The one concrete justification ("useful once/if something wants to
+    skip shelling out to clang on textual LLVM IR") is also already
+    true today, independent of any byte-buffer type: `llvm_backend.py`
+    parses the generated IR text in-process via libLLVM's C API
+    whenever it's available, with `clang`/`cc` only a fallback when
+    it's not. And the in-place string-append work (#243) already made
+    building that IR text cheaply mutable as a plain `text`. Left open
+    since a mutable, indexable byte buffer could still be useful on its
+    own merits (binary protocol/data construction) — but not on the
+    self-hosting-compiler premise this bullet used to rest on, and full
+    new-primitive-type surface area (lexer through runtime) is a real
+    cost against a currently-unmotivated feature.
 
 ## Memory model
 
