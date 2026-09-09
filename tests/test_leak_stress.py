@@ -441,6 +441,13 @@ class TestLeakStress:
             "regex_and_files_churn.f",  # regex compilation, file and time text
             "structs_and_rows_churn.f", # structs, query rows, scope exits
             "text_churn.f",             # text, the copy-managed one
+            # claude.md #256: the `ascii` type -- a REFCOUNTED string,
+            # so a genuinely different ownership shape from
+            # text_churn.f's copy-managed one just above, and the only
+            # type whose indexing hands back an IMMORTAL value (one of
+            # the 128 single-character singletons) that must never be
+            # freed however many times it is dropped.
+            "ascii_churn.f",
             # claude.md #130: splice's own 3rd-argument insertion --
             # element-range retain/copy into a SEPARATE array's buffer,
             # a genuinely different ownership shape than push/unshift's
