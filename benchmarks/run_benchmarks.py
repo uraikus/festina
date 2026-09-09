@@ -37,7 +37,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 BENCHMARK_MD = os.path.join(REPO_ROOT, "benchmark.md")
 
-BENCHMARKS = ["hello", "fib", "loop_sum", "array_sum", "string_concat"]
+BENCHMARKS = ["hello", "fib", "loop_sum", "array_sum", "string_concat", "char_scan"]
 RUNS_PER_BENCHMARK = 7  # minimum of this many timed runs, after 1 untimed warmup
 
 

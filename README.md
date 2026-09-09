@@ -11,7 +11,7 @@ directly into the language, not bolted on as libraries.
 
 Version 0.44 — see [CHANGELOG.md](CHANGELOG.md).
 
-[![Tests](https://img.shields.io/badge/tests-2389%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-2392%20passing-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -205,6 +205,7 @@ bin/festina compile examples/tic_tac_toe.f -o tic_tac_toe && ./tic_tac_toe
 | [`basic.f`](examples/basic.f) / [`hello.f`](examples/hello.f) | Tables, SQLite queries, structs, functions |
 | [`multifile.f`](examples/multifile.f) + [`geometry.f`](examples/geometry.f) | `import` across files |
 | [`maps.f`](examples/maps.f) | `map[T]` literals, indexed get/set, `.forEach()` |
+| [`ascii_scan.f`](examples/ascii_scan.f) | `ascii` — O(1) indexing for character-by-character scanning |
 | [`config.f`](examples/config.f) | `DatabaseURL`, `environment.NAME` |
 | [`regex.f`](examples/regex.f) | `/pattern/flags` literals, `.test()`, `.match()`, `.replace()`, and `/g` for every-match |
 | [`timers.f`](examples/timers.f) | `setTimeout`/`setInterval`/`clearInterval` |
@@ -234,7 +235,7 @@ frame about twice as fast as Chromium's.
 ## Project status
 
 The compiler frontend, LLVM codegen backend, and native C runtime are
-real and tested: **2389 tests, 0 failures** (14 more skip cleanly when
+real and tested: **2392 tests, 0 failures** (14 more skip cleanly when
 their optional tooling isn't installed — see
 [setup.md](setup.md#running-the-test-suite)). Every language construct
 in the [specification](claude.md) is implemented end to end, not just

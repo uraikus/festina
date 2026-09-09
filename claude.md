@@ -4900,4 +4900,4 @@ failed to compile -- while the structurally identical `C? x = makeCircle()` comp
 
 **Verified.** The LeakSanitizer table above; `tests/test_manually_managed.py` gains three tests (a fresh call into `blob?`, into `ascii?`, and the ascii method-result forms), 56 pass in that file. Two of my own probe programs failed first and were wrong rather than the compiler: one called `.slice()` on a text literal, and one assigned an `ascii?` into a plain `ascii`, which the no-implicit-decay rule correctly rejects -- worth recording, because each looked like a compiler bug until read properly.
 
-**Full suite:** TBD.
+**Full suite:** `python3 -m pytest tests -q`: **2392 passed, 14 skipped, 0 failed** in 552.85s (9:12), clean on the first run with no flakes.
