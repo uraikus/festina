@@ -16434,6 +16434,133 @@ class TestCharCodeAtAndToChar:
             semantic.analyze(program)
 
 
+class TestAscii:
+    """claude.md #256: the `ascii` type -- one byte per character.
+
+    That single property is the whole point. When a character IS a
+    byte, the character count IS the byte count, so it can live in a
+    header (at payload-16, with the refcount at payload-8 exactly where
+    festina_retain/festina_release_check already look) and both
+    `.length` and `s[i]` become O(1) reads. `text` cannot have any of
+    this: it is UTF-8, variable width, and a bare `char *` with four
+    different provenances (heap, .rodata literal, getenv's environ
+    pointer, an X11 stack buffer), so there is nowhere to put a header
+    and nothing to cache. The two types coexist rather than one
+    replacing the other.
+    """
+
+    def test_length_is_the_character_count(self, compile_and_run):
+        result = compile_and_run("ascii s = 'hello'\nlog(s.length)")
+        assert result.returncode == 0
+        assert result.stdout == "5\n"
+
+    def test_empty_ascii_has_zero_length(self, compile_and_run):
+        result = compile_and_run("ascii s = ''\nlog(s.length)")
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_indexing_returns_a_one_character_ascii(self, compile_and_run):
+        result = compile_and_run("ascii s = 'hello'\nlog(s[1])\nlog(s[1].length)")
+        assert result.returncode == 0
+        assert result.stdout == "e\n1\n"
+
+    def test_out_of_range_index_is_null_not_a_crash(self, compile_and_run):
+        # The same "answer null, don't crash" choice text[i] makes --
+        # and deliberately NOT arr[T]'s unchecked indexing.
+        result = compile_and_run(
+            "ascii s = 'hi'\nlog(s[99] == null)\nlog(s[0 - 1] == null)")
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+    def test_char_code_at_reads_the_byte(self, compile_and_run):
+        result = compile_and_run("ascii s = 'hello'\nlog(s.charCodeAt(0))")
+        assert result.returncode == 0
+        assert result.stdout == "104\n"
+
+    def test_char_code_at_out_of_range_is_null(self, compile_and_run):
+        result = compile_and_run("ascii s = 'hi'\nlog(s.charCodeAt(99) == null)")
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_slice_is_end_exclusive(self, compile_and_run):
+        result = compile_and_run("ascii s = 'hello'\nlog(s.slice(1, 4))")
+        assert result.returncode == 0
+        assert result.stdout == "ell\n"
+
+    def test_slice_clamps_instead_of_failing(self, compile_and_run):
+        # Inverted and out-of-range pairs both answer something rather
+        # than faulting -- an empty ascii, and the whole thing.
+        result = compile_and_run(
+            "ascii s = 'hello'\nlog(s.slice(4, 1).length)\nlog(s.slice(0 - 5, 99))")
+        assert result.returncode == 0
+        assert result.stdout == "0\nhello\n"
+
+    def test_concatenation(self, compile_and_run):
+        result = compile_and_run(
+            "ascii a = 'hello'\nascii b = a + ' world'\nlog(b)\nlog(b.length)")
+        assert result.returncode == 0
+        assert result.stdout == "hello world\n11\n"
+
+    def test_equality_against_a_literal(self, compile_and_run):
+        # The single most common thing a lexer does, and the case that
+        # costs nothing: the literal resolves to an immortal .rodata
+        # constant at compile time.
+        result = compile_and_run(
+            "ascii s = 'let'\nlog(s == 'let')\nlog(s == 'nope')\nlog(s != 'let')")
+        assert result.returncode == 0
+        assert result.stdout == "true\nfalse\nfalse\n"
+
+    def test_round_trip_through_text(self, compile_and_run):
+        result = compile_and_run(
+            "ascii s = 'hello'\ntext t = s.toText()\nlog(t)\nlog(t.length)\n"
+            "ascii back = t.toAscii()\nlog(back == s)")
+        assert result.returncode == 0
+        assert result.stdout == "hello\n5\ntrue\n"
+
+    def test_to_ascii_is_null_for_non_ascii_text(self, compile_and_run):
+        # Built at runtime so the compiler cannot fold it -- toAscii()
+        # answers null the way toInt() does for unparseable text,
+        # rather than throwing.
+        result = compile_and_run(
+            "text t = 'caf'\nt = t + 'é'\nascii a = t.toAscii()\nlog(a == null)")
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_a_non_ascii_literal_is_a_compile_error(self, compile_and_run):
+        # Known at compile time, so it fails to build rather than
+        # deferring to a null at runtime.
+        with pytest.raises(Exception) as exc_info:
+            compile_and_run("ascii bad = 'café'\nlog(bad)")
+        assert "not an ascii character" in str(exc_info.value)
+
+    def test_length_is_bytes_where_text_length_is_codepoints(self, compile_and_run):
+        # The two types answer differently on purpose, and this pins
+        # that difference down.
+        result = compile_and_run(
+            "text t = 'caf'\nt = t + 'é'\nlog(t.length)\n"
+            "ascii a = 'cafe'\nlog(a.length)")
+        assert result.returncode == 0
+        assert result.stdout == "4\n4\n"
+
+    def test_ascii_has_no_field_other_than_length(self, parser, semantic, errors):
+        program = parser.parse("ascii s = 'hi'\nlog(s.nope)")
+        with pytest.raises(errors.CompileError, match="ascii has no field"):
+            semantic.analyze(program)
+
+    def test_indexing_in_a_loop_does_not_leak(self, compile_and_run):
+        # The singleton path: 5,000 reads that must allocate nothing at
+        # all. A regression shows up as a leak under
+        # scripts/leak_stress.sh (tests/stress/ascii_churn.f); this
+        # keeps the behavior pinned in the ordinary suite too.
+        result = compile_and_run(
+            "ascii s = 'abcde'\nint total = 0\n"
+            "for int i = 0, i < 5000, i++ {\n"
+            "    total = total + s.charCodeAt(i % 5)\n"
+            "}\nlog(total)")
+        assert result.returncode == 0
+        assert result.stdout == "495000\n"
+
+
 class TestTextAndBlobLength:
     """claude.md #251: text.length:int and blob.length:int.
 

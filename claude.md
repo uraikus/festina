@@ -4825,3 +4825,48 @@ The last of the four candidates from #252 -- a raw byte-buffer type. Before scop
 **Outcome: todo.md's bullet corrected, not the feature built.** Rewrote the bullet to drop the fabricated citation, record the checked-and-false LLVM-IR justification, and note #243's coverage of the mutation half -- left open only on its own, narrower merits (a mutable indexable byte buffer is a plausible primitive for binary protocol/data work on its own) rather than the self-hosting-compiler premise it used to rest on. No code changes; no runtime or compiler surface touched. All four #252 candidates are now accounted for: `match` (#252) and the lex/parse cache (#253) shipped; the cycle-collector buffer was measured and deliberately left unbuilt (#254); the byte-buffer type's own stated case for existing didn't survive being checked (#255).
 
 **Full suite:** not run for this entry -- a documentation-only correction, no compiler or runtime code touched.
+
+256. THE `ascii` TYPE: ONE BYTE PER CHARACTER, SO THE LENGTH CAN LIVE IN A HEADER
+
+Asked what the biggest obstacle to bootstrapping Festina in Festina actually is. The answer turned out to be none of #252's four candidates: it is that `text` has no O(1) random access and no cached length, which is the single operation a lexer performs most. `festina_text_length` is a full UTF-8 code-point walk per call; `festina_text_char_at` walks from byte zero counting code points AND mallocs a fresh 1-4 byte string per access. So `for int i = 0, i < src.length, i++ { text c = src[i] }` is quadratic twice over plus an allocation per character.
+
+**The first design considered was giving `text` itself a header, and a full audit killed it.** Three parallel explorations found that a live `text` pointer today has FOUR distinct provenances, not one: heap buffers; bare `.rodata` `@.str.N` literal pointers (passed uncopied at call arguments, method receivers, non-escaping parameters, template pieces and comparison operands -- `_is_owning_text_source` returns False for `StringLit` precisely because "freeing one would corrupt the binary's own static data"); `festina_getenv`'s borrowed pointer into the process environment; and an X11 `char name[32]` STACK buffer handed straight to `@__festina_on_keyDown` as a text argument. Every one would need a valid header or every header read is undefined behavior -- across ~120 free sites and ~90 producer sites, where each miss is silent heap corruption rather than a loud failure. #243 had already reached the same conclusion from the other direction, and its wording is worth keeping: "`text` is a bare `char *` -- no header, freed by plain `free` at dozens of codegen and runtime sites -- so a length cannot live in front of the string."
+
+**So `text` was left completely untouched and `ascii` was added as its own type.** One byte per character is the entire idea: when a character IS a byte, the character count IS the byte count, so it can be stored. And because `ascii` is new, every literal, producer and free site is greenfield -- none of text's four provenances exist for it. The audit's conclusion became the design constraint rather than a problem to work around.
+
+**Layout, reusing the existing machinery rather than adding any:**
+
+```
+base+0    int64_t length     <- payload - 16
+base+8    int64_t refcount   <- payload - 8
+base+16   the bytes, NUL-terminated
+```
+
+This is exactly #176's tagged-struct shape, chosen for exactly #176's reason: the refcount sits at precisely `payload - 8`, so `festina_retain`/`festina_release_check` work on an ascii with ZERO changes, while the length sits one word further back where only ascii's own code looks. Verified directly in a C harness before any codegen existed -- retain took the count 1 -> 2, release_check answered 0, both unmodified. A NEGATIVE refcount is the standard immortal sentinel, unchanged, which is what lets literals and the singletons below be handed around as ordinary ascii values that retain/release simply no-op on.
+
+**Two things follow from the header that are worth naming separately.** First, `ascii` is REFERENCE COUNTED where `text` is copy-on-alias (#83) -- `ascii b = a` retains rather than copying, which is the case a lexer hits constantly. Second, `s[i]` allocates NOTHING: 128 immortal single-character values built into `.data` at compile time (not lazily -- a lazy table would race between Festina threads; these are constant, so there is nothing to initialize). Making indexing O(1) without this would have been half a fix, since the malloc-per-character was as expensive as the walk.
+
+**Literals are resolved at compile time.** A quoted literal is still a `text` literal; assigning one to an `ascii` emits an inline-header constant straight into `.rodata` -- the same `{i64, T}`-plus-getelementptr shape `_global_var_defs` already uses for struct/arr/map globals. So `tok == 'let'`, the single most common thing a lexer does, allocates nothing at all. And because the bytes are known at compile time, a non-ASCII literal FAILS TO BUILD rather than deferring to a runtime null. `text.toAscii()` is the runtime path and answers null for anything not representable, matching `toInt()`'s own "null when the input does not answer the question" convention.
+
+**This is also the answer to the original request, which was to make `charCodeAt` O(1).** `ascii.charCodeAt(i)` is a bounds check and a byte load. `text.charCodeAt` is unchanged and still walks -- without a header on `text` there is nothing for it to read, and the audit above is why there will not be one.
+
+**One real bug, caught by leak_stress and not by anything else.** The first full stress run leaked exactly 6,000 objects over 2,000 iterations -- three per iteration, precisely the three heap-allocated locals (`slice`, `+`, `toAscii`). `_is_refcounted` and `_release_fn_for` both knew about ascii, but the VarDecl branch that SCHEDULES a local for scope-exit release did not, so nothing ever called the release. Fixed by adding ascii to that branch on blob's exact terms (always scheduled, no escaping-ness or fresh-source test, because every ascii binding owns one counted reference however it was produced). Worth recording that the type checked out completely in hand probes before this: correct output, correct edge cases, no crash. Only ASan found it.
+
+**Measured, not assumed.** A character-by-character identifier scan, same program over the same input, `text` versus `ascii`, token count checked against an independently computed value:
+
+| input | `text` | `ascii` |
+|---|---|---|
+| 10.4 KB | 50.1 ms | -- |
+| 20.8 KB | 201.5 ms | -- |
+| 41.6 KB | 799.8 ms | -- |
+| 520 KB | -- | 2.3 ms |
+| 2.08 MB | -- | 10.9 ms |
+| 4.16 MB | -- | 21.5 ms |
+
+The shape is the real result: `text` QUADRUPLES when the input doubles (a walk per index, over every index -- textbook O(n^2)), `ascii` doubles. The two are deliberately measured at different sizes because the honest comparison at a shared size was not resolvable -- at 20 KB the ascii scan was under 0.1 ms with a 1.6 ms process-startup baseline, so the "3,000x" ratio that fell out of subtracting one from the other was mostly noise and is not claimed. What IS claimed: at 41.6 KB `text` needs 800 ms, and `ascii` scans 4.16 MB -- a hundred times more input -- in 21.5 ms. Extrapolating text's measured quadratic to this repo's own `codegen.py` (~500 KB) gives roughly two minutes to scan one file, which is the bootstrapping argument made concrete.
+
+**Verified.** A C harness first (layout, retain/release interop, singleton identity and immortality, out-of-range nulls, embedded NULs, non-ASCII rejection), then hand probes end to end, then `tests/test_codegen.py::TestAscii` (16 tests) and `tests/stress/ascii_churn.f` under `scripts/leak_stress.sh` -- clean after the tracking fix above, whose numbers were hand-computed rather than read off the program. Non-ASCII coverage in the suite was thin (only `'café'`, no 3- or 4-byte code points), so the new tests pin the text/ascii length difference explicitly.
+
+**Docs.** api.md gains an `ascii` section (with the measured table and the cost model); CHANGELOG under 0.44's "Added"; todo.md's Memory-model bullet corrected -- it claimed `text` carries a refcount header, which it does not and never has.
+
+**Full suite:** TBD.

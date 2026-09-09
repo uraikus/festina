@@ -13,6 +13,22 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Added
 
+- **`ascii` — a one-byte-per-character string type,** alongside `text`
+  rather than replacing it. Because a character is a byte, the
+  character count *is* the byte count, so it lives in the value's own
+  header and `.length`, `s[i]` and `charCodeAt(i)` are all O(1) reads
+  instead of the UTF-8 walks `text` needs. Indexing allocates nothing
+  at all — a one-character `ascii` comes from a table of 128 immortal
+  singletons. Supports `.length`, `s[i]`, `.charCodeAt(i)`,
+  `.slice(start, end)`, `+`, `==`/`!=`, interpolation, `.toText()` and
+  `text.toAscii()`. A quoted literal assigned to an `ascii` is
+  converted at compile time, so a non-ASCII literal fails to build;
+  `toAscii()` answers `null` at runtime for text that isn't
+  representable. Measured on a character-by-character scan: `text` is
+  quadratic (50 ms at 10.4 KB, 201 ms at 20.8 KB, 800 ms at 41.6 KB),
+  `ascii` linear (21.5 ms for 4.16 MB — a hundred times more input than
+  `text` needed 800 ms for).
+
 - **`pool.postMessage(x)` — no index — auto-selects an idle instance.**
   Routes to whichever pool instance currently has nothing queued and
   isn't mid-handler, falling back to plain round-robin when every

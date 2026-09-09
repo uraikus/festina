@@ -454,6 +454,83 @@ one-character `text`. Both follow the same "test, don't fail" rule as
 `0x10FFFF`, or inside the UTF-16 surrogate range `0xD800`–`0xDFFF` —
 answers `null` rather than crashing.
 
+## `ascii` — one byte per character
+
+`text` is UTF-8, so a character can be one to four bytes. That makes
+`text.length` a real scan and `s[i]` a walk from the start of the
+string, and it is the right trade for text that has to hold any
+language. But it is the wrong trade for a scanner — a lexer reads every
+character by index, and a walk per read is quadratic over the whole
+input.
+
+`ascii` is the other trade. One byte per character means the character
+count *is* the byte count, so it lives in the value's own header and
+both `.length` and `s[i]` are O(1) reads:
+
+```festina
+ascii src = 'int x = 1'
+log(src.length)          // 9   -- a stored count, not a scan
+log(src[4])              // 'x' -- a byte offset, not a walk
+log(src.charCodeAt(4))   // 120
+log(src.slice(0, 3))     // 'int'
+log(src == 'int x = 1')  // true
+```
+
+Both types coexist; neither replaces the other. Use `text` for anything
+a person types or reads, and `ascii` where the input really is one byte
+per character and you index it heavily — source code, protocol headers,
+CSV fields.
+
+### Converting
+
+A quoted literal is a `text` literal. Assigning one to an `ascii`
+converts it at compile time, so a literal that isn't ASCII fails to
+build rather than deferring to a runtime null:
+
+```festina
+ascii ok = 'let'          // fine
+ascii bad = 'café'        // compile error: 'é' is not an ascii character
+```
+
+At runtime the conversion has to be checked, so it answers `null` for
+anything not representable one byte per character — the same "test,
+don't fail" rule `s[i]` and `toInt()` already follow:
+
+```festina
+blob f = 'input.txt'
+ascii scan = f.toText().toAscii()   // null if the file isn't ascii
+if scan == null { fail('expected ascii input') }
+
+text back = scan.toText()        // always works, always a copy
+```
+
+### Cost
+
+`.length`, `s[i]` and `charCodeAt(i)` are O(1). Indexing allocates
+nothing at all: a one-character `ascii` comes from a table of 128
+immortal single-character values rather than a fresh buffer, so a
+character-by-character scan does no allocation whatsoever.
+
+`slice()` and `+` copy, because an `ascii` owns its bytes.
+
+The difference this makes to a scanner is not small. Counting
+identifiers character by character over the same input:
+
+| input | `text` | `ascii` |
+|---|---|---|
+| 10.4 KB | 50 ms | — |
+| 20.8 KB | 201 ms | — |
+| 41.6 KB | 800 ms | — |
+| 4.16 MB | — | 21.5 ms |
+
+`text` quadruples when the input doubles (a walk per index, over every
+index); `ascii` doubles. At 41.6 KB `text` needs 800 ms; `ascii` scans
+4.16 MB — a hundred times more input — in 21.5 ms.
+
+An `ascii` is reference counted, so `ascii b = a` shares one buffer
+rather than copying it, and `b` is not a snapshot: see
+[`T?`](#t-manually-managed-values) for what `ascii?` means.
+
 ## Logging and rendering
 
 `log()` and `${}` interpolation accept any value that has a text form —

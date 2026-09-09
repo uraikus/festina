@@ -2309,6 +2309,187 @@ char *festina_text_own(const char *s) {
     return out;
 }
 
+/* ---- claude.md #256: the `ascii` string type ----
+ *
+ * A one-byte-per-character string, parallel to `text` rather than a
+ * replacement for it. That single property is the whole point: when a
+ * character IS a byte, the character count IS the byte count, so both
+ * `.length` and `s[i]` become O(1) reads instead of the UTF-8 walks
+ * `text` is stuck with (festina_text_length / festina_text_char_at
+ * above -- see their own comments on why `text` can cache neither).
+ *
+ * Layout, chosen to reuse the existing refcount machinery verbatim:
+ *
+ *     base+0    int64_t length     <- payload - 16
+ *     base+8    int64_t refcount   <- payload - 8
+ *     base+16   the bytes, always NUL-terminated at [length]
+ *
+ * This is exactly claude.md #176's tagged-struct shape, for exactly
+ * #176's reason: the refcount stays at precisely `payload - 8`, so
+ * festina_retain/festina_release_check work on an ascii with ZERO
+ * changes, while the length sits one word further back where only
+ * ascii's own code ever looks. A NEGATIVE refcount is the standard
+ * immortal sentinel, unchanged -- which is what lets a literal (an
+ * inline header emitted straight into .rodata by codegen) and the
+ * single-character singletons below be handed around as ordinary
+ * ascii values that retain/release simply no-op on.
+ *
+ * Unlike text (claude.md #83: copy on alias, free unconditionally),
+ * ascii is REFERENCE COUNTED -- `ascii b = a` retains instead of
+ * copying, which is the case a lexer hits constantly. */
+
+#define FESTINA_ASCII_HEADER (2 * sizeof(int64_t))
+
+int64_t festina_ascii_length(void *payload) {
+    if (!payload) return 0;
+    return *(int64_t *)((char *)payload - FESTINA_ASCII_HEADER);
+}
+
+/* An uninitialized ascii of exactly `len` bytes, refcount 1, already
+ * NUL-terminated -- the caller fills payload[0..len). */
+char *festina_ascii_alloc(int64_t len) {
+    if (len < 0) len = 0;
+    char *raw = malloc(FESTINA_ASCII_HEADER + (size_t)len + 1);
+    if (!raw) festina_fail("out of memory allocating an ascii");
+    *(int64_t *)raw = len;
+    *(int64_t *)(raw + sizeof(int64_t)) = 1;
+    char *payload = raw + FESTINA_ASCII_HEADER;
+    payload[len] = '\0';
+    return payload;
+}
+
+void festina_ascii_release(void *payload) {
+    if (!payload) return;
+    if (!festina_release_check(payload)) return;
+    free((char *)payload - FESTINA_ASCII_HEADER);
+}
+
+/* claude.md #256: `s[i]` hands back a one-character ascii WITHOUT
+ * allocating -- one immortal singleton per ASCII code, built into
+ * .data at compile time rather than lazily (a lazy table would race
+ * between Festina threads; these are constant, so there is nothing to
+ * initialize). The negative refcount is the same immortal sentinel
+ * every other immortal value uses, so retain/release/free on one are
+ * already no-ops through festina_release_check's own check.
+ *
+ * The struct's first two words ARE the header, so `.bytes` sits at
+ * exactly offset 16 -- the same payload-relative layout a heap ascii
+ * has, which is what makes a singleton indistinguishable from one. */
+typedef struct {
+    int64_t length;
+    int64_t refcount;
+    char bytes[2];
+} FestinaAsciiChar;
+
+#define FESTINA_AC(c) { 1, -1, { (char)(c), '\0' } }
+#define FESTINA_AC16(n) \
+    FESTINA_AC((n) + 0),  FESTINA_AC((n) + 1),  FESTINA_AC((n) + 2),  FESTINA_AC((n) + 3),  \
+    FESTINA_AC((n) + 4),  FESTINA_AC((n) + 5),  FESTINA_AC((n) + 6),  FESTINA_AC((n) + 7),  \
+    FESTINA_AC((n) + 8),  FESTINA_AC((n) + 9),  FESTINA_AC((n) + 10), FESTINA_AC((n) + 11), \
+    FESTINA_AC((n) + 12), FESTINA_AC((n) + 13), FESTINA_AC((n) + 14), FESTINA_AC((n) + 15)
+
+static FestinaAsciiChar g_festina_ascii_chars[128] = {
+    FESTINA_AC16(0),  FESTINA_AC16(16), FESTINA_AC16(32),  FESTINA_AC16(48),
+    FESTINA_AC16(64), FESTINA_AC16(80), FESTINA_AC16(96),  FESTINA_AC16(112)
+};
+
+#undef FESTINA_AC16
+#undef FESTINA_AC
+
+/* s[i] -> a one-character ascii, or NULL for a negative/past-the-end
+ * index, mirroring festina_text_char_at's own answer to the identical
+ * question. O(1) and allocation-free: index the singleton table. */
+char *festina_ascii_char_at(void *payload, int64_t index) {
+    if (!payload) return NULL;
+    int64_t len = festina_ascii_length(payload);
+    if (index < 0 || index >= len) return NULL;
+    unsigned char c = (unsigned char)((char *)payload)[index];
+    if (c > 127) return NULL;  /* not reachable for a validated ascii */
+    return g_festina_ascii_chars[c].bytes;
+}
+
+/* s.charCodeAt(i) -- the whole reason this type exists in one line: a
+ * single byte load, where text's own charCodeAt has to walk. */
+int64_t festina_ascii_char_code_at(void *payload, int64_t index) {
+    if (!payload) return festina_null_int();
+    int64_t len = festina_ascii_length(payload);
+    if (index < 0 || index >= len) return festina_null_int();
+    return (int64_t)(unsigned char)((char *)payload)[index];
+}
+
+char *festina_ascii_concat(void *a, void *b) {
+    int64_t la = festina_ascii_length(a), lb = festina_ascii_length(b);
+    char *out = festina_ascii_alloc(la + lb);
+    if (la) memcpy(out, a, (size_t)la);
+    if (lb) memcpy(out + la, b, (size_t)lb);
+    return out;
+}
+
+/* Length first, then memcmp -- never strlen/strcmp: both lengths are
+ * already known, and an ascii may legitimately contain a NUL byte
+ * (s[0] of a NUL is a valid one-character ascii). */
+int8_t festina_ascii_eq(void *a, void *b) {
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    int64_t la = festina_ascii_length(a), lb = festina_ascii_length(b);
+    if (la != lb) return 0;
+    return memcmp(a, b, (size_t)la) == 0 ? 1 : 0;
+}
+
+/* s.slice(start, end) -- end-exclusive, both clamped into range, so an
+ * inverted or out-of-range pair yields an empty ascii rather than a
+ * fault. Copies: an ascii owns its bytes. */
+char *festina_ascii_slice(void *payload, int64_t start, int64_t end) {
+    int64_t len = festina_ascii_length(payload);
+    if (start < 0) start = 0;
+    if (end > len) end = len;
+    if (end < start) end = start;
+    int64_t n = end - start;
+    char *out = festina_ascii_alloc(n);
+    if (n) memcpy(out, (char *)payload + start, (size_t)n);
+    return out;
+}
+
+char *festina_ascii_to_text(void *payload) {
+    if (!payload) return NULL;
+    int64_t len = festina_ascii_length(payload);
+    char *out = malloc((size_t)len + 1);
+    if (!out) festina_fail("out of memory in festina_ascii_to_text");
+    memcpy(out, payload, (size_t)len);
+    out[len] = '\0';
+    return out;
+}
+
+/* text.toAscii() -- validates, then copies. NULL for a NULL input or
+ * for any byte above 127, matching toInt()'s own "null when the input
+ * does not answer the question" convention rather than throwing:
+ * "is this text representable as ascii" is a question with a real
+ * negative answer, not an error. */
+char *festina_ascii_from_text(const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    for (size_t i = 0; i < len; i++) {
+        if ((unsigned char)s[i] > 127) return NULL;
+    }
+    char *out = festina_ascii_alloc((int64_t)len);
+    memcpy(out, s, len);
+    return out;
+}
+
+/* claude.md #195/#198: the thread boundary is a deep clone, so an
+ * ascii crossing it gets its own buffer -- never a shared pointer,
+ * which is what keeps every retain/release in this runtime safely
+ * non-atomic. Always a fresh heap copy, even of an immortal literal
+ * or singleton (cloning one as immortal would be correct but pointless
+ * -- the receiving thread would just hold the same .rodata). */
+char *festina_ascii_clone(void *payload) {
+    if (!payload) return NULL;
+    int64_t len = festina_ascii_length(payload);
+    char *out = festina_ascii_alloc(len);
+    if (len) memcpy(out, payload, (size_t)len);
+    return out;
+}
+
 /* ---- claude.md #93: math, files and time ----
  *
  * Everything here is libc or libm, both already on every link line

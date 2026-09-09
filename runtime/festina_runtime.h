@@ -194,7 +194,24 @@ char *festina_sb_finish(void *sb);
 void *festina_text_split(const char *s, const char *sep);
 void *festina_regex_split(void *compiled, const char *s);
 char *festina_arr_join(void *arr, const char *sep, const char *kind);
-char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
+char *festina_text_own(const char *s);
+
+/* claude.md #256: the `ascii` type -- one byte per character, so the
+ * character count IS the byte count and both live in a header at
+ * {payload-16 length, payload-8 refcount}. See festina_runtime.c's own
+ * section comment for why that layout (it is claude.md #176's, so
+ * festina_retain/festina_release_check need no changes at all). */
+int64_t festina_ascii_length(void *payload);
+char *festina_ascii_alloc(int64_t len);
+void festina_ascii_release(void *payload);
+char *festina_ascii_char_at(void *payload, int64_t index);
+int64_t festina_ascii_char_code_at(void *payload, int64_t index);
+char *festina_ascii_concat(void *a, void *b);
+int8_t festina_ascii_eq(void *a, void *b);
+char *festina_ascii_slice(void *payload, int64_t start, int64_t end);
+char *festina_ascii_to_text(void *payload);
+char *festina_ascii_from_text(const char *s);
+char *festina_ascii_clone(void *payload);  /* claude.md #83: NULL-safe strdup */
 
 /* claude.md #132: mkdir(path) -> bool (true if IT created the
  * directory, false for every other outcome, including "already

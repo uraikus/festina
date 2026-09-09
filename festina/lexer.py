@@ -36,6 +36,11 @@ SPEC_KEYWORDS = frozenset({
               # Parser.eat_name already accepts any keyword as a member
               # name (the same reason `free`/`delete` don't break
               # `blob.delete()`), so `'x'.match(regex)` is unaffected.
+    "ascii",  # claude.md #256: a one-byte-per-character string type,
+              # parallel to `text` rather than a replacement for it.
+              # One byte per character is what makes `.length` and
+              # `s[i]` O(1) reads off its own header, which `text`
+              # (UTF-8, variable width, headerless) cannot be.
 })
 
 # Extra control tokens the parser needs distinct token types for, so it
@@ -54,7 +59,7 @@ _EXTRA_KEYWORDS = frozenset({"return", "var", "let", "throw", "free", "delete"})
 # present, not that nothing else is.
 KEYWORDS = SPEC_KEYWORDS | _EXTRA_KEYWORDS
 
-PRIMITIVE_TYPE_KEYWORDS = frozenset({"int", "float", "bool", "text", "blob"})
+PRIMITIVE_TYPE_KEYWORDS = frozenset({"int", "float", "bool", "text", "blob", "ascii"})
 
 TOKEN_SPEC = [
     ("WS", r"[ \t\r\n]+"),

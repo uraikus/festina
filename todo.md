@@ -56,11 +56,14 @@ blocking: AddressSanitizer/LeakSanitizer coverage for the target.
 
 ## Memory model
 
-Automatic reclamation is escape analysis plus reference counting —
-every managed type (`struct`/`arr[T]`/`map[T]`/`text`/`img`/`aud`/
-`regex`/`blob`/`http`/`url`/`socket`) carries a refcount header, and
-reference cycles are collected by trial deletion, with `free`/`delete`
-as the manual override. What remains open:
+Automatic reclamation is escape analysis plus reference counting.
+Most managed types (`struct`/`arr[T]`/`map[T]`/`ascii`/`img`/`aud`/
+`regex`/`blob`/`http`/`url`/`socket`) carry a refcount header;
+`text` is the exception — it has no header at all and is instead
+copied on alias and freed outright (claude.md #83, and #256 for why a
+header cannot be added to it). Reference cycles are collected by trial
+deletion, with `free`/`delete` as the manual override. What remains
+open:
 
 - **Cycle trials are synchronous and per-release** — every
   still-referenced release of a cycle-capable type walks the value's

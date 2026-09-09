@@ -334,6 +334,9 @@ INT = types_mod.PrimitiveType("int")
 FLOAT = types_mod.PrimitiveType("float")
 TEXT = types_mod.PrimitiveType("text")
 BLOB = types_mod.PrimitiveType("blob")
+# claude.md #256: one byte per character, so the character count IS the
+# byte count -- both live in the value's own header. See _llvm_type.
+ASCII = types_mod.PrimitiveType("ascii")
 REGEX = types_mod.RegexType()
 AUDIO = types_mod.AudioType()
 
@@ -495,7 +498,13 @@ def _is_refcounted(t):
                            types_mod.AudioType, types_mod.RegexType,
                            types_mod.HttpType, types_mod.SocketType,
                            types_mod.UrlType, types_mod.EnumType))
-            or t == BLOB)
+            or t == BLOB
+            # claude.md #256: ascii carries the identical i64 refcount
+            # at payload-8 (its length sits one word further back), so
+            # every generic part of the protocol -- festina_retain,
+            # festina_release_check, retain-then-release on reassign --
+            # already works on it unchanged, exactly as for blob.
+            or t == ASCII)
 
 
 def _is_manually_managed(t):
@@ -712,7 +721,11 @@ def _llvm_type(t):
         # transiently wherever LLVM itself requires one -- see
         # _bool_cond and every zext-to-i8-immediately-after site.
         return {"int": "i64", "float": "double", "bool": "i8",
-                "text": "ptr", "blob": "ptr"}[t.name]
+                "text": "ptr", "blob": "ptr",
+                # claude.md #256: a `ptr` to the payload, exactly like
+                # every other headered type -- the {length, refcount}
+                # header sits behind it at payload-16/payload-8.
+                "ascii": "ptr"}[t.name]
     if isinstance(t, types_mod.StructType):
         return "ptr"
     if isinstance(t, types_mod.EnumType):
@@ -1004,6 +1017,9 @@ class CodeGen:
                                                 # never by an arbitrary TableType-typed binding, which
                                                 # would double-free a row the array still owns.
         self.extra_globals = []                # globals discovered while emitting main() (e.g. table column arrays)
+        # claude.md #256: interned ascii literals -- text -> the constant
+        # GEP expression naming its payload. See ascii_const.
+        self.ascii_constants = {}
         self.entry_stmts = []                  # top-level statements for __festina_main
         self.func_decls = {}                   # name -> ast.FuncDecl (for signatures)
         self.cur_block = None                  # label of the block currently being emitted into
@@ -1411,6 +1427,42 @@ class CodeGen:
         self.string_constants[text] = name
         return name
 
+    def ascii_const(self, text):
+        """claude.md #256: a text literal in an ascii-typed position,
+        emitted straight into .rodata with its own INLINE
+        {length, refcount} header -- exactly the shape _global_var_defs
+        already uses for struct/arr/map globals (`{i64 -1, T}` plus a
+        getelementptr past the header). The refcount is the standard
+        immortal sentinel, so retain, release and `free` on a literal
+        are all no-ops through the same checks every other immortal
+        value goes through, and the payload pointer handed out is
+        indistinguishable from a heap ascii's -- which is the whole
+        reason ascii can have a header where text cannot (claude.md
+        #83's four provenances have no equivalent here: every ascii in
+        existence is built by this compiler or by festina_ascii_alloc).
+
+        Non-ASCII is rejected HERE rather than at the runtime boundary
+        because a literal's bytes are known at compile time -- there is
+        no reason to defer to a null at runtime what can simply fail to
+        build."""
+        for ch in text:
+            if ord(ch) > 127:
+                raise CodegenError(
+                    f"'{ch}' is not an ascii character -- an ascii literal "
+                    f"must be one byte per character (use text for unicode, "
+                    f"or .toAscii() to convert and check at runtime)")
+        if text in self.ascii_constants:
+            return self.ascii_constants[text]
+        encoded, length = _encode_c_string(text)
+        name = f"@.astr.{len(self.ascii_constants)}"
+        ty = f"{{i64, i64, [{length} x i8]}}"
+        self.extra_globals.append(
+            f'{name} = private unnamed_addr constant {ty} '
+            f'{{i64 {length - 1}, i64 -1, [{length} x i8] c"{encoded}"}}')
+        ref = f"getelementptr inbounds ({ty}, ptr {name}, i32 0, i32 2)"
+        self.ascii_constants[text] = ref
+        return ref
+
     # ---- struct layout ----
     def struct_llvm_name(self, name):
         return f"%struct.{name}"
@@ -1596,6 +1648,21 @@ class CodeGen:
             "declare ptr @festina_str_from_float(double)",
             "declare ptr @festina_str_from_bool(i8)",
             "declare ptr @festina_str_concat(ptr, ptr)",
+            # claude.md #256: the `ascii` type. Only the operations
+            # that need real work are calls -- `.length`, `s[i]` and
+            # `charCodeAt` are emitted as direct loads with no call at
+            # all, which is the entire point of the type.
+            "declare i64 @festina_ascii_length(ptr)",
+            "declare ptr @festina_ascii_alloc(i64)",
+            "declare void @festina_ascii_release(ptr)",
+            "declare ptr @festina_ascii_char_at(ptr, i64)",
+            "declare i64 @festina_ascii_char_code_at(ptr, i64)",
+            "declare ptr @festina_ascii_concat(ptr, ptr)",
+            "declare i8 @festina_ascii_eq(ptr, ptr)",
+            "declare ptr @festina_ascii_slice(ptr, i64, i64)",
+            "declare ptr @festina_ascii_to_text(ptr)",
+            "declare ptr @festina_ascii_from_text(ptr)",
+            "declare ptr @festina_ascii_clone(ptr)",
             # claude.md #243: in-place append for `s = `${s}...`` / `s = s + ...`
             "declare ptr @festina_text_append(ptr, i64, ptr, i64, ptr)",
             # claude.md #83: text values are copy-managed, not
@@ -4812,10 +4879,23 @@ class CodeGen:
                                 # does. See _StackStructFieldsOnly's own
                                 # comment.
                                 self._track_local(ref, _StackStructFieldsOnly(type_), lines)
-                        elif type_ == BLOB or type_ == REGEX or isinstance(
+                        elif type_ == BLOB or type_ == REGEX or type_ == ASCII or isinstance(
                                 type_, (types_mod.ImageType, types_mod.AudioType,
                                        types_mod.HttpType, types_mod.SocketType,
                                        types_mod.UrlType, types_mod.EnumType)):
+                            # claude.md #256: ascii joins this branch on
+                            # exactly blob's terms -- always scheduled
+                            # for release, no escaping-ness or
+                            # fresh-source test, because every ascii
+                            # BINDING owns one counted reference however
+                            # it was produced (a fresh slice/concat
+                            # starts at 1; an aliasing bind retains; an
+                            # immortal literal or singleton no-ops on
+                            # both). Omitting it leaked exactly the
+                            # three heap-allocated locals per iteration
+                            # that tests/stress/ascii_churn.f allocates,
+                            # caught by leak_stress before this branch
+                            # existed.
                             # claude.md #197: EnumType/HttpType/
                             # SocketType/UrlType join this branch too --
                             # see the matching widening (and its own,
@@ -5792,6 +5872,25 @@ class CodeGen:
         # built per iteration is the ordinary way to use one. Measured
         # at 1,029 bytes over 49 iterations for `img s = `${dir}x.png``
         # before this existed.
+        # claude.md #256: `ascii tok = 'let'`. A literal is resolved
+        # entirely at compile time into an immortal .rodata constant --
+        # no allocation, no validation, no call. Anything else is a
+        # real runtime conversion that has to validate, and answers
+        # null for non-ascii input the way toInt() answers null for
+        # unparseable text.
+        if to_type == ASCII and from_type == TEXT:
+            if isinstance(source_expr, ast.StringLit):
+                return self.ascii_const(source_expr.value)
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_ascii_from_text(ptr {val})")
+            self._free_text_temp(source_expr, val, TEXT, lines)
+            return out
+        # claude.md #256: the other direction -- always a real copy,
+        # since a text is a bare char* with no header in front of it.
+        if to_type == TEXT and from_type == ASCII:
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_ascii_to_text(ptr {val})")
+            return out
         if to_type == BLOB and from_type == TEXT:
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_blob_open(ptr {val})")
@@ -6110,6 +6209,17 @@ class CodeGen:
                 # _free_text_temp is the same direct-free helper
                 # charCodeAt's own receiver already uses (claude.md
                 # #249) for exactly this reason.
+                if obj_type == ASCII:
+                    # claude.md #256: the length is already sitting in
+                    # the value's own header at payload-16 -- a load,
+                    # not a call, and certainly not text's walk. This
+                    # is the entire reason the type exists.
+                    len_ptr = self.tmp()
+                    out = self.tmp()
+                    lines.append(f"  {len_ptr} = getelementptr i8, ptr {obj_val}, i64 -16")
+                    lines.append(f"  {out} = load i64, ptr {len_ptr}")
+                    self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+                    return out, INT
                 if obj_type == TEXT:
                     out = self.tmp()
                     lines.append(f"  {out} = call i64 @festina_text_length(ptr {obj_val})")
@@ -6171,7 +6281,7 @@ class CodeGen:
                     out = self._mint_and_release_computed(
                         expr, out[0], obj_val, obj_type, obj_type.value, lines)
                     return out, obj_type.value
-                if obj_type == TEXT:
+                if obj_type == TEXT or obj_type == ASCII:
                     # claude.md #150: unlike arr[text][i] (a BORROWED
                     # pointer into the array's own storage, see
                     # _mint_and_release_computed's own "a scalar element
@@ -6190,6 +6300,18 @@ class CodeGen:
                     # NO leak either way.
                     idx_val, _ = self._emit_expr(expr.prop, env, lines)
                     out = self.tmp()
+                    if obj_type == ASCII:
+                        # claude.md #256: one of the 128 immortal
+                        # single-character singletons -- O(1) and no
+                        # allocation, where text[i] both walks and
+                        # mallocs. NOT added to _minted_values: the
+                        # result is immortal, so treating it as an
+                        # owning temporary would emit a release that is
+                        # a no-op at best and misleading at worst.
+                        lines.append(
+                            f"  {out} = call ptr @festina_ascii_char_at(ptr {obj_val}, i64 {idx_val})")
+                        self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+                        return out, ASCII
                     lines.append(f"  {out} = call ptr @festina_text_char_at(ptr {obj_val}, i64 {idx_val})")
                     self._free_text_temp(expr.obj, obj_val, obj_type, lines)
                     self._minted_values.add(id(expr))
@@ -6340,6 +6462,13 @@ class CodeGen:
             lines.append(f"  {sb} = call ptr @festina_sb_new()")
             lines.append(f"  call void {fn}(ptr {val}, ptr {sb}, i64 0)")
             lines.append(f"  {out} = call ptr @festina_sb_finish(ptr {sb})")
+        elif type_ == ASCII:
+            # claude.md #256: the characters, as a fresh text buffer --
+            # always total, since every ascii byte is a valid
+            # single-byte UTF-8 code point. This is also what
+            # ascii.toText() compiles to, and the two must not
+            # disagree, exactly as for blob just below.
+            lines.append(f"  {out} = call ptr @festina_ascii_to_text(ptr {val})")
         elif type_ == BLOB:
             # claude.md #115: the contents. A binary blob renders its
             # bytes up to the first NUL -- which is exactly what its
@@ -9383,6 +9512,11 @@ class CodeGen:
             # with openPort()/on request/fetch() and must not force
             # uses_http on a program that only ever parses a URL.
             return "@festina_release_url"
+        if type_ == ASCII:
+            # claude.md #256: unlike text just below, ascii IS
+            # refcounted -- its destructor frees at payload-16, the
+            # base of its {length, refcount} header.
+            return "@festina_ascii_release"
         if type_ == TEXT:
             # claude.md #83: text has no refcount header to dispatch
             # through -- "releasing" one is always just a plain,
@@ -10708,6 +10842,42 @@ class CodeGen:
             left_val, left_type = self._emit_expr(expr.left, env, lines)
             right_val, right_type = self._emit_expr(expr.right, env, lines)
 
+        # claude.md #256: ascii == / != / + . A text operand on either
+        # side is coerced UP to ascii rather than the other way round,
+        # which is what makes `tok == 'let'` free: a literal resolves to
+        # an immortal .rodata constant at compile time, so the common
+        # lexer comparison allocates nothing at all. (A non-literal text
+        # operand does allocate, via festina_ascii_from_text -- the
+        # honest cost of validating that it is representable.)
+        if left_type == ASCII or right_type == ASCII:
+            if left_type == TEXT:
+                left_val = self._coerce(left_val, TEXT, ASCII, lines, expr.left)
+                left_type = ASCII
+            if right_type == TEXT:
+                right_val = self._coerce(right_val, TEXT, ASCII, lines, expr.right)
+                right_type = ASCII
+            if expr.op in ("==", "!="):
+                out = self.tmp()
+                lines.append(f"  {out} = call i8 @festina_ascii_eq(ptr {left_val}, ptr {right_val})")
+                if expr.op == "!=":
+                    neg = self.tmp()
+                    lines.append(f"  {neg} = xor i8 {out}, 1")
+                    result = neg
+                else:
+                    result = out
+                self._release_owned_receiver(expr.left, left_val, ASCII, lines)
+                self._release_owned_receiver(expr.right, right_val, ASCII, lines)
+                return result, BOOL
+            if expr.op == "+":
+                out = self.tmp()
+                lines.append(f"  {out} = call ptr @festina_ascii_concat("
+                             f"ptr {left_val}, ptr {right_val})")
+                self._release_owned_receiver(expr.left, left_val, ASCII, lines)
+                self._release_owned_receiver(expr.right, right_val, ASCII, lines)
+                self._minted_values.add(id(expr))
+                return out, ASCII
+            raise CodegenError(
+                f"'{expr.op}' is not supported between ascii values")
         if left_type == TEXT or right_type == TEXT:
             if expr.op in ("==", "!="):
                 out = self.tmp()
@@ -11065,6 +11235,16 @@ class CodeGen:
                         f"log() only supports primitive values right now, "
                         f"found {types_mod.type_name(vtype)}",
                         file=self.filename, line=callee.line)
+                if vtype == ASCII:
+                    # claude.md #256: rendered as its characters, via
+                    # the same _to_text path ascii.toText() uses, so
+                    # the two can never disagree -- exactly how blob
+                    # and the containers are logged.
+                    rendered = self._to_text(val, vtype, lines)
+                    lines.append(f"  call void @festina_log_text(ptr {rendered})")
+                    lines.append(f"  call void @free(ptr {rendered})")
+                    self._release_owned_receiver(expr.args[0], val, vtype, lines)
+                    return "0", None
                 fn = {"int": "festina_log_int", "float": "festina_log_float",
                       "bool": "festina_log_bool", "text": "festina_log_text"}[vtype.name]
                 ty = _llvm_type(vtype)
@@ -11827,6 +12007,19 @@ class CodeGen:
             # shape just below for that comparison).
             if callee.prop == "charCodeAt":
                 val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == ASCII:
+                    # claude.md #256: this is the request that started
+                    # the whole type -- an O(1) charCodeAt. One byte per
+                    # character means the byte at offset i IS the code
+                    # point, so this is a bounds check and a load where
+                    # text's own version below has to walk from byte
+                    # zero counting code points.
+                    idx_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call i64 @festina_ascii_char_code_at(ptr {val}, i64 {idx_val})")
+                    self._release_owned_receiver(callee.obj, val, vtype, lines)
+                    return out, INT
                 if vtype == TEXT:
                     idx_val, _ = self._emit_expr(expr.args[0], env, lines)
                     out = self.tmp()
@@ -11834,6 +12027,29 @@ class CodeGen:
                         f"  {out} = call i64 @festina_text_char_code_at(ptr {val}, i64 {idx_val})")
                     self._free_text_temp(callee.obj, val, vtype, lines)
                     return out, INT
+            # claude.md #256: ascii.slice(start, end) -- clamped both
+            # ends in the runtime, so nothing here needs to check.
+            if callee.prop == "slice":
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == ASCII:
+                    a_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    b_val, _ = self._emit_expr(expr.args[1], env, lines)
+                    out = self.tmp()
+                    lines.append(f"  {out} = call ptr @festina_ascii_slice("
+                                 f"ptr {val}, i64 {a_val}, i64 {b_val})")
+                    self._release_owned_receiver(callee.obj, val, vtype, lines)
+                    self._minted_values.add(id(expr))
+                    return out, ASCII
+                self._release_owned_receiver(callee.obj, val, vtype, lines)
+            # claude.md #256: text.toAscii() -- validating, and null for
+            # anything not representable one byte per character.
+            if callee.prop == "toAscii" and not expr.args:
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = call ptr @festina_ascii_from_text(ptr {val})")
+                self._free_text_temp(callee.obj, val, vtype, lines)
+                self._minted_values.add(id(expr))
+                return out, ASCII
             # claude.md #249: int.toChar() -> text -- the inverse of
             # charCodeAt(); the result is a fresh, exclusively-owned
             # one-character buffer (festina_int_to_char always mallocs
@@ -11857,6 +12073,13 @@ class CodeGen:
                 val, vtype = self._emit_expr(callee.obj, env, lines)
                 if vtype in (INT, FLOAT, BOOL):
                     return self._to_text(val, vtype, lines), TEXT
+                if vtype == ASCII:
+                    # claude.md #256: a real copy into a bare char*,
+                    # since a text has no header to carry. Total -- an
+                    # ascii byte is always a valid one-byte code point.
+                    out = self._to_text(val, vtype, lines)
+                    self._release_owned_receiver(callee.obj, val, vtype, lines)
+                    return out, TEXT
                 # claude.md #114: the explicit spelling of the rendering
                 # log()/`${}` now do implicitly for containers.
                 if isinstance(vtype, (types_mod.StructType, types_mod.TableType,

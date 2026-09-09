@@ -223,6 +223,7 @@ _FLOAT = types_mod.PrimitiveType("float")
 _NUMERIC_TYPES = (_INT, _FLOAT)
 _TEXT = types_mod.PrimitiveType("text")
 _BLOB = types_mod.PrimitiveType("blob")
+_ASCII = types_mod.PrimitiveType("ascii")
 _BOOL = types_mod.PrimitiveType("bool")
 
 
@@ -240,6 +241,16 @@ def _is_blob_type(t):
     `T`'s; only the handful of sites that gate AUTOMATIC bookkeeping
     care about the flag at all."""
     return isinstance(t, types_mod.PrimitiveType) and t.name == "blob"
+
+
+def _is_ascii_type(t):
+    """claude.md #256: `ascii`'s own counterpart to _is_blob_type just
+    above -- same reason, same rule. `ascii` is refcounted and so `T?`
+    means something real for it, which makes `t == _ASCII` wrong at
+    every site dispatching by VALUE SHAPE rather than by whether
+    automatic bookkeeping is on."""
+    return isinstance(t, types_mod.PrimitiveType) and t.name == "ascii"
+
 
 # claude.md #202: `T?` -- the exact set of resolved types
 # `manually_managed` means something real for, mirroring
@@ -276,6 +287,11 @@ def apply_manually_managed(resolved_type, manually_managed):
         return dataclasses.replace(resolved_type, manually_managed=True)
     if resolved_type == _BLOB:
         return types_mod.PrimitiveType("blob", manually_managed=True)
+    # claude.md #256: `ascii` is refcounted exactly like blob is, so
+    # `ascii?` means the same real thing -- the identical PrimitiveType
+    # special case, for the identical reason (no dedicated dataclass).
+    if resolved_type == _ASCII:
+        return types_mod.PrimitiveType("ascii", manually_managed=True)
     return resolved_type
 
 
@@ -1550,6 +1566,21 @@ def analyze(program, filename="<string>"):
         # stops working for `blob?` specifically.
         if _is_blob_type(declared) and actual == _TEXT:
             return
+        # claude.md #256: `ascii tok = 'let'` -- the same
+        # one-directional text -> X allowance blob has just above, and
+        # for the same reason (there is no separate ascii-literal
+        # syntax). Unlike blob's, this one is a REAL conversion in
+        # codegen: an ascii carries a {length, refcount} header a bare
+        # text has nothing to fill in, so a literal becomes an inline
+        # .rodata constant and anything else goes through
+        # festina_ascii_from_text, which validates. The reverse
+        # direction is allowed too -- an ascii is always representable
+        # as text, so `text t = someAscii` is total where the forward
+        # direction is not.
+        if _is_ascii_type(declared) and actual == _TEXT:
+            return
+        if declared == _TEXT and _is_ascii_type(actual):
+            return
         # claude.md #91: `color red = 'red'` / `font body = '13px arial'`
         # -- a colour and a font are written as text because that is what
         # reads well, and resolved to their compiled form at the
@@ -2131,6 +2162,18 @@ def analyze(program, filename="<string>"):
                     # included -- the int side is coerced to float, the
                     # same as every other binary operator.
                     or (left in _NUMERIC_TYPES and right in _NUMERIC_TYPES)
+                    # claude.md #256: ascii and text compare freely.
+                    # `tok == 'let'` is the single most common thing a
+                    # lexer does, and a literal is exactly the case
+                    # that costs nothing -- codegen resolves it to an
+                    # immortal ascii constant at compile time. A
+                    # non-literal text operand is a real conversion
+                    # (and so allocates), which is why the comparison
+                    # is expressed this way round rather than by
+                    # widening the ascii side to text.
+                    or (_is_ascii_type(left) and right == _TEXT)
+                    or (left == _TEXT and _is_ascii_type(right))
+                    or (_is_ascii_type(left) and _is_ascii_type(right))
                 )
                 # claude.md #216: `worker:thread` is never `null` any
                 # more (claude.md #208's own "null when sent by main"
@@ -2270,6 +2313,21 @@ def analyze(program, filename="<string>"):
                         category="invalid operand type",
                     )
                 return obj_type.value
+            if _is_ascii_type(obj_type):
+                # claude.md #256: s[i] -> a one-character ascii, or
+                # null past either end -- the same "answer null, don't
+                # crash" choice text[i] makes just below. Unlike
+                # text[i] this costs nothing at runtime: one byte IS
+                # one character, so the byte at offset i IS the answer,
+                # handed back as one of the 128 immortal
+                # single-character singletons rather than allocated.
+                if idx_type is not None and idx_type is not NULL and idx_type != _INT:
+                    raise CompileError(
+                        f"ascii index must be int, found {types_mod.type_name(idx_type)}",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
+                return _ASCII
             if obj_type == _TEXT:
                 # claude.md #150: s[i] -> a single UTF-8 code point, the
                 # same unit split('') already uses -- or null (not a
@@ -2388,6 +2446,18 @@ def analyze(program, filename="<string>"):
                     category="invalid field access",
                 )
             return types_mod.PrimitiveType("int")
+        if _is_ascii_type(obj_type):
+            # claude.md #256: ascii.length -> int. Same shape as text's
+            # just below, but a stored count read straight out of the
+            # value's own header rather than a walk -- one byte per
+            # character is exactly what makes that possible.
+            if expr.prop != "length":
+                raise CompileError(
+                    f"ascii has no field '{expr.prop}' (did you mean '.length'?)",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            return _INT
         if obj_type == _TEXT:
             # claude.md #251: text.length -> int, the number of UTF-8
             # CODE POINTS -- the same unit s[i]/charCodeAt/split('')
@@ -3393,14 +3463,23 @@ def analyze(program, filename="<string>"):
             # site in this language already answers with) when nothing
             # parseable is found at all, never a compile-time-only or
             # runtime failure.
-            if callee.prop == "toInt" and not expr.args and infer(callee.obj, scope) == _TEXT:
+            if callee.prop == "toInt" and not expr.args and (
+                    infer(callee.obj, scope) == _TEXT
+                    or _is_ascii_type(infer(callee.obj, scope))):
                 return _INT
             # claude.md #249: text.charCodeAt(i:int) -> int -- the
             # Unicode CODE POINT at code-point index i (the same unit
             # text[i] already uses), null for i<0 or past the last
             # code point, mirroring text[i]'s own answer to the
             # identical question.
-            if callee.prop == "charCodeAt" and infer(callee.obj, scope) == _TEXT:
+            # claude.md #256: an ascii receiver answers the identical
+            # question -- one byte per character means the byte at
+            # offset i IS the code point -- so it shares this branch
+            # rather than duplicating the arity/argument rules. The
+            # difference is entirely in codegen: a load, not a walk.
+            if callee.prop == "charCodeAt" and (
+                    infer(callee.obj, scope) == _TEXT
+                    or _is_ascii_type(infer(callee.obj, scope))):
                 if len(expr.args) != 1:
                     raise CompileError(
                         f"charCodeAt() expects exactly 1 argument, got {len(expr.args)}",
@@ -3428,9 +3507,56 @@ def analyze(program, filename="<string>"):
             # does implicitly for these three types (see codegen.py's
             # _to_text); the receiver check is against the SAME three
             # types _to_text itself handles, kept in sync deliberately.
+            # claude.md #256: ascii.slice(start, end) -> ascii,
+            # end-exclusive, both ends clamped into range so an
+            # inverted or out-of-range pair yields an empty ascii
+            # rather than failing -- the same "answer something, don't
+            # crash" posture s[i] and a missing map key already take.
+            # Copies: an ascii owns its bytes.
+            if callee.prop == "slice" and _is_ascii_type(infer(callee.obj, scope)):
+                if len(expr.args) != 2:
+                    raise CompileError(
+                        f"slice() expects exactly 2 arguments, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for arg in expr.args:
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                        raise CompileError(
+                            f"slice() expects int arguments, found "
+                            f"{types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return _ASCII
+            # claude.md #256: text.toAscii() -> ascii, validating. Null
+            # when the text is not representable one-byte-per-character,
+            # matching toInt()'s own "null when the input does not
+            # answer the question" convention rather than throwing --
+            # "is this text ascii" has a real negative answer. A LITERAL
+            # never needs this (codegen resolves `ascii x = 'lit'` at
+            # compile time and rejects non-ascii outright); this is for
+            # text whose contents are only known at runtime.
+            if callee.prop == "toAscii" and not expr.args:
+                recv = infer(callee.obj, scope)
+                if recv is not None and recv is not NULL and recv != _TEXT:
+                    raise CompileError(
+                        f"toAscii() can only be called on text, found "
+                        f"{types_mod.type_name(recv)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid method call",
+                    )
+                return _ASCII
             if callee.prop == "toText" and not expr.args:
                 recv = infer(callee.obj, scope)
                 if recv in (_INT, _FLOAT, types_mod.PrimitiveType("bool")):
+                    return _TEXT
+                # claude.md #256: ascii.toText() -- always a real copy
+                # (a text is a bare char* with no header in front of
+                # it), and always total, since every ascii byte is a
+                # valid single-byte UTF-8 code point.
+                if _is_ascii_type(recv):
                     return _TEXT
                 # claude.md #114: containers render JSON-like, so their
                 # explicit .toText() types as text too. (blob's own
