@@ -33,17 +33,6 @@ blocking: AddressSanitizer/LeakSanitizer coverage for the target.
   media-using program. Revisit only with a concrete need.
 - **Self-hosting-compiler ergonomics, roadmapped alongside `match`
   (claude.md #252) but not started:**
-  - **Lex/parse cache for repeat compiles.** `festina/imports.py`
-    treats every `import` as a single C-style `#include` translation
-    unit (claude.md #5/#6, deliberate) — there are no real module
-    boundaries to cache separate *compilation* along today. The safe,
-    scoped version: cache the *lex+parse* step only, per file,
-    content-hash keyed, still merging into one AST for semantic
-    analysis/codegen exactly as now (mirrors the existing
-    `festina-runtime-cache` object-file cache and the wasm LTO bitcode
-    cache, #242, one layer up). A real incremental/separate-compilation
-    redesign would mean revisiting #5/#6 itself and needs its own
-    sign-off first — not assumed here.
   - **A raw byte-buffer type** (a generalized, writable `blob`, or a
     new `bytes` type, with `[i] =` assignment and
     `text.toBytes()`/`bytes.toText()` conversions at the boundary —

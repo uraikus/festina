@@ -73,6 +73,14 @@ round-by-round design and implementation record predating 0.1 lives in
   subject must be a plain variable or field access (not a call or any
   other expression that could run code), so it's only ever evaluated
   once regardless of arm count.
+- **A disk-persisted cache for the lex/parse step of `festina
+  compile`,** keyed by each imported file's exact content (not mtime)
+  plus a hash of the compiler's own grammar — an unchanged file across
+  two compiles is loaded from cache instead of re-lexed and re-parsed;
+  changing one file's content invalidates only that file's own entry.
+  Any cache failure (missing, corrupt, a festina upgrade) degrades
+  silently to an ordinary fresh parse — correctness never depends on
+  it working. `FESTINA_NO_PARSE_CACHE=1` disables it entirely.
 
 ### Fixed
 

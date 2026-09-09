@@ -1,4 +1,6 @@
 """claude.md #5 (imports), #6 (import resolution)."""
+import os
+
 import pytest
 
 
@@ -154,3 +156,108 @@ class TestBuildProgram:
         program = imports_mod.build_program(str(root / "main.f"))
         assert len(program.body) == 1
         semantic.analyze(program, filename=str(root / "main.f"))
+
+
+class TestParseCache:
+    """claude.md #253: a disk-persisted lex/parse cache for repeat
+    `festina compile` invocations, keyed by exact source content (not
+    mtime) plus a "grammar epoch" hash of festina's own lexer/parser/
+    ast/imports source -- see festina/imports.py's own _parse_cached
+    for the full design. Correctness never depends on the cache
+    working: every failure mode (missing, corrupt, cross-version) must
+    degrade silently to an ordinary fresh parse."""
+
+    def _clear_calls(self, monkeypatch, imports_mod):
+        """Wraps parser_mod.parse to count real (non-cached) parses,
+        returning the list calls get appended to."""
+        calls = []
+        real_parse = imports_mod.parser_mod.parse
+
+        def counting_parse(*args, **kwargs):
+            calls.append(1)
+            return real_parse(*args, **kwargs)
+
+        monkeypatch.setattr(imports_mod.parser_mod, "parse", counting_parse)
+        return calls
+
+    def test_a_second_build_hits_the_cache(self, imports_mod, write_source, monkeypatch):
+        monkeypatch.delenv("FESTINA_NO_PARSE_CACHE", raising=False)
+        root = write_source({"main.f": "log('hi')\n"})
+        imports_mod.build_program(str(root / "main.f"))  # warms the cache
+        calls = self._clear_calls(monkeypatch, imports_mod)
+        imports_mod.build_program(str(root / "main.f"))
+        assert calls == []
+
+    def test_changing_a_files_content_reparses_only_that_file(
+        self, imports_mod, write_source, monkeypatch
+    ):
+        monkeypatch.delenv("FESTINA_NO_PARSE_CACHE", raising=False)
+        root = write_source({
+            "main.f": "import util.f\nlog('main')\n",
+            "util.f": "log('v1')\n",
+        })
+        imports_mod.build_program(str(root / "main.f"))  # warms both entries
+        (root / "util.f").write_text("log('v2')\n", encoding="utf-8")
+        calls = self._clear_calls(monkeypatch, imports_mod)
+        imports_mod.build_program(str(root / "main.f"))
+        # Only util.f's new content is a genuine cache miss -- main.f's
+        # own content never changed, so exactly one real parse happens,
+        # not two.
+        assert len(calls) == 1
+
+    def test_a_dependencys_behavior_change_is_reflected_end_to_end(
+        self, compile_and_run, tmp_path
+    ):
+        (tmp_path / "util.f").write_text(
+            "int func compute() { return 1 }\n", encoding="utf-8")
+        source = "import util.f\nlog(compute())\n"
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "1"
+
+        # Same entry file, unchanged -- but the IMPORTED file's content
+        # changed. The cache must not serve util.f's stale, cached AST.
+        (tmp_path / "util.f").write_text(
+            "int func compute() { return 2 }\n", encoding="utf-8")
+        result = compile_and_run(source)
+        assert result.stdout.strip() == "2"
+
+    def test_a_corrupted_cache_file_degrades_to_a_fresh_parse(
+        self, imports_mod, write_source, monkeypatch
+    ):
+        monkeypatch.delenv("FESTINA_NO_PARSE_CACHE", raising=False)
+        root = write_source({"main.f": "log('hi')\n"})
+        source = (root / "main.f").read_text(encoding="utf-8")
+        cache_path = imports_mod._parse_cache_path(source, imports_mod._grammar_epoch_hash())
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "wb") as f:
+            f.write(b"not a pickle at all, deliberately corrupt")
+        # No exception, and the program still compiles/behaves correctly
+        # -- a corrupt cache entry is exactly a cache miss, never a
+        # compile failure.
+        program = imports_mod.build_program(str(root / "main.f"))
+        assert len(program.body) == 1
+
+    def test_a_different_grammar_epoch_is_never_served_from_the_old_one(
+        self, imports_mod, write_source, monkeypatch
+    ):
+        monkeypatch.delenv("FESTINA_NO_PARSE_CACHE", raising=False)
+        root = write_source({"main.f": "log('hi')\n"})
+        imports_mod.build_program(str(root / "main.f"))  # warms under today's epoch
+        monkeypatch.setattr(imports_mod, "_grammar_epoch_hash", lambda: "a-different-epoch")
+        calls = self._clear_calls(monkeypatch, imports_mod)
+        imports_mod.build_program(str(root / "main.f"))
+        # A different epoch is a different cache key entirely -- this
+        # must be a real parse, not a hit against the old epoch's entry.
+        assert len(calls) == 1
+
+    def test_the_escape_hatch_disables_both_read_and_write(
+        self, imports_mod, write_source, monkeypatch
+    ):
+        monkeypatch.setenv("FESTINA_NO_PARSE_CACHE", "1")
+        root = write_source({"main.f": "log('hi')\n"})
+        calls = self._clear_calls(monkeypatch, imports_mod)
+        imports_mod.build_program(str(root / "main.f"))
+        imports_mod.build_program(str(root / "main.f"))
+        # Every build is a real parse under the escape hatch -- the
+        # second call gets no benefit from the first.
+        assert len(calls) == 2
