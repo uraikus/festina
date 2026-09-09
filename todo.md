@@ -53,17 +53,24 @@ as the manual override. What remains open:
 
 - **Cycle trials are synchronous and per-release** — every
   still-referenced release of a cycle-capable type walks the value's
-  reachable subgraph. Correct, and measured fast for ordinary object
-  graphs (20k dropped 21-node cycles in ~34 ms), but a very large,
-  heavily-aliased cyclic structure could feel it; the classic
-  deferred-root buffer is the known optimization if a real program
-  ever does. Roadmapped alongside claude.md #252's `match` (a
-  self-hosted compiler's own AST is exactly that kind of large,
-  heavily-aliased graph) but deliberately not started: this changes
-  memory-management behavior for *every* Festina program, not only a
-  hypothetical one, and batching trades lower amortized CPU for higher
-  peak memory (collection is delayed) — a real trade-off to confirm
-  explicitly before writing any C, not an assumed win.
+  reachable subgraph. Fine for ordinary object graphs (20k dropped
+  21-node *disjoint* cycles in ~34 ms, claude.md #120) — but claude.md
+  #254 measured the case that number never tested, *shared* structure
+  under repeated release-while-live churn, and found a real, cleanly
+  linear cost specifically tied to sharing (not just total node count):
+  a shared ring costs ~9-10x a disjoint one at the same total node/
+  iteration count, scaling linearly in both ring size and iteration
+  count. The classic deferred-root buffer is the known optimization,
+  now motivated by measurement rather than assumption. Still
+  deliberately not started: the real algorithm needs the *free* path of
+  every cyclic release wrapper to become buffering-aware too (a
+  still-buffered node hitting refcount zero can't be freed immediately
+  without leaving a dangling pointer in the pending-roots buffer) — new
+  correctness-critical surface in code every struct/arr/map-using
+  Festina program runs through, and batching still trades lower
+  amortized CPU for higher peak memory (collection is delayed). Earns
+  its own dedicated round: a fresh plan, and ASan/LeakSanitizer-under-
+  stress verification of the deferred-free "zombie" path specifically.
 - **A table-row element off a call-result array leaks the array**
   (`rows()[0]` where the elements are query rows). Rows have no
   refcount header — the array owns them outright — so the element
