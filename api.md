@@ -765,6 +765,66 @@ if typeof shape == 'Circle' {
 }
 ```
 
+### `match`
+
+The `if typeof shape == '...'` chain above written as a statement of
+its own, exhaustiveness-checked against every member of the enum:
+
+```festina
+int func extractShapeMetric(shape:Shape) {
+    int result = 0
+    match shape {
+        'Circle' { result = shape.radius }
+        'Square' { result = shape.area }
+    }
+    return result
+}
+```
+
+Each arm is a quoted tag — the exact same text `typeof` itself
+returns — followed by a `{ }` block; no `case`/`:`. `default { }`
+covers everything the written arms don't:
+
+```festina
+match shape {
+    'Circle' { log('a circle') }
+    default { log('something else') }
+}
+```
+
+Leaving a member uncovered with no `default` is a compile error naming
+the missing one, not a silent gap:
+
+```festina
+match shape {
+    'Circle' { log('a circle') }
+}
+// error: match on 'Shape' does not cover 'Square' -- add a case or a default
+```
+
+An arm tag that isn't a real member, or a tag repeated across two arms,
+is also a compile error — a typo or a copy-paste duplicate is caught
+before it can silently do nothing. `match` works on any expression, not
+only an enum — `match n { 'int' { ... } }` — with the same
+exhaustiveness rule applied to its one static type.
+
+`match`'s subject must be a plain variable or field access
+(`shape`, `w.shape`) — not a call, a computed index, or any other
+expression that could run code or allocate:
+
+```festina
+match nextShape() { ... }
+// error: match's subject must be a plain variable or field access --
+// bind a call result to a name first
+```
+
+Bind it to a name first (`Shape s = nextShape(); match s { ... }`), the
+same idiom `typeof`'s own examples already use. This is what makes
+`match` free: it desugars entirely, at compile time, into the identical
+`typeof`/`if`/`else if` chain shown above — the subject is evaluated
+exactly once regardless of how many arms exist, and the compiled
+program has no `match`-specific code path to pay for at all.
+
 ### Representation and cost
 
 A pure-struct enum (every member a struct) is zero-overhead: a

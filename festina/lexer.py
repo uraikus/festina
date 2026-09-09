@@ -29,6 +29,13 @@ SPEC_KEYWORDS = frozenset({
     "thread",  # claude.md #195: thread NAME { ... } -- an isolated
                # background worker with its own OS thread, message
                # queues, and (optionally) its own sqlite handle.
+    "match",  # claude.md #252: match EXPR { 'Tag' { ... } ... } --
+              # sugar over typeof + if/else-if, desugared away entirely
+              # in semantic analysis before codegen ever sees it. Safe
+              # to reserve globally (unlike #246's contextual `use`):
+              # Parser.eat_name already accepts any keyword as a member
+              # name (the same reason `free`/`delete` don't break
+              # `blob.delete()`), so `'x'.match(regex)` is unaffected.
 })
 
 # Extra control tokens the parser needs distinct token types for, so it

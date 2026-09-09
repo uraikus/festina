@@ -37,10 +37,15 @@ while i < 3000 {
         s.area = i % 100
         shape = s
     }
-    if typeof shape == 'Circle' {
-        shapeTotal = shapeTotal + shape.radius
-    } else {
-        shapeTotal = shapeTotal + shape.area
+    // claude.md #252: match desugars to exactly this typeof-if shape
+    // at semantic-analysis time -- on a reassigned-every-iteration
+    // enum local, the same aliasing/release churn this loop's own
+    // comment already describes, now reached through the sugar
+    // instead of hand-written, confirming the desugar changes nothing
+    // about ownership.
+    match shape {
+        'Circle' { shapeTotal = shapeTotal + shape.radius }
+        'Square' { shapeTotal = shapeTotal + shape.area }
     }
     i = i + 1
 }
@@ -106,8 +111,15 @@ int freshTotal = 0
 i = 0
 while i < 3000 {
     Choice fresh = `fresh${i}`
-    if typeof fresh == 'text' {
-        freshTotal = freshTotal + 1
+    // claude.md #252: match on a MIXED enum's fresh, with-initializer
+    // local -- the exact shape #197's own comment above says used to
+    // leak (a fresh box plus its own boxed text buffer), now reached
+    // through match's desugared typeof-if instead of a hand-written
+    // one.
+    match fresh {
+        'int' { }
+        'text' { freshTotal = freshTotal + 1 }
+        'Box' { }
     }
     i = i + 1
 }

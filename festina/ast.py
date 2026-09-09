@@ -203,6 +203,28 @@ class IfStmt(Node):
         self.column = column
 
 
+class MatchStmt(Node):
+    """claude.md #252: `match EXPR { 'Tag' { ... } ... default { ... } }`
+    -- pure sugar over `typeof`/`if`, exhaustiveness-checked against the
+    subject's declared type (an enum's own member set, or the subject's
+    single static type otherwise). `arms` is `[(tag:str, body:Block),
+    ...]` in source order; `default` is a `Block` or `None`. Parsed
+    structurally with no semantic knowledge at all -- semantic.py is
+    what validates every arm tag is real, checks exhaustiveness, and
+    then DESUGARS this node away entirely into the equivalent
+    right-nested `IfStmt`/`TypeofExpr` chain before codegen ever runs
+    (see semantic.py's own `_desugar_match` doc comment), so `MatchStmt`
+    is never a codegen.py concern -- the whole point of the feature
+    being provably zero-cost: it reuses an already-shipped code path
+    rather than adding a new one."""
+    def __init__(self, subject, arms, default, line=0, column=0):
+        self.subject = subject
+        self.arms = arms
+        self.default = default
+        self.line = line
+        self.column = column
+
+
 class Return(Node):
     def __init__(self, value, line=0, column=0):
         self.value = value

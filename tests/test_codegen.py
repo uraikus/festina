@@ -16790,6 +16790,189 @@ class TestEnums:
         assert result.stdout.strip() == "done"
 
 
+class TestMatchStatement:
+    """claude.md #252: `match EXPR { 'Tag' { ... } ... default { ... }
+    }` -- pure sugar over `typeof`/`if`, exhaustiveness-checked against
+    the subject's type, desugared away entirely in semantic.py before
+    codegen ever runs (codegen.py has zero MatchStmt-specific code at
+    all -- these are all behavioral tests of the desugared result,
+    which is provably the same `IfStmt`/`TypeofExpr` shape the existing
+    `typeof`-based dispatch tests already cover)."""
+
+    _SHAPE = """
+    struct Circle { radius:int }
+    struct Square { area:int }
+    enum Shape = Circle, Square
+    """
+
+    def test_the_apimd_example_dispatches_by_variant(self, compile_and_run):
+        source = self._SHAPE + """
+        int func extractShapeMetric(shape:Shape) {
+            int result = 0
+            match shape {
+                'Circle' { result = shape.radius }
+                'Square' { result = shape.area }
+            }
+            return result
+        }
+        Circle c
+        c.radius = 5
+        log(extractShapeMetric(c))
+        Square sq
+        sq.area = 42
+        log(extractShapeMetric(sq))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["5", "42"]
+
+    def test_default_arm_catches_the_rest(self, compile_and_run):
+        source = self._SHAPE + """
+        text func describe(shape:Shape) {
+            text out = ''
+            match shape {
+                'Circle' { out = 'a circle' }
+                default { out = 'something else' }
+            }
+            return out
+        }
+        Circle c
+        c.radius = 1
+        Square sq
+        sq.area = 1
+        log(describe(c))
+        log(describe(sq))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["a circle", "something else"]
+
+    def test_a_mixed_non_struct_enum(self, compile_and_run):
+        source = """
+        enum Json = int, text, bool
+        text func describe(j:Json) {
+            text out = ''
+            match j {
+                'int' { out = 'int' }
+                'text' { out = 'text' }
+                'bool' { out = 'bool' }
+            }
+            return out
+        }
+        log(describe(5))
+        log(describe('hi'))
+        log(describe(true))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["int", "text", "bool"]
+
+    def test_a_non_enum_subject_matches_its_own_static_type(self, compile_and_run):
+        source = """
+        int n = 5
+        match n {
+            'int' { log('it is an int') }
+            default { log('unreachable') }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "it is an int"
+
+    def test_a_field_access_subject_is_simple_and_allowed(self, compile_and_run):
+        source = self._SHAPE + """
+        struct Wrapper { shape:Shape }
+        Wrapper w
+        Circle c
+        c.radius = 7
+        w.shape = c
+        match w.shape {
+            'Circle' { log(w.shape.radius) }
+            'Square' { log(w.shape.area) }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "7"
+
+    def test_non_exhaustive_without_default_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse(self._SHAPE + """
+        Circle c
+        Shape shape = c
+        match shape {
+            'Circle' { log('circle') }
+        }
+        """)
+        with pytest.raises(errors.CompileError, match="does not cover"):
+            semantic.analyze(program)
+
+    def test_an_unknown_case_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse(self._SHAPE + """
+        Circle c
+        Shape shape = c
+        match shape {
+            'Circle' { log('a') }
+            'Triangle' { log('b') }
+            default { log('c') }
+        }
+        """)
+        with pytest.raises(errors.CompileError, match="no case 'Triangle'"):
+            semantic.analyze(program)
+
+    def test_a_duplicate_case_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse(self._SHAPE + """
+        Circle c
+        Shape shape = c
+        match shape {
+            'Circle' { log('a') }
+            'Circle' { log('b') }
+            default { log('c') }
+        }
+        """)
+        with pytest.raises(errors.CompileError, match="already has a case"):
+            semantic.analyze(program)
+
+    def test_a_non_simple_subject_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse(self._SHAPE + """
+        Shape func makeShape() { Circle c ; return c }
+        match makeShape() {
+            'Circle' { log('a') }
+            default { log('b') }
+        }
+        """)
+        with pytest.raises(errors.CompileError, match="plain variable or field access"):
+            semantic.analyze(program)
+
+    def test_a_second_default_is_a_parse_error(self, parser, errors):
+        with pytest.raises(errors.CompileError, match="already has a 'default'"):
+            parser.parse(self._SHAPE + """
+            Circle c
+            Shape shape = c
+            match shape {
+                'Circle' { log('a') }
+                default { log('b') }
+                default { log('c') }
+            }
+            """)
+
+    def test_match_regex_method_call_still_parses_as_the_existing_method(self, compile_and_run):
+        # claude.md #252: `match` is a genuine reserved keyword now, but
+        # Parser.eat_name already accepts any keyword as a member name
+        # (the same reason free/delete don't break blob.delete()), so
+        # 'x'.match(regex) must be completely unaffected.
+        result = compile_and_run("log('hello world'.match(/world/))")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "world"
+
+    def test_default_is_still_an_ordinary_identifier_elsewhere(self, compile_and_run):
+        # `default` is deliberately NOT a reserved word globally (only
+        # recognized by value inside a match block) -- confirm it still
+        # works as a plain variable name.
+        result = compile_and_run("int default = 5\nlog(default)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "5"
+
+
 class TestThreads:
     """claude.md #195 Phase 2: `thread NAME { ... }` -- the real,
     compiled-and-run counterpart to tests/test_threads.py's parser/

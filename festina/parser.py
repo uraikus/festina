@@ -248,6 +248,8 @@ class Parser:
             return self.parse_if()
         if t.type == "while":
             return self.parse_while()
+        if t.type == "match":
+            return self.parse_match()
         if t.type == "for":
             return self.parse_for()
         if t.type == "return":
@@ -814,6 +816,36 @@ class Parser:
             test = self.parse_expression()
         body = self.parse_block()
         return ast.WhileStmt(test, body, t.line, t.column)
+
+    def parse_match(self):
+        # claude.md #252: `match EXPR { 'Tag' { ... } ... default { ... }
+        # }` -- purely structural here, exactly like parse_if/parse_while
+        # just above: no semantic knowledge of what tags are valid, no
+        # exhaustiveness checking (semantic.py owns both, since they need
+        # the subject's resolved type -- see _desugar_match there).
+        # `default` is recognized by VALUE (mirroring `use` in
+        # parse_event_handler above, claude.md #246), not reserved
+        # globally, since unlike `match` itself it's common enough as an
+        # ordinary identifier/field name that claiming it everywhere
+        # would be a real breaking change for no benefit.
+        t = self.eat("match")
+        subject = self.parse_expression()
+        self.eat("LBRACE")
+        arms = []
+        default = None
+        while not self.at("RBRACE"):
+            if self.at("IDENT") and self.peek().value == "default":
+                if default is not None:
+                    raise self.err(self.peek(), "invalid match",
+                                    "match already has a 'default' case")
+                self.eat("IDENT")  # 'default'
+                default = self.parse_block()
+                continue
+            tag_tok = self.eat("STRING")
+            body = self.parse_block()
+            arms.append((tag_tok.value, body))
+        self.eat("RBRACE")
+        return ast.MatchStmt(subject, arms, default, t.line, t.column)
 
     def parse_for(self):
         # claude.md #60: `for initialization, condition, update { }` --

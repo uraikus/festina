@@ -63,6 +63,16 @@ round-by-round design and implementation record predating 0.1 lives in
   already use, not bytes) — a real scan, since UTF-8 is variable-width.
   `blob.length` is the exact byte count, an O(1) stored-field read.
   Both read-only, like `arr[T].length`.
+- **`match EXPR { 'Tag' { ... } ... default { ... } }`.** Exhaustiveness-
+  checked dispatch on an enum's member (or any expression's own static
+  type) — every tag string is the exact one `typeof` already returns,
+  and leaving one uncovered with no `default` is a compile error naming
+  it. Pure sugar: desugars entirely, at compile time, into the
+  equivalent `typeof`/`if`/`else if` chain, so a compiled program pays
+  nothing for it beyond what a hand-written chain already costs. The
+  subject must be a plain variable or field access (not a call or any
+  other expression that could run code), so it's only ever evaluated
+  once regardless of arm count.
 
 ### Fixed
 

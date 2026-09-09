@@ -4999,7 +4999,111 @@ def analyze(program, filename="<string>"):
         finally:
             _current_thread[0] = None
 
+    def _is_simple_match_subject(expr):
+        """claude.md #252: True for an expression `match` can safely
+        re-evaluate once per arm with no side effects and no extra
+        cost -- a bare Identifier, or a chain of non-computed Member
+        accesses rooted in one (`node.kind`, `req.headers`... well,
+        `.headers` itself resolves to a map, but the point stands for
+        any plain dotted path). False for anything that could run
+        code or allocate (a Call, a computed index, any operator) --
+        match requires those to be bound to a plain variable first,
+        the same idiom this language's own typeof examples already
+        use (`Shape shape = c` before `typeof shape`, api.md's own
+        enum section)."""
+        if isinstance(expr, ast.Identifier):
+            return True
+        if isinstance(expr, ast.Member) and not expr.computed:
+            return _is_simple_match_subject(expr.obj)
+        return False
+
+    def _desugar_match(stmt, scope):
+        """claude.md #252: validates a MatchStmt (subject simplicity,
+        every arm tag a real member, no duplicate tags, exhaustive
+        coverage) then rewrites it into the exact `IfStmt`/
+        `TypeofExpr`/`BinOp` chain a hand-written `if typeof(subject)
+        == 'tag' { ... } else if ... else { default }` would already
+        produce -- the SAME `stmt.subject` AST node reused in every
+        `TypeofExpr`, safe only because `_is_simple_match_subject`
+        already confirmed re-evaluating it has no side effects. Tag
+        strings are compared against `types_mod.type_name(member)` --
+        the exact same formatter `_enum_tag_const` (codegen.py) feeds
+        into the runtime tag constant `typeof` reads back at runtime,
+        so this check is against the identical strings the compiled
+        program would actually see, entirely at compile time.
+
+        Returns the desugared `IfStmt`. `analyze_statement` reassigns
+        its own local `stmt` to this return value BEFORE the ordinary
+        big if/elif dispatch below even runs, so the SAME call falls
+        straight through into the existing `ast.IfStmt` branch --
+        nothing downstream, including codegen (which never sees a
+        `MatchStmt` at all), needs any awareness sugar was involved."""
+        if not _is_simple_match_subject(stmt.subject):
+            raise CompileError(
+                "match's subject must be a plain variable or field access "
+                "-- bind a call result to a name first, e.g. "
+                "'Shape s = f()' then 'match s { ... }'",
+                file=filename, line=stmt.line, column=stmt.column,
+                category="invalid match",
+            )
+        subject_type = infer(stmt.subject, scope)
+        if isinstance(subject_type, types_mod.EnumType):
+            info = enums.get(subject_type.name)
+            expected = {types_mod.type_name(m) for m in info.members} if info else set()
+            type_desc = subject_type.name
+        elif subject_type is not None:
+            expected = {types_mod.type_name(subject_type)}
+            type_desc = types_mod.type_name(subject_type)
+        else:
+            expected = set()
+            type_desc = "null"
+        seen = set()
+        for tag, _body in stmt.arms:
+            if tag not in expected:
+                raise CompileError(
+                    f"match has no case '{tag}' on '{type_desc}'",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid match",
+                )
+            if tag in seen:
+                raise CompileError(
+                    f"match already has a case for '{tag}'",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid match",
+                )
+            seen.add(tag)
+        if stmt.default is None:
+            missing = expected - seen
+            if missing:
+                raise CompileError(
+                    f"match on '{type_desc}' does not cover "
+                    f"'{sorted(missing)[0]}' -- add a case or a default",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid match",
+                )
+        # Right-nested IfStmt chain, built tail (rightmost/default)
+        # first so each earlier arm's `orelse` is the chain built so
+        # far -- exactly the shape parse_if's own `else if` produces.
+        orelse = stmt.default
+        for tag, body in reversed(stmt.arms):
+            test = ast.BinOp("==", ast.TypeofExpr(stmt.subject, stmt.line, stmt.column),
+                              ast.StringLit(tag), stmt.line, stmt.column)
+            orelse = ast.IfStmt(test, body, orelse, stmt.line, stmt.column)
+        if orelse is None:
+            # Only reachable when `expected` itself was empty (a
+            # subject whose type infer() couldn't pin down) -- every
+            # OTHER zero-coverage case already raised above. A no-op
+            # statement is the honest answer to "match nothing, cover
+            # nothing", not a crash.
+            orelse = ast.IfStmt(ast.BoolLit(False), ast.Block([]), None,
+                                 stmt.line, stmt.column)
+        if hasattr(stmt, "file"):
+            orelse.file = stmt.file
+        return orelse
+
     def analyze_statement(stmt, scope, return_type, loop_depth=0):
+        if isinstance(stmt, ast.MatchStmt):
+            stmt = _desugar_match(stmt, scope)
         if isinstance(stmt, ast.ImportDecl):
             imports.append(stmt.path)
         elif isinstance(stmt, ast.StructDecl):
@@ -5029,7 +5133,13 @@ def analyze(program, filename="<string>"):
             analyze_block(stmt.then, scope, return_type, loop_depth)
             if stmt.orelse is not None:
                 if isinstance(stmt.orelse, ast.IfStmt):
-                    analyze_statement(stmt.orelse, scope, return_type, loop_depth)
+                    # claude.md #252: write back, matching analyze_block's
+                    # own reasoning -- stmt.orelse can never actually BE a
+                    # MatchStmt (an `else match { }` isn't grammar this
+                    # parser produces), so this is always a same-node
+                    # round trip today, but the contract stays correct
+                    # regardless of what analyze_statement returns.
+                    stmt.orelse = analyze_statement(stmt.orelse, scope, return_type, loop_depth)
                 else:
                     analyze_block(stmt.orelse, scope, return_type, loop_depth)
         elif isinstance(stmt, ast.WhileStmt):
@@ -5232,11 +5342,18 @@ def analyze(program, filename="<string>"):
                         category="invalid declaration",
                     )
         # unrecognized statement kinds are ignored (no-op)
+        return stmt
 
     def analyze_block(block, parent_scope, return_type, loop_depth=0):
+        # claude.md #252: indexed write-back, not a plain `for stmt in
+        # block.body` -- analyze_statement's return value is `stmt`
+        # unchanged for every ordinary statement, but a MatchStmt comes
+        # back as its own desugared IfStmt, and codegen (which re-walks
+        # this SAME block.body list later) must see that replacement,
+        # not the original MatchStmt it has no handling for at all.
         scope = Scope(parent_scope)
-        for stmt in block.body:
-            analyze_statement(stmt, scope, return_type, loop_depth)
+        for i, stmt in enumerate(block.body):
+            block.body[i] = analyze_statement(stmt, scope, return_type, loop_depth)
 
     # claude.md #220: `thread NAME[] { ... }` -- empty brackets, no
     # literal N -- resolves its own pool size HERE, before anything
@@ -5311,7 +5428,7 @@ def analyze(program, filename="<string>"):
         for func_decl in _iter_func_decls([stmt]):
             register_func_signature(func_decl)
 
-    for stmt in program.body:
+    for i, stmt in enumerate(program.body):
         # claude.md #6: a multi-file program (festina.imports.build_program)
         # is one merged ast.Program, but errors should still point at
         # whichever source file a statement actually came from. Every
@@ -5326,7 +5443,11 @@ def analyze(program, filename="<string>"):
         # (see build_program), so this is a no-op change of behavior for
         # today's single-file callers.
         filename = getattr(stmt, "file", filename)
-        analyze_statement(stmt, global_scope, None)
+        # claude.md #252: write back -- a top-level `match` desugars
+        # into an IfStmt here exactly like analyze_block's own indexed
+        # loop does one level down; codegen re-walks this SAME
+        # program.body list later and has no MatchStmt handling at all.
+        program.body[i] = analyze_statement(stmt, global_scope, None)
 
     # claude.md #70: DatabaseURL = <expr> -- festina.imports.build_program
     # already validated *position* (first statement of the entry file,

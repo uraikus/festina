@@ -31,6 +31,28 @@ blocking: AddressSanitizer/LeakSanitizer coverage for the target.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately: each new
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
+- **Self-hosting-compiler ergonomics, roadmapped alongside `match`
+  (claude.md #252) but not started:**
+  - **Lex/parse cache for repeat compiles.** `festina/imports.py`
+    treats every `import` as a single C-style `#include` translation
+    unit (claude.md #5/#6, deliberate) — there are no real module
+    boundaries to cache separate *compilation* along today. The safe,
+    scoped version: cache the *lex+parse* step only, per file,
+    content-hash keyed, still merging into one AST for semantic
+    analysis/codegen exactly as now (mirrors the existing
+    `festina-runtime-cache` object-file cache and the wasm LTO bitcode
+    cache, #242, one layer up). A real incremental/separate-compilation
+    redesign would mean revisiting #5/#6 itself and needs its own
+    sign-off first — not assumed here.
+  - **A raw byte-buffer type** (a generalized, writable `blob`, or a
+    new `bytes` type, with `[i] =` assignment and
+    `text.toBytes()`/`bytes.toText()` conversions at the boundary —
+    sketched in the same conversation as claude.md #251's own "what
+    would a raw byte implementation look like" answer). Full new-
+    primitive-type surface area, lexer through runtime. Only useful
+    once/if something wants to skip shelling out to clang on textual
+    LLVM IR, which the in-place string-append work (#243) already
+    makes cheap without it — not an obvious near-term need.
 
 ## Memory model
 
@@ -46,7 +68,13 @@ as the manual override. What remains open:
   graphs (20k dropped 21-node cycles in ~34 ms), but a very large,
   heavily-aliased cyclic structure could feel it; the classic
   deferred-root buffer is the known optimization if a real program
-  ever does.
+  ever does. Roadmapped alongside claude.md #252's `match` (a
+  self-hosted compiler's own AST is exactly that kind of large,
+  heavily-aliased graph) but deliberately not started: this changes
+  memory-management behavior for *every* Festina program, not only a
+  hypothetical one, and batching trades lower amortized CPU for higher
+  peak memory (collection is delayed) — a real trade-off to confirm
+  explicitly before writing any C, not an assumed win.
 - **A table-row element off a call-result array leaks the array**
   (`rows()[0]` where the elements are query rows). Rows have no
   refcount header — the array owns them outright — so the element
