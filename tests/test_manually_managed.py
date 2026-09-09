@@ -249,6 +249,46 @@ class TestSemantic:
         with pytest.raises(Exception):
             semantic.analyze(parser.parse(source))
 
+    def test_a_fresh_call_initializes_a_manually_managed_blob(self, parser, semantic):
+        # claude.md #257: broken since #204. The fresh-construction
+        # escape hatch stripped the `?` only for the manually-manageable
+        # DATACLASSES, missing PrimitiveType -- which is blob's own
+        # category (blob has no dedicated dataclass, the same gap
+        # `_is_blob_type` exists for). So the flag survived into
+        # check_assignable and this exact shape was rejected, even
+        # though #204's own doc comment names it as what the hatch was
+        # written to allow.
+        program = parser.parse(
+            "blob func mk() { blob b = 'f.txt'\n return b }\n"
+            "blob? x = mk()\n"
+            "log(x.exists())\n")
+        semantic.analyze(program)
+
+    def test_a_fresh_call_initializes_a_manually_managed_ascii(self, parser, semantic):
+        # claude.md #256's type inherited the same PrimitiveType gap the
+        # moment it existed, which is how the blob case above was found.
+        program = parser.parse(
+            "ascii func mk() { ascii a = 'hi'\n return a }\n"
+            "ascii? x = mk()\n"
+            "log(x)\n")
+        semantic.analyze(program)
+
+    def test_a_fresh_method_result_initializes_a_manually_managed_ascii(
+            self, parser, semantic):
+        # The forms that actually produce a heap ascii -- without these
+        # an `ascii?` could only ever hold a literal, which is immortal
+        # and so the one value `?` is pointless for.
+        for init in ("a.slice(0, 2)", "a + 'z'", "'hi'.toAscii()"):
+            program = parser.parse(f"ascii a = 'xyz'\nascii? b = {init}\nlog(b)\n")
+            if init == "a + 'z'":
+                # A BinOp is not a "fresh construction" shape -- see
+                # _is_fresh_construction's own deliberately-narrow list.
+                # Recorded rather than asserted either way: concatenation
+                # always allocates, so this is a candidate for widening,
+                # not a rule with a reason behind it.
+                continue
+            semantic.analyze(program)
+
     def test_an_existing_plain_binding_still_cannot_initialize_a_manually_managed_one(
             self, parser, semantic):
         # claude.md #204: the escape hatch is scoped to FRESH

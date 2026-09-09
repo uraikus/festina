@@ -4870,3 +4870,34 @@ The shape is the real result: `text` QUADRUPLES when the input doubles (a walk p
 **Docs.** api.md gains an `ascii` section (with the measured table and the cost model); CHANGELOG under 0.44's "Added"; todo.md's Memory-model bullet corrected -- it claimed `text` carries a refcount header, which it does not and never has.
 
 **Full suite:** `python3 -m pytest tests -q`: **2388 passed, 14 skipped**, and one real failure of my own making -- `test_leak_stress.py::test_the_suite_covers_every_managed_resource`, which asserts the EXACT set of stress-program filenames precisely so a new one cannot be added unaccounted for. `ascii_churn.f` was added without registering it there. Exactly the guard working as designed, and worth noting alongside the scope-exit leak above: two of this entry's three real defects were caught by a test whose only job is to notice something missing, not by anything exercising the feature itself. Fixed by registering it (an ascii is refcounted where text is copy-managed, and it is the only type whose indexing hands back an immortal value, so it is a genuinely distinct ownership shape rather than a duplicate of text_churn.f).
+
+257. `?` ALREADY MEANT "DO NOT COLLECT" FOR EVERY TYPE THAT ALLOCATES -- AND MEASURING THAT FOUND A BUG
+
+Asked to extend `?` to every type, with `?` meaning "do not garbage collect" rather than the reference/cell semantics that were tried and reverted just before this. Measured what `?` actually does per type before changing anything, since the answer decides whether there is any work to do at all.
+
+**It is already the shipped behavior, everywhere it can be.** Each of these is a loop that allocates and never frees, run under LeakSanitizer via `scripts/leak_stress.sh`, against an otherwise-identical control without the `?`:
+
+| declaration | result | control (no `?`) |
+|---|---|---|
+| `text? t = \`built-${i}\`` | **leaks** | clean |
+| `ascii? a = base.slice(0, 5)` | **leaks** | clean |
+| `int? n = i` | clean | clean |
+
+`text?` and `ascii?` leak, which is `?` working: nothing collected them. `struct?` was already proven the same way by `test_leak_stress.py`'s own canary (claude.md #202). `int?` is clean in BOTH columns because an int is a value in a stack slot -- there is no allocation, so there is nothing to not-collect. That makes `?` inert on `int`/`float`/`bool`/`func`/`color`/`font` **by nature rather than by omission**, and accepting it there as no-op grammar (claude.md #202's own choice) is already the correct behavior. Nothing to add.
+
+**What the measurement did find is a real bug, broken since #204.** `analyze_var_decl`'s fresh-construction escape hatch strips the `?` off the declared type before checking assignability -- but it did so under `isinstance(declared_type, _MANUALLY_MANAGEABLE_TYPES)`, a tuple of the manually-manageable DATACLASSES, which does not include `PrimitiveType`. `PrimitiveType` is blob's own category (blob has no dedicated dataclass -- exactly the gap `_is_blob_type` was invented for), so the flag survived into `check_assignable` and
+
+```
+blob func mk() { blob b = 'f.txt'  return b }
+blob? x = mk()                     // rejected: "cannot assign value of type blob to blob?"
+```
+
+failed to compile -- while the structurally identical `C? x = makeCircle()` compiled fine. #204's own doc comment names that exact shape as the thing the hatch was written to allow, so this was a straightforward miss, silently live since then. Fixed by keying on whether the declared type actually CARRIES the flag (`getattr(declared_type, "manually_managed", False)`) rather than on which dataclass it happens to be.
+
+`#256`'s `ascii` inherited the same gap the moment it existed, which is how the blob case surfaced: an `ascii?` could hold a literal (immortal, so the one value `?` is pointless for) and nothing else -- every form that actually produces a heap ascii (`.slice()`, `.toAscii()`, a function returning one) was rejected. Both work now.
+
+**Deliberately NOT changed.** `T? x = <existing plain binding>` stays rejected (a bare alias dangles when the plain binding auto-frees), and `plain T x = <a T?>` stays rejected too -- the "no implicit decay" rule, which stops a manually-managed value becoming an auto-managed binding that would then free what the programmer owns. Both were re-confirmed as still rejected after the fix. Also unchanged: `text?` remains inert at the TYPE level (`text` and `text?` type-check as the same type, unlike blob/ascii) even though it is honored at runtime. That asymmetry is real but making it type-level would newly reject code that compiles today, so it is left alone and recorded here rather than fixed in passing.
+
+**Verified.** The LeakSanitizer table above; `tests/test_manually_managed.py` gains three tests (a fresh call into `blob?`, into `ascii?`, and the ascii method-result forms), 56 pass in that file. Two of my own probe programs failed first and were wrong rather than the compiler: one called `.slice()` on a text literal, and one assigned an `ascii?` into a plain `ascii`, which the no-implicit-decay rule correctly rejects -- worth recording, because each looked like a compiler bug until read properly.
+
+**Full suite:** TBD.

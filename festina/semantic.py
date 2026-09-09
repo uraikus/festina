@@ -4732,8 +4732,20 @@ def analyze(program, filename="<string>"):
                 # is what actually gets bound below, same as every
                 # other branch here.
                 actual_type = infer(decl.init, scope)
+                # claude.md #257: keyed on whether the declared type
+                # actually CARRIES the flag, not on whether it is one of
+                # the manually-manageable dataclasses. The isinstance
+                # check this replaces missed `PrimitiveType` entirely --
+                # which is blob's category (blob has no dedicated
+                # dataclass of its own, the same gap `_is_blob_type`
+                # exists for) and now ascii's too. So the flag survived
+                # into check_assignable and `blob? x = makeBlob()` was
+                # rejected, even though #204's own doc comment names
+                # exactly that shape as what it was written to allow.
+                # Broken for blob since #204; found by measuring what
+                # `?` does per type rather than by reading the code.
                 bare_declared = (dataclasses.replace(declared_type, manually_managed=False)
-                                  if isinstance(declared_type, _MANUALLY_MANAGEABLE_TYPES)
+                                  if getattr(declared_type, "manually_managed", False)
                                   else declared_type)
                 check_assignable(bare_declared, actual_type, decl)
             else:

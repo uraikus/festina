@@ -100,6 +100,15 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **`T? x = <a fresh call>` now compiles for `blob` and `ascii`.** The
+  fresh-construction escape hatch stripped the `?` off the declared
+  type only for the manually-manageable dataclasses, missing
+  `PrimitiveType` — which is `blob`'s category — so
+  `blob? x = makeBlob()` was rejected while the structurally identical
+  `Circle? c = makeCircle()` compiled. Broken since the escape hatch
+  was introduced; `ascii?` inherited it. `T? x = <an existing plain
+  binding>` stays rejected, unchanged.
+
 - **A copied `headers` map no longer duplicates `Host`/
   `Content-Length`/`Connection`/`Transfer-Encoding` on the wire.**
   These four are always computed by this runtime itself; forwarding a
