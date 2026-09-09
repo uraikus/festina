@@ -292,15 +292,6 @@ def apply_manually_managed(resolved_type, manually_managed):
     # special case, for the identical reason (no dedicated dataclass).
     if resolved_type == _ASCII:
         return types_mod.PrimitiveType("ascii", manually_managed=True)
-    # claude.md #257: `?` means the same thing for EVERY type now -- a
-    # pointer to a cell holding a T -- so it is no longer inert on
-    # scalars. `int? a = 6` allocates a cell; `int? b = a` points at
-    # the same one, so `b++` is visible through `a`. The
-    # memory-management consequence follows from the reference-ness
-    # rather than being the primary meaning, which is what makes one
-    # rule cover scalars and heap values alike.
-    if isinstance(resolved_type, types_mod.PrimitiveType):
-        return types_mod.PrimitiveType(resolved_type.name, manually_managed=True)
     return resolved_type
 
 
@@ -1664,24 +1655,6 @@ def analyze(program, filename="<string>"):
             info = enums.get(declared.name)
             if info is not None and actual in info.members:
                 return
-        # claude.md #257: `T?` and `T` differ only in indirection, and
-        # both directions across that boundary are meaningful, so both
-        # are allowed here and realized in codegen:
-        #   T? x = <plain T>  boxes a COPY into a fresh cell (so it
-        #                     does not track the source -- exactly the
-        #                     same as `T? x = <literal>`)
-        #   T  x = <a T?>     reads the value OUT of the cell
-        # This is what lifts claude.md #204's old rejection of
-        # `T? x = <existing plain binding>`: that rule existed because a
-        # bare alias would dangle once the plain binding auto-freed,
-        # and a cell holding its own retained/copied value cannot.
-        if (declared is not None and actual is not None
-                and hasattr(declared, "manually_managed")
-                and hasattr(actual, "manually_managed")
-                and declared.manually_managed != actual.manually_managed
-                and dataclasses.replace(declared, manually_managed=False)
-                    == dataclasses.replace(actual, manually_managed=False)):
-            return
         if declared != actual:
             raise CompileError(
                 f"cannot assign {what} of type {types_mod.type_name(actual)} "
