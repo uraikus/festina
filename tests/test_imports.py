@@ -167,6 +167,27 @@ class TestParseCache:
     working: every failure mode (missing, corrupt, cross-version) must
     degrade silently to an ordinary fresh parse."""
 
+    @pytest.fixture(autouse=True)
+    def _isolated_parse_cache_dir(self, tmp_path, monkeypatch, imports_mod):
+        """Every test here gets its own empty parse-cache directory.
+        `tempfile.gettempdir()/festina-parse-cache` is a REAL directory
+        that survives across separate pytest processes -- and even
+        across unrelated runs of this very suite on this very machine
+        -- so sharing it directly let a leftover entry from an earlier
+        run silently satisfy a test expecting a fresh cache miss (this
+        is exactly what broke `test_changing_a_files_content_reparses_
+        only_that_file` and `test_a_different_grammar_epoch_is_never_
+        served_from_the_old_one` under a full-suite run: byte-identical
+        fixture content like "log('hi')\\n" recurs across tests, and a
+        pickle left over from a previous invocation was still sitting
+        on disk). In-process monkeypatching of `tempfile.gettempdir` is
+        enough for every test in this class except
+        `test_a_dependencys_behavior_change_is_reflected_end_to_end`,
+        which shells out to a real `festina` subprocess -- but that one
+        never asserts on cache-hit *counts*, only on correctly
+        recompiled output, so it is unaffected either way."""
+        monkeypatch.setattr(imports_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+
     def _clear_calls(self, monkeypatch, imports_mod):
         """Wraps parser_mod.parse to count real (non-cached) parses,
         returning the list calls get appended to."""

@@ -137,13 +137,29 @@ def _grammar_epoch_hash():
     -- since `cli.py` already imports `imports.py`; importing back
     would be circular. Memoized: these four files cannot change
     mid-process, so hashing them once per compile (not once per
-    imported file) is enough."""
+    imported file) is enough.
+
+    Under the packaged compiler binary (claude.md #59;
+    `cli.py`'s own `_data_root` has the full story) this module is
+    loaded from inside a PyInstaller --onefile archive, not a real
+    `.py` file at a real path on disk -- reading these four files by
+    path raises `FileNotFoundError` there (confirmed: it did, on the
+    first real packaged-binary run of this cache -- every compile
+    failed outright). Falls back to festina's own release version in
+    that case: within one packaged binary's lifetime the grammar can't
+    change at all (the binary IS the grammar), so the version string
+    is exactly as good an epoch as the real hash would be, and a
+    version bump always means a fresh build anyway."""
     if _grammar_epoch_cache[0] is None:
-        pkg_dir = os.path.dirname(os.path.abspath(__file__))
         h = hashlib.sha256()
-        for name in _GRAMMAR_EPOCH_FILES:
-            with open(os.path.join(pkg_dir, name), "rb") as f:
-                h.update(f.read())
+        try:
+            pkg_dir = os.path.dirname(os.path.abspath(__file__))
+            for name in _GRAMMAR_EPOCH_FILES:
+                with open(os.path.join(pkg_dir, name), "rb") as f:
+                    h.update(f.read())
+        except OSError:
+            from . import __version__
+            h.update(__version__.encode())
         _grammar_epoch_cache[0] = h.hexdigest()[:16]
     return _grammar_epoch_cache[0]
 
