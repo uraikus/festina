@@ -23,8 +23,14 @@ Compiling to `wasm32-wasi` is supported and CI-verified — see
 [wasm.md](wasm.md) — and a compiled `.wasm` runs in a browser tab on
 this project's own WASI host (`runtime/wasm/browser.html`, verified in
 headless Chromium on every push). Graphics/audio are out of scope there
-permanently (WASI has no backend for either); what remains open, not
-blocking: AddressSanitizer/LeakSanitizer coverage for the target.
+permanently (WASI has no backend for either), and so, it turns out, is
+sanitizer coverage: `clang --target=wasm32-wasi -fsanitize=address` is
+rejected by the compiler outright, and the wasm32 compiler-rt package
+ships only `builtins` — no sanitizer runtime exists for the target.
+Nothing this project can work around, and nothing it needs to: every
+allocation the native sanitizer runs exercise is the same C source a
+wasm build compiles, whose entire `__wasi__` delta is non-allocating
+stubs (claude.md #263). Nothing open here.
 
 ## Language & standard library
 

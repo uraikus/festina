@@ -301,15 +301,24 @@ A few more things worth knowing, that aren't compile-time errors:
   whatever directory the host granted (the invoking shell's cwd, for
   both `festina run --target=wasm32-wasi` and the benchmark runner),
   not the whole real filesystem the way a native binary can see.
-- **No ASan/LeakSanitizer coverage for this target.** The rest of this
-  project verifies its memory management with real
-  ASan/LeakSanitizer runs (`scripts/leak_stress.sh`,
-  `tests/test_leak_stress.py`); whether sanitizer builds work at all
-  under `wasm32-wasi` has not been investigated (macOS's own sanitizer
-  tier is out of scope too, for an unrelated reason — LeakSanitizer is
-  unreliable on darwin). This target's own memory-management codegen is
-  instead verified by running real programs end-to-end and checking
-  correct output, not by a sanitizer run.
+- **No ASan/LeakSanitizer coverage for this target — the toolchain has
+  none to offer.** `clang --target=wasm32-wasi -fsanitize=address`
+  fails outright with *"unsupported option '-fsanitize=address' for
+  target 'wasm32-unknown-wasi'"*, and the wasm32 compiler-rt package
+  this target needs (`libclang-rt-18-dev-wasm32`) ships exactly one
+  library, `libclang_rt.builtins-wasm32.a` — no sanitizer runtime at
+  all. So this is an upstream gap, not an un-run configuration. (macOS
+  is out of the sanitizer tier too, for an unrelated reason —
+  LeakSanitizer is unreliable on darwin.)
+
+  What matters is that the memory management being verified is not
+  wasm-specific in the first place. The whole runtime compiles from the
+  same C source for every target, and the entire `__wasi__`-guarded
+  delta is *absences* — `throw`, `exec` and signals are stubs there,
+  none of which allocate anything — so every allocation
+  `scripts/leak_stress.sh` exercises natively is the identical code a
+  wasm build runs. This target's own end of things is verified by
+  running real programs end to end and checking correct output.
 - **Static linking is the only linking there is.** There's no
   dynamic-vs-static sqlite3 choice to make for wasm — the vendored
   amalgamation is always compiled in.

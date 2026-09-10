@@ -5027,3 +5027,15 @@ Exactly the prediction todo.md recorded. Worth writing down that the prediction 
 **Verified.** `tests/stress/chain_length_churn.f`, 2,000 iterations of one-link and two-link chains across all four field types, plus the no-chain owning and borrowed receivers. ASan-clean; **1,580,000 bytes in 66,000 allocations without the fix**. The struct field is a SHARED blob read back after the loop, deliberately, so the over-release direction shows up as a use-after-free rather than as nothing. One pytest test pins the answers for all six shapes plus that read-back. Answers are byte-identical to the old build across every shape -- only the ownership traffic changed.
 
 **Full suite:** `python3 -m pytest tests -q`: **2405 passed, 14 skipped, 0 failed** in 548.12s (9:08); `scripts/leak_stress.sh`: all 32 programs clean.
+
+263. ANSWERED: ASan/LeakSanitizer FOR wasm32-wasi -- THE TOOLCHAIN HAS NONE, AND IT DOES NOT MATTER
+
+todo.md carried "AddressSanitizer/LeakSanitizer coverage for the target" as open-but-not-blocking, and wasm.md said whether sanitizer builds work there "has not been investigated". Investigated now, and it closes rather than opens work.
+
+**The toolchain refuses the flag.** `clang --target=wasm32-wasi -fsanitize=address` fails with *"unsupported option '-fsanitize=address' for target 'wasm32-unknown-wasi'"* -- not a link error to work around, a front-end rejection. And the package this target's own compiler-rt comes from (`libclang-rt-18-dev-wasm32`, one of cli.py's own wasm dependencies) contains exactly one library: `libclang_rt.builtins-wasm32.a`. There is no sanitizer runtime for the target to link even if the driver accepted the flag.
+
+**The more useful half: there is nothing wasm-specific to sanitize.** The entire runtime compiles from the same C source for every target, and the whole `__wasi__`-guarded delta is ABSENCES -- `festina_throw` is a stub (wasi-libc has no setjmp/longjmp), `festina_run_argv` is a stub (WASI has no process model), signal handling is compiled out (wasi-libc's `<signal.h>` is an unconditional `#error`) -- none of which allocate anything. The one `__wasi__` branch that touches allocation at all shares Linux's `malloc_usable_size`. So every allocation `scripts/leak_stress.sh` exercises natively is the identical code a wasm build runs, and the target-specific surface that a wasm-only sanitizer run could newly cover is empty.
+
+**What was considered and rejected as the alternative.** A crude leak signal IS possible without a sanitizer -- a wasm module's linear memory only grows, so churning a program under a WASI host and watching `memory.size` across iterations would surface an allocator-visible leak. Not worth building: it would be re-testing the same allocator calls the native runs already prove, at far lower resolution (page granularity, no allocation site, no double-free detection at all), for a target whose only unique code allocates nothing.
+
+**Closed rather than carried.** todo.md's Platforms section no longer lists it as open; wasm.md's bullet now states the toolchain finding and the shared-source argument instead of "not investigated". No code changed.
