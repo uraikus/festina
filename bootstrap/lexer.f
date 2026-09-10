@@ -1,32 +1,19 @@
 // Festina's lexer, written in Festina -- the first step of bootstrapping
-// the compiler in its own language (claude.md #271, #272).
+// the compiler in its own language (claude.md #271, #272, #273).
 //
-// This is a PORT of festina/lexer.py, not a redesign: it reproduces that
-// file's token stream exactly, and `bootstrap/difftest.py` proves it by
-// running both over every .f file in the repository and diffing. Where
-// the Python lexer leans on `re` (one master pattern with named groups
-// and `lastgroup`), this is a hand-written character scanner -- Festina's
-// own regex is POSIX ERE with no named groups.
+// This file is the LIBRARY: token structures, the keyword tables and
+// tokenize() itself, with no top-level entry point of its own, so that
+// both `bootstrap/lexdump.f` (which dumps a token stream for the
+// differential test) and `bootstrap/parser.f` can `import` it. Festina's
+// import model is a single translation unit (claude.md #5/#6), so any
+// top-level statement here would run in every importer -- which is
+// exactly why the entry point moved out (claude.md #273).
 //
-// It scans a `blob` by BYTE OFFSET rather than converting the source to
-// `ascii` first (claude.md #272). The first version did convert, and
-// could not read 3 of this repository's own .f files: text.toAscii()
-// validates, so one non-ASCII byte anywhere -- inside a comment, inside
-// a string literal -- made the whole file unreadable. A lexer never has
-// to INTERPRET those bytes, only carry them through, which is exactly
-// what blob.byteAt()/blob.slice() give it.
+// initLexer() has to be called once before tokenize(): the keyword
+// tables are built at runtime from a space-separated string rather than
+// written out as map literals, and an importer's own top-level code is
+// the only place that call can live.
 //
-// The alternation order of festina/lexer.py's TOKEN_SPEC is load-bearing:
-// Python's `re` alternation is leftmost-FIRST, not longest-match, so the
-// scan below tries the same kinds in the same order. Getting that order
-// wrong is how `x++` becomes `+` `+` and `12.5` becomes `12` `.` `5`.
-//
-// Output is one token per line, in a canonical form difftest.py emits
-// from the Python side too:
-//     line:col|KIND|value            (value escaped by esc() below)
-//     line:col|REGEX|pattern|flags   (regex literals carry two fields)
-// A lexing error prints a single LEXERR line instead, so the differential
-// test covers rejection as well as acceptance.
 
 struct Tok {
     kind:text
@@ -666,48 +653,19 @@ arr[Tok] func tokenize(src:blob, from:int, to:int) {
 }
 
 // ---------------------------------------------------------------------
-// Entry point.
+// One-time setup. Called by whichever program imports this file.
 
-int ki = 0
-arr[text] kws = KW_SRC.split(' ')
-while ki < kws.length {
-    KEYWORDS[kws[ki]] = 1
-    ki++
-}
-int ei = 0
-arr[text] ees = EE_SRC.split(' ')
-while ei < ees.length {
-    EXPR_ENDING[ees[ei]] = 1
-    ei++
-}
-
-blob source = argv[1]
-arr[Tok] toks = tokenize(source, 0, source.length)
-text out = ''
-// A failed lex reports ONLY where it failed. The Python lexer raises a
-// CompileError and produces no token list at all, so emitting the tokens
-// that happened to precede the bad character would be a difference in the
-// harness rather than in the lexers.
-int errAt = 0 - 1
-int e = 0
-while e < toks.length {
-    if toks[e].kind == 'LEXERR' { errAt = e break }
-    e++
-}
-if errAt >= 0 {
-    Tok bad = toks[errAt]
-    log(`${bad.line}:${bad.col}|LEXERR|${esc(bad.val)}`)
-    close(0)
-}
-int i = 0
-while i < toks.length {
-    Tok t = toks[i]
-    if t.kind == 'REGEX' {
-        out = out + `${t.line}:${t.col}|REGEX|${esc(t.val)}|${esc(t.extra)}`
-    } else {
-        out = out + `${t.line}:${t.col}|${t.kind}|${esc(t.val)}`
+void func initLexer() {
+    int ki = 0
+    arr[text] kws = KW_SRC.split(' ')
+    while ki < kws.length {
+        KEYWORDS[kws[ki]] = 1
+        ki++
     }
-    out = out + 10.toChar()
-    i++
+    int ei = 0
+    arr[text] ees = EE_SRC.split(' ')
+    while ei < ees.length {
+        EXPR_ENDING[ees[ei]] = 1
+        ei++
+    }
 }
-log(out)

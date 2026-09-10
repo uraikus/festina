@@ -29,7 +29,7 @@ from festina import lexer as py_lexer          # noqa: E402
 from festina.errors import CompileError        # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LEXER_SOURCE = os.path.join(REPO_ROOT, "bootstrap", "lexer.f")
+LEXER_SOURCE = os.path.join(REPO_ROOT, "bootstrap", "lexdump.f")
 
 
 def _esc(s):

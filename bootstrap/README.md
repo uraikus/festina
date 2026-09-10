@@ -1,25 +1,51 @@
 # bootstrap/
 
-Festina's own compiler, being rewritten in Festina — starting with the
-lexer.
+Festina's own compiler, being rewritten in Festina — the lexer, and a
+partial parser.
 
 ## What's here
 
 | | |
 |---|---|
-| `lexer.f` | `festina/lexer.py`, ported to Festina |
-| `difftest.py` | runs both lexers over every `.f` file in the repo and diffs the token streams |
-| `cases/*.f` | targeted sources covering what the repo corpus doesn't reach |
+| `lexer.f` | `festina/lexer.py`, ported — the importable library |
+| `lexdump.f` | entry point: dumps a token stream in the canonical form |
+| `parser.f` | `festina/parser.py`, **partially** ported (imports `lexer.f`) |
+| `astdumpf.f` | entry point: dumps an AST in the canonical form |
+| `difftest.py` | diffs both lexers over every `.f` file in the repo |
+| `astdump.py` | the Python side's canonical AST dump |
+| `astdiff.py` | diffs both parsers over the same corpus |
+| `cases/*.f` | targeted sources covering what the corpus doesn't reach |
 
-`tests/test_bootstrap_lexer.py` runs the same comparison from pytest, so
-a divergence fails CI rather than waiting to be noticed.
+`tests/test_bootstrap_lexer.py` and `tests/test_bootstrap_parser.py` run
+the same comparisons from pytest, so a divergence fails CI rather than
+waiting to be noticed.
 
 ## Running it
 
 ```sh
-python bootstrap/difftest.py                        # the whole corpus
+python bootstrap/difftest.py                        # lexer, whole corpus
+python bootstrap/astdiff.py                         # parser, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
+
+Current state:
+
+- **lexer: 87 files match, 0 differ.**
+- **parser: 64 match, 0 differ, 25 unported** — event handlers (17
+  files), `thread` (6), `match` (1), arrow functions (1).
+
+## The parser is partial, and says so
+
+A construct with no implementation yet produces an `(UNPORTED ...)` node,
+and `astdiff.py` counts a file containing one as *unported* — never as a
+match, never as a difference. So the coverage number moves only when a
+construct is really implemented, and one that silently mis-parsed instead
+shows up as a difference rather than as progress.
+
+Its AST is one generic node — a kind plus a list of named fields — rather
+than the ~45 structs mirroring `festina/ast.py` would need. That is what
+lets the dump be generic on both sides; a per-node dumper would be a
+second parser to keep in sync.
 
 Both sides print one token per line in the same canonical form:
 
@@ -28,8 +54,6 @@ line:col|KIND|value            # value escaped: \\ \n \t \r \p (|)
 line:col|REGEX|pattern|flags
 line:col|LEXERR|char           # a rejected source reports only this
 ```
-
-Current state: **85 files match, 0 differ, 0 known divergences, 0 skipped.**
 
 ## Why a port, not a rewrite
 
@@ -96,9 +120,20 @@ language instead of tolerated here. If a future divergence genuinely
 cannot be fixed, that table is where it goes, so the decision lives next
 to the test rather than in a commit message.
 
+## What the port has found in the compiler itself
+
+Beyond the four language limits above, writing a parser in Festina found
+a real bug in the shipped one (claude.md #274): **`while (a || b) && c`
+did not parse.** `parse_if`/`parse_while` implemented optional condition
+parens by eating a leading `(` and its match, which truncates any
+condition that merely *begins* with a parenthesised group. 2,500 tests
+and 89 corpus files had never written that shape; a parser needed it
+immediately. Fixed by deleting the special case — `parse_primary`
+already handles `( expr )` as ordinary grouping.
+
 ## Next
 
-The parser is the natural next step, and it needs none of the above
-fixed. Semantic analysis and codegen should wait for the `?` cell model
-(the plan's Part 2), which is a documented breaking change to `?`
+Finish the parser: event handlers first (17 files), then `thread`,
+`match` and arrow functions. Semantic analysis and codegen should wait
+for the `?` cell model, which is a documented breaking change to `?`
 semantics and would otherwise land under a half-ported compiler.

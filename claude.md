@@ -5289,3 +5289,37 @@ This is not cosmetic: that column is what every compile error a user reads point
 **Result: 85 files match, 0 differ, 0 known divergences, 0 skipped.** The `KNOWN_DIVERGENCES` table #271 introduced is now empty -- its one entry (`'a\0b'`) was fixed in the language rather than tolerated in the harness -- and kept, rather than deleted, so a future divergence has an honest place to be recorded instead of a commit message.
 
 **Verified.** 23 new pytest tests; `tests/stress/bytes_trim_churn.f` under ASan/LeakSanitizer, mixing a named receiver read repeatedly (must NOT be released) with a call-result receiver (must be), over a non-ASCII file so `slice()` really copies multi-byte sequences. Negative control: deleting the receiver release from the new codegen branch leaks **340,000 bytes in 12,000 allocations**, so the program tests what it claims to. Three differential negative controls, including a new one for the column fix, which differs on exactly the two non-ASCII files.
+
+273. THE PARSER, WRITTEN IN FESTINA -- A PARTIAL PORT THAT SAYS SO
+
+The second step of bootstrapping, after the lexer (#271, #272). `bootstrap/parser.f` reproduces `festina/parser.py`'s AST, and `bootstrap/astdiff.py` proves it the same way the lexer's own harness does.
+
+**Result: 64 files match, 0 differ, 25 unported, of 89.**
+
+**The partial-ness is the design, not an apology.** A parser is a far bigger surface than a lexer, and a half-finished one that quietly mis-parses is worse than none. So a construct with no implementation produces an `(UNPORTED :what="...")` node, and the harness classifies a file containing one as *unported* -- never as a match, never as a difference. The coverage number can only move when a construct is genuinely implemented; a construct that mis-parsed instead shows up as a difference, not as progress. Still unported: event handlers (17 files), `thread` (6), `match` (1), arrow functions (1).
+
+**AST representation: one generic node, not forty-five structs.** `festina/ast.py` has ~45 classes. Mirroring that in Festina would mean 45 structs plus a 45-member enum, and -- worse -- a dumper per node on each side, which is a second parser to keep in sync. Instead a node here is a kind string plus a list of named fields, and the dump is generic on BOTH sides: Python walks `vars(node)`, Festina walks its own field list, and each sorts by field name so neither depends on the other's declaration order. Every field is dumped, `line`/`column` included -- the parser's whole downstream job is good error locations, and a structural-only comparison would let a port lose them silently.
+
+**A real bug in the shipped compiler, found by writing Festina in Festina (recorded separately as #274).** `while (a || b) && i < 3 { }` did not parse. `parse_if`/`parse_while` implemented optional condition parens by eating a leading `LPAREN` and its match, which truncates any condition that merely BEGINS with a parenthesised sub-expression: the condition ended at `)` and the parser then demanded `{` at `&&`. Nothing in 2,500 tests or 89 corpus files had written that shape. Writing a parser did, on the first try.
+
+**Two mistakes of my own worth recording, both caught by the harness rather than by reading.**
+
+The first: `unported()` returned a marker node without consuming anything, so `parseProgram`'s loop spun forever on a token it neither parsed nor advanced past. The symptom was not a parse error but the harness reporting `exit -9` -- the OOM killer. A "not implemented" path still has to make progress or terminate; returning a value is not the same as handling the input.
+
+The second, and the reason 34 of an initial 35 differences were one bug: `TemplateLit.parts`, `EnumDecl.members` and `FuncTypeExpr.param_types` are lists of plain STRINGS in Python. My `'#str'` marker nodes were unwrapped for single fields but not inside lists, so every template literal in the corpus dumped `[(#str :v="x")]` against Python's `["x"]`. One fix, 34 files. Worth noting how that read at first: 35 failures across unrelated files looked like a deep problem and was a three-line one -- the kind of ratio that argues for looking at what the failures have in common before looking at any one of them closely.
+
+**Two smaller language findings**, on top of #272's four: `text` has no `.slice()` (both `ascii` and now `blob` do), so extracting the payload from the lexer's `'int 42'` token value goes through `split(' ')`; and `fail` is a reserved builtin, so a parser cannot name its own error helper `fail()`.
+
+**Verified.** `tests/test_bootstrap_parser.py` runs the comparison per corpus file, plus a guard against the opposite failure -- if a change made everything report "unported", every comparison would skip and the suite would pass while testing nothing, so it asserts at least 60 files still parse identically. Two negative controls: swapping additive/multiplicative precedence differs on 25 files, deleting postfix `++` handling on 24.
+
+274. `while (a || b) && c` DID NOT PARSE
+
+Found by #273's parser port, which needed exactly that shape and could not compile itself.
+
+`parse_if` and `parse_while` supported optional condition parens (`if (x) { }` as well as `if x { }`) by checking for a leading `LPAREN`, eating it, parsing an expression, and eating the matching `RPAREN`. That is correct only when the parens wrap the WHOLE condition. When they wrap only its first operand, the condition is truncated at the closing paren and the parser demands the block at whatever follows -- `expected LBRACE, found OP('&&')`.
+
+**The fix is to delete the special case, not to extend it.** `parse_primary` already treats `( expr )` as an ordinary grouped expression, so `test = self.parse_expression()` handles both spellings and the truncation cannot recur: there is no longer any code that treats a leading paren as anything other than grouping. `if (x) { }` parses exactly as before.
+
+**Why nothing caught it.** The shape is only reachable when a condition both starts with a parenthesised group and continues with an operator. 2,500 tests and 89 corpus files never wrote it. This is the same lesson as #267's enum/JSON interaction, in a different place: the gap was not in any feature's own coverage but in a combination none of them owned. A new, demanding program written in the language is what found it -- which is the argument for bootstrapping, stated in the only way that counts.
+
+Verified: five regression tests pinning both spellings, the grouped-operand case, the bare case, and that `(a || b) && c` keeps its grouping rather than re-associating. Full suite 2527 passed.

@@ -32,11 +32,12 @@ round-by-round design and implementation record predating 0.1 lives in
   was loaded from, and a slice of one has no path of its own. Together
   they let a scanner read a UTF-8 file the compiler never has to
   validate first, which `ascii` cannot do.
-- **`bootstrap/` — Festina's lexer, written in Festina.**
+- **`bootstrap/` — Festina's lexer and a partial parser, written in
+  Festina.**
   `bootstrap/lexer.f` reproduces `festina/lexer.py`'s token stream
   exactly; `bootstrap/difftest.py` and `tests/test_bootstrap_lexer.py`
   prove it by diffing both lexers over every `.f` file in the
-  repository — 85 files, all matching. Nothing in the shipped compiler
+  repository — 87 files, all matching. Nothing in the shipped compiler
   depends on it: this is the first step of self-hosting, and a real
   consumer that surfaced four concrete limits of the language itself
   (see `bootstrap/README.md` and claude.md #271/#272). Three are fixed
@@ -47,6 +48,12 @@ round-by-round design and implementation record predating 0.1 lives in
   differential test also found a bug neither lexer showed alone: a
   column is a *character* offset, and counting bytes misplaces the caret
   in every compile error on a line containing non-ASCII text.
+  `bootstrap/parser.f` follows (claude.md #273), checked the same way
+  against a canonical AST dump: 64 corpus files match, 0 differ, 25 use
+  a construct not ported yet. It is deliberately explicit about being
+  partial — an unimplemented construct produces an `UNPORTED` node the
+  harness counts separately, so coverage can only move when something is
+  really implemented.
 - **`ascii` — a one-byte-per-character string type,** alongside `text`
   rather than replacing it. Because a character is a byte, the
   character count *is* the byte count, so it lives in the value's own
@@ -133,6 +140,14 @@ round-by-round design and implementation record predating 0.1 lives in
   it working. `FESTINA_NO_PARSE_CACHE=1` disables it entirely.
 
 ### Fixed
+
+- **`while (a || b) && c { }` and `if (a || b) && c { }` now parse.**
+  Optional condition parens were implemented by eating a leading `(` and
+  its match, which truncated any condition that merely *begins* with a
+  parenthesised group — the condition ended at `)` and the parser then
+  demanded the block at `&&`. Both spellings work now, and the grouped
+  operand keeps its own precedence. Found by writing Festina's parser in
+  Festina (claude.md #273/#274).
 
 - **A JSON-parsed struct is now a valid member of its own enum.**
   `.toStruct(T)`/`.toArr(T)`, where `T` is one of an enum's members,
