@@ -87,8 +87,15 @@
           project's own WASI host (<code>runtime/wasm/browser.html</code>,
           verified in headless Chromium on every push). Graphics/audio
           are out of scope there permanently (WASI has no backend for
-          either); what remains open, not blocking:
-          AddressSanitizer/LeakSanitizer coverage for the target.
+          either), and so, it turns out, is sanitizer coverage:
+          <code>clang --target=wasm32-wasi -fsanitize=address</code> is
+          rejected by the compiler outright, and the wasm32
+          compiler-rt package ships only <code>builtins</code> — no
+          sanitizer runtime exists for the target. Nothing this project
+          can work around, and nothing it needs to: every allocation the
+          native sanitizer runs exercise is the same C source a wasm
+          build compiles, whose entire <code>__wasi__</code> delta is
+          non-allocating stubs. Nothing open here.
         </p>
       </section>
 
@@ -96,6 +103,7 @@
         <h2>Language &amp; standard library <a class="anchor" href="#language-standard-library">#</a></h2>
         <ul>
           <li><strong>Media formats</strong> stay PNG/JPEG + WAV/MP3, deliberately: each new format is a new system dependency for every machine that compiles a media-using program. Revisit only with a concrete need.</li>
+          <li><strong>A raw byte-buffer type</strong> — a generalized, writable <code>blob</code>, or a new <code>bytes</code> type, with <code>[i] =</code> assignment and <code>text.toBytes()</code>/<code>bytes.toText()</code> conversions at the boundary. Open but unmotivated: the case usually made for it is skipping a shell-out to clang on textual LLVM IR, and that is already true without it — <code>llvm_backend.py</code> parses the generated IR in-process via libLLVM's C API whenever it is available, with <code>clang</code>/<code>cc</code> only a fallback, and in-place string append makes building that IR text cheap as a plain <code>text</code>. A mutable, indexable byte buffer could still earn its place on its own merits (binary protocol and data construction), but a full new primitive type costs surface area from the lexer through to the runtime, and nothing currently needs one.</li>
         </ul>
       </section>
 
@@ -103,17 +111,21 @@
         <h2>Memory model <a class="anchor" href="#memory-model">#</a></h2>
         <p>
           Automatic reclamation is escape analysis plus reference
-          counting — every managed type
-          (<code>struct</code><wbr>/<code>arr[T]</code><wbr>/<code>map[T]</code><wbr>/<code>text</code><wbr>/<code>img</code><wbr>/<code>aud</code><wbr>/<code>regex</code><wbr>/<code>blob</code><wbr>/<code>http</code><wbr>/<code>url</code><wbr>/<code>socket</code>)
-          carries a refcount header, and reference cycles are collected
-          by trial deletion, with <code>free</code>/<code>delete</code>
-          as the manual override. What remains open:
+          counting. Most managed types
+          (<code>struct</code><wbr>/<code>arr[T]</code><wbr>/<code>map[T]</code><wbr>/<code>ascii</code><wbr>/<code>img</code><wbr>/<code>aud</code><wbr>/<code>regex</code><wbr>/<code>blob</code><wbr>/<code>http</code><wbr>/<code>url</code><wbr>/<code>socket</code>/table
+          rows) carry a refcount header; <code>text</code> is the
+          exception — it has no header at all and is instead copied on
+          alias and freed outright — a live <code>text</code> pointer
+          can be a heap buffer, a bare <code>.rodata</code> literal, a
+          borrowed <code>environ</code> pointer or an X11 stack buffer,
+          and a header would have to be valid for all four. Reference
+          cycles are collected by trial deletion, with
+          <code>free</code>/<code>delete</code> as the manual override.
+          What remains open:
         </p>
         <ul>
-          <li><strong>Cycle trials are synchronous and per-release</strong> — every still-referenced release of a cycle-capable type walks the value's reachable subgraph. Correct, and measured fast for ordinary object graphs (20k dropped 21-node cycles in ~34 ms), but a very large, heavily-aliased cyclic structure could feel it; the classic deferred-root buffer is the known optimization if a real program ever does.</li>
-          <li><strong>A table-row element off a call-result array leaks the array</strong> (<code>rows()[0]</code> where the elements are query rows). Rows have no refcount header — the array owns them outright — so the element cannot be retained past its container. Bind the array to a name first and it reclaims normally. The real fix is scoped: a per-table row-copy function is straightforward (it mirrors the existing per-table row-release function, using the already-existing <code>festina_text_own</code>/<code>festina_retain</code> primitives column-by-column), but it only closes the leak once paired with genuine scope-exit ownership tracking for <code>TableType</code> locals generally — the same "always owned once bound, always released at scope exit" symmetry <code>text</code> itself needed six dedicated, individually-verified rounds to get right. A real fix is that size, not a quick patch.</li>
+          <li><strong>Cycle trials are synchronous and per-release</strong> — every still-referenced release of a cycle-capable type walks the value's reachable subgraph. Fine for ordinary object graphs (20k dropped 21-node <em>disjoint</em> cycles in ~34 ms) — but the case that number never tested, <em>shared</em> structure under repeated release-while-live churn, measures a real, cleanly linear cost specifically tied to sharing rather than to total node count: a shared ring costs ~9-10x a disjoint one at the same total node/iteration count, scaling linearly in both ring size and iteration count. The classic deferred-root buffer is the known optimization, now motivated by measurement rather than assumption. Still deliberately not started: the real algorithm needs the <em>free</em> path of every cyclic release wrapper to become buffering-aware too (a still-buffered node hitting refcount zero can't be freed immediately without leaving a dangling pointer in the pending-roots buffer) — new correctness-critical surface in code every struct/arr/map-using Festina program runs through, and batching still trades lower amortized CPU for higher peak memory (collection is delayed). Earns its own dedicated round: a fresh plan, and ASan/LeakSanitizer-under-stress verification of the deferred-free "zombie" path specifically.</li>
           <li><strong>Text globals are not freed at process exit</strong> — deliberate: they are reachable until exit, LeakSanitizer agrees, and freeing them would be exit-time busywork.</li>
-          <li><strong>A <code>throw</code> out of a runtime-driven callback</strong> (<code>.forEach(fn)</code>, <code>.sort(cmp)</code>, a timer) crosses the runtime's own C frame on the way to the catching <code>try</code>. Festina-side locals are released (the general "intermediate frame" leak that used to be listed here is closed — see <a href="api.html#try-catch-throw">api.md</a>); whatever that C frame itself held mid-operation — <code>qsort</code>'s scratch buffer, an iteration cursor — is not. Error-path-only, bounded per throw.</li>
         </ul>
       </section>
 

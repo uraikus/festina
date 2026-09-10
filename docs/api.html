@@ -65,12 +65,18 @@
         <a class="sub" href="#building-a-string-piece-by-piece">Building a string piece by piece</a>
         <a class="sub" href="#parsing-an-int">Parsing an int</a>
         <a class="sub" href="#indexing-a-character-out">Indexing a character out</a>
+        <a class="sub" href="#length">Length</a>
+        <a class="sub" href="#charcodeat-and-tochar">charCodeAt() and toChar()</a>
+        <a href="#ascii">ascii -- one byte per character</a>
+        <a class="sub" href="#ascii-converting">Converting</a>
+        <a class="sub" href="#ascii-cost">Cost</a>
         <a href="#logging-and-rendering">Logging and rendering</a>
         <a href="#structs">Structs</a>
         <a class="sub" href="#a-struct-can-name-itself">A struct can name itself</a>
         <a href="#enums">Enums</a>
         <a class="sub" href="#typeof">typeof</a>
         <a class="sub" href="#enum-field-access">Field access</a>
+        <a class="sub" href="#match">match</a>
         <a class="sub" href="#enum-representation">Representation and cost</a>
         <a href="#arrays">Arrays</a>
         <a class="sub" href="#indexing-is-not-bounds-checked">Indexing is not bounds-checked</a>
@@ -182,7 +188,7 @@
       <section class="doc-section" id="cli">
         <h2>CLI <a class="anchor" href="#cli">#</a></h2>
         <p>
-          Four subcommands (<code>festina/cli.py</code>), not a single
+          Five subcommands (<code>festina/cli.py</code>), not a single
           bare <code>festina file.f</code> — that would leave
           <code>festina run</code> (which executes the compiled result)
           ambiguous with <code>festina compile</code> (which never does)
@@ -194,6 +200,7 @@
           <tr><td>festina run entry.f</td><td>Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the <em>compiled program's own</em> exit code, so <code>festina run x.f &amp;&amp; ...</code> composes the same way <code>go run</code>/<code>cargo run</code> do. The temp binary is always cleaned up afterward. <code>--target=wasm32-wasi</code> runs the compiled <code>.wasm</code> through Node's built-in WASI support instead of executing it directly.</td></tr>
           <tr><td>festina doctor</td><td>Checks every dependency the compiler itself needs (a C compiler, <code>pkg-config</code>, sqlite3/cairo-xlib/alsa dev headers, <code>libLLVM</code>) and reports what's missing and how to install it — the same install hints a real compile failure would give, just checked proactively instead of only on failure. Also reports whether <code>festina</code> itself is resolvable on <code>PATH</code>. Exits 0 if every <em>required</em> dependency is present — graphics/audio are optional.</td></tr>
           <tr><td>festina doctor --fix</td><td>Same report, then actually fixes what it found: installs missing dependencies via the detected package manager (<code>apt</code> on Linux, Homebrew on macOS, MSYS2's <code>pacman</code> on Windows), and adds <code>festina</code> to <code>PATH</code> if it isn't resolving. Prints the exact command/change first and asks for confirmation (<code>--yes</code>/<code>-y</code> skips that); refuses to guess for any other package manager or overwrite something unrelated already on disk.</td></tr>
+          <tr><td>festina update</td><td>Pulls the latest source into this installation's own git checkout and fast-forwards to it (<code>git fetch</code> + <code>git merge --ff-only</code>) — there's no separate release pipeline or package to fetch, the running <code>festina</code> <em>is</em> this checkout, so updating it is exactly this. Refuses, with a clear message and no changes made, when the working tree has uncommitted changes, when <code>HEAD</code> is detached, or when local history has genuinely diverged from origin — never force-resets over local work. Not available for a packaged (PyInstaller) binary, which has no source tree of its own to pull into.</td></tr>
           <tr><td>festina help</td><td>Prints this same command list.</td></tr>
         </table>
         </div>
@@ -384,6 +391,18 @@ log(7 / 2)                  <span class="cm">// 3.5 (float) -- ordinary division
         <p>Division/modulo by zero return <code>null</code> rather than crashing:</p>
         <pre class="code"><span class="kw">float</span> divided = 10 / 0   <span class="cm">// null -- / always returns float</span>
 <span class="kw">int</span> remainder = 10 % 0    <span class="cm">// null -- % still returns int for two ints</span></pre>
+
+        <p>
+          Testing for that <code>null</code> works for the
+          <code>int</code> result but <strong>not</strong> the
+          <code>float</code> one: a null <code>float</code> is a real
+          NaN, and IEEE-754 says every comparison against a NaN is
+          false, so <code>divided == null</code> and
+          <code>divided != null</code> are <em>both</em>
+          <code>false</code>. <code>remainder == null</code> is
+          <code>true</code> as you would expect. See
+          <a href="#types">the null representations</a> above.
+        </p>
 
         <p>
           <code>int</code>/<code>float</code>/<code>bool</code> also each
@@ -618,6 +637,153 @@ log(s[-1])              <span class="cm">// null -- negative, not a crash</span>
           buffer. Read-only — <code>s[0] = 'x'</code> is a compile-time
           error, the same way <code>environment.NAME = ...</code> is.
         </p>
+
+        <h3 id="length">Length <a class="anchor" href="#length">#</a></h3>
+        <pre class="code">log(<span class="str">'hello'</span>.length)   <span class="cm">// 5</span>
+log(<span class="str">'café'</span>.length)    <span class="cm">// 4 -- code points, not bytes ('é' is 2 bytes)</span>
+log(<span class="str">''</span>.length)        <span class="cm">// 0</span></pre>
+        <p class="muted">
+          <code>text.length</code> is the number of UTF-8
+          <strong>code points</strong> — the same unit
+          <code>s[i]</code>/<code>charCodeAt</code>/<code>split('')</code>
+          already use, not a byte count. Because UTF-8 is
+          variable-width, this is a real scan, not a stored count —
+          unlike <a href="#files"><code>blob.length</code></a>, which
+          counts bytes exactly and is O(1). Read-only, like
+          <code>arr[T].length</code>.
+        </p>
+
+        <h3 id="charcodeat-and-tochar">charCodeAt() and toChar() <a class="anchor" href="#charcodeat-and-tochar">#</a></h3>
+        <pre class="code"><span class="kw">int</span> fortyTwo = 42
+<span class="kw">text</span> char = fortyTwo.toChar()          <span class="cm">// '*'</span>
+<span class="kw">int</span> numberAgain = char.charCodeAt(0)   <span class="cm">// 42</span>
+
+log(<span class="str">'a'</span>.charCodeAt(0))    <span class="cm">// 97</span>
+log(42.toChar())          <span class="cm">// '*'</span>
+log(<span class="str">'café'</span>.charCodeAt(3)) <span class="cm">// 233 -- the 'é', by code point, not byte</span>
+log(233.toChar())         <span class="cm">// 'é'</span></pre>
+        <p class="muted">
+          <code>text.charCodeAt(i)</code> reads the Unicode scalar
+          value of the <code>i</code>-th <strong>code point</strong>
+          (not byte, and not a UTF-16 code unit the way JavaScript's
+          own <code>charCodeAt</code> sometimes is — Festina's text
+          indexing is code-point-based everywhere, and this matches
+          <code>s[i]</code>/<code>.length</code>).
+          <code>int.toChar()</code> is the inverse: it UTF-8 encodes a
+          code point into a one-character <code>text</code>. Both
+          follow the same "test, don't fail" rule as <code>s[i]</code>:
+          an out-of-range or negative index into <code>charCodeAt</code>
+          answers <code>null</code>, and a code point
+          <code>toChar()</code> can't represent — negative, above
+          <code>0x10FFFF</code>, or inside the UTF-16 surrogate range
+          <code>0xD800</code>–<code>0xDFFF</code> — answers
+          <code>null</code> rather than crashing.
+        </p>
+      </section>
+
+      <section class="doc-section" id="ascii">
+        <h2><code>ascii</code> — one byte per character <a class="anchor" href="#ascii">#</a></h2>
+        <p>
+          <code>text</code> is UTF-8, so a character can be one to four
+          bytes. That makes <code>text.length</code> a real scan and
+          <code>s[i]</code> a walk from the start of the string, and it
+          is the right trade for text that has to hold any language.
+          But it is the wrong trade for a scanner — a lexer reads every
+          character by index, and a walk per read is quadratic over the
+          whole input.
+        </p>
+        <p>
+          <code>ascii</code> is the other trade. One byte per character
+          means the character count <em>is</em> the byte count, so it
+          lives in the value's own header and both <code>.length</code>
+          and <code>s[i]</code> are O(1) reads:
+        </p>
+        <pre class="code"><span class="kw">ascii</span> src = <span class="str">'int x = 1'</span>
+log(src.length)          <span class="cm">// 9   -- a stored count, not a scan</span>
+log(src[4])              <span class="cm">// 'x' -- a byte offset, not a walk</span>
+log(src.charCodeAt(4))   <span class="cm">// 120</span>
+log(src.slice(0, 3))     <span class="cm">// 'int'</span>
+log(src == <span class="str">'int x = 1'</span>)  <span class="cm">// true</span></pre>
+        <p>
+          Both types coexist; neither replaces the other. Use
+          <code>text</code> for anything a person types or reads, and
+          <code>ascii</code> where the input really is one byte per
+          character and you index it heavily — source code, protocol
+          headers, CSV fields.
+        </p>
+
+        <h3 id="ascii-converting">Converting <a class="anchor" href="#ascii-converting">#</a></h3>
+        <p>
+          A quoted literal is a <code>text</code> literal. Assigning one
+          to an <code>ascii</code> converts it at compile time, so a
+          literal that isn't ASCII fails to build rather than deferring
+          to a runtime null:
+        </p>
+        <pre class="code"><span class="kw">ascii</span> ok = <span class="str">'let'</span>          <span class="cm">// fine</span>
+<span class="kw">ascii</span> bad = <span class="str">'café'</span>        <span class="cm">// compile error: 'é' is not an ascii character</span></pre>
+        <p>
+          At runtime the conversion has to be checked, so it answers
+          <code>null</code> for anything not representable one byte per
+          character — the same "test, don't fail" rule <code>s[i]</code>
+          and <code>toInt()</code> already follow:
+        </p>
+        <pre class="code"><span class="kw">blob</span> f = <span class="str">'input.txt'</span>
+<span class="kw">ascii</span> scan = f.toText().toAscii()   <span class="cm">// null if the file isn't ascii</span>
+<span class="kw">if</span> scan == <span class="kw">null</span> { fail(<span class="str">'expected ascii input'</span>) }
+
+<span class="kw">text</span> back = scan.toText()        <span class="cm">// always works, always a copy</span></pre>
+
+        <h3 id="ascii-cost">Cost <a class="anchor" href="#ascii-cost">#</a></h3>
+        <p>
+          <code>.length</code>, <code>s[i]</code> and
+          <code>charCodeAt(i)</code> are O(1). Indexing allocates
+          nothing at all: a one-character <code>ascii</code> comes from
+          a table of 128 immortal single-character values rather than a
+          fresh buffer, so a character-by-character scan does no
+          allocation whatsoever.
+        </p>
+        <p>
+          <code>.length</code> and <code>charCodeAt(i)</code> cost no
+          function call either — both compile to loads off the value's
+          own header, inline in the loop that uses them, so a scan
+          loop's body contains no call at all.
+        </p>
+        <p><code>slice()</code> and <code>+</code> copy, because an <code>ascii</code> owns its bytes.</p>
+        <p>
+          The difference this makes to a scanner is not small. Counting
+          identifiers character by character over the same input:
+        </p>
+        <div class="table-wrap">
+        <table class="sig-table">
+          <thead><tr><th>input</th><th class="num"><code>text</code></th><th class="num"><code>ascii</code></th></tr></thead>
+          <tbody>
+            <tr><td>10.4 KB</td><td class="num">50 ms</td><td class="num">—</td></tr>
+            <tr><td>20.8 KB</td><td class="num">201 ms</td><td class="num">—</td></tr>
+            <tr><td>41.6 KB</td><td class="num">800 ms</td><td class="num">—</td></tr>
+            <tr><td>4.16 MB</td><td class="num">—</td><td class="num">21.5 ms</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <p class="muted">
+          <code>text</code> quadruples when the input doubles (a walk
+          per index, over every index); <code>ascii</code> doubles. At
+          41.6 KB <code>text</code> needs 800 ms; <code>ascii</code>
+          scans 4.16 MB — a hundred times more input — in 21.5 ms.
+        </p>
+        <p class="muted">
+          Against other languages on the same scan, <code>ascii</code>
+          is competitive rather than merely better than <code>text</code>:
+          see <a href="benchmark.html#char_scan"><code>char_scan</code></a>,
+          where Festina finishes ahead of equivalent Rust and Go loops
+          indexing raw bytes.
+        </p>
+        <p class="muted">
+          An <code>ascii</code> is reference counted, so
+          <code>ascii b = a</code> shares one buffer rather than copying
+          it, and <code>b</code> is not a snapshot: see
+          <a href="#t-manually-managed-values"><code>T?</code></a> for
+          what <code>ascii?</code> means.
+        </p>
       </section>
 
       <section class="doc-section" id="logging-and-rendering">
@@ -807,10 +973,13 @@ a.next = a      <span class="cm">// reclaimed when `a` goes away, cycle and all<
           Query results are reclaimed too: the rows an
           <code>arr[Table]</code> holds, and each row's own text columns,
           are freed when that array is — so a program that queries
-          repeatedly stays bounded. A single row read out
-          of one (<code>People p = rows[0]</code>) borrows from the array
-          rather than owning a copy, so it stays valid exactly as long as
-          the array does.
+          repeatedly stays bounded. A row is reference counted like a
+          struct, so a single row read out of one
+          (<code>People p = rows[0]</code>) holds its own reference and
+          stays valid even if the array goes away first. Rows alias
+          rather than copy: writing <code>p.name = 'x'</code> is visible
+          through every binding of that row, including the array's own
+          element.
         </p>
         <p class="muted">
           <code>img</code>, <code>aud</code> and <code>regex</code>
@@ -923,6 +1092,67 @@ log(shape.radius)   <span class="cm">// fail: field 'radius' is only valid when 
 } <span class="kw">else</span> {
     log(shape.area)
 }</pre>
+
+        <h3 id="match">match <a class="anchor" href="#match">#</a></h3>
+        <p>
+          The <code>if typeof shape == '...'</code> chain above written
+          as a statement of its own, exhaustiveness-checked against
+          every member of the enum:
+        </p>
+        <pre class="code"><span class="kw">int</span> func extractShapeMetric(shape:Shape) {
+    <span class="kw">int</span> result = 0
+    match shape {
+        <span class="str">'Circle'</span> { result = shape.radius }
+        <span class="str">'Square'</span> { result = shape.area }
+    }
+    return result
+}</pre>
+        <p>
+          Each arm is a quoted tag — the exact same text
+          <code>typeof</code> itself returns — followed by a
+          <code>{ }</code> block; no <code>case</code>/<code>:</code>.
+          <code>default { }</code> covers everything the written arms
+          don't:
+        </p>
+        <pre class="code">match shape {
+    <span class="str">'Circle'</span> { log(<span class="str">'a circle'</span>) }
+    default { log(<span class="str">'something else'</span>) }
+}</pre>
+        <p>
+          Leaving a member uncovered with no <code>default</code> is a
+          compile error naming the missing one, not a silent gap:
+        </p>
+        <pre class="code">match shape {
+    <span class="str">'Circle'</span> { log(<span class="str">'a circle'</span>) }
+}
+<span class="cm">// error: match on 'Shape' does not cover 'Square' -- add a case or a default</span></pre>
+        <p class="muted">
+          An arm tag that isn't a real member, or a tag repeated across
+          two arms, is also a compile error — a typo or a copy-paste
+          duplicate is caught before it can silently do nothing.
+          <code>match</code> works on any expression, not only an enum —
+          <code>match n { 'int' { ... } }</code> — with the same
+          exhaustiveness rule applied to its one static type.
+        </p>
+        <p class="muted">
+          <code>match</code>'s subject must be a plain variable or field
+          access (<code>shape</code>, <code>w.shape</code>) — not a
+          call, a computed index, or any other expression that could run
+          code or allocate:
+        </p>
+        <pre class="code">match nextShape() { ... }
+<span class="cm">// error: match's subject must be a plain variable or field access --</span>
+<span class="cm">// bind a call result to a name first</span></pre>
+        <p class="muted">
+          Bind it to a name first (<code>Shape s = nextShape(); match s { ... }</code>),
+          the same idiom <code>typeof</code>'s own examples already use.
+          This is what makes <code>match</code> free: it desugars
+          entirely, at compile time, into the identical
+          <code>typeof</code>/<code>if</code>/<code>else if</code> chain
+          shown above — the subject is evaluated exactly once regardless
+          of how many arms exist, and the compiled program has no
+          <code>match</code>-specific code path to pay for at all.
+        </p>
 
         <h3 id="enum-representation">Representation and cost <a class="anchor" href="#enum-representation">#</a></h3>
         <p class="muted">
@@ -2401,10 +2631,19 @@ notes.append(<span class="str">' world'</span>)                <span class="cm">
 <span class="kw">text</span> body = notes.toText()            <span class="cm">// -&gt; the bytes, as text</span>
 <span class="kw">bool</span> there = notes.exists()           <span class="cm">// -&gt; bool</span>
 notes.delete()                        <span class="cm">// -&gt; bool; deletes the FILE</span>
+<span class="kw">int</span> size = notes.length               <span class="cm">// -&gt; int; the byte count</span>
 
 notes.save()                          <span class="cm">// -&gt; bool; write the bytes to its path</span>
 notes.save(<span class="str">'other.txt'</span>)               <span class="cm">// -&gt; bool; adopt that path, then write</span>
 notes.saveCopy(<span class="str">'backup.txt'</span>)          <span class="cm">// -&gt; bool; write there, keep its own path</span></pre>
+        <p class="muted">
+          <code>.length</code> is the exact <strong>byte</strong> count
+          — unlike <a href="#length"><code>text.length</code></a>, a
+          blob has no UTF-8 structure to walk, so this is a plain
+          stored count, not a scan. An unreadable path is <code>0</code>,
+          the same "empty blob" answer <code>.exists()</code>/
+          <code>.toText()</code> already give it.
+        </p>
         <p class="muted">
           The path may be any text expression, like <code>img</code> and
           <code>aud</code>: <code>blob save = saveDir + 'slot1.dat'</code>.
@@ -3330,9 +3569,8 @@ Worker.postMessage(c)</pre>
           <strong>every type</strong>:
         </p>
         <ul>
-          <li><strong>struct / <code>arr[T]</code> / <code>map[T]</code> / <code>blob</code> / <code>img</code> / <code>aud</code> / <code>regex</code></strong> — a reference-count <em>decrement</em>, not a forced free. A value something else still points at survives until its last reference drops; freeing an array releases each element the same way, so a shared element outlives its array. An alias of a freed <code>img</code>/<code>aud</code> stays fully usable — the freed <em>binding</em> reads <code>null</code>, the alias does not, and the surface or clip goes away when the last reference does. Freeing an <code>aud</code> that was the last reference stops every channel still playing it. A <code>/pattern/</code> literal's process-lifetime cache is immortal, so <code>free</code> on a binding aliasing one is a safe no-op.</li>
+          <li><strong>struct / <code>arr[T]</code> / <code>map[T]</code> / query row / <code>blob</code> / <code>img</code> / <code>aud</code> / <code>regex</code></strong> — a reference-count <em>decrement</em>, not a forced free. A value something else still points at survives until its last reference drops; freeing an array releases each element the same way, so a shared element outlives its array. An alias of a freed <code>img</code>/<code>aud</code> stays fully usable — the freed <em>binding</em> reads <code>null</code>, the alias does not, and the surface or clip goes away when the last reference does. Freeing an <code>aud</code> that was the last reference stops every channel still playing it. A <code>/pattern/</code> literal's process-lifetime cache is immortal, so <code>free</code> on a binding aliasing one is a safe no-op.</li>
           <li><strong><code>text</code></strong> — the buffer is freed (a text is exclusively owned).</li>
-          <li><strong>a query row</strong> — the binding is nulled <em>without</em> freeing: the row is owned by the array it came from. Free the array.</li>
           <li><strong><code>int</code> / <code>float</code> / <code>bool</code></strong> — nothing to release; <code>free x</code> is <code>x = null</code>.</li>
         </ul>
         <p class="muted">
@@ -4516,7 +4754,7 @@ log(<span class="str">'still running'</span>)</pre>
           whatever <code>try</code> encloses <em>that</em>.
         </p>
         <div class="callout">
-          <strong>A throw leaks nothing on its way out (0.43).</strong>
+          <strong>A throw leaks nothing on its way out.</strong>
           <code>throw</code> unwinds by jumping directly to the catching
           <code>try</code> (not by returning normally through every call
           frame in between), which used to mean that a function which
@@ -4548,6 +4786,21 @@ log(<span class="str">'still running'</span>)</pre>
           (2 million calls: 0.25 s to 0.33 s), and lost in the noise on
           anything that does real work with them.
         </div>
+        <p class="muted">
+          That covers the runtime's own frames too. A
+          <code>.sort()</code> comparator is ordinary Festina code and
+          can <code>throw</code>; the throw jumps past the runtime's
+          sorting frame, and the scratch buffer that frame allocated is
+          released on the way out like anything else. The array being
+          sorted is sorted <em>in place</em>, so after a comparator
+          throws it still holds some permutation of its own elements —
+          never freed, never corrupted — and sorts correctly if you sort
+          it again. <code>.forEach()</code> allocates nothing and never
+          had the problem. A <code>throw</code> from a timer or an event
+          handler is a different case: those fire from the event loop,
+          where no <code>try</code> can be live, so such a throw ends
+          the program exactly as an uncaught one does.
+        </p>
         <p class="muted">
           <strong>Not available under <code>--target=wasm32-wasi</code>.</strong>
           wasi-libc has no setjmp/longjmp support at all — rejected at
