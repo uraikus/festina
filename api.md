@@ -198,6 +198,12 @@ float divided = 10 / 0   // null -- / always returns float
 int remainder = 10 % 0    // null -- % still returns int for two ints
 ```
 
+Testing for that `null` works for the `int` result but **not** the
+`float` one: a null `float` is a real NaN, and IEEE-754 says every
+comparison against a NaN is false, so `divided == null` and
+`divided != null` are *both* `false`. `remainder == null` is `true` as
+you would expect. See [the null representations](#types) above.
+
 `int`/`float`/`bool` also each have `.toText()`, returning the same
 text template interpolation already produces for that value implicitly
 — useful when that text is needed outside of a template:
@@ -742,11 +748,12 @@ that rebuilds a string each iteration (`` s = `${s}x` ``) frees the
 previous buffer every time instead of accumulating them.
 
 Query results are reclaimed too: the rows an `arr[Table]` holds, and
-each row's own text columns, are freed when that array is — so
-repeated queries don't grow memory without bound. A single
-row read out of one (`People p = rows[0]`) borrows from the array
-rather than owning a copy, so it stays valid exactly as long as the
-array does.
+each row's own text columns, are freed when that array is — so repeated
+queries don't grow memory without bound. A row is reference counted
+like a struct, so a single row read out of one (`People p = rows[0]`)
+holds its own reference and stays valid even if the array goes away
+first. Rows alias rather than copy: writing `p.name = 'x'` is visible
+through every binding of that row, including the array's own element.
 
 `img`, `aud` and `regex` handles are reference counted exactly like
 structs: every binding — aliased, escaping, or a `/pattern/` literal's
@@ -1572,13 +1579,11 @@ accept a further optional trailing `borderColor`, after the fill
 color — paints the border with it for that one call only, leaving the
 current `borderColor()` untouched for every other shape, the same
 "this call only, then restore" contract the fill-color argument
-already has. `drawCircle` gained BOTH trailing forms here — it
-previously had no per-call color override at all. This is the direct
-fix for global draw style silently leaking between unrelated shapes:
-a border color left over from a previous, unrelated `drawRect`/
-`drawCircle` call no longer has to be reset with `borderColor()` or
-`saveState()`/`restoreState()` by hand before every shape that needs
-its own.
+already has. This is what keeps global draw style from silently leaking
+between unrelated shapes: a border color left over from an earlier,
+unrelated `drawRect`/`drawCircle` call needs no `borderColor()` or
+`saveState()`/`restoreState()` reset by hand before every shape that
+wants its own.
 
 `getPixelColor(x, y)` reads one pixel back off the canvas, and
 `img.getPixelColor(x, y)` reads one back off an `img`'s own surface —
@@ -2758,10 +2763,10 @@ where it's easiest to trip over: forwarding a REAL request's own
 `req.headers` into an outbound one (`'headers': req.headers`) already
 carries the ORIGINAL `Host`, and forwarding a REAL response's own
 `headers` back out (`res.headers = upstream.headers`) already carries
-its `Content-Length`/`Connection` — sending those through unfiltered
-used to produce a request or response with the SAME header name
-twice, which a strict server (Go's `net/http`, which hard-rejects a
-request with two `Host` lines) refuses outright.
+its `Content-Length`/`Connection`. Sending those through unfiltered
+would produce a request or response with the SAME header name twice,
+which a strict server (Go's `net/http`, which hard-rejects a request
+with two `Host` lines) refuses outright.
 
 **Same-host requests reuse a connection instead of opening a fresh one
 every time** (plain `http://`, POSIX only — an `https://` request and
@@ -3145,8 +3150,8 @@ void func consume(c:Circle?) {
 ```
 
 **Crossing a `thread` boundary shares the reference, never clones
-it** — `postMessage`/`on message` deep-clone every other value type
-(claude.md #195), but a manually-managed one crosses by handing the
+it** — `postMessage`/`on message` deep-clone every other value type, but a
+manually-managed one crosses by handing the
 raw reference straight to the other side, exactly like an ordinary
 alias within one thread does. Both directions work the same way:
 
@@ -3172,7 +3177,7 @@ Worker.postMessage(c)
 
 This is sound for the identical reason `T?`'s own automatic-management
 opt-out is sound in the first place: the whole safety argument behind
-deep-cloning everything else (claude.md #195) is that this runtime's
+deep-cloning everything else is that this runtime's
 retain/release counters are non-atomic, correct only because exactly
 one thread ever touches a given value's refcount. A manually-managed
 value's refcount is *never* touched by either side's automatic
@@ -3668,10 +3673,8 @@ field) is unavailable inside a thread body** — its callback always
 runs on the *main* program's own OS thread, regardless of which thread
 dispatched the request, so a thread handing it a closure over its own
 private state would be a real cross-thread violation. (`exec()` has no
-such hazard any more — claude.md #221 removed its own non-blocking
-`exec(args, callback)` form for exactly this reason, so only the
-always-safe blocking `exec(args)` remains, usable freely from any
-thread body.)
+such hazard: it is the blocking `exec(args)` only, usable freely from
+any thread body.)
 
 ### A thread's own database: `DatabaseURL`
 
@@ -3957,8 +3960,8 @@ all; an ordinary, auto-managed `req:http` is rejected outright, since
 main's own end-of-handler cleanup would still release it out from
 under the thread it was just handed to. **There is no compile-time
 check that main's own code never touches `r` again after handing it
-off** — the same accepted-risk contract `T?` itself already carries
-(claude.md #202): once handed off, the connection belongs entirely to
+off** — the same accepted-risk contract `T?` itself already carries: once
+handed off, the connection belongs entirely to
 the receiving thread, and reading or writing `r` afterward is
 undefined. In exchange, this costs nothing to make safe at the
 value level: a manually-managed value was never auto-retained or
@@ -4292,17 +4295,14 @@ normally from inside either a `try` or a `catch` body, and a caught
 `catch` body can itself `throw` again (a rethrow, or a different error
 entirely) to propagate out to whatever `try` encloses *that*.
 
-**A throw leaks nothing on its way out (0.43, claude.md #236).**
-`throw` unwinds by jumping directly to the catching `try` (not by
-returning normally through every call frame in between), which used to
-mean that a function which merely *called* something that eventually
-threw — no `throw` or `try` of its own — never ran its scope-exit
-cleanup, and its `struct`/`arr`/`map`/`text`/etc. locals leaked. Not
-any more: in a program that contains a `try` anywhere, every managed
-local is registered on a per-thread *cleanup stack* in the runtime as
-it is bound (the same stack `.toStruct()`/`.toArr()` already use for
-their half-built values), and a `throw` releases every entry above the
-catching `try`, newest first — the throwing function's own locals,
+**A throw leaks nothing on its way out.** `throw` unwinds by jumping
+directly to the catching `try`, not by returning normally through every
+call frame in between — so nothing between the two runs its ordinary
+scope-exit cleanup. In a program that contains a `try` anywhere, every
+managed local is instead registered on a per-thread *cleanup stack* in
+the runtime as it is bound (the same stack `.toStruct()`/`.toArr()` use
+for their half-built values), and a `throw` releases every entry above
+the catching `try`, newest first — the throwing function's own locals,
 every intermediate frame's, the argument temporaries each call site on
 the chain was holding for its callee (a literal `[1, 2, 3]`, a template
 text, a call result), and a catch variable of a frame that rethrows.
@@ -4318,14 +4318,13 @@ text, two arrays and a struct and does nothing else (2 million calls:
 0.25 s to 0.33 s), and lost in the noise on anything that does real
 work with them.
 
-That covers the runtime's own frames too (0.44, claude.md #259). A
-`.sort()` comparator is ordinary Festina code and can `throw`; the
-throw jumps past the runtime's sorting frame, which used to strand the
-merge scratch buffer that frame had allocated. It is now released on
-the way out like anything else. The array being sorted is sorted *in
-place*, so after a comparator throws it still holds some permutation of
-its own elements — never freed, never corrupted — and sorts correctly
-if you sort it again. `.forEach()` allocates nothing and never had the
+That covers the runtime's own frames too. A `.sort()` comparator is
+ordinary Festina code and can `throw`; the throw jumps past the
+runtime's sorting frame, and the scratch buffer that frame allocated is
+released on the way out like anything else. The array being sorted is
+sorted *in place*, so after a comparator throws it still holds some
+permutation of its own elements — never freed, never corrupted — and
+sorts correctly if you sort it again. `.forEach()` allocates nothing and never had the
 problem. A `throw` from a timer or an event handler is a different
 case: those fire from the event loop, where no `try` can be live, so
 such a throw ends the program exactly as an uncaught one does.
@@ -4339,9 +4338,7 @@ enclosing try" case above — prints and exits(1) — since that was
 always the fallback for an uncaught throw anyway); what's actually
 unavailable is catching one. Every native target — Linux, macOS and
 Windows — has it: a `try` is a direct call to libc's own `setjmp` and
-a `throw` is libc's `longjmp` (0.43, claude.md #235; earlier versions
-used LLVM's SjLj intrinsics, which have no AArch64 lowering — so macOS
-rejected `try` outright — and a broken x86_64 Windows one).
+a `throw` is libc's `longjmp`.
 
 ## `.toStruct()` / `.toArr()` — parsing JSON
 
@@ -4408,17 +4405,15 @@ supported (raw, un-escaped non-ASCII UTF-8 bytes in a JSON string are
 unaffected and parse completely normally — this only affects a
 producer that specifically chooses to `\u`-escape).
 
-**A parse that fails partway through leaks nothing (claude.md #223,
-redone in #233).** A JSON value that fails to parse *partway through*
-being built — a struct whose third field turns out to be the wrong
-type, having already parsed the first two; an array whose fourth
-element fails, having already collected three; a complete value
-followed by trailing data — used to leak whatever was already built for
-that one call, the same structural class as `throw`'s own
-intermediate-frame limitation above. It no longer does: every generated
-parsing function registers the value it is building (and each JSON key
-it has read but not yet freed) on a per-thread *cleanup stack* in the
-runtime, and the `.toStruct()`/`.toArr()` call site registers its own
+**A parse that fails partway through leaks nothing.** A JSON value can
+fail to parse *partway through* being built — a struct whose third
+field turns out to be the wrong type, having already parsed the first
+two; an array whose fourth element fails, having already collected
+three; a complete value followed by trailing data. Whatever was built
+so far is still reclaimed: every generated parsing function registers
+the value it is building (and each JSON key it has read but not yet
+freed) on a per-thread *cleanup stack* in the runtime, and the
+`.toStruct()`/`.toArr()` call site registers its own
 cursor, the receiver's temporary text and the finished value; a `throw`
 releases every one of them, newest first, on its way to the catching
 `try`. This is plain runtime C — no `setjmp` of its own — which is why
@@ -4434,11 +4429,8 @@ self-referencing struct, malformed syntax, a duplicate `text` key whose
 second value fails, trailing data after a complete value, and
 2000-level nesting — 0 bytes lost and 0 invalid frees
 (`tests/valgrind_stress/json_parse_fail_churn.f`, run by
-`scripts/valgrind_stress.sh`; since 0.43 the same program also runs
-clean under `scripts/leak_stress.sh`'s AddressSanitizer build — the
-Valgrind tier originally existed only because ASan could not
-instrument through the LLVM SjLj intrinsics `try` used to be built on,
-which claude.md #235 replaced with libc's own `setjmp`/`longjmp`).
+`scripts/valgrind_stress.sh`), and the same program runs clean under
+`scripts/leak_stress.sh`'s AddressSanitizer build.
 
 ## Error format
 

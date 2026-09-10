@@ -17,7 +17,7 @@ what's supported on each. What remains open:
   `_GRAPHICS`, `FESTINA_ENABLE_WINDOWS_AUDIO`) until confirmed on real
   hardware. Windows windowing needs no hardware: the CI job opens a
   real Win32 window and drives its mouse, keyboard, resize and close
-  handlers itself (claude.md #238, [windows.md](windows.md)).
+  handlers itself (see [windows.md](windows.md)).
 
 Compiling to `wasm32-wasi` is supported and CI-verified — see
 [wasm.md](wasm.md) — and a compiled `.wasm` runs in a browser tab on
@@ -30,35 +30,25 @@ ships only `builtins` — no sanitizer runtime exists for the target.
 Nothing this project can work around, and nothing it needs to: every
 allocation the native sanitizer runs exercise is the same C source a
 wasm build compiles, whose entire `__wasi__` delta is non-allocating
-stubs (claude.md #263). Nothing open here.
+stubs. Nothing open here.
 
 ## Language & standard library
 
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately: each new
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
-- **Self-hosting-compiler ergonomics, roadmapped alongside `match`
-  (claude.md #252):** `match` and the lex/parse cache (#253) both
-  shipped; the cycle-collector item was measured, not built (#254, see
-  Memory model below). One item left, and reviewing it found its own
-  stated rationale doesn't hold up:
-  - **A raw byte-buffer type** (a generalized, writable `blob`, or a
-    new `bytes` type, with `[i] =` assignment and
-    `text.toBytes()`/`bytes.toText()` conversions at the boundary).
-    Previously cited a claude.md #251 "sketch" as prior art — that
-    sketch does not exist; #251 is entirely about `.length`, unrelated.
-    The one concrete justification ("useful once/if something wants to
-    skip shelling out to clang on textual LLVM IR") is also already
-    true today, independent of any byte-buffer type: `llvm_backend.py`
-    parses the generated IR text in-process via libLLVM's C API
-    whenever it's available, with `clang`/`cc` only a fallback when
-    it's not. And the in-place string-append work (#243) already made
-    building that IR text cheaply mutable as a plain `text`. Left open
-    since a mutable, indexable byte buffer could still be useful on its
-    own merits (binary protocol/data construction) — but not on the
-    self-hosting-compiler premise this bullet used to rest on, and full
-    new-primitive-type surface area (lexer through runtime) is a real
-    cost against a currently-unmotivated feature.
+- **A raw byte-buffer type** — a generalized, writable `blob`, or a
+  new `bytes` type, with `[i] =` assignment and
+  `text.toBytes()`/`bytes.toText()` conversions at the boundary. Open
+  but unmotivated: the case usually made for it is skipping a shell-out
+  to clang on textual LLVM IR, and that is already true without it —
+  `llvm_backend.py` parses the generated IR in-process via libLLVM's C
+  API whenever it is available, with `clang`/`cc` only a fallback, and
+  in-place string append makes building that IR text cheap as a plain
+  `text`. A mutable, indexable byte buffer could still earn its place
+  on its own merits (binary protocol and data construction), but a full
+  new primitive type costs surface area from the lexer through to the
+  runtime, and nothing currently needs one.
 
 ## Memory model
 
@@ -67,18 +57,19 @@ Most managed types (`struct`/`arr[T]`/`map[T]`/`ascii`/`img`/`aud`/
 `regex`/`blob`/`http`/`url`/`socket`/table rows) carry a refcount
 header;
 `text` is the exception — it has no header at all and is instead
-copied on alias and freed outright (claude.md #83, and #256 for why a
-header cannot be added to it). Reference cycles are collected by trial
+copied on alias and freed outright — a live `text` pointer can be a
+heap buffer, a bare `.rodata` literal, a borrowed environ pointer or an
+X11 stack buffer, and a header would have to be valid for all four. Reference cycles are collected by trial
 deletion, with `free`/`delete` as the manual override. What remains
 open:
 
 - **Cycle trials are synchronous and per-release** — every
   still-referenced release of a cycle-capable type walks the value's
   reachable subgraph. Fine for ordinary object graphs (20k dropped
-  21-node *disjoint* cycles in ~34 ms, claude.md #120) — but claude.md
-  #254 measured the case that number never tested, *shared* structure
-  under repeated release-while-live churn, and found a real, cleanly
-  linear cost specifically tied to sharing (not just total node count):
+  21-node *disjoint* cycles in ~34 ms) — but the case that number
+  never tested, *shared* structure under repeated release-while-live
+  churn, measures a real, cleanly linear cost specifically tied to
+  sharing rather than to total node count:
   a shared ring costs ~9-10x a disjoint one at the same total node/
   iteration count, scaling linearly in both ring size and iteration
   count. The classic deferred-root buffer is the known optimization,

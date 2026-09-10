@@ -69,9 +69,8 @@ files (`_wasm_runtime_objects`):
 
 A `.wasm` for a program that never declares a `table` or calls
 `sqlite()` is about **31 KB** (`hello`); one that does is about
-1.1 MB, almost all of it SQLite. Two things made the first number
-possible, both found by measuring a 1.47 MB `hello.wasm`
-(claude.md #242):
+1.1 MB, almost all of it SQLite. Two things keep the first number
+down:
 
 - **SQLite is dead-code eliminated when nothing uses it.** `wasm-ld`
   drops unreferenced functions by default, but the whole ~1 MB of
@@ -217,8 +216,8 @@ gcc/cc fallback native builds have doesn't apply here.
 
 ## In a browser
 
-A browser has no built-in WASI host, so `runtime/wasm/` ships one
-(claude.md #237): `festina_wasi_browser.js`, a dependency-free ES
+A browser has no built-in WASI host, so `runtime/wasm/` ships one:
+`festina_wasi_browser.js`, a dependency-free ES
 module implementing WASI Preview 1 — every import a compiled Festina
 program names — over an in-memory filesystem, with `/` preopened
 exactly as `run_wasi.mjs` preopens a real directory. `browser.html` is
@@ -279,9 +278,9 @@ fail at compile time, before any of the real work
 - **`try`/`catch`/`throw`** — wasi-libc has no setjmp/longjmp at all
   (they need WebAssembly exception handling, which this project's plain
   wasm32-wasi build doesn't use), and a `try` is a direct call to
-  libc's `setjmp` (claude.md #235). `.toStruct()`/`.toArr()` are *not*
-  affected (claude.md #233 — their cleanup is plain runtime C, not a
-  catch frame): they compile and run here, and a parse failure ends
+  libc's `setjmp`. `.toStruct()`/`.toArr()` are *not* affected —
+  their cleanup is plain runtime C, not a catch frame, so they compile
+  and run here, and a parse failure ends
   the program the way any uncaught `throw` does, since there is no
   `try` to catch it.
 
@@ -478,13 +477,10 @@ benchmark.md itself leads with. What the numbers above actually show:
   (pure arithmetic, all three languages converge to the same ~910ms,
   suggesting Node's WASI dispatch overhead — not code quality — is the
   floor on a loop this tight).
-- **Festina's `.wasm` is smaller than C's on these five programs**
-  — since claude.md #242 the vendored SQLite is dead-code eliminated
-  from any program that never touches a database, and the sysroot's
-  debug sections are stripped (see [Binary size](#binary-size) above);
-  before that every Festina binary carried all 1.47 MB of it
-  unconditionally, the way native binaries still statically link
-  libsqlite3. Go's runtime — goroutine scheduler, GC — ships in every
+- **Festina's `.wasm` is smaller than C's on these programs** — the
+  vendored SQLite is dead-code eliminated from any program that never
+  touches a database, and the sysroot's debug sections are stripped
+  (see [Binary size](#binary-size) above). Go's runtime — goroutine scheduler, GC — ships in every
   binary regardless of whether a given program uses any of it.
 - **Where the gap to native comes from.** Against benchmark.md's native
   table, `hello` under wasm is ~50 ms against 1.4 ms — but ~30 ms of
@@ -494,14 +490,11 @@ benchmark.md itself leads with. What the numbers above actually show:
   compute benchmarks the remaining ratio is what V8's wasm tier is
   known for: `loop_sum` 1.5x native, `fib` and `array_sum` about 2x
   (every memory access is bounds-checked, calls are dearer).
-  `string_concat` used to be the outlier at ~5x its native time once
-  startup was subtracted: the benchmark was O(n²) copying — 15,000
-  concatenations of a string growing to 15,000 characters, ~112 MB
-  through `memcpy` — and a wasm `memcpy` is a compiled loop, not the
-  SIMD one glibc has, so the same copies simply cost more. Since
-  claude.md #243 that pattern compiles as an in-place append (see
-  api.md's "Strings"), the copying is gone on every target, and the
-  wasm run sits a few milliseconds above the host's own floor.
+  `string_concat` sits a few milliseconds above the host's own floor:
+  the naive-concatenation pattern it uses compiles as an in-place
+  append (see api.md's "Strings") rather than O(n²) copying, which
+  matters more here than natively — a wasm `memcpy` is a compiled loop,
+  not the SIMD one glibc has, so copies that size would cost more.
   Link-time optimization across the program/runtime boundary was
   measured too and changes none of these by more than noise; the wins
   from it are all size.
