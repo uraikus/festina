@@ -100,6 +100,15 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **Returning a table row no longer crashes.** A function that
+  returned a row read out of its own local query-result array released
+  that array on the way out, freeing the row it was handing back — a
+  use-after-free the caller then read. Such a function now keeps the
+  array alive instead, which leaks it (the same bounded row-array leak
+  [todo.md](todo.md) already describes) rather than corrupting memory.
+  Returning a row from an array the caller passed in, or from a global,
+  was always safe and is unchanged.
+
 - **`.length` off a `blob`/`text`/`ascii` field no longer leaks the
   object it came from.** `make().someBlob.length`, and every shape like
   it — a struct field or a query-row column — kept the whole struct or

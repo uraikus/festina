@@ -3283,6 +3283,24 @@ the fix, 66,000 allocations without, and the shared blob it reads back
 after the loop is what catches the over-release direction.
 `tests/test_codegen.py::TestTextAndBlobLength` pins the answers.
 
+**claude.md #264** (returning a table row): a function returning a row
+read out of its own local query-result array released that array on the
+way out, freeing the row it handed back -- a heap-use-after-free that
+crashed (exit 245), pre-existing and reproduced forty commits back. All
+ten row-escaping shapes were probed individually; only a FUNCTION-LOCAL
+array is released early enough to strand the row, while parameter,
+global and call-result arrays were always safe. Contained by not
+tracking row-owning locals for scope-exit release inside a row-returning
+function -- safe by construction rather than by analysis, since it can
+only ever release less, so the worst case is the bounded row-array leak
+todo.md already carries (measured at 96 bytes, one array, not
+per-iteration). Not a fix: #224's ownership model would copy the row on
+the way out. Pinned by two `TestComputedIndexAndArgumentOwnership` tests
+-- one that the former crashes now return real data, one that the
+parameter and global cases are untouched, so a future tightening cannot
+quietly break them. No stress-suite entry: those programs now leak by
+design, and `scripts/leak_stress.sh` requires clean.
+
 **claude.md #237** (a compiled `.wasm` in a browser): the project's own
 WASI Preview 1 host (`runtime/wasm/festina_wasi_browser.js`) is verified
 by `tests/test_wasm_browser.py` (10 tests) two ways -- under Node via

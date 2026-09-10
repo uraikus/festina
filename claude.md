@@ -5039,3 +5039,50 @@ todo.md carried "AddressSanitizer/LeakSanitizer coverage for the target" as open
 **What was considered and rejected as the alternative.** A crude leak signal IS possible without a sanitizer -- a wasm module's linear memory only grows, so churning a program under a WASI host and watching `memory.size` across iterations would surface an allocator-visible leak. Not worth building: it would be re-testing the same allocator calls the native runs already prove, at far lower resolution (page granularity, no allocation site, no double-free detection at all), for a target whose only unique code allocates nothing.
 
 **Closed rather than carried.** todo.md's Platforms section no longer lists it as open; wasm.md's bullet now states the toolchain finding and the shared-source argument instead of "not investigated". No code changed.
+
+264. RETURNING A TABLE ROW WAS A USE-AFTER-FREE -- NOW A BOUNDED LEAK
+
+Found while sizing what #260 deliberately left open (the shapes where the ROW itself escapes, not a column read off it). Probing all ten of them turned up something worse than the leak that item is about: two of them **crash**.
+
+```
+People func firstOwned() {
+    arr[People] r = sqlite('SELECT * FROM People')
+    return r[0]                       // exit 245
+}
+```
+
+ASan says exactly what it is:
+
+```
+ERROR: AddressSanitizer: heap-use-after-free
+READ of size 8 ... in main
+freed by thread T0 here: ... in firstOwned
+previously allocated by: ... festina_sqlite_collect_rows
+```
+
+The function releases its local array on the way out, the array's cascade frees every row it owns (#85 -- rows have no header, the array owns them outright), and the caller then reads the row it was handed. **Pre-existing, and not from this session**: reproduced identically at `HEAD~40`, forty commits back.
+
+**The full matrix, because "returning a row" is not one thing.** Ten shapes probed individually:
+
+| shape | before |
+|---|---|
+| `return r[0]`, `r` a LOCAL array | **crash** |
+| `People p = r[0]  return p`, `r` a LOCAL array | **crash** |
+| `return xs[0]`, `xs` a PARAMETER array | fine -- the caller owns it |
+| `return gRows[0]`, a GLOBAL array | fine -- outlives everything |
+| `return rows()[0]`, a call-result array | fine -- that array leaks, so the row stays valid |
+| a row bound, passed as an argument, pushed into an array, stored in a struct field or a map value | all fine |
+
+Only a FUNCTION-LOCAL array is released early enough to strand the row it hands back. Everything that "works" today either owns the array elsewhere or leaks it.
+
+**The fix trades corruption for a leak, deliberately, and says so.** Inside a function whose return type is a table row, a local that could own rows is not tracked for scope-exit release at all. It is a one-line gate in `_track_local`, and it is safe by CONSTRUCTION rather than by analysis: it can only ever release LESS, so no amount of being wrong about which array the row came from can produce a dangling pointer -- the worst case is a leak. That leak is the same bounded, already-documented row-array residual todo.md carries for every other borrowed-row shape (measured: 96 bytes, 2 allocations, one array, not per-iteration).
+
+**Only an `arr[Table]` can own rows, and the predicate says why rather than guessing.** A `map[Table]` cannot -- its release gate is `_is_refcounted(value) or value == TEXT`, and a row is neither, so map values are never released. Nor can a struct field of row type. But both own rows INDIRECTLY when they hold an `arr[Table]`, so `_can_own_table_rows` recurses through arrays, map values and struct fields (bounded by a `seen` set, since #17 allows self-referencing structs) rather than checking one level.
+
+**What this is NOT.** It is not #224's ownership model, which would COPY the row on the way out and make the whole family work properly. It is not a compile-time rejection either -- that was considered and needs a real borrow analysis to avoid rejecting the parameter and global cases, which work today and are legitimate. This is the difference between a leak and memory corruption, nothing more, and todo.md now says so under the same bullet #224 already owns.
+
+**One self-inflicted mistake worth recording.** The first attempt inserted the new method immediately after the line it was guarding, which ORPHANED `_track_local`'s remaining two lines -- the cleanup-stack push -- into the new method's body, after its `return`. Every `festina_cleanup_push` in every program vanished. Caught immediately by three tests, one of which (`test_a_program_with_try_registers_every_tracked_local`) exists precisely to count those pushes and reported `[]` against an expected 6. A reminder that inserting a method inside another one's body is a silent, valid-Python way to delete code.
+
+**Verified.** All ten shapes give the right answer and exit 0. Under ASan, the two former crashes now report a bounded leak and nothing else; the parameter and global cases stay completely clean, which is the check that says the gate did not overreach. Two pytest tests, one per direction. No stress-suite entry: this program leaks BY DESIGN now, and `scripts/leak_stress.sh` requires clean.
+
+**Full suite:** `python3 -m pytest tests -q`: **2407 passed, 14 skipped, 0 failed** in 549.75s (9:09); `scripts/leak_stress.sh`: all 32 programs clean.

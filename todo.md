@@ -93,7 +93,11 @@ open:
   stress verification of the deferred-free "zombie" path specifically.
 - **A table row bound off a call-result array leaks the array**
   (`People p = rows()[0]`, a row passed as an argument, or one
-  returned). Reading a COLUMN off such a row — `rows()[0].name`, the
+  returned). Returning one used to be worse than a leak — a
+  use-after-free that crashed, when the row borrowed from the
+  function's own local array — and claude.md #264 made it a bounded
+  leak instead by not releasing row-owning locals inside a
+  row-returning function. That is a containment, not the fix. Reading a COLUMN off such a row — `rows()[0].name`, the
   shape this was originally reported as — is fixed (claude.md #260):
   the array is parked on the enclosing member chain and released once
   the column that escapes has been copied. What is left is the shapes

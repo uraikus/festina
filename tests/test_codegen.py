@@ -8148,6 +8148,61 @@ class TestComputedIndexAndArgumentOwnership:
         assert result.returncode == 0
         assert result.stdout == "ada grace 2\ntrue\ngrace!\n"
 
+    def test_returning_a_row_borrowed_from_a_local_array_does_not_crash(
+            self, compile_and_run, tmp_path):
+        # claude.md #264: BOTH of these used to be a use-after-free that
+        # crashed (exit 245, confirmed under ASan as a
+        # heap-use-after-free): the function released its local array on
+        # the way out, freeing the very row it was handing back. The
+        # array is now left alive instead -- a bounded leak, the same
+        # one todo.md already carries for every other borrowed-row
+        # shape, and unambiguously better than corruption. What this
+        # pins is that the caller reads real data.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'ada'])
+        People func direct() {{
+            arr[People] r = sqlite('SELECT * FROM People')
+            return r[0]
+        }}
+        People func viaLocalRow() {{
+            arr[People] r = sqlite('SELECT * FROM People')
+            People p = r[0]
+            return p
+        }}
+        log(direct().name)
+        log(viaLocalRow().id)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ada\n1\n"
+
+    def test_returning_a_row_borrowed_from_a_parameter_or_global_is_unaffected(
+            self, compile_and_run, tmp_path):
+        # claude.md #264's opt-out is keyed on the FUNCTION's return
+        # type, not on which array a row came from, so these two -- an
+        # array the caller owns, and one that lives until exit -- were
+        # always safe and stay exactly as they were. They are here so a
+        # future tightening of that rule cannot quietly start rejecting
+        # or mismanaging them.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'ada'])
+        arr[People] gRows = sqlite('SELECT * FROM People')
+        People func fromParam(xs:arr[People]) {{ return xs[0] }}
+        People func fromGlobal() {{ return gRows[0] }}
+        arr[People] held = sqlite('SELECT * FROM People')
+        log(fromParam(held).name)
+        log(fromGlobal().name)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ada\nada\n"
+
     def test_a_row_bound_to_a_name_still_borrows_from_its_array(
             self, compile_and_run, tmp_path):
         # claude.md #260 deliberately changed nothing here: with the

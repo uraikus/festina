@@ -939,6 +939,8 @@ class _StackArrayOrMap:
         self.type_ = type_
 
 
+
+
 class CodeGen:
     def __init__(self, analyzed, filename="main.f", target="native", host_platform=None):
         self.analyzed = analyzed
@@ -1324,6 +1326,11 @@ class CodeGen:
                                                 # "instance-level stack, not threaded through ctx" shape as
                                                 # _loop_targets, for the same reason: it needs to keep
                                                 # working correctly through arbitrary nesting depth.
+        # claude.md #264: is the function currently being emitted one
+        # whose return type is a table ROW? A row is a borrow into an
+        # array that owns it, so such a function must not release a
+        # local that could free rows -- see _track_local.
+        self._current_func_returns_row = False
         self._current_func_frame_base = 0      # claude.md #140: the self._active_free_locals index of
                                                 # the OUTERMOST frame belonging to the function/handler
                                                 # currently being emitted -- normally 0, since
@@ -2671,10 +2678,73 @@ class CodeGen:
         at binding time -- a local reassigned before the throw releases
         what it holds THEN (the ordinary scope-exit semantics), and one
         nulled by `free` releases nothing (every release is null-safe,
-        see _emit_free)."""
+        see _emit_free).
+
+        claude.md #264: one deliberate exception. A table ROW is a
+        borrowed handle into an array that owns it outright (#85 -- a
+        row has no refcount header of its own), so a function that
+        RETURNS a row hands its caller a pointer into some array. If
+        that array is this function's own local, releasing it here
+        frees the row the caller is about to read: a use-after-free,
+        crashing before this. So inside a row-returning function, a
+        local that could own rows is not tracked at all -- it leaks
+        instead. Strictly safer, because it can only ever release LESS,
+        and the leak is the same bounded, already-documented row-array
+        residual todo.md carries for the other borrowed-row shapes. The
+        real fix is #224's ownership model, which would COPY the row on
+        the way out instead; until then this is the difference between
+        a leak and memory corruption."""
+        if self._current_func_returns_row and self._can_own_table_rows(type_):
+            return
         self._active_free_locals[-1].append((ref, type_))
         if self.program_has_try:
             lines.append(f"  call void @festina_cleanup_push(ptr {ref}, ptr {self._unwind_fn_for(type_)})")
+
+    def _can_own_table_rows(self, type_, seen=None):
+        """claude.md #264: could releasing a local of this type FREE a
+        table row?
+
+        Only an `arr[Table]` ever owns rows outright -- that is the one
+        release path that cascades into _emit_table_row_release_fn (see
+        _release_fn_for_array). A `map[Table]` does not: its own gate is
+        `_is_refcounted(value) or value == TEXT`, and a row is neither,
+        so a map's values are never released. Nor does a struct field of
+        row type. But both can own rows INDIRECTLY, by holding an
+        `arr[Table]` -- `map[arr[People]]` releases each value through
+        the array wrapper, and a struct's cascade releases its array
+        field the same way -- so this recurses rather than checking one
+        level.
+
+        Answers for the wrapper kinds _active_free_locals actually
+        stores, not just bare types: a stack arr/map and a stack struct
+        with struct fields both arrive wrapped, and a _TryFrameMarker is
+        not a local at all. Struct recursion is bounded by `seen`, since
+        claude.md #17 allows a struct to reference its own type.
+
+        Conservative in the LEAKING direction on purpose: the only
+        caller uses this to decide NOT to release something, so a false
+        positive costs a bounded leak inside one row-returning function
+        while a false negative is the use-after-free it exists to
+        prevent."""
+        if seen is None:
+            seen = set()
+        if isinstance(type_, _StackArrayOrMap):
+            return self._can_own_table_rows(type_.type_, seen)
+        if isinstance(type_, _StackStructFieldsOnly):
+            return self._can_own_table_rows(type_.struct_type, seen)
+        if isinstance(type_, types_mod.ArrayType):
+            if isinstance(type_.element, types_mod.TableType):
+                return True
+            return self._can_own_table_rows(type_.element, seen)
+        if isinstance(type_, types_mod.MapType):
+            return self._can_own_table_rows(type_.value, seen)
+        if isinstance(type_, types_mod.StructType):
+            if type_.name in seen:
+                return False
+            seen.add(type_.name)
+            return any(self._can_own_table_rows(f, seen)
+                       for f in self.structs.get(type_.name, {}).values())
+        return False
 
     def _guard_call_arg_temps(self, arg_temps, lines):
         """claude.md #236: the call-site half of throw unwinding. A
@@ -3155,6 +3225,11 @@ class CodeGen:
         # function's still-live locals, not just its own empty frame).
         saved_func_frame_base = self._current_func_frame_base
         self._current_func_frame_base = len(self._active_free_locals)
+        # claude.md #264: see _track_local. Saved/restored around the
+        # body for the same reason the frame base is -- a nested
+        # FuncDecl must answer for ITSELF, not for whatever encloses it.
+        saved_returns_row = self._current_func_returns_row
+        self._current_func_returns_row = isinstance(return_type, types_mod.TableType)
         self._active_free_locals.append([])
         escaping = self._emit_param_bindings(decl, param_types, body_env, body_lines)
 
@@ -3189,6 +3264,7 @@ class CodeGen:
                 block["lines"].append(f"  ret {_llvm_type(return_type)} {self._zero_value(return_type)}")
         self._active_free_locals.pop()
         self._current_func_frame_base = saved_func_frame_base
+        self._current_func_returns_row = saved_returns_row
 
         func = [f"define {llvm_ret} {symbol}({params_ir}) {{"]
         func.extend(block["lines"])
