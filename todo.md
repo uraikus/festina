@@ -103,24 +103,6 @@ open:
   same "always owned once bound, always released at scope exit"
   symmetry `text` itself needed six dedicated, individually-verified
   rounds to get right (claude.md #11-16).
-- **`X().someBlob.length` leaks the object the blob came from**, and
-  the obvious one-line fix would make it a double free. The `.length`
-  branch drains its parked member chain only for an *array* receiver
-  and drops it for `blob`/`text`/`ascii` ones (measured: 201
-  allocations over 200 iterations). The drop is currently masking an
-  over-release in the other direction:
-  `_is_owning_refcounted_source(X().someBlob)` answers True — a chain
-  whose base is a `Call` — while the inner `_emit_member_load` link
-  never actually minted anything, so `_release_owned_receiver` releases
-  a blob it does not own, and gets away with it only because the leaked
-  object's cascade never runs to release it a second time. Draining the
-  parked entry without also fixing that predicate mismatch converts the
-  leak into a use-after-free. The real fix is to route those branches
-  through `_release_member_chain` (whose own filter excludes
-  never-minted intermediate links by construction) — but `text` and
-  `ascii` receivers are not in that filter's refcounted family at all,
-  so each needs its own treatment. Found while closing #260; a
-  predicate-alignment round of its own, not a patch.
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.

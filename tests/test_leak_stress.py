@@ -671,6 +671,18 @@ class TestLeakStress:
             # ASan, not LeakSanitizer alone. Verified to FAIL without
             # the fix.
             "row_chain_churn.f",
+            # claude.md #262: `.length` off a member chain whose
+            # receiver is NOT an array -- a blob/text/ascii field of a
+            # call-result struct. Those three cases dropped the chain's
+            # parked bases entirely, leaking the whole object the field
+            # came from. A use-after-free test first and a leak test
+            # second: the drop was masking an over-release of the field
+            # itself, so draining without removing that release is a
+            # heap-use-after-free (confirmed under ASan before the fix
+            # was written). The shared blob read back after the loop is
+            # what catches that direction. Verified to FAIL without the
+            # fix (66,000 allocations).
+            "chain_length_churn.f",
             # claude.md #245: pool.postMessage(x) with no index --
             # main plus 3 feeder threads all auto-selecting against the
             # SAME handles array and round-robin counter at once, 12,000

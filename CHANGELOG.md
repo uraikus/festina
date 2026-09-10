@@ -100,6 +100,12 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **`.length` off a `blob`/`text`/`ascii` field no longer leaks the
+  object it came from.** `make().someBlob.length`, and every shape like
+  it — a struct field or a query-row column — kept the whole struct or
+  row alive. Only the `arr[T]` case ever released it. Answers are
+  unchanged everywhere; only what gets reclaimed afterwards changed.
+
 - **Reading a column off a query row taken straight from a call
   result no longer leaks the array.** `rows()[0].name` — where
   `rows()` returns a query result never bound to a name — kept the

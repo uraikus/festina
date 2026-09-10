@@ -3229,7 +3229,7 @@ call site's owning argument temporaries are registered on the
 runtime's cleanup stack, and `festina_throw` releases everything above
 the catching frame. Leak-freedom is measured by
 `tests/stress/throw_unwind_churn.f` under ASan (`scripts/leak_stress.sh`,
-31 programs now) and Valgrind -- every kind of local through three
+32 programs now) and Valgrind -- every kind of local through three
 frames, a rethrow, a JSON failure two frames down, 400 balanced
 non-throwing calls; behaviour and IR shape by `tests/test_try_catch.py::
 TestThrowUnwindsIntermediateFrames` (8 tests, including that a program
@@ -3269,6 +3269,19 @@ plus the name-bound control. Behaviour by
 tests, one of which reads several columns off several such arrays and
 prints them all afterwards, so a use-after-free shows up as wrong output
 and not only as a sanitizer report.
+
+**claude.md #262** (`.length` off a non-array member chain): the
+`blob`/`text`/`ascii` cases dropped the chain's parked bases where the
+`arr[T]` case drained them, leaking the struct or row the field came
+from. The drop was masking an over-release of the field itself, so a
+naive drain is a heap-use-after-free -- confirmed under ASan before the
+fix. Fixed by discriminating on whether a base was parked at all (a
+parked base means the direct receiver is an alias into it) and sharing
+one owning-receiver filter, `_owning_chain_receivers`, across every
+drain site. Measured by `tests/stress/chain_length_churn.f`: clean with
+the fix, 66,000 allocations without, and the shared blob it reads back
+after the loop is what catches the over-release direction.
+`tests/test_codegen.py::TestTextAndBlobLength` pins the answers.
 
 **claude.md #237** (a compiled `.wasm` in a browser): the project's own
 WASI Preview 1 host (`runtime/wasm/festina_wasi_browser.js`) is verified

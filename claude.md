@@ -5001,3 +5001,29 @@ The test connected to the server, signalled SIGTERM, then sent the request. But 
 **Quantified rather than argued.** The same scenario, 20 runs each, under deliberate CPU load (one spinning process per core): the old shape failed 2 of 20, the new one 0 of 20.
 
 **The fix makes the test stricter, not looser.** It now sends a PARTIAL request before the signal and completes it after, so the connection is genuinely mid-request when shutdown is triggered -- which is the state the grace period actually exists for, and a stronger property than "a socket sitting in a backlog gets served". It also removes the race by construction: the server has readable data waiting, so its poll() wakes and accepts immediately, and the sleep that follows gives that accept room before the signal lands. Recorded because "rerun until green" would have left a real 10%-under-load race in the suite and taught nothing.
+
+262. `.length` OFF A NON-ARRAY MEMBER CHAIN -- A LEAK THAT WAS MASKING A USE-AFTER-FREE
+
+Found while closing #260, recorded in todo.md rather than patched at the end of that session, and fixed here on its own.
+
+**The leak.** `.length` has participated in the member chain since #108, but only its `arr[T]` case ever DRAINED the chain -- the `blob`, `text` and `ascii` cases dropped the parked bases on the floor. #251's own comment states the reasoning it did so on: *"blob has no further sub-fields to chain through (no `make().someBlob.length` shape exists the way `make().inner.items.length` does for arr[T])"*. Any struct with a blob, text or ascii field is that shape, and so is any table row with such a column. Measured on the unmodified compiler: **201 allocations over 200 iterations** of `mk().b.length`.
+
+**The trap, and why this got its own round rather than a one-line drain.** The drop was MASKING an over-release in the other direction. `_release_owned_receiver`, which those branches called instead, tests `_is_owning_refcounted_source` -- which answers True for `mk().b` (a chain whose base is a `Call`) even though the inner `_emit_member_load` link was NESTED and therefore never minted anything. So it released a field the expression did not own, and got away with it purely because the leaked struct's cascade never ran to release it a second time. Two bugs cancelling.
+
+**Confirmed, not inferred.** Draining the chain while leaving that release in place, then running the probe:
+
+```
+ERROR: AddressSanitizer: heap-use-after-free
+SUMMARY: heap-use-after-free festina_runtime.c:4584 in festina_release_check
+```
+
+Exactly the prediction todo.md recorded. Worth writing down that the prediction was tested: it would have been just as easy to state it and move on, and the whole point of the note was that the naive fix is dangerous.
+
+**The fix is a discriminator, not a new predicate.** A non-empty `pending` can only happen when an inner `_emit_member_load` frame ran, which can only happen when the direct receiver is itself a `Member` -- an alias INTO the parked graph, freed by that graph's own cascade. So:
+
+- `pending` non-empty: release only the parked owning bases, through the same `isinstance(e, ast.Call) or id(e) in _minted_values` filter `_release_member_chain` has always used (now shared as `_owning_chain_receivers`, so no drain site can reach for a different rule again). The direct receiver is not released at all.
+- `pending` empty: the existing single-receiver release, unchanged -- which is what keeps `getBlob().length` and, importantly, `(cond ? a : b).length` working. A Ternary is "owning" to `_is_owning_refcounted_source` (#173 normalizes whichever branch ran into a real +1) but is NOT in the chain filter, so routing everything through `_release_member_chain` would have quietly leaked it. That near-miss is why the fix discriminates instead of unifying.
+
+**Verified.** `tests/stress/chain_length_churn.f`, 2,000 iterations of one-link and two-link chains across all four field types, plus the no-chain owning and borrowed receivers. ASan-clean; **1,580,000 bytes in 66,000 allocations without the fix**. The struct field is a SHARED blob read back after the loop, deliberately, so the over-release direction shows up as a use-after-free rather than as nothing. One pytest test pins the answers for all six shapes plus that read-back. Answers are byte-identical to the old build across every shape -- only the ownership traffic changed.
+
+**Full suite:** `python3 -m pytest tests -q`: **2405 passed, 14 skipped, 0 failed** in 548.12s (9:08); `scripts/leak_stress.sh`: all 32 programs clean.

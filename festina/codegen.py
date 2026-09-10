@@ -6279,6 +6279,15 @@ class CodeGen:
                 # _free_text_temp is the same direct-free helper
                 # charCodeAt's own receiver already uses (claude.md
                 # #249) for exactly this reason.
+                # claude.md #262: each of the three branches below ends
+                # the same way -- `pending` is the chain's parked owning
+                # bases, and dropping it (which all three used to do) is
+                # a leak. When there IS a parked base the direct
+                # receiver is necessarily a Member, an alias INTO that
+                # base's graph, so only the base may be released;
+                # releasing the alias too is a double free, which is
+                # exactly what the per-receiver helpers below would do
+                # if left in place. See _release_chain_bases.
                 if obj_type == ASCII:
                     # claude.md #256: the length is already sitting in
                     # the value's own header at payload-16 -- a load,
@@ -6288,27 +6297,35 @@ class CodeGen:
                     out = self.tmp()
                     lines.append(f"  {len_ptr} = getelementptr i8, ptr {obj_val}, i64 -16")
                     lines.append(f"  {out} = load i64, ptr {len_ptr}")
-                    self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+                    if pending:
+                        self._release_chain_bases(pending, lines)
+                    else:
+                        self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
                     return out, INT
                 if obj_type == TEXT:
                     out = self.tmp()
                     lines.append(f"  {out} = call i64 @festina_text_length(ptr {obj_val})")
-                    self._free_text_temp(expr.obj, obj_val, obj_type, lines)
+                    if pending:
+                        self._release_chain_bases(pending, lines)
+                    else:
+                        self._free_text_temp(expr.obj, obj_val, obj_type, lines)
                     return out, INT
                 # claude.md #251: blob.length -- blob IS refcounted
-                # (claude.md #109), but this follows img.width/height's
-                # own simpler _release_owned_receiver pattern just
-                # above in this file rather than the chain machinery:
-                # blob has no further sub-fields to chain through (no
+                # (claude.md #109). This used to reason that the chain
+                # machinery was unnecessary here because "no
                 # `make().someBlob.length` shape exists the way
-                # `make().inner.items.length` does for arr[T]), so the
-                # single-receiver release _release_owned_receiver
-                # already gives is exactly as correct and matches every
-                # other blob method's own receiver-release call site.
+                # `make().inner.items.length` does for arr[T]".
+                # claude.md #262: it does -- any struct with a blob
+                # field, or a table row with a blob column -- and the
+                # single-receiver release left the whole object behind
+                # (measured: 201 allocations over 200 iterations).
                 if obj_type == BLOB:
                     out = self.tmp()
                     lines.append(f"  {out} = call i64 @festina_blob_length(ptr {obj_val})")
-                    self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+                    if pending:
+                        self._release_chain_bases(pending, lines)
+                    else:
+                        self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
                     return out, INT
             if expr.computed:
                 # claude.md #26/#72: arr[i] / map[key] -- expr.obj is
@@ -8488,11 +8505,7 @@ class CodeGen:
         Call-base walk, which computed bases made insufficient.
         Returns the (possibly replaced) result value."""
         receivers = list(pending) + [(obj_expr, obj_val, obj_type)]
-        call_receivers = [
-            (e, v, t) for e, v, t in receivers
-            if (isinstance(e, ast.Call) or id(e) in self._minted_values)
-            and _is_refcounted(t)
-        ]
+        call_receivers = self._owning_chain_receivers(receivers)
         if not call_receivers:
             return out
         if out is not None and _is_refcounted(ftype):
@@ -8508,6 +8521,46 @@ class CodeGen:
         for _, v, t in call_receivers:
             lines.append(f"  call void {self._release_fn_for(t)}(ptr {v})")
         return out
+
+    def _owning_chain_receivers(self, receivers):
+        """The subset of a member chain's receivers that this expression
+        actually owns a reference to, and so may release.
+
+        A receiver qualifies only if its emission MINTED ownership -- a
+        Call's fresh result, or (claude.md #119) anything recorded in
+        _minted_values. An intermediate link's value (`.inner` in
+        `make().inner.n`) is an alias INTO the base call's graph,
+        reached exactly once by that base's own release cascade, so
+        releasing it directly too would double-free. That exclusion is
+        the whole point of the filter, and it is why every drain site
+        must go through here rather than testing ownership its own way.
+
+        Split out by claude.md #262 so the .length branches can share
+        it: they used to drop their parked chain entirely for a non-
+        array receiver, and reaching for a per-receiver predicate
+        instead of this one is exactly how that hole turned into a
+        double free."""
+        return [
+            (e, v, t) for e, v, t in receivers
+            if (isinstance(e, ast.Call) or id(e) in self._minted_values)
+            and _is_refcounted(t)
+        ]
+
+    def _release_chain_bases(self, pending, lines):
+        """claude.md #262: releases the OWNING bases a member chain
+        parked, and nothing else -- for the `.length` branches, whose
+        receiver type (`blob`/`text`/`ascii`) is not the one whose value
+        escapes, so there is nothing to mint and _release_member_chain's
+        full retain-then-release dance does not apply.
+
+        Deliberately does NOT include the direct receiver. A non-empty
+        `pending` means an inner _emit_member_load frame ran, which can
+        only happen when the direct receiver is itself a Member -- an
+        alias into the parked graph, freed by that graph's own cascade.
+        Releasing it here as well is the double free this exists to
+        avoid."""
+        for _, v, t in self._owning_chain_receivers(pending):
+            lines.append(f"  call void {self._release_fn_for(t)}(ptr {v})")
 
     def _mint_and_release_computed(self, expr, out, obj_val, obj_type,
                                    elem_type, lines):

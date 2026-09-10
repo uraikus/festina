@@ -16818,6 +16818,49 @@ class TestTextAndBlobLength:
         assert result.returncode == 0
         assert result.stdout == "5\n"
 
+    def test_length_off_a_field_of_a_call_result(self, compile_and_run, tmp_path):
+        # claude.md #262: `make().someBlob.length` and its text/ascii
+        # siblings. The `.length` branch used to drain its member chain
+        # only for an ARRAY receiver and drop it for these three, which
+        # leaked the whole struct the field came from. Fixing that
+        # required removing the per-receiver release that was ALSO
+        # running -- it released a field the expression never owned, and
+        # only escaped notice because the leaked struct's cascade never
+        # ran a second time. So this reads the shared blob back
+        # afterwards: an over-release shows up there as a
+        # use-after-free, not as a leak.
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        source = f"""
+        struct Inner {{ b:blob  t:text  a:ascii  xs:arr[int] }}
+        struct Outer {{ inner:Inner  label:text }}
+        blob shared = '{path}'
+        Inner func mkInner() {{
+            Inner x
+            x.b = shared
+            x.t = 'hello there'
+            x.a = 'abcd'
+            x.xs = [1, 2, 3]
+            return x
+        }}
+        Outer func mkOuter() {{
+            Outer o
+            o.inner = mkInner()
+            o.label = 'outer'
+            return o
+        }}
+        log(mkInner().b.length)
+        log(mkInner().t.length)
+        log(mkInner().a.length)
+        log(mkInner().xs.length)
+        log(mkOuter().inner.b.length)
+        log(mkOuter().label.length)
+        log(shared.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "5\n11\n4\n3\n5\n5\n5\n"
+
     def test_blob_length_is_not_settable(self, parser, semantic, errors):
         program = parser.parse("blob b = 'x.txt'\nb.length = 5")
         with pytest.raises(errors.CompileError):
