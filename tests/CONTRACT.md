@@ -3229,7 +3229,7 @@ call site's owning argument temporaries are registered on the
 runtime's cleanup stack, and `festina_throw` releases everything above
 the catching frame. Leak-freedom is measured by
 `tests/stress/throw_unwind_churn.f` under ASan (`scripts/leak_stress.sh`,
-33 programs now) and Valgrind -- every kind of local through three
+34 programs now) and Valgrind -- every kind of local through three
 frames, a rethrow, a JSON failure two frames down, 400 balanced
 non-throwing calls; behaviour and IR shape by `tests/test_try_catch.py::
 TestThrowUnwindsIntermediateFrames` (8 tests, including that a program
@@ -3321,6 +3321,25 @@ binding) re-verified byte-for-byte against the old build. The
 `table_rows` per-type isolation program caught the one real bug on the
 way -- an un-widened VarDecl branch skipping the retain -- and named the
 type in the failure, which is exactly what those programs are for.
+
+**claude.md #266** (lexer errors): `imports.py` tokenizes a file before
+the parser does, so the parser's SyntaxError-to-CompileError wrapper was
+unreachable for every lexer error -- a stray character printed a Python
+traceback. The lexer raises a real CompileError with its own line and
+column now, with hints for an unterminated string and for `$` outside a
+template. Pinned by `tests/test_errors.py`'s own diagnostic-shape tests.
+
+**claude.md #267** (a JSON-parsed enum member): the from-JSON builder
+was the one construction site that did not write the self-tag claude.md
+#176 gives an enum member's widened header, so a successful parse
+produced a struct that crashed when used as its enum and a failing one
+freed the half-built value at `payload-16` of an allocation reaching
+only `payload-8`. Measured by `tests/stress/enum_json_churn.f` over 500
+iterations alternating good and bad input, each parsed value used AS its
+enum: ASan-clean, heap-buffer-overflow without the fix. Behaviour by two
+`TestEnums` tests, one per direction. Found by combining features whose
+own suites never meet -- the enum tests never parse JSON, the JSON tests
+never declare an enum.
 
 **claude.md #237** (a compiled `.wasm` in a browser): the project's own
 WASI Preview 1 host (`runtime/wasm/festina_wasi_browser.js`) is verified

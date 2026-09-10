@@ -14,10 +14,21 @@ from . import parser as parser_mod
 from .errors import CompileError, CircularImportError
 
 
-def _scan_import_paths(source):
+def _scan_import_paths(source, filename="<string>"):
     """Return the raw import path strings a file's `import` statements
-    reference, in source order."""
-    tokens = lexer_mod.tokenize(source)
+    reference, in source order.
+
+    claude.md #266: `filename` is passed through so a lex error names
+    the real path. This scan runs BEFORE the parser ever sees the file,
+    so it is the first thing an unlexable source reaches -- the lexer
+    raises a real CompileError now, and the SyntaxError arm below stays
+    only as a backstop for anything else that might raise one."""
+    try:
+        tokens = lexer_mod.tokenize(source, filename=filename)
+    except CompileError:
+        raise
+    except SyntaxError as e:
+        raise CompileError(str(e), file=filename, category="invalid syntax") from e
     paths = []
     i = 0
     while i < len(tokens):
@@ -54,7 +65,7 @@ def resolve_imports(entry_path):
         in_progress.append(path)
         source = open(path, encoding="utf-8").read()
         from_dir = os.path.dirname(path)
-        for raw in _scan_import_paths(source):
+        for raw in _scan_import_paths(source, filename=path):
             dep = raw if os.path.isabs(raw) else os.path.join(from_dir, raw)
             dep = os.path.realpath(dep)
             visit(dep)

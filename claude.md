@@ -5137,3 +5137,55 @@ Net: the change ADDS a header and REMOVES three special cases, two of them writt
 **todo.md loses the whole bullet.** The Memory model section's remaining open item is the cycle-collector deferred-root buffer.
 
 **Full suite:** `python3 -m pytest tests -q`: **2408 passed, 14 skipped, 0 failed** in 541.28s (9:01); `scripts/leak_stress.sh`: all 33 programs clean.
+
+266. EVERY LEXER ERROR WAS A PYTHON TRACEBACK
+
+Found by a probe whose only purpose was to check nested template literals. The nesting turned out not to matter -- what surfaced was that `festina run` on a source with ANY unexpected character printed a twenty-line Python stack trace ending in `SyntaxError: <string>:1:11: unexpected character '$'`, instead of the `file:line:col: error: ...` diagnostic every other compile error produces.
+
+**Why it escaped.** `parser.parse` has always wrapped a lexer `SyntaxError` into a `CompileError`. But `imports.py`'s `_scan_import_paths` tokenizes the file FIRST, to find its `import` statements, before the parser ever sees it -- and it called `lexer_mod.tokenize(source)` bare, with no wrapping and no filename. So the parser's guard was unreachable for the one thing it was guarding.
+
+**Every unexpected character reached it**, not some rare corner: a stray `@`, a `$` outside a template, and -- the one a beginner is most likely to hit -- an unterminated string, since the lexer's string patterns only match a CLOSED string and an unpartnered quote therefore never matches at all.
+
+**Fixed at the source rather than at the caller.** The lexer raises a real `CompileError` with this file's own line and column, so both callers get it right and neither has to remember to wrap. Two hints were added where the raw "unexpected character" is technically true and useless: an unterminated string names itself, and a `$` outside a template says where `${...}` actually works. `imports.py` passes the real path through (it was reporting `<string>`) and keeps a `SyntaxError` arm as a backstop.
+
+One wrong turn worth recording: the first version of the quote hint said Festina strings use single quotes. They do not -- `"double"` works too, and the probe that suggested otherwise had simply left its string unterminated. Checked before shipping the hint, which is the only reason it says the right thing now.
+
+267. A JSON-PARSED STRUCT WAS NOT A VALID MEMBER OF ITS OWN ENUM
+
+The best find of the hunt, and it took a delta-debugger to isolate: a probe combining enums, first-class functions, regexes and try/catch aborted with `free(): invalid pointer`, while every one of those parts passed on its own. Reducing it section by section left a program whose crashing part did not crash in isolation -- the difference turned out to be a declaration that was never used.
+
+**The minimal case is four lines.**
+
+```
+struct A { x:int  s:text }
+struct B { y:text }
+enum E = A, B          // never used below -- but it changes A's layout
+try { A p = 'not json'.toStruct(A) } catch (e:text) { log('caught') }
+```
+
+claude.md #176 widens the header of a struct that is a member of a pure-struct enum, from `{refcount}` to `{tag, refcount}`, so the payload starts at `base+16` and the tag sits at `payload-16`. Every construction site passes the tag -- the clone path, the VarDecl path. The from-JSON builder did not, and it was the only one.
+
+**Both directions were broken by the one omission**, which is what makes it worth more than a leak:
+
+- a **successful** parse produced an untagged struct. Reading its fields worked, so it looked fine; using it as its enum read a tag that was never written. Exit 245.
+- a **failing** parse released the half-built value -- correctly registered on #233's cleanup stack -- through the TAGGED release function, which frees `payload - 16` of an allocation that only reached `payload - 8`. ASan: *attempting free on address which was not malloc()-ed*.
+
+`.toStruct(T)` was, in other words, the one way to build a T that was not a valid E.
+
+**The fix is one line**: pass `type_tag` to `_emit_fresh_heap_header`, exactly as the other two sites do. `.toArr(T)` shares the same per-struct function and was fixed by the same line.
+
+**Verified.** `tests/stress/enum_json_churn.f`, 500 iterations alternating good and bad input so both paths run every time, using each parsed value AS its enum so a missing tag cannot pass unnoticed -- ASan-clean, and a heap-buffer-overflow without the fix. Two pytest tests, one per direction.
+
+**What this says about the hunt.** Both of tonight's finds came from combining features that are individually well-tested, not from any single feature's own coverage. The enum tests never parse JSON; the JSON tests never declare an enum. Neither suite was wrong; the interaction simply had no owner.
+
+268. OPTIMIZATION CHECK: THREE CANDIDATES MEASURED, NONE WORTH TAKING
+
+Asked for an optimization pass alongside the bug hunt. Three candidates, each measured rather than argued, and the honest result is that none of them earns a change.
+
+**`s[i]` on an `ascii` is still a runtime call** (#258 inlined `charCodeAt` but deliberately not this). Measured over ~418,000 characters: 3.6 ms against 2.2 ms for the same scan through `charCodeAt` -- about 3.3 ns per character. Real, but inlining it means hard-coding the 128-entry singleton table's C struct layout into emitted IR, which is the ABI coupling #258 declined for a gap this size. Unchanged, now with a number attached.
+
+**A top-level variable is an external-linkage global**, which looked like it should stop LLVM promoting it to a register in a hot loop -- `loop_sum`, the one benchmark where Festina trails Go. Tested directly by hand-editing `@total` to `internal` and rebuilding: **499.7 ms against 496.9 ms**, 0.5%, reproduced twice. LLVM already promotes it; the linkage is not the cost. The gap to Go is Go's own code generation, and Festina is at parity with Rust here (497 ms against Rust's 501 ms in the same run).
+
+**The divide-by-zero guard is emitted even for a literal non-zero divisor** -- `icmp eq i64 1000000007, 0` and three basic blocks around it, in every `/` and `%`. LLVM folds it before it reaches the back end, so the runtime cost is zero; folding it in codegen would shrink emitted IR and shave compile time only. Recorded, not done: it optimizes the compiler's output size rather than the compiled program.
+
+A measurement that says "leave it alone" is worth the same as one that says "change it", provided it was actually taken.

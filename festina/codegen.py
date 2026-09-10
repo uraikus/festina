@@ -7168,7 +7168,20 @@ class CodeGen:
 
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         struct_ty = self.struct_llvm_name(struct_type.name)
-        out = self._emit_fresh_heap_header(struct_ty, body)
+        # claude.md #267: the type tag, when this struct is a member of
+        # a pure-struct enum. Every other construction site passes it
+        # (the clone path, the VarDecl path); this one did not, which
+        # made `.toStruct(A)` the one way to build an A that was NOT a
+        # valid E. Both directions were broken by it: a SUCCESSFUL parse
+        # produced an untagged struct that crashed the moment it was
+        # used as its enum, and a FAILING one had its half-built value
+        # released through the tagged release function, which frees
+        # `payload - 16` where the untagged allocation only reached
+        # `payload - 8` -- an invalid free, caught by ASan as "attempting
+        # free on address which was not malloc()-ed".
+        type_tag = (self._enum_tag_const(struct_type)
+                    if struct_type.name in self._tagged_structs else None)
+        out = self._emit_fresh_heap_header(struct_ty, body, type_tag=type_tag)
         # claude.md #233: `out` sits on the cleanup stack for the whole
         # field-reading loop below (see _emit_json_cleanup_push). It is
         # a fully zero-initialized header at this point, so a throw's

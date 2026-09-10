@@ -684,6 +684,19 @@ class TestLeakStress:
             # to release. Verified to FAIL without the change, with a
             # heap-use-after-free.
             "row_ownership_churn.f",
+            # claude.md #267: a struct that is a member of an enum,
+            # built by the JSON parser. Every other construction site
+            # tags such a struct in a WIDENED header (claude.md #176);
+            # the from-JSON builder did not, so a successful parse
+            # produced an untagged struct that crashed when used as its
+            # enum, and a failing one released the half-built value
+            # through the TAGGED release function -- freeing payload-16
+            # of an allocation that only reached payload-8. A
+            # memory-corruption test first: good and bad input alternate
+            # so both paths run every iteration, and the parsed value is
+            # used AS its enum so a missing tag cannot pass unnoticed.
+            # Verified to FAIL without the fix (heap-buffer-overflow).
+            "enum_json_churn.f",
             # claude.md #262: `.length` off a member chain whose
             # receiver is NOT an array -- a blob/text/ascii field of a
             # call-result struct. Those three cases dropped the chain's

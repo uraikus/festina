@@ -17038,6 +17038,55 @@ class TestEnums:
         assert result.returncode == 1
         assert "field 'radius' is only valid when this Shape value is a Circle" in result.stderr
 
+    def test_a_json_parsed_struct_is_a_valid_enum_member(self, compile_and_run):
+        # claude.md #267: `.toStruct(T)`/`.toArr(T)` were the one way to
+        # build a T that was NOT a valid member of its enum -- the JSON
+        # builder allocated the plain {refcount} header where every other
+        # construction site allocates the widened {tag, refcount} one
+        # (claude.md #176). The parse itself looked fine; using the
+        # result as its enum crashed. Both builders share the per-struct
+        # function, so both are pinned here.
+        source = """
+        struct Point { x:int  label:text }
+        struct Tag { name:text }
+        enum Shape = Point, Tag
+        Point p = '{"x": 7, "label": "hi"}'.toStruct(Point)
+        log(p.x)
+        Shape s
+        s = p
+        log(typeof s)
+        arr[Point] many = '[{"x": 1}, {"x": 2}]'.toArr(Point)
+        Shape fromArr
+        fromArr = many[1]
+        log(typeof fromArr)
+        log(many[1].x)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "7\nPoint\nPoint\n2\n"
+
+    def test_a_failed_json_parse_of_an_enum_member_is_caught_cleanly(
+            self, compile_and_run):
+        # claude.md #267's other direction: the half-built struct sits on
+        # the cleanup stack, so a throw part-way through releases it --
+        # through the TAGGED release function, which frees payload-16.
+        # With the untagged allocation that was an invalid free (ASan:
+        # "attempting free on address which was not malloc()-ed"), and
+        # the program aborted instead of reaching its own catch.
+        source = """
+        struct Point { x:int  label:text }
+        struct Tag { name:text }
+        enum Shape = Point, Tag
+        try {
+            Point bad = '{"x": 1, "label": '.toStruct(Point)
+            log('no throw')
+        } catch (e:text) { log('caught') }
+        log('still running')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "caught\nstill running\n"
+
     def test_typeof_on_a_null_enum_value_fails_loudly(self, compile_and_run):
         # claude.md #176: an enum-typed value defaults to null until
         # assigned (no auto-vivify) -- typeof must fail loudly rather

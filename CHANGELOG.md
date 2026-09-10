@@ -100,6 +100,20 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **A JSON-parsed struct is now a valid member of its own enum.**
+  `.toStruct(T)`/`.toArr(T)`, where `T` is one of an enum's members,
+  built the struct without the type tag every other way of building one
+  writes. A successful parse produced a value that crashed the moment it
+  was used as its enum; a failing parse freed the half-built value at
+  the wrong offset. Both are fixed; nothing changes for a struct that
+  isn't an enum member.
+
+- **A stray character in a source file reports a normal compile error.**
+  Any character the lexer doesn't recognise — including an unterminated
+  string, the most likely typo — used to print a Python stack trace
+  instead of `file:line:col: error: ...`. An unterminated string and a
+  `$` outside a template string now say which mistake they are.
+
 - **A query row is reference counted, so every way of using one is now
   safe.** A row used to be a bare borrow into the array that owned it,
   so a row outliving its array was either a leak or a crash depending
