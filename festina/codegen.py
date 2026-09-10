@@ -1463,6 +1463,77 @@ class CodeGen:
         self.ascii_constants[text] = ref
         return ref
 
+    def _emit_ascii_char_code_at(self, payload_val, idx_val, lines):
+        """claude.md #258: `s.charCodeAt(i)` on an ascii, emitted INLINE.
+        There is no runtime function for it at all -- the one that used
+        to exist was deleted, because this is the only caller it ever
+        had and nothing about the operation needs a call.
+
+        This is the loop body of every scanner ever written, and a call
+        per character is what the char_scan benchmark measured Festina
+        losing to Rust and Go on: they index raw bytes in the loop, we
+        called out to do a null check, a length load, a bounds check and
+        a return. The type already put the length at a fixed offset in
+        the value's own header, so there is nothing in that function a
+        compiler cannot emit directly.
+
+        Emitted BRANCHLESS, deliberately -- no new basic blocks, so the
+        expression stays a straight-line value the surrounding emitter
+        can keep treating as one, and so LLVM can hoist the loop-
+        invariant length load without having to prove a guard. Both
+        loads are made unconditionally safe by substitution rather than
+        by control flow:
+
+          - a null payload is replaced by the interned EMPTY ascii
+            literal, whose .rodata header reads length 0 -- so a null
+            receiver falls into the out-of-range case below and answers
+            null, which is what the deleted runtime function did with
+            its own explicit `if (!payload)`.
+          - an out-of-range index is replaced by 0 for the byte load
+            only. Offset 0 is always readable: festina_ascii_alloc
+            always allocates len+1 bytes and NUL-terminates, and the
+            empty literal is one NUL byte, so even an empty ascii has a
+            valid byte at 0. The loaded byte is then discarded by the
+            final select.
+
+        Semantics are identical to the runtime function it replaces --
+        null receiver, negative index and index >= length all answer
+        INT_NULL_CONST, verified by diffing both builds' output over
+        every one of those cases before the function was deleted.
+
+        Only charCodeAt is inlined. `s[i]` still calls
+        @festina_ascii_char_at: its result is a pointer into the
+        128-entry immortal singleton table, and reaching that table from
+        here would mean hard-coding the C struct's layout into emitted
+        IR -- real ABI coupling, for an operation no measured workload
+        has put in a hot loop."""
+        empty = self.ascii_const("")
+        is_null = self.tmp()
+        safe_ptr = self.tmp()
+        lines.append(f"  {is_null} = icmp eq ptr {payload_val}, null")
+        lines.append(f"  {safe_ptr} = select i1 {is_null}, ptr {empty}, ptr {payload_val}")
+        len_ptr = self.tmp()
+        length = self.tmp()
+        lines.append(f"  {len_ptr} = getelementptr i8, ptr {safe_ptr}, i64 -16")
+        lines.append(f"  {length} = load i64, ptr {len_ptr}")
+        too_low = self.tmp()
+        too_high = self.tmp()
+        out_of_range = self.tmp()
+        lines.append(f"  {too_low} = icmp slt i64 {idx_val}, 0")
+        lines.append(f"  {too_high} = icmp sge i64 {idx_val}, {length}")
+        lines.append(f"  {out_of_range} = or i1 {too_low}, {too_high}")
+        safe_idx = self.tmp()
+        byte_ptr = self.tmp()
+        byte = self.tmp()
+        code = self.tmp()
+        out = self.tmp()
+        lines.append(f"  {safe_idx} = select i1 {out_of_range}, i64 0, i64 {idx_val}")
+        lines.append(f"  {byte_ptr} = getelementptr i8, ptr {safe_ptr}, i64 {safe_idx}")
+        lines.append(f"  {byte} = load i8, ptr {byte_ptr}")
+        lines.append(f"  {code} = zext i8 {byte} to i64")
+        lines.append(f"  {out} = select i1 {out_of_range}, i64 {INT_NULL_CONST}, i64 {code}")
+        return out
+
     # ---- struct layout ----
     def struct_llvm_name(self, name):
         return f"%struct.{name}"
@@ -1656,7 +1727,6 @@ class CodeGen:
             "declare ptr @festina_ascii_alloc(i64)",
             "declare void @festina_ascii_release(ptr)",
             "declare ptr @festina_ascii_char_at(ptr, i64)",
-            "declare i64 @festina_ascii_char_code_at(ptr, i64)",
             "declare ptr @festina_ascii_concat(ptr, ptr)",
             "declare i8 @festina_ascii_eq(ptr, ptr)",
             "declare ptr @festina_ascii_slice(ptr, i64, i64)",
@@ -12013,11 +12083,12 @@ class CodeGen:
                     # character means the byte at offset i IS the code
                     # point, so this is a bounds check and a load where
                     # text's own version below has to walk from byte
-                    # zero counting code points.
+                    # zero counting code points. claude.md #258: and
+                    # that bounds-check-and-load is emitted inline here
+                    # rather than called, so a scan loop costs no call
+                    # at all -- see _emit_ascii_char_code_at.
                     idx_val, _ = self._emit_expr(expr.args[0], env, lines)
-                    out = self.tmp()
-                    lines.append(
-                        f"  {out} = call i64 @festina_ascii_char_code_at(ptr {val}, i64 {idx_val})")
+                    out = self._emit_ascii_char_code_at(val, idx_val, lines)
                     self._release_owned_receiver(callee.obj, val, vtype, lines)
                     return out, INT
                 if vtype == TEXT:

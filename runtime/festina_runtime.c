@@ -2408,14 +2408,12 @@ char *festina_ascii_char_at(void *payload, int64_t index) {
     return g_festina_ascii_chars[c].bytes;
 }
 
-/* s.charCodeAt(i) -- the whole reason this type exists in one line: a
- * single byte load, where text's own charCodeAt has to walk. */
-int64_t festina_ascii_char_code_at(void *payload, int64_t index) {
-    if (!payload) return festina_null_int();
-    int64_t len = festina_ascii_length(payload);
-    if (index < 0 || index >= len) return festina_null_int();
-    return (int64_t)(unsigned char)((char *)payload)[index];
-}
+/* s.charCodeAt(i) has NO runtime function, deliberately (claude.md
+ * #258): the whole operation is a null check, a header load, a bounds
+ * check and a byte load, and codegen emits all four inline -- see
+ * _emit_ascii_char_code_at in codegen.py. A function here would only
+ * exist to be called once per character, which is precisely the cost
+ * the char_scan benchmark caught. */
 
 char *festina_ascii_concat(void *a, void *b) {
     int64_t la = festina_ascii_length(a), lb = festina_ascii_length(b);

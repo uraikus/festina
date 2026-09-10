@@ -4901,3 +4901,33 @@ failed to compile -- while the structurally identical `C? x = makeCircle()` comp
 **Verified.** The LeakSanitizer table above; `tests/test_manually_managed.py` gains three tests (a fresh call into `blob?`, into `ascii?`, and the ascii method-result forms), 56 pass in that file. Two of my own probe programs failed first and were wrong rather than the compiler: one called `.slice()` on a text literal, and one assigned an `ascii?` into a plain `ascii`, which the no-implicit-decay rule correctly rejects -- worth recording, because each looked like a compiler bug until read properly.
 
 **Full suite:** `python3 -m pytest tests -q`: **2392 passed, 14 skipped, 0 failed** in 552.85s (9:12), clean on the first run with no flakes.
+
+258. `ascii.charCodeAt(i)` IS EMITTED INLINE, AND ITS RUNTIME FUNCTION IS GONE
+
+#256's own benchmark said Festina was slower than Rust and Go at the one workload the type was added for. `benchmarks/char_scan.f` scans a ~1.7 MB buffer character by character counting identifier runs, five passes, and measured **Festina 24.8 ms against Rust 15.5 ms and Go 14.4 ms** -- roughly 1.7x behind. Recorded honestly at the time rather than explained away, with the cause named: `charCodeAt(i)` compiled to a CALL into `festina_ascii_char_code_at` per character, where Rust and Go index raw bytes inline in the loop body. Everything that function did -- a null check, a load from a fixed header offset, a bounds check, a byte load -- is something a compiler can emit directly.
+
+**It now does, and the runtime function was deleted rather than left behind.** Inlining removed its only caller; keeping a function nothing calls, purely because it used to be the definition, is cruft with a comment attached. What replaced it in `festina_runtime.c` is a comment saying where the operation lives now and why.
+
+**Emitted BRANCHLESS, deliberately.** No new basic blocks, so the expression stays a straight-line value every surrounding emitter can keep treating as one (no phi, no block bookkeeping threaded through `_emit_expr`), and so LLVM can hoist the loop-invariant length load without first having to prove a guard. Both loads are made unconditionally safe by SUBSTITUTION rather than by control flow:
+
+- a null payload is replaced, via `select`, by the interned EMPTY ascii literal -- whose `.rodata` header reads length 0, so a null receiver falls into the out-of-range case and answers null, which is exactly what the deleted function's `if (!payload)` did.
+- an out-of-range index is replaced by 0 for the byte load only. Offset 0 is ALWAYS readable: `festina_ascii_alloc` allocates `len + 1` and NUL-terminates, and the empty literal is one NUL byte, so even an empty ascii has a valid byte there. The loaded byte is then discarded by the final `select`.
+
+**Equivalence was verified by diffing, not by reasoning.** Both builds -- runtime call and inline -- were run over the same probe covering every edge the function had: in-range, last index, one past the end, negative, empty receiver, a null receiver from a failed `toAscii()`, and a null receiver arriving as a call RESULT (which also exercises `_release_owned_receiver` on a null). Byte-for-byte identical output, including the raw `-9223372036854775808` an unguarded `log()` of a null int prints.
+
+**The result, same machine, same input, same seven-run minimum:**
+
+| | before | after |
+|---|---|---|
+| Festina | 24.8 ms | **13.6 ms** |
+| Rust | 15.5 ms | 16.3 ms |
+| Go | 14.4 ms | 14.8 ms |
+| Bun | 42.0 ms | 40.6 ms |
+
+Just under 2x, and Festina is now the fastest of the four rather than the slowest of the three native ones. The other three moved only within run-to-run noise, which is the control that says the change is real and not the machine.
+
+**Only `charCodeAt` is inlined.** `s[i]` still calls `@festina_ascii_char_at`: its result is a pointer INTO the 128-entry immortal singleton table, and reaching that table from emitted IR would mean hard-coding the C struct's layout (`{i64, i64, char[2]}`, 24 bytes with padding) into codegen -- real ABI coupling between two files that today share only function signatures, in exchange for an operation no measured workload has yet put in a hot loop. Left as a call, on purpose, and recorded here so the asymmetry reads as a decision rather than an oversight.
+
+**Verified.** Three new tests in `tests/test_codegen.py::TestAscii`: the edge sweep above, the call-result-receiver form, and -- the one that actually guards the point of this entry -- a DIFFERENTIAL IR check. The same loop with `charCodeAt` swapped for plain arithmetic must emit the identical set of called functions, so anything charCodeAt costs shows up as a difference, while the runtime prologue both programs share stays out of it. Pinning an exact call list instead would have failed the moment the prologue changed, and testing only the answer would have passed just as happily when it WAS a call -- the answer was never what was wrong. `scripts/leak_stress.sh` clean across all 29 programs.
+
+**Full suite:** `python3 -m pytest tests -q`: **2397 passed, 14 skipped, 0 failed** in 525.02s (8:45).

@@ -511,6 +511,10 @@ nothing at all: a one-character `ascii` comes from a table of 128
 immortal single-character values rather than a fresh buffer, so a
 character-by-character scan does no allocation whatsoever.
 
+`.length` and `charCodeAt(i)` cost no function call either — both
+compile to loads off the value's own header, inline in the loop that
+uses them, so a scan loop's body contains no call at all.
+
 `slice()` and `+` copy, because an `ascii` owns its bytes.
 
 The difference this makes to a scanner is not small. Counting
@@ -526,6 +530,11 @@ identifiers character by character over the same input:
 `text` quadruples when the input doubles (a walk per index, over every
 index); `ascii` doubles. At 41.6 KB `text` needs 800 ms; `ascii` scans
 4.16 MB — a hundred times more input — in 21.5 ms.
+
+Against other languages on the same scan, `ascii` is competitive rather
+than merely better than `text`: see
+[`char_scan`](benchmark.md#char_scan), where Festina finishes ahead of
+equivalent Rust and Go loops indexing raw bytes.
 
 An `ascii` is reference counted, so `ascii b = a` shares one buffer
 rather than copying it, and `b` is not a snapshot: see

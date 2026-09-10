@@ -205,7 +205,6 @@ int64_t festina_ascii_length(void *payload);
 char *festina_ascii_alloc(int64_t len);
 void festina_ascii_release(void *payload);
 char *festina_ascii_char_at(void *payload, int64_t index);
-int64_t festina_ascii_char_code_at(void *payload, int64_t index);
 char *festina_ascii_concat(void *a, void *b);
 int8_t festina_ascii_eq(void *a, void *b);
 char *festina_ascii_slice(void *payload, int64_t start, int64_t end);

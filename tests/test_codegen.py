@@ -16482,6 +16482,64 @@ class TestAscii:
         assert result.returncode == 0
         assert result.stdout == "true\n"
 
+    def test_char_code_at_emits_no_call(self, parser, semantic, codegen):
+        # claude.md #258: the whole point -- a scan loop must not cost a
+        # call per character. Asserted on the emitted IR rather than only
+        # on the answer, because the answer was already right when it WAS
+        # a call: what changed is the cost, and the cost is what a
+        # regression here would quietly undo.
+        def calls(body):
+            source = ("ascii s = 'hello'\n"
+                      "int total = 0\n"
+                      "for int i = 0, i < s.length, i++ {\n"
+                      f"    {body}\n"
+                      "}\n"
+                      "log(total)\n")
+            program = parser.parse(source, filename="main.f")
+            analyzed = semantic.analyze(program, filename="main.f")
+            ir = codegen.generate_ir(program, analyzed, filename="main.f")
+            assert "festina_ascii_char_code_at" not in ir
+            return sorted(line.strip().split("@", 1)[1].split("(", 1)[0]
+                          for line in ir.splitlines()
+                          if " call " in f" {line.strip()} " and "@" in line)
+
+        # Differential rather than a pinned list: the same loop with the
+        # charCodeAt swapped for plain arithmetic must emit the SAME
+        # calls. Anything charCodeAt costs would show up as a difference,
+        # and the runtime prologue both share stays out of it.
+        assert calls("total = total + s.charCodeAt(i)") == calls("total = total + i")
+
+    def test_char_code_at_answers_null_on_every_edge(self, compile_and_run):
+        # claude.md #258: the inline sequence is branchless -- a null
+        # receiver and an out-of-range index are both handled by
+        # substituting a safe pointer/offset and then discarding the
+        # loaded byte. These are the cases where that substitution has to
+        # produce exactly what the explicit `if` it replaced produced.
+        result = compile_and_run(
+            "ascii s = 'AbZ'\n"
+            "log(s.charCodeAt(0))\n"
+            "log(s.charCodeAt(2))\n"
+            "log(s.charCodeAt(3) == null)\n"
+            "log(s.charCodeAt(0 - 1) == null)\n"
+            "ascii e = ''\n"
+            "log(e.charCodeAt(0) == null)\n"
+            "text bad = 'café'\n"
+            "ascii? missing = bad.toAscii()\n"
+            "log(missing.charCodeAt(0) == null)\n")
+        assert result.returncode == 0
+        assert result.stdout == "65\n90\ntrue\ntrue\ntrue\ntrue\n"
+
+    def test_char_code_at_on_a_call_result_receiver(self, compile_and_run):
+        # The receiver is an owning temporary here, so the inline
+        # sequence has to leave it in a state _release_owned_receiver can
+        # still release -- including when the call answered null.
+        result = compile_and_run(
+            "ascii func pick(t:text) { return t.toAscii() }\n"
+            "log(pick('ok').charCodeAt(1))\n"
+            "log(pick('nöt').charCodeAt(0) == null)\n")
+        assert result.returncode == 0
+        assert result.stdout == "107\ntrue\n"
+
     def test_slice_is_end_exclusive(self, compile_and_run):
         result = compile_and_run("ascii s = 'hello'\nlog(s.slice(1, 4))")
         assert result.returncode == 0

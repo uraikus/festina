@@ -129,6 +129,19 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Changed
 
+- **`ascii.charCodeAt(i)` no longer costs a function call.** It compiles
+  to a null check, a header load, a bounds check and a byte load emitted
+  inline where the expression is used, so a character-by-character scan
+  loop contains no call at all. The runtime function it replaced was
+  deleted rather than kept unused. Behavior is unchanged in every case,
+  including the `null` answers for a null receiver, a negative index and
+  an index past the end. On the `char_scan` benchmark this took Festina
+  from 24.8 ms to 13.6 ms — ahead of equivalent Rust (16.3 ms) and Go
+  (14.8 ms) loops indexing raw bytes, where it had been ~1.7x behind
+  both. `s[i]` still calls into the runtime: its result points into the
+  immortal singleton table, and reaching that from emitted IR would mean
+  hard-coding the C struct's layout.
+
 - **Building a string one piece at a time is O(n), not O(n²).**
   `s = `${s}...`` and `s = s + ...` (any number of further pieces:
   literals, other variables, plain field reads) now grow `s`'s own
