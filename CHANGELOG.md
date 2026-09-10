@@ -13,6 +13,22 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Added
 
+- **`ascii` — a one-byte-per-character string type,** alongside `text`
+  rather than replacing it. Because a character is a byte, the
+  character count *is* the byte count, so it lives in the value's own
+  header and `.length`, `s[i]` and `charCodeAt(i)` are all O(1) reads
+  instead of the UTF-8 walks `text` needs. Indexing allocates nothing
+  at all — a one-character `ascii` comes from a table of 128 immortal
+  singletons. Supports `.length`, `s[i]`, `.charCodeAt(i)`,
+  `.slice(start, end)`, `+`, `==`/`!=`, interpolation, `.toText()` and
+  `text.toAscii()`. A quoted literal assigned to an `ascii` is
+  converted at compile time, so a non-ASCII literal fails to build;
+  `toAscii()` answers `null` at runtime for text that isn't
+  representable. Measured on a character-by-character scan: `text` is
+  quadratic (50 ms at 10.4 KB, 201 ms at 20.8 KB, 800 ms at 41.6 KB),
+  `ascii` linear (21.5 ms for 4.16 MB — a hundred times more input than
+  `text` needed 800 ms for).
+
 - **`pool.postMessage(x)` — no index — auto-selects an idle instance.**
   Routes to whichever pool instance currently has nothing queued and
   isn't mid-handler, falling back to plain round-robin when every
@@ -41,8 +57,98 @@ round-by-round design and implementation record predating 0.1 lives in
   only). One small connection cache per OS thread, no locking needed;
   entirely transparent otherwise, including a dead reused connection
   being silently replaced rather than surfaced as a request failure.
+- **`text.charCodeAt(i)` and `int.toChar()`.** `charCodeAt` reads the
+  Unicode scalar value of the `i`-th UTF-8 code point (not byte, and
+  not a UTF-16 code unit the way JavaScript's own `charCodeAt`
+  sometimes is — matching how `s[i]` already indexes by code point);
+  `toChar` is the inverse, UTF-8 encoding a code point into a
+  one-character `text`. Both follow `s[i]`'s own "test, don't fail"
+  rule: an out-of-range/negative `charCodeAt` index, or a `toChar`
+  code point with no valid encoding (negative, above `0x10FFFF`, or in
+  the UTF-16 surrogate range `0xD800`–`0xDFFF`), answers `null` rather
+  than crashing.
+- **`festina update`.** Pulls the latest source into this
+  installation's own git checkout and fast-forwards to it (`git fetch`
+  + `git merge --ff-only`) — there's no separate release pipeline, the
+  running `festina` *is* this checkout. Refuses, with no changes made,
+  on a dirty working tree, a detached `HEAD`, genuinely diverged
+  history, or an installation that isn't a git checkout at all (e.g. a
+  packaged binary) — it never force-resets over local work.
+- **`text.length` and `blob.length`.** `text.length` is the number of
+  UTF-8 code points (the same unit `s[i]`/`charCodeAt`/`split('')`
+  already use, not bytes) — a real scan, since UTF-8 is variable-width.
+  `blob.length` is the exact byte count, an O(1) stored-field read.
+  Both read-only, like `arr[T].length`.
+- **`match EXPR { 'Tag' { ... } ... default { ... } }`.** Exhaustiveness-
+  checked dispatch on an enum's member (or any expression's own static
+  type) — every tag string is the exact one `typeof` already returns,
+  and leaving one uncovered with no `default` is a compile error naming
+  it. Pure sugar: desugars entirely, at compile time, into the
+  equivalent `typeof`/`if`/`else if` chain, so a compiled program pays
+  nothing for it beyond what a hand-written chain already costs. The
+  subject must be a plain variable or field access (not a call or any
+  other expression that could run code), so it's only ever evaluated
+  once regardless of arm count.
+- **A disk-persisted cache for the lex/parse step of `festina
+  compile`,** keyed by each imported file's exact content (not mtime)
+  plus a hash of the compiler's own grammar — an unchanged file across
+  two compiles is loaded from cache instead of re-lexed and re-parsed;
+  changing one file's content invalidates only that file's own entry.
+  Any cache failure (missing, corrupt, a festina upgrade) degrades
+  silently to an ordinary fresh parse — correctness never depends on
+  it working. `FESTINA_NO_PARSE_CACHE=1` disables it entirely.
 
 ### Fixed
+
+- **A JSON-parsed struct is now a valid member of its own enum.**
+  `.toStruct(T)`/`.toArr(T)`, where `T` is one of an enum's members,
+  built the struct without the type tag every other way of building one
+  writes. A successful parse produced a value that crashed the moment it
+  was used as its enum; a failing parse freed the half-built value at
+  the wrong offset. Both are fixed; nothing changes for a struct that
+  isn't an enum member.
+
+- **A stray character in a source file reports a normal compile error.**
+  Any character the lexer doesn't recognise — including an unterminated
+  string, the most likely typo — used to print a Python stack trace
+  instead of `file:line:col: error: ...`. An unterminated string and a
+  `$` outside a template string now say which mistake they are.
+
+- **A query row is reference counted, so every way of using one is now
+  safe.** A row used to be a bare borrow into the array that owned it,
+  so a row outliving its array was either a leak or a crash depending
+  on the shape: returning one read out of a function's own local array
+  was a use-after-free, and reading a column off a call-result array
+  (`rows()[0].name`) leaked the whole array. Rows now carry the same
+  refcount header every other managed type has, so binding, aliasing,
+  passing, returning, storing in an `arr`/`map`, and `free` all behave
+  exactly as they do for a struct. Rows still alias — `p.name = 'x'` is
+  visible through every binding of that row, unchanged.
+
+- **`.length` off a `blob`/`text`/`ascii` field no longer leaks the
+  object it came from.** `make().someBlob.length`, and every shape like
+  it — a struct field or a query-row column — kept the whole struct or
+  row alive. Only the `arr[T]` case ever released it. Answers are
+  unchanged everywhere; only what gets reclaimed afterwards changed.
+
+- **A `throw` out of a `.sort()` comparator no longer leaks the sort's
+  scratch buffer.** The comparator is ordinary Festina code, so it can
+  throw, and the throw jumps straight past the runtime's own sorting
+  frame — skipping that frame's `free()`. Festina-side locals were
+  already released on the way out; this was the one piece of memory the
+  runtime itself was still holding. `.forEach()` was audited too and
+  never leaked (it allocates nothing), and a throw out of a timer or
+  event handler cannot reach a `try` at all — it ends the program, as
+  before. Error-path only; nothing changes on a sort that doesn't throw.
+
+- **`T? x = <a fresh call>` now compiles for `blob` and `ascii`.** The
+  fresh-construction escape hatch stripped the `?` off the declared
+  type only for the manually-manageable dataclasses, missing
+  `PrimitiveType` — which is `blob`'s category — so
+  `blob? x = makeBlob()` was rejected while the structurally identical
+  `Circle? c = makeCircle()` compiled. Broken since the escape hatch
+  was introduced; `ascii?` inherited it. `T? x = <an existing plain
+  binding>` stays rejected, unchanged.
 
 - **A copied `headers` map no longer duplicates `Host`/
   `Content-Length`/`Connection`/`Transfer-Encoding` on the wire.**
@@ -53,8 +159,29 @@ round-by-round design and implementation record predating 0.1 lives in
   caller's copy on top of the runtime's own, producing the same header
   name twice. A strict server (Go's `net/http`) hard-rejects a request
   with two `Host` lines outright.
+- **`return <text-expr>` from a `blob`/`img`/`aud` func no longer leaks
+  the intermediate text.** The implicit text-to-handle load conversion
+  at a `return` site (`blob func f() { return `path${x}` }`) passed
+  the fresh path text to `festina_blob_open`/`festina_load_image`/
+  `festina_load_audio` — all three copy what they need internally —
+  and never freed the original afterward. The ordinary `blob b =
+  <text-expr>` declaration form was unaffected; only a `return` of a
+  computed path was.
 
 ### Changed
+
+- **`ascii.charCodeAt(i)` no longer costs a function call.** It compiles
+  to a null check, a header load, a bounds check and a byte load emitted
+  inline where the expression is used, so a character-by-character scan
+  loop contains no call at all. The runtime function it replaced was
+  deleted rather than kept unused. Behavior is unchanged in every case,
+  including the `null` answers for a null receiver, a negative index and
+  an index past the end. On the `char_scan` benchmark this took Festina
+  from 24.8 ms to 13.6 ms — ahead of equivalent Rust (16.3 ms) and Go
+  (14.8 ms) loops indexing raw bytes, where it had been ~1.7x behind
+  both. `s[i]` still calls into the runtime: its result points into the
+  immortal singleton table, and reaching that from emitted IR would mean
+  hard-coding the C struct's layout.
 
 - **Building a string one piece at a time is O(n), not O(n²).**
   `s = `${s}...`` and `s = s + ...` (any number of further pieces:

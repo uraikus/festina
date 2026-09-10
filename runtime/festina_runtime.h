@@ -194,7 +194,23 @@ char *festina_sb_finish(void *sb);
 void *festina_text_split(const char *s, const char *sep);
 void *festina_regex_split(void *compiled, const char *s);
 char *festina_arr_join(void *arr, const char *sep, const char *kind);
-char *festina_text_own(const char *s);  /* claude.md #83: NULL-safe strdup */
+char *festina_text_own(const char *s);
+
+/* claude.md #256: the `ascii` type -- one byte per character, so the
+ * character count IS the byte count and both live in a header at
+ * {payload-16 length, payload-8 refcount}. See festina_runtime.c's own
+ * section comment for why that layout (it is claude.md #176's, so
+ * festina_retain/festina_release_check need no changes at all). */
+int64_t festina_ascii_length(void *payload);
+char *festina_ascii_alloc(int64_t len);
+void festina_ascii_release(void *payload);
+char *festina_ascii_char_at(void *payload, int64_t index);
+char *festina_ascii_concat(void *a, void *b);
+int8_t festina_ascii_eq(void *a, void *b);
+char *festina_ascii_slice(void *payload, int64_t start, int64_t end);
+char *festina_ascii_to_text(void *payload);
+char *festina_ascii_from_text(const char *s);
+char *festina_ascii_clone(void *payload);  /* claude.md #83: NULL-safe strdup */
 
 /* claude.md #132: mkdir(path) -> bool (true if IT created the
  * directory, false for every other outcome, including "already
@@ -218,6 +234,27 @@ void *festina_ls(const char *path);
  * call here already does. */
 int64_t festina_text_to_int(const char *s);
 char *festina_text_char_at(const char *s, int64_t index);
+
+/* claude.md #249: text.charCodeAt(i) -> int (the Unicode CODE POINT at
+ * the i-th character, the same code-point unit text[i] already uses --
+ * NOT a UTF-16 code unit the way JS's own charCodeAt reads one half of
+ * a surrogate pair for anything outside the Basic Multilingual Plane;
+ * null for i<0 or past the last code point, mirroring text[i]'s own
+ * answer to the identical question) and its inverse, int.toChar() ->
+ * text (UTF-8 encodes one code point into its own single-character
+ * text; null for a code point with no valid UTF-8 encoding -- negative,
+ * past 0x10FFFF, or inside the reserved UTF-16 surrogate range
+ * 0xD800-0xDFFF). */
+int64_t festina_text_char_code_at(const char *s, int64_t index);
+char *festina_int_to_char(int64_t cp);
+
+/* claude.md #251: text.length -> int, the number of UTF-8 CODE POINTS
+ * (the same unit text[i]/charCodeAt/split('') already index by, NOT a
+ * byte count) -- an O(n) walk, since UTF-8 is variable-width, unlike
+ * blob.length's O(1) stored-length read just below. NULL-safe on a
+ * null receiver, treated as "" (length 0) like every other text-
+ * consuming call in this file. */
+int64_t festina_text_length(const char *s);
 
 /* claude.md #150: argv -- builds a fresh refcounted arr[text] (the same
  * shape festina_text_split's own pieces-array does) from the argc/argv
@@ -1686,6 +1723,12 @@ void festina_blob_release(void *payload);
 void *festina_blob_clone(void *payload);
 char *festina_blob_to_text(void *payload);   /* owned copy, per claude.md #83 */
 const void *festina_blob_bytes(void *payload, int64_t *out_len);
+/* claude.md #251: blob.length -> int, the byte count -- an O(1) read
+ * off the same `length` field festina_blob_bytes already exposes via
+ * an out-param, trimmed to a single return value for the field-access
+ * codegen site (see that site's own comment). NULL-safe like every
+ * other blob accessor here. */
+int64_t festina_blob_length(void *payload);
 int8_t festina_blob_write(void *payload, const char *content);
 int8_t festina_blob_append(void *payload, const char *content);
 int8_t festina_blob_exists(void *payload);

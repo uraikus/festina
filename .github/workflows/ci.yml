@@ -194,7 +194,15 @@ jobs:
     # request/on upgrade/on message/on socketClose all clean, with one
     # documented gap, graceful shutdown, see api.md). Audio's own tier
     # still sheds as skips via the conftest mechanism macOS Phase 0
-    # built; graphics/http no longer need to.
+    # built; graphics/http no longer need to. claude.md #269: `git` is
+    # in the pacman list below for the same "exactly one PATH to reason
+    # about" reason everything else is. The runner does have Git for
+    # Windows -- actions/checkout shells out to it -- but at
+    # C:\Program Files\Git\bin, a native path setup-msys2's default
+    # minimal path-type deliberately keeps out of this shell, so
+    # tests/test_cli.py's TestUpdate (which drives real `git`
+    # subprocesses against a throwaway origin+clone pair) hard-failed
+    # here with WinError 2 while passing on linux and macos.
     runs-on: windows-latest
     # claude.md #238: the full suite took 25.5 of these minutes on one
     # run and blew straight through 30 on the next (every segment ~1.4x
@@ -220,6 +228,7 @@ jobs:
             mingw-w64-ucrt-x86_64-mpg123
             mingw-w64-ucrt-x86_64-cairo
             mingw-w64-ucrt-x86_64-libjpeg-turbo
+            git
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Run the test suite

@@ -4698,3 +4698,529 @@ Continuing #247's own investigation with the duplicate-header bug fixed and 0.65
 **Verified, not assumed.** Hand probes before any pytest test, against a real Go upstream (not just Festina-to-Festina): plain-body reuse across 5 sequential sends, a genuinely chunked response (`Transfer-Encoding: chunked`, no Content-Length) decoded correctly mid-pool, a second plain request immediately after proving the pool wasn't corrupted by the chunked one sharing a slot, and an upstream-forced `Connection: close` correctly NOT pooled with the NEXT request still succeeding (not hung) on a fresh connection. `strace` re-run after the fix: `connect()`/`socket()` both down to exactly 1 across 2091 requests in a 3s window (was 1641, 1:1, before). `tests/test_codegen.py::TestOutboundConnectionReuse` (2 tests: 50 sequential requests to the same upstream all correct; a client-only thread killed and respawned mid-pool-usage still serves a correct request afterward). New `tests/stress/http_client_pool_churn.f` (four separate driver threads, each with its own private pool, all hammering the same upstream concurrently via #245's own bare `pool.postMessage(x)`, 3000 messages, 0 failures) and `tests/stress/http_client_pool_kill_live_churn.f` (300 kill()/live() cycles, 20 real requests per incarnation, mirroring `thread_db_kill_live_churn.f`'s own shape) -- both clean under `scripts/leak_stress.sh` and `scripts/thread_tsan_stress.sh` (full default sets, every stress file included, confirming nothing else regressed).
 
 **Final numbers, same machine, same methodology as the investigation's own opening measurement.** Festina's rebuilt proxy: 13,785 req/s. Bun's: 13,479. **Festina is now at parity with Bun on this benchmark -- from 0.66x behind to roughly 1.02x ahead** -- both fixes combined (the header bug alone got to 0.65x; connection reuse closed essentially the entire remaining gap). Docs: api.md's "Making outbound requests" section gains the connection-reuse paragraph (right after #247's own header one); CHANGELOG under 0.44's "Added". docs/examples.html's own reverse-proxy benchmark numbers are NOT updated in this entry -- that page's own numbers reflect a specific prior measurement run and updating it is a separate, deliberate documentation task, not a side effect of a runtime fix.
+
+249. `text.charCodeAt(i)` AND `int.toChar()` -- BY CODE POINT, NOT UTF-16 UNIT
+
+Requested directly, with the exact shape spelled out: "Add a charCodeAt method to text types, like in JS. Also add an int method: .toChar()" plus a worked round-trip (`int fortyTwo = 42; text char = fortyTwo.toChar(); int numberAgain = char.charCodeAt(0)`) and both a text-literal (`'a'.charCodeAt(0)`) and int-literal (`42.toChar()`) receiver.
+
+**"Like in JS" stops at the name.** JavaScript's own `charCodeAt` reads a UTF-16 CODE UNIT -- for any character outside the Basic Multilingual Plane it returns half a surrogate pair, not the character's real code point, and the inverse (`fromCharCode`) has the identical split. This language's text indexing has never worked that way: `s[i]` (claude.md's own established convention) already reads the `i`-th UTF-8 CODE POINT, so a `charCodeAt` that quietly switched units for this one method would be a trap, not a JS-compatibility feature. `charCodeAt(i)` reads the same code point `s[i]` would, as its numeric scalar value; `toChar()` is its exact inverse, UTF-8 encoding a scalar value into a one-character text. `233.toChar()` is `'é'` in one call, not two.
+
+**Runtime: one new decode loop, one new encode function, no new logic invented from scratch.** `festina_text_char_code_at` (runtime/festina_runtime.c, right after `festina_text_char_at`) walks UTF-8 by code point with the identical loop shape `festina_text_char_at` already uses to locate the i-th character's byte offset and length, but decodes the located 1-4 byte sequence into its scalar value via a `switch` on that length instead of copying the bytes out -- no decoder existed anywhere in this codebase before this entry; the closest relative, `festina_text_char_at`, only ever needed to copy bytes, never interpret them. `festina_int_to_char` is the inverse encode, and here nothing needed inventing: the exact 1-4-byte UTF-8 encoding logic already existed, inline, inside `festina_json_parse_string`'s own `\u` escape handling (claude.md #206) -- copied out essentially unchanged rather than re-derived, since a second, subtly different UTF-8 encoder living a few functions away from the first would be its own bug waiting to happen. Both are null-safe on the same "test, don't fail" convention `festina_text_char_at` itself established: `charCodeAt` answers `festina_null_int()` for a negative or past-the-end index; `toChar` answers `NULL` for a negative code point, one above `0x10FFFF`, or one inside the UTF-16 surrogate range `0xD800`-`0xDFFF` (a code point no UTF-8 sequence may legally encode, surrogate halves being a UTF-16-only concept) -- none of these three is a crash or a compile-time-only restriction, all are ordinary runtime nulls a program can check.
+
+**Compiler: two more entries in already-established chains, not new machinery.** `semantic.py`'s `_infer_call` gains `charCodeAt` (receiver `text`, exactly one `int` argument, `CompileError` otherwise -- the same arity/type-checked shape `.match(pattern)` already has) and `toChar` (receiver `int`, zero arguments, falling through silently on a mismatch the same way sibling zero-arg methods `.toFloat()`/`.toInt()` already do -- not specially validated, matching them exactly rather than inventing a stricter rule just for the new method). `codegen.py` declares both runtime functions, emits `charCodeAt` exactly like the existing `toInt` call (evaluate receiver, evaluate the int argument, call, free the text receiver via the existing `_free_text_temp` helper), and emits `toChar` like the existing int-returning-text methods, marking the runtime's freshly-`malloc`'d result a "minted value" (`self._minted_values.add(id(expr))`) so it is correctly owned and freed if discarded rather than double-freed or copied unnecessarily -- the identical bookkeeping `text[i]`'s own codegen already does for `festina_text_char_at`'s result.
+
+**Verified, not assumed.** A dozen hand probes before any pytest test: the user's own round-trip example exactly as given; both literal-receiver forms (`'a'.charCodeAt(0)`, `42.toChar()`); a multi-byte code point (`'café'.charCodeAt(3)` == 233, `233.toChar()` == `'é'`, proving code-point indexing, not byte indexing); out-of-range and negative `charCodeAt` indices both null; `toChar` on -1, `0x110000`, and `0xD800` all null; a fully dynamic receiver and index (not literals, so nothing constant-folds away in Python and the real runtime path is actually exercised). `tests/test_codegen.py::TestCharCodeAtAndToChar` (9 tests) turns those into permanent coverage, including the two compile-error cases (wrong arg count, wrong arg type). `tests/stress/text_churn.f` gained a 500-iteration loop exercising both methods on COMPUTED (not literal) receivers throughout -- a call-result text as `charCodeAt`'s receiver every iteration, and a discarded, never-bound `toChar()` result chained straight into a `log()` argument every iteration -- clean under `scripts/leak_stress.sh`. No TSan run: neither method touches thread-shared state. Docs: api.md gains a "charCodeAt() and toChar()" subsection right after the existing "Indexing a character out" one; CHANGELOG under 0.44's "Added".
+
+**Full suite, run twice (recorded after both entries below).** First run: 1 failed (`TestFullscreenAndDecorations::test_the_window_is_really_decorated_under_a_real_window_manager`, a pre-existing window-manager timing flake in the same family claude.md #240/#241 already documented -- passes in isolation, unrelated to this entry), 2335 passed, 14 skipped. Second run: **2336 passed, 14 skipped, 0 failed** in 9m17s -- clean, the flake did not recur. README's test count updated.
+
+**One pre-existing gap and one pre-existing parser bug found along the way, neither touched here.** `text` has no `.length` property in this language at all (only `arr[T]`/map do) -- discovered the hard way, writing the stress-test loop, and worked around there with a fixed-safe modulus instead of fixing the language; unrelated to this feature, left as a gap for a future entry. Separately, a bare parenthesized-expression statement -- `` (`x${k}`.charCodeAt(0)).toChar() `` on its own line, not bound to a variable and not passed as a call argument -- mis-parses into an unrelated "unknown variable" error at the wrong position; isolated with two throwaway probe files (the same chain bound to a variable compiles and runs correctly; the identical chain as a bare statement does not), confirmed pre-existing and unrelated to charCodeAt/toChar specifically (any bare-`(`-led statement should trigger it), and worked around in the stress test by wrapping the expression in `log(...)`. Out of scope for this entry; not fixed here.
+
+250. `festina update` -- THE INSTALLATION *IS* THE CHECKOUT, SO UPDATING IT IS A FAST-FORWARD
+
+Requested directly, mid-conversation, alongside the charCodeAt/toChar work above: "Also add a cli 'festina update' command."
+
+**Design: there is no release pipeline to pull from, because there is no build to ship.** `install.sh`'s own top comment says as much -- it clones straight to `$HOME/.festina` and `bin/festina` execs `python3 -m festina.cli` against that checkout in place; a PyInstaller-packaged binary is the one other shape `_data_root()` (the existing repo-root resolver, reused here unchanged) already knows how to recognize, and it has no source tree of its own to pull into. So "update" has exactly one honest meaning for the common case: fetch and fast-forward the checkout that's already running.
+
+**Deliberately more conservative than `install.sh`'s own update path.** `install.sh` itself does `git fetch` + `git checkout` + a HARD `git reset --hard origin/BRANCH` when a checkout already exists at the install dir -- safe there only because that flow runs at bootstrap time, against a directory with nothing local to lose. `festina update` runs against a checkout someone may actually be living in or hacking on, so it never discards anything: `git merge --ff-only origin/BRANCH` only, refusing cleanly with a clear stderr message and a non-zero exit -- and making NO changes -- when the working tree is dirty, `HEAD` is detached, local history has genuinely diverged from origin (a real merge/rebase situation), `git` itself isn't installed, or the installation isn't a git checkout at all. Every refusal path was chosen to fail loudly rather than guess.
+
+**Verified, not assumed.** All five paths (clean fast-forward, dirty tree, diverged history, detached HEAD, non-git installation) covered by `tests/test_cli.py::TestUpdate` (6 tests, all against REAL on-disk git repos built with real `git` subprocesses -- an origin plus a clone, no mocking, matching this project's own established testing discipline) plus the CLI dispatch wiring itself. The clean fast-forward mechanism was additionally hand-validated end to end against a real stale clone of this project's own repo: reset to an old commit, `festina update` run against it with the new code copied in, correctly fast-forwarded all the way to current `HEAD` with no conflicts. `python3 -m festina.cli --help` confirms the new `update` subcommand is listed alongside the existing four. Docs: api.md's "## CLI" section, table row added ("Five subcommands", was "Four"); CHANGELOG under 0.44's "Added".
+
+251. `text.length` AND `blob.length` -- THE GAP #249 FOUND, CLOSED
+
+Requested directly: "Can you add .length property to text types, as well as blob type" -- following straight from #249's own writeup, which noted in passing that `text` had no `.length` at all (only `arr[T]`/map did) and left it as a gap. `blob` had none either, discovered the same way while designing this entry (grep, not assumed).
+
+**Two different costs, because the two types are shaped nothing alike.** `text.length` is the number of UTF-8 **code points** -- the same unit `s[i]`/`charCodeAt`/`split('')` already use (claude.md #150/#249), not bytes -- and since UTF-8 is variable-width there is no stored count anywhere to read: it is a real O(n) walk, the identical loop shape `festina_text_char_at`/`festina_text_char_code_at` already use to locate a code point, just counting instead of locating or decoding. `blob.length` is the exact byte count, and blob already tracked one: `FestinaBlob`'s own `length` field (set at load, at `.write()`/`.append()`, at `.callback()`'s background fill -- see `festina_blob_bytes`'s existing out-param) was already there for `festina_blob_bytes` to hand out; `.length` is a one-line O(1) getter trimming that same field to a single return value, nothing new to track.
+
+**Runtime: one new function, one trivial one.** `festina_text_length` (runtime/festina_runtime.c, right after `festina_int_to_char`) walks by code point exactly like its siblings, NULL-safe (a null-text receiver reads as `""`, length `0`, matching `festina_text_char_at`'s own "null text behaves like empty text" contract rather than inventing a different answer for this one method). `festina_blob_length` (right after `festina_blob_bytes`) is `if (!payload) return 0; return b->length;` -- deliberately not implemented by calling `festina_blob_bytes` and discarding its pointer, since that would cost codegen an unused extra out-param slot for zero benefit.
+
+**Compiler: extends the existing `.length` field-access site, not a new one.** `codegen.py` already had exactly one place `.length` reaches for `arr[T]` (the `not expr.computed and expr.prop == "length"` branch); `text`/`blob` are two more `if obj_type == ...` branches inside the SAME one, sharing its single already-emitted `obj_val, obj_type` rather than re-evaluating the receiver. Release strategy had to split, though: `text` is copy-on-alias/free-unconditionally, not refcount-headered (claude.md #83), so its receiver goes through `_free_text_temp` -- the same direct-`free` helper #249's own `charCodeAt` receiver already uses -- and deliberately does NOT go through `_release_member_chain` (array's own `.length` release path), whose `call_receivers` filter is `_is_refcounted(t)` and would silently never match a text receiver at all, leaking it. `blob` IS refcount-headered (claude.md #109), but reuses `_release_owned_receiver` -- the same simpler, non-chain pattern `img.width`/`.height` and blob's own other methods already use -- rather than the chain machinery, since blob has no further sub-fields a `.length` chain would ever walk through the way `make().inner.items.length` does for arrays. `semantic.py` adds matching `_infer_member` branches (`obj_type == _TEXT`, `_is_blob_type(obj_type)` -- not `== _BLOB`, so `blob?` reads identically, per that helper's own doc comment) returning `_INT`, plus a NEW explicit read-only-assignment guard: `s.length = 5` type-checked with no error at all before this entry (the ArrayType-only guard claude.md #63 wrote never covered anything else), which would have reached codegen with no `Store` path for a non-addressable computed field. Caught and fixed here, alongside adding the feature, rather than left for whoever tried it first.
+
+**A genuine, unrelated leak found via this entry's own stress-test coverage -- and fixed, on request, in a same-day follow-up.** Exercising a computed (call-result) `blob` receiver for `.length` -- the same "not just literals, which constant-fold away" discipline #249 already established -- surfaced that `blob func f() { return `path${x}` }` (a `blob`-typed function returning a `text` expression, relying on the implicit text-to-blob conversion) leaks the intermediate concatenated text: `festina_blob_open` `strdup`s the path internally, and the ORIGINAL text buffer the `return` statement handed it is never freed. Confirmed independent of `.length` itself (a bare `return `x${i}`` from a `blob func`, never calling `.length` on the result at all, leaks identically -- proven with a standalone probe and by reading the generated LLVM IR directly: `festina_str_concat` produces the path, `festina_blob_open` consumes it, no `free` in between). The ordinary `blob b = <text-expr>` VarDecl conversion is NOT affected -- this exact stress file's own pre-existing `blob save = `save_${i % 4}.dat`` line proves that shape leak-free.
+
+**Root cause: one `_coerce` call site, out of two dozen, never threaded its own source expression through.** `_coerce`'s `to_type == BLOB/ImageType/AudioType and from_type == TEXT` branches (claude.md #100/#101/#109 -- the three "load from a path" conversions) already call `_free_text_temp(source_expr, ...)` to free the intermediate text correctly, and every OTHER call site that can reach one of these three conversions (VarDecl init, assignment, argument, array/map element, struct/thread-reply field, ...) already passes `source_expr=` its own expression node. The `Return` statement's own call (`codegen.py`, the `ast.Return` branch) was the one exception, calling `self._coerce(val, vtype, return_type, lines)` with no fourth argument at all -- so `_free_text_temp`'s `_is_owning_text_source(None)` check (nothing about `None` matches any of its "this is a fresh, owning value" cases) always answered "not owning," and the free was silently skipped on every `return <text-expr>` into a `blob`/`img`/`aud`-typed function, for every kind of fresh source (template literal, `+` concat, a nested call) alike. Fix: `source_expr=stmt.value` on that one call. A `return p` (a bare local variable -- the ALIASING half of the same check) still correctly skips the free here, since `p`'s own buffer is freed moments later by this same Return's `_emit_free_active_locals` call -- freeing it in `_coerce` too would have been a double free, not a fix.
+
+**Verified, not assumed, before and after.** The standalone probe (a `blob func` returning a template literal, no `.length` anywhere) leaked under `scripts/leak_stress.sh` before the fix and is clean after; a broader probe covering all three types (`img`/`aud`/`blob`, both a fresh template-literal return and a bare-local-variable return) is clean under the same script, confirming the aliasing case wasn't broken by the fix. `tests/test_codegen.py::TestReturnTextToHandleConversion` (5 tests: a blob func returning a literal path, one returning a template literal, one returning a bound local -- the double-free-risk case -- and one each for img/aud) turn the correctness half into permanent coverage; leak-freedom itself stays `leak_stress.sh`'s job, not re-proven under plain pytest (no ASan there). `tests/stress/media_churn.f`'s `reload()` helper -- the exact function that surfaced this -- was simplified back to the natural direct-return shape it should have been all along, so it keeps exercising the fixed path rather than a workaround; `scripts/leak_stress.sh`'s full default set stays clean. todo.md's Memory model bullet for this leak is removed (fixed, not merely documented).
+
+**Verified, not assumed.** Hand probes before any pytest test: ASCII and multi-byte text length (`'café'.length` == 4, not the 5-byte UTF-8 encoding); empty text; a null-text receiver (`'xyz'.match(/[0-9]+/)`, no match) reading as length `0`; a computed (call-result) text receiver; a blob's byte length matching what was written to disk; a blob from an unreadable path reading `0`; a computed (call-result) blob receiver; both `.length = ` assignment targets confirmed as compile errors; both wrong-field-name error messages confirmed to mention `.length`; a struct field literally named `length` confirmed unaffected (reads/writes normally, since StructType's own branch in `_infer_member` is checked well before text/blob's). `tests/test_codegen.py::TestTextAndBlobLength` (13 tests) turns those into permanent coverage. `tests/stress/text_churn.f`'s existing charCodeAt loop now computes its own modulus from a computed receiver's `word.length` instead of a hardcoded constant (closing the exact gap #249's own writeup flagged); `tests/stress/media_churn.f` gained `.length` on both an aliased (`save`) and a computed (`reload(i)`, fixed to route through a local rather than the buggy direct-return path above) blob receiver -- both clean under `scripts/leak_stress.sh`'s full default set. No TSan run: neither method touches thread-shared state. Docs: api.md gains a "Length" subsection (text, right before charCodeAt/toChar) and a `.length` line plus explanatory paragraph in the Files/blob section; CHANGELOG under 0.44's "Added"; todo.md's Memory model section gains the return-conversion leak bullet.
+
+**Full suite, run three times across the `.length` addition and the return-conversion fix (recorded after both).** After `.length` alone: 2 failed (`TestFullscreenAndDecorations::test_the_window_is_really_decorated_under_a_real_window_manager` and `::test_entering_and_exiting_fullscreen_resizes_the_real_window_and_fires_on_resize` -- the same pre-existing real-window-manager timing flake family claude.md #240/#241 already documented; both pass in isolation, confirmed before assuming so), 2347 passed, 14 skipped; re-run clean at 2349 passed. After the return-conversion fix (5 more tests, `TestReturnTextToHandleConversion`): 1 failed (the window-manager flake again, same family, passes in isolation again), 2353 passed, 14 skipped; re-run clean at **2354 passed, 14 skipped, 0 failed** in 8m44s. `scripts/leak_stress.sh`'s full default set: clean both before and after the fix (the "before" run is what caught the leak in the first place). README's test count updated.
+
+252. `match EXPR { 'Tag' { ... } ... default { ... } }` -- EXHAUSTIVENESS-CHECKED SUGAR OVER `typeof`, PROVABLY FREE
+
+Requested in two steps: "What features would you want to implement to optimize bootstrapping without adding a hit to performance," clarified as "if we were to write Festina in Festina rather than Python, what features could we implement to make this easier without impacting the performance of the produced binaries" -- answered with four candidates (a `match` statement, a lex/parse cache, the cycle collector's already-documented deferred-root-buffer optimization, a raw byte-buffer type), then "I like all of your suggestions. Let's implement." Given each of those four is independently a multi-round effort by this project's own pace (enum/typeof took #72-77, threading took #82-116), and two of them touch load-bearing, deliberate design decisions (`festina/imports.py`'s single-translation-unit `#include` model, #5/#6; the cycle collector's synchronous-per-release strategy, todo.md), `EnterPlanMode` surfaced that scope question directly: implement `match` alone, to completion; roadmap the rest (todo.md, both sections) rather than start them blind.
+
+**The whole point is that a compiled program pays nothing for it.** `match` desugars ENTIRELY, in semantic.py, before codegen ever runs -- into the identical `IfStmt`/`TypeofExpr`/`BinOp` chain a hand-written `if typeof(x) == 'Circle' { ... } else if ...` would already produce (claude.md #176's own `typeof`/enum machinery, unchanged). `codegen.py` has zero lines of `MatchStmt`-specific code, and never will: there is nothing there to add, only an existing, already-shipped-and-tested code path to reuse. This is the answer to "without impacting the performance of the produced binaries" in the most literal sense available -- not "measured to have negligible overhead," but "provably the same generated code as the equivalent hand-written chain, because it IS that chain by the time codegen looks at it."
+
+**Syntax, and why quoted tags.** `match shape { 'Circle' { ... } 'Square' { ... } default { ... } }` -- one arm per quoted tag string, no `case`/`:`. `AskUserQuestion` posed the real fork directly: quote the tag (reusing `typeof shape == 'Circle'`'s own existing convention verbatim) or accept a bare identifier (reading closer to Rust/Swift, but needing new grammar to tell a capitalized bare-identifier pattern apart from an ordinary expression in that position). Quoted, chosen: zero new disambiguation to get wrong, and the tag string a `match` arm writes is LITERALLY the same string `typeof` would answer, not a separate name that happens to correlate with it.
+
+**`match` is a genuine reserved keyword; `default` deliberately isn't.** Unlike #246's `use` (recognized by value, only directly after `on request`, precisely because `use` is common enough as an ordinary identifier that claiming it globally would be a real breaking change), `match` was safe to add to `SPEC_KEYWORDS` outright: `Parser.eat_name` ("Like eat('IDENT'), but also accepts keyword tokens as names") already lets ANY keyword serve as a member/property name -- the exact mechanism that already keeps `free`/`delete` from breaking `blob.delete()` -- so `'x'.match(regex)` parses exactly as before, confirmed directly (`tests/test_codegen.py::TestMatchStatement::test_match_regex_method_call_still_parses_as_the_existing_method`). `default`, by contrast, stayed contextual, recognized by value only inside a `match { }` block's own arm-start position (the identical technique `use` established) -- it's ordinary enough a word that reserving it everywhere would break real programs for no benefit; `int default = 5` still works.
+
+**Design: subject simplicity is a real, enforced restriction, not an assumption.** A `match` desugars by reusing the SAME `stmt.subject` AST node once per arm's own `TypeofExpr` -- correct only when re-evaluating that expression has no side effects to duplicate. `_is_simple_match_subject` (semantic.py) accepts a bare `Identifier` or a chain of non-computed `Member` accesses rooted in one (`node.kind`, `w.shape`); anything else -- a `Call`, a computed index, any operator -- is a compile error naming the fix directly: `"match's subject must be a plain variable or field access -- bind a call result to a name first"`, the exact idiom api.md's own `typeof` examples already use (`Shape shape = c` before `typeof shape`). This is a NEW predicate, not a repurposing of `_is_owning_text_source`/`_is_owning_refcounted_source` -- those classify by ownership (is this a fresh value to release), a different axis entirely from side-effect-freedom (is this safe to evaluate twice).
+
+**Exhaustiveness is checked against `typeof`'s own tag strings, not a parallel table.** `types_mod.type_name(member)` -- the exact formatter `_enum_tag_const` (codegen.py) already feeds into the runtime constant `typeof` reads back -- gives the expected tag set: every member's name for an `EnumType` subject, or the single static type name otherwise (so `match n { 'int' { ... } }` on a plain `int` works too, trivially exhaustive). Every arm tag must be a real member of that set (a typo is a compile error naming the bad tag, not a silently-dead arm) and none may repeat; missing coverage without a `default` is a compile error naming the first uncovered tag. All of this runs entirely at compile time, against strings the compiled program would produce anyway -- no new runtime lookup table exists or is needed.
+
+**The mechanical part: `analyze_statement` now returns its own (possibly replaced) statement, and every caller writes it back.** `MatchStmt` is validated and desugared into an `IfStmt` at the very top of `analyze_statement`, reassigning its own local `stmt` before the existing big if/elif dispatch even runs -- so the SAME call then falls straight through the pre-existing `ast.IfStmt` branch, unmodified. For the replacement to actually reach codegen (which re-walks the SAME `Block.body`/`program.body` lists later, unaware any analysis happened), every one of the three call sites that used to discard `analyze_statement`'s return value now writes it back by index: `analyze_block`'s own loop (`block.body[i] = analyze_statement(...)`, covering every nested context uniformly -- function/event-handler/thread bodies and if/while/for/try bodies all funnel through this one shared helper already), the top-level `program.body` loop (same pattern, plus copying the original `MatchStmt`'s `.file` tag onto the desugared root so multi-file error attribution, claude.md #6, stays correct for whatever a `match`'s own arm bodies might raise), and the one recursive `if isinstance(stmt.orelse, ast.IfStmt): analyze_statement(stmt.orelse, ...)` self-call (`stmt.orelse` can never actually BE a `MatchStmt` -- `else match { }` isn't grammar this parser produces -- so this is always a same-node round trip today, but the contract now holds regardless). Three call sites, each a mechanical indexed-write-back change, zero new codegen surface.
+
+**Verified, not assumed.** Hand probes before any pytest test, exactly mirroring api.md's own new examples: the `Shape`/`Circle`/`Square` walkthrough (5, 42 -- identical to the doc's own `if typeof` version); `default` catching the uncovered member; a mixed (non-struct) enum (`enum Json = int, text, bool`); a non-enum subject (`int n`); a field-access subject (`w.shape.radius` inside the arm, proving the desugar's reused subject node still resolves field access through the pre-existing enum machinery unchanged); every rejection (non-exhaustive without `default`, an unknown tag, a duplicate tag, a non-simple `Call` subject) with the exact error text; `'hello world'.match(/world/)` still parsing and running as the ordinary regex method call. `tests/test_codegen.py::TestMatchStatement` (12 tests) turns all of that into permanent coverage. `tests/stress/enum_churn.f`'s own two pre-existing `typeof`-`if` chains (a pure-struct `Shape` reassigned every iteration over 3000 iterations, and a fresh mixed-`Choice` local declared inside the loop -- the exact shape claude.md #197 found leaking before its own fix) were rewritten AS `match`, directly confirming the desugar changes nothing about ownership/release on the two shapes already proven to matter here; clean under `scripts/leak_stress.sh`'s full default set. No TSan run: `match` touches no thread-shared state.
+
+**Docs.** api.md gains a `### match` subsection, right after the existing `typeof`/field-access sections in the enum documentation, ending with the "provably free" argument stated explicitly (matching this entry's own framing, since that's the entire premise of the feature request). CHANGELOG under 0.44's "Added". todo.md gains the three roadmapped items (lex/parse cache, cycle-collector deferred-root buffer, byte-buffer type) each carrying the open design question surfaced while scoping this entry, so the NEXT session picking one up starts from a real fork already identified rather than re-deriving it.
+
+**Full suite, run twice.** First run: 3 failed -- the same two real-window-manager timing flakes claude.md #240/#241 already documented, plus one new one this session hadn't seen yet (`TestHttpGracefulShutdown::test_an_in_flight_connection_still_completes_before_exit`, a `ConnectionResetError` -- an HTTP graceful-shutdown timing test, unrelated to `match`/enum/`typeof` in every way; all three confirmed to pass in isolation before assuming so), 2363 passed, 14 skipped. Second run: **2366 passed, 14 skipped, 0 failed** in 7m08s -- clean, none of the three flakes recurred. README's test count updated.
+
+253. A DISK-PERSISTED LEX/PARSE CACHE FOR REPEAT COMPILES
+
+Continuing the same design discussion behind #252: "continue onto the next feature" -- Phase 2 of the four candidates this whole thread started from, the one todo.md scoped precisely enough to start from directly: cache the lex+parse step alone, content-hash keyed, leaving `festina/imports.py`'s single-translation-unit `#include` model (#5/#6) and everything downstream of parsing (semantic analysis, codegen) completely untouched.
+
+**The problem, confirmed by reading, not assumed: every `festina compile` re-parses every file, every time.** `build_program` (`festina/imports.py`) loops over `resolve_imports`'s dependency-ordered file list and calls `parser_mod.parse` unconditionally for each one -- no caching existed there before this entry, for either a changed or an unchanged file. For a multi-file program (the shape a self-hosted compiler's own source would be), an edit to ONE file forces a full re-lex+re-parse of every OTHER file too, every single compile.
+
+**Design: content-hash keyed, not mtime-keyed -- deliberately more conservative than this project's own existing cache.** `_ensure_runtime_object`/`_ensure_wasm_object` (`festina/cli.py`) already cache the compiled RUNTIME object files the identical way -- `tempfile.gettempdir()/festina-runtime-cache/`, checked against source mtime -- and this entry's own cache (`festina-parse-cache/`, a sibling directory) copies that shape deliberately, EXCEPT for the freshness check itself. A wrong `.o` file mostly fails to link; a wrong, silently-reused PARSED AST could compile successfully into the WRONG PROGRAM. So this cache is keyed by `sha256(source bytes)` -- exact content, never "close enough" -- combined with a `_grammar_epoch_hash()`: a `sha256` over the CURRENT contents of `lexer.py`+`parser.py`+`ast.py`+`imports.py` itself (located via this module's own `__file__`, not `cli._data_root()` -- `cli.py` already imports `imports.py`, so importing back would be circular), computed once per compile and memoized. Upgrading festina's own grammar or AST node shapes therefore invalidates every existing cache entry automatically -- no manual version bump anywhere, ever.
+
+**Failure handling: every possible failure degrades silently to "parse it fresh."** Missing file, corrupt pickle, a cross-version `AttributeError` from unpickling an old AST shape against today's classes -- `_parse_cached` catches all of it (a bare `except Exception`, deliberately: `pickle.load` can raise several different exception types depending on exactly how a file is broken, and every one of them means the identical thing here) and falls through to a normal parse, then best-effort tries to write the result back -- to a temp file in the same directory, `os.replace()`'d onto the final name so a concurrent reader never sees a torn pickle. The write side is wrapped the same way: a failure there is swallowed too, after cleaning up the leftover temp file. Correctness never depends on any of this working, the identical rule claude.md #93 already established for an unreadable blob path, applied here to a cache instead. `FESTINA_NO_PARSE_CACHE=1` (mirroring `FESTINA_NO_DIRECT_FILL=1`'s own escape-hatch precedent) skips both the read and the write outright.
+
+**Verified, not assumed -- including the failure paths, not just the happy one.** A real two-file program compiled twice end to end: byte-identical binaries both times (`cmp` on the compiled executables, not just matching stdout). A cache file deliberately overwritten with garbage bytes: the next `build_program` call recovers silently, no exception, correct output. `tests/test_imports.py::TestParseCache` (6 tests) turns this into permanent coverage: a second build hits the cache (verified by wrapping `parser_mod.parse` and counting real calls -- zero on the hit); changing one file's content in a two-file program causes exactly one real reparse, not two; an end-to-end `compile_and_run` proves a changed DEPENDENCY's new behavior is never served stale from cache; a corrupted cache file degrades to a fresh parse; a monkeypatched "different grammar epoch" is never served from the old epoch's entry; the escape hatch forces a real parse on every call.
+
+**Measured, not assumed: the parse step really is faster, but it is not most of a compile's wall time.** Two synthetic multi-file programs (41 files/~2,200 lines; 301 files/~13,500 lines, generated for this measurement, not committed) gave `build_program` alone a genuine 2.5-3x speedup, cold vs. warm (41 files: 156ms -> ~55ms; 301 files: 983ms -> 399ms). But the FULL `festina compile` wall time barely moved (41 files: ~1.43s cold vs. ~1.5s warm; 301 files: 5.44s vs. 5.24s) -- within measurement noise at the smaller size, and only a few percent at the larger one. Reading this honestly rather than forcing the result to look better: parsing is not the dominant cost of a `festina compile` invocation at either size measured -- semantic analysis, LLVM IR text generation, and the clang/link step that follows it dominate, and (surprisingly, working against the naive assumption that parsing's SHARE of total time would grow with program size) those costs appear to grow FASTER than parse time as file count increases, not slower, so the cache's relative visibility in a full compile's wall clock actually shrank between the two measured sizes rather than growing. The win is real and unconditional for the parse phase itself -- exactly what was asked for, and exactly what todo.md scoped -- but anyone expecting it to make a whole `festina compile` invocation dramatically faster on today's single-translation-unit model should not expect that from this entry alone; that would need semantic analysis/codegen to get an analogous cache too, which the single-translation-unit model (#5/#6) makes substantially harder and was explicitly out of scope here.
+
+**Docs.** CHANGELOG under 0.44's "Added" (no api.md entry -- this is an internal compiler-speed change with no language-surface effect and no new subcommand, the same reason the earlier wasm LTO bitcode caching, #242, never went in api.md's CLI table either; `FESTINA_NO_DIRECT_FILL=1` is the one precedent for an escape-hatch env var documented in-line, and this one has no comparable "feature section" of its own to live inside, so it stays CHANGELOG/claude.md-only). todo.md's roadmap bullet for this item is removed now that it's shipped.
+
+**Two real bugs the first full-suite run caught, neither visible in the targeted `TestParseCache` run alone.** (1) `_grammar_epoch_hash` read `lexer.py`/`parser.py`/`ast.py`/`imports.py` by path off this module's own `__file__` unconditionally -- correct for a source checkout, but under the PyInstaller-packaged compiler binary (#59) this module loads from inside a `--onefile` archive, not a real `.py` file at a real path, so the read raised `FileNotFoundError` and every single packaged-binary compile failed outright (`tests/test_packaging.py`'s two tests both failed this way: "No such file or directory: '/tmp/_MEI.../festina/lexer.py'"). Fixed by catching `OSError` there and falling back to `festina.__version__` as the epoch: within one packaged binary's lifetime the grammar cannot change at all (the binary IS the grammar), so the version string is exactly as good an epoch as the real hash, and a version bump always means a fresh build anyway. (2) Two `TestParseCache` tests (`test_changing_a_files_content_reparses_only_that_file`, `test_a_different_grammar_epoch_is_never_served_from_the_old_one`) failed ONLY under the full suite, never alone -- both asserted a fresh parse (`len(calls) == 1`) but got a silent cache HIT (`len(calls) == 0`) instead. Root cause: the real `tempfile.gettempdir()/festina-parse-cache/` directory persists across separate pytest *processes*, and byte-identical fixture content (`"log('hi')\n"`, `"log('v2')\n"`, even the test's own hardcoded monkeypatched epoch string `"a-different-epoch"`) had already been cached to disk by an earlier run of this exact test file -- a test-isolation gap, not a production defect (a real second compile of byte-identical content SHOULD hit the cache; only the *test's* assumption that it was starting from an empty cache was wrong). Fixed with an autouse `_isolated_parse_cache_dir` fixture that monkeypatches `tempfile.gettempdir` to a fresh `tmp_path` for every test in the class.
+
+**Full suite, run twice after both fixes (this session's own "confirm any flake in isolation, then rerun clean" discipline):** first run (before either fix): 2 pre-existing window-manager timing flakes (`TestFullscreenAndDecorations`, the same two seen throughout this session -- confirmed passing in isolation, 6/6, immediately after) plus the two real bugs above hitting twice each across their two affected test files, 6 failures total, 2366 passed. Clean rerun, after both fixes: **2372 passed, 14 skipped, 0 failed** in 460.45s (0:07:40) -- no flakes at all this time, including the window-manager tests.
+
+254. CYCLE-TRIAL COST: MEASURING WHETHER THE DEFERRED-ROOT BUFFER IS A REAL WIN, BEFORE WRITING ANY C
+
+The third of the four self-hosting-compiler-ergonomics candidates behind #252/#253, and the one todo.md itself flagged as needing a real measurement first: "batching trades lower amortized CPU for higher peak memory -- a real trade-off to confirm explicitly before writing any C, not an assumed win." Asked directly, given how correctness-critical a change here would be (new logic in the free path of every struct/arr/map release wrapper, touched by every Festina program that uses any of them), the call was: measure first, decide after. This entry is that measurement -- no runtime or codegen code changes at all.
+
+**The hypothesis the old number never actually tested.** todo.md's existing "20k dropped 21-node cycles in ~34ms" (#120) measured *disjoint* cycles -- each iteration builds a fresh, isolated 4-node ring, uses it, and lets the whole thing go. That shape never exercises what a deferred-root buffer is *for*: redundantly re-walking the same *shared* structure once per release, because today's trial (`runtime/festina_runtime.c:5264-5425`, gray -> scan -> white) runs synchronously and independently every single time a cyclic-capable value's release finds it still externally referenced (`festina/codegen.py`'s `_emit_cycle_trial`, called from the still-alive branch of each cyclic struct/arr/map's release wrapper).
+
+**A benchmark built to isolate sharing, not just size.** Two synthetic Festina programs (scratchpad only, generated by a small parametrized script, not committed -- same precedent as #253's own disposable benchmark programs), both closing a `struct Node { n:int  next:Node }` chain into a genuine reference cycle exactly like the existing `struct_self` leak-stress idiom, but built for comparison rather than isolation:
+
+- **"shared"**: one ring of `RING_SIZE` nodes, with `NUM_ROOTS` external anchor references spread evenly around it. A tight loop of `ITERATIONS` repeatedly takes a scratch reference into the ring via one anchor and drops it again -- every drop is a release that finds the node still referenced (by the ring's own internal `.next` edges and the other anchors), so every iteration runs one FULL trial over the *entire* `RING_SIZE`-node ring.
+- **"disjoint"** (control): the identical total node count and identical total iteration count, but split into `NUM_ROOTS` independent private rings of `RING_SIZE/NUM_ROOTS` nodes each, with no cross-root sharing at all -- each iteration's trial only ever walks its own small ring.
+
+Both programs print a checksum (a sum over the anchors' `.n` fields, arranged so each anchor carries a distinct value); both were hand-verified against a computed expected total at a small scale (ring=12, roots=3, iterations=10: shared -> 36, disjoint -> 9000, both matched exactly) before trusting any timing run.
+
+**Measured, not assumed -- and the hypothesis held, cleanly:**
+
+| ring_size | num_roots | iterations | shared (wall) | disjoint (wall) |
+|---|---|---|---|---|
+| 5,000 | 10 | 5,000 | 258 ms | 28 ms |
+| 5,000 | 10 | 10,000 (2x iters) | 511 ms (~2.0x) | 54 ms (~1.9x) |
+| 20,000 (4x ring) | 10 | 5,000 | 1,051 ms (~4.1x) | 106 ms (~3.8x) |
+
+Same total node count, same total iteration count, same checksum-verified correctness -- and the *shared* case costs roughly 9-10x the *disjoint* case throughout, scaling linearly in both the iteration count and the ring size exactly as the "trial cost is O(walked-graph-size) per release" model predicts. This is the redundant-re-walk cost the deferred-root buffer specifically targets: batching the anchors' releases would let one trial resolve the whole ring's liveness once per batch instead of once per release. Extrapolating the measured linear scaling, a real program doing this much release-while-live churn against a large shared structure (a self-hosted compiler repeatedly re-pointing AST references during a long-lived pass, for instance) would see multi-second costs at sizes well within plausible reach -- a genuinely different regime from #120's already-fine 34ms number.
+
+**Decision, per the plan's own stated rule: the cost is real and scales with sharing specifically, so Phase 2 (the actual buffered-roots implementation) is now motivated by measurement rather than assumption** -- but it is *not* started in this entry. The design itself (sketched in the approved plan, not repeated here) is materially more invasive than "add a queue": Bacon-Rajan's real buffered-roots algorithm requires the *free* path of every cyclic release wrapper to become buffering-aware too (a node still marked "possible root" when its count hits zero must not be deallocated immediately -- its pointer is sitting in the pending-roots buffer, so an immediate free would leave that buffer holding a dangling pointer for the next batched trial to dereference; it has to survive as a zombie until the batch resolves it for real). That is new correctness-critical surface in code every struct/arr/map-using Festina program runs through, and it earns its own dedicated round -- its own plan, its own ASan/LeakSanitizer-under-stress verification of the zombie-free path specifically, not a tack-on to this measurement. todo.md's bullet is updated to record this finding as evidence, not rewritten as already-decided.
+
+**Full suite:** not run for this entry -- no compiler or runtime code changed; the benchmark programs are scratchpad-only and exercise existing, already-tested trial-deletion code exclusively.
+
+255. THE FOURTH SELF-HOSTING CANDIDATE'S OWN RATIONALE DIDN'T SURVIVE CHECKING IT
+
+The last of the four candidates from #252 -- a raw byte-buffer type. Before scoping it, checked its own stated justification against the actual repo, the same way #254 checked the cycle-collector item's justification with a real measurement rather than taking todo.md's wording at face value. It didn't hold up, on two separate counts:
+
+**The cited prior art doesn't exist.** todo.md's bullet said the feature was "sketched in the same conversation as claude.md #251's own 'what would a raw byte implementation look like' answer." #251 is real, but it's entirely about adding `.length` to `text`/`blob` and a same-day leak fix -- no such sketch, question, or answer appears anywhere in it, or anywhere else in claude.md. Grepping both claude.md and todo.md for the phrase turns up nothing beyond todo.md's own bullet. The actual origin is #252's four-candidate list itself, where the byte-buffer type was one of three items explicitly deferred to a roadmap rather than designed -- todo.md's citation was describing a design conversation that never happened.
+
+**The one concrete justification is already true today, independent of any byte-buffer type.** The bullet's stated motivation was "useful once/if something wants to skip shelling out to clang on textual LLVM IR." Checking `festina/llvm_backend.py`: the compiler already avoids that subprocess whenever libLLVM is available -- it parses the generated IR text in-process via LLVM's own C API (`LLVMParseIRInContext`) and emits an object file directly, falling back to writing a `.ll` file and shelling out to `clang`/`cc` only when the in-process path isn't available. Nothing about that in-process path needs a byte-buffer type; it already runs today, built entirely on ordinary `text`. And the other half of the original motivation -- cheaply mutating a large in-progress IR buffer rather than reconstructing it -- is exactly what #243's in-place string-append already solved for `text` specifically, which is what todo.md's own wording already conceded ("already makes cheap without it") without drawing the further conclusion that this leaves nothing concrete left to justify the feature.
+
+**Outcome: todo.md's bullet corrected, not the feature built.** Rewrote the bullet to drop the fabricated citation, record the checked-and-false LLVM-IR justification, and note #243's coverage of the mutation half -- left open only on its own, narrower merits (a mutable indexable byte buffer is a plausible primitive for binary protocol/data work on its own) rather than the self-hosting-compiler premise it used to rest on. No code changes; no runtime or compiler surface touched. All four #252 candidates are now accounted for: `match` (#252) and the lex/parse cache (#253) shipped; the cycle-collector buffer was measured and deliberately left unbuilt (#254); the byte-buffer type's own stated case for existing didn't survive being checked (#255).
+
+**Full suite:** not run for this entry -- a documentation-only correction, no compiler or runtime code touched.
+
+256. THE `ascii` TYPE: ONE BYTE PER CHARACTER, SO THE LENGTH CAN LIVE IN A HEADER
+
+Asked what the biggest obstacle to bootstrapping Festina in Festina actually is. The answer turned out to be none of #252's four candidates: it is that `text` has no O(1) random access and no cached length, which is the single operation a lexer performs most. `festina_text_length` is a full UTF-8 code-point walk per call; `festina_text_char_at` walks from byte zero counting code points AND mallocs a fresh 1-4 byte string per access. So `for int i = 0, i < src.length, i++ { text c = src[i] }` is quadratic twice over plus an allocation per character.
+
+**The first design considered was giving `text` itself a header, and a full audit killed it.** Three parallel explorations found that a live `text` pointer today has FOUR distinct provenances, not one: heap buffers; bare `.rodata` `@.str.N` literal pointers (passed uncopied at call arguments, method receivers, non-escaping parameters, template pieces and comparison operands -- `_is_owning_text_source` returns False for `StringLit` precisely because "freeing one would corrupt the binary's own static data"); `festina_getenv`'s borrowed pointer into the process environment; and an X11 `char name[32]` STACK buffer handed straight to `@__festina_on_keyDown` as a text argument. Every one would need a valid header or every header read is undefined behavior -- across ~120 free sites and ~90 producer sites, where each miss is silent heap corruption rather than a loud failure. #243 had already reached the same conclusion from the other direction, and its wording is worth keeping: "`text` is a bare `char *` -- no header, freed by plain `free` at dozens of codegen and runtime sites -- so a length cannot live in front of the string."
+
+**So `text` was left completely untouched and `ascii` was added as its own type.** One byte per character is the entire idea: when a character IS a byte, the character count IS the byte count, so it can be stored. And because `ascii` is new, every literal, producer and free site is greenfield -- none of text's four provenances exist for it. The audit's conclusion became the design constraint rather than a problem to work around.
+
+**Layout, reusing the existing machinery rather than adding any:**
+
+```
+base+0    int64_t length     <- payload - 16
+base+8    int64_t refcount   <- payload - 8
+base+16   the bytes, NUL-terminated
+```
+
+This is exactly #176's tagged-struct shape, chosen for exactly #176's reason: the refcount sits at precisely `payload - 8`, so `festina_retain`/`festina_release_check` work on an ascii with ZERO changes, while the length sits one word further back where only ascii's own code looks. Verified directly in a C harness before any codegen existed -- retain took the count 1 -> 2, release_check answered 0, both unmodified. A NEGATIVE refcount is the standard immortal sentinel, unchanged, which is what lets literals and the singletons below be handed around as ordinary ascii values that retain/release simply no-op on.
+
+**Two things follow from the header that are worth naming separately.** First, `ascii` is REFERENCE COUNTED where `text` is copy-on-alias (#83) -- `ascii b = a` retains rather than copying, which is the case a lexer hits constantly. Second, `s[i]` allocates NOTHING: 128 immortal single-character values built into `.data` at compile time (not lazily -- a lazy table would race between Festina threads; these are constant, so there is nothing to initialize). Making indexing O(1) without this would have been half a fix, since the malloc-per-character was as expensive as the walk.
+
+**Literals are resolved at compile time.** A quoted literal is still a `text` literal; assigning one to an `ascii` emits an inline-header constant straight into `.rodata` -- the same `{i64, T}`-plus-getelementptr shape `_global_var_defs` already uses for struct/arr/map globals. So `tok == 'let'`, the single most common thing a lexer does, allocates nothing at all. And because the bytes are known at compile time, a non-ASCII literal FAILS TO BUILD rather than deferring to a runtime null. `text.toAscii()` is the runtime path and answers null for anything not representable, matching `toInt()`'s own "null when the input does not answer the question" convention.
+
+**This is also the answer to the original request, which was to make `charCodeAt` O(1).** `ascii.charCodeAt(i)` is a bounds check and a byte load. `text.charCodeAt` is unchanged and still walks -- without a header on `text` there is nothing for it to read, and the audit above is why there will not be one.
+
+**One real bug, caught by leak_stress and not by anything else.** The first full stress run leaked exactly 6,000 objects over 2,000 iterations -- three per iteration, precisely the three heap-allocated locals (`slice`, `+`, `toAscii`). `_is_refcounted` and `_release_fn_for` both knew about ascii, but the VarDecl branch that SCHEDULES a local for scope-exit release did not, so nothing ever called the release. Fixed by adding ascii to that branch on blob's exact terms (always scheduled, no escaping-ness or fresh-source test, because every ascii binding owns one counted reference however it was produced). Worth recording that the type checked out completely in hand probes before this: correct output, correct edge cases, no crash. Only ASan found it.
+
+**Measured, not assumed.** A character-by-character identifier scan, same program over the same input, `text` versus `ascii`, token count checked against an independently computed value:
+
+| input | `text` | `ascii` |
+|---|---|---|
+| 10.4 KB | 50.1 ms | -- |
+| 20.8 KB | 201.5 ms | -- |
+| 41.6 KB | 799.8 ms | -- |
+| 520 KB | -- | 2.3 ms |
+| 2.08 MB | -- | 10.9 ms |
+| 4.16 MB | -- | 21.5 ms |
+
+The shape is the real result: `text` QUADRUPLES when the input doubles (a walk per index, over every index -- textbook O(n^2)), `ascii` doubles. The two are deliberately measured at different sizes because the honest comparison at a shared size was not resolvable -- at 20 KB the ascii scan was under 0.1 ms with a 1.6 ms process-startup baseline, so the "3,000x" ratio that fell out of subtracting one from the other was mostly noise and is not claimed. What IS claimed: at 41.6 KB `text` needs 800 ms, and `ascii` scans 4.16 MB -- a hundred times more input -- in 21.5 ms. Extrapolating text's measured quadratic to this repo's own `codegen.py` (~500 KB) gives roughly two minutes to scan one file, which is the bootstrapping argument made concrete.
+
+**Verified.** A C harness first (layout, retain/release interop, singleton identity and immortality, out-of-range nulls, embedded NULs, non-ASCII rejection), then hand probes end to end, then `tests/test_codegen.py::TestAscii` (16 tests) and `tests/stress/ascii_churn.f` under `scripts/leak_stress.sh` -- clean after the tracking fix above, whose numbers were hand-computed rather than read off the program. Non-ASCII coverage in the suite was thin (only `'café'`, no 3- or 4-byte code points), so the new tests pin the text/ascii length difference explicitly.
+
+**Docs.** api.md gains an `ascii` section (with the measured table and the cost model); CHANGELOG under 0.44's "Added"; todo.md's Memory-model bullet corrected -- it claimed `text` carries a refcount header, which it does not and never has.
+
+**Full suite:** `python3 -m pytest tests -q`: **2388 passed, 14 skipped**, and one real failure of my own making -- `test_leak_stress.py::test_the_suite_covers_every_managed_resource`, which asserts the EXACT set of stress-program filenames precisely so a new one cannot be added unaccounted for. `ascii_churn.f` was added without registering it there. Exactly the guard working as designed, and worth noting alongside the scope-exit leak above: two of this entry's three real defects were caught by a test whose only job is to notice something missing, not by anything exercising the feature itself. Fixed by registering it (an ascii is refcounted where text is copy-managed, and it is the only type whose indexing hands back an immortal value, so it is a genuinely distinct ownership shape rather than a duplicate of text_churn.f).
+
+257. `?` ALREADY MEANT "DO NOT COLLECT" FOR EVERY TYPE THAT ALLOCATES -- AND MEASURING THAT FOUND A BUG
+
+Asked to extend `?` to every type, with `?` meaning "do not garbage collect" rather than the reference/cell semantics that were tried and reverted just before this. Measured what `?` actually does per type before changing anything, since the answer decides whether there is any work to do at all.
+
+**It is already the shipped behavior, everywhere it can be.** Each of these is a loop that allocates and never frees, run under LeakSanitizer via `scripts/leak_stress.sh`, against an otherwise-identical control without the `?`:
+
+| declaration | result | control (no `?`) |
+|---|---|---|
+| `text? t = \`built-${i}\`` | **leaks** | clean |
+| `ascii? a = base.slice(0, 5)` | **leaks** | clean |
+| `int? n = i` | clean | clean |
+
+`text?` and `ascii?` leak, which is `?` working: nothing collected them. `struct?` was already proven the same way by `test_leak_stress.py`'s own canary (claude.md #202). `int?` is clean in BOTH columns because an int is a value in a stack slot -- there is no allocation, so there is nothing to not-collect. That makes `?` inert on `int`/`float`/`bool`/`func`/`color`/`font` **by nature rather than by omission**, and accepting it there as no-op grammar (claude.md #202's own choice) is already the correct behavior. Nothing to add.
+
+**What the measurement did find is a real bug, broken since #204.** `analyze_var_decl`'s fresh-construction escape hatch strips the `?` off the declared type before checking assignability -- but it did so under `isinstance(declared_type, _MANUALLY_MANAGEABLE_TYPES)`, a tuple of the manually-manageable DATACLASSES, which does not include `PrimitiveType`. `PrimitiveType` is blob's own category (blob has no dedicated dataclass -- exactly the gap `_is_blob_type` was invented for), so the flag survived into `check_assignable` and
+
+```
+blob func mk() { blob b = 'f.txt'  return b }
+blob? x = mk()                     // rejected: "cannot assign value of type blob to blob?"
+```
+
+failed to compile -- while the structurally identical `C? x = makeCircle()` compiled fine. #204's own doc comment names that exact shape as the thing the hatch was written to allow, so this was a straightforward miss, silently live since then. Fixed by keying on whether the declared type actually CARRIES the flag (`getattr(declared_type, "manually_managed", False)`) rather than on which dataclass it happens to be.
+
+`#256`'s `ascii` inherited the same gap the moment it existed, which is how the blob case surfaced: an `ascii?` could hold a literal (immortal, so the one value `?` is pointless for) and nothing else -- every form that actually produces a heap ascii (`.slice()`, `.toAscii()`, a function returning one) was rejected. Both work now.
+
+**Deliberately NOT changed.** `T? x = <existing plain binding>` stays rejected (a bare alias dangles when the plain binding auto-frees), and `plain T x = <a T?>` stays rejected too -- the "no implicit decay" rule, which stops a manually-managed value becoming an auto-managed binding that would then free what the programmer owns. Both were re-confirmed as still rejected after the fix. Also unchanged: `text?` remains inert at the TYPE level (`text` and `text?` type-check as the same type, unlike blob/ascii) even though it is honored at runtime. That asymmetry is real but making it type-level would newly reject code that compiles today, so it is left alone and recorded here rather than fixed in passing.
+
+**Verified.** The LeakSanitizer table above; `tests/test_manually_managed.py` gains three tests (a fresh call into `blob?`, into `ascii?`, and the ascii method-result forms), 56 pass in that file. Two of my own probe programs failed first and were wrong rather than the compiler: one called `.slice()` on a text literal, and one assigned an `ascii?` into a plain `ascii`, which the no-implicit-decay rule correctly rejects -- worth recording, because each looked like a compiler bug until read properly.
+
+**Full suite:** `python3 -m pytest tests -q`: **2392 passed, 14 skipped, 0 failed** in 552.85s (9:12), clean on the first run with no flakes.
+
+258. `ascii.charCodeAt(i)` IS EMITTED INLINE, AND ITS RUNTIME FUNCTION IS GONE
+
+#256's own benchmark said Festina was slower than Rust and Go at the one workload the type was added for. `benchmarks/char_scan.f` scans a ~1.7 MB buffer character by character counting identifier runs, five passes, and measured **Festina 24.8 ms against Rust 15.5 ms and Go 14.4 ms** -- roughly 1.7x behind. Recorded honestly at the time rather than explained away, with the cause named: `charCodeAt(i)` compiled to a CALL into `festina_ascii_char_code_at` per character, where Rust and Go index raw bytes inline in the loop body. Everything that function did -- a null check, a load from a fixed header offset, a bounds check, a byte load -- is something a compiler can emit directly.
+
+**It now does, and the runtime function was deleted rather than left behind.** Inlining removed its only caller; keeping a function nothing calls, purely because it used to be the definition, is cruft with a comment attached. What replaced it in `festina_runtime.c` is a comment saying where the operation lives now and why.
+
+**Emitted BRANCHLESS, deliberately.** No new basic blocks, so the expression stays a straight-line value every surrounding emitter can keep treating as one (no phi, no block bookkeeping threaded through `_emit_expr`), and so LLVM can hoist the loop-invariant length load without first having to prove a guard. Both loads are made unconditionally safe by SUBSTITUTION rather than by control flow:
+
+- a null payload is replaced, via `select`, by the interned EMPTY ascii literal -- whose `.rodata` header reads length 0, so a null receiver falls into the out-of-range case and answers null, which is exactly what the deleted function's `if (!payload)` did.
+- an out-of-range index is replaced by 0 for the byte load only. Offset 0 is ALWAYS readable: `festina_ascii_alloc` allocates `len + 1` and NUL-terminates, and the empty literal is one NUL byte, so even an empty ascii has a valid byte there. The loaded byte is then discarded by the final `select`.
+
+**Equivalence was verified by diffing, not by reasoning.** Both builds -- runtime call and inline -- were run over the same probe covering every edge the function had: in-range, last index, one past the end, negative, empty receiver, a null receiver from a failed `toAscii()`, and a null receiver arriving as a call RESULT (which also exercises `_release_owned_receiver` on a null). Byte-for-byte identical output, including the raw `-9223372036854775808` an unguarded `log()` of a null int prints.
+
+**The result, same machine, same input, same seven-run minimum:**
+
+| | before | after |
+|---|---|---|
+| Festina | 24.8 ms | **13.6 ms** |
+| Rust | 15.5 ms | 16.3 ms |
+| Go | 14.4 ms | 14.8 ms |
+| Bun | 42.0 ms | 40.6 ms |
+
+Just under 2x, and Festina is now the fastest of the four rather than the slowest of the three native ones. The other three moved only within run-to-run noise, which is the control that says the change is real and not the machine.
+
+**Only `charCodeAt` is inlined.** `s[i]` still calls `@festina_ascii_char_at`: its result is a pointer INTO the 128-entry immortal singleton table, and reaching that table from emitted IR would mean hard-coding the C struct's layout (`{i64, i64, char[2]}`, 24 bytes with padding) into codegen -- real ABI coupling between two files that today share only function signatures, in exchange for an operation no measured workload has yet put in a hot loop. Left as a call, on purpose, and recorded here so the asymmetry reads as a decision rather than an oversight.
+
+**Verified.** Three new tests in `tests/test_codegen.py::TestAscii`: the edge sweep above, the call-result-receiver form, and -- the one that actually guards the point of this entry -- a DIFFERENTIAL IR check. The same loop with `charCodeAt` swapped for plain arithmetic must emit the identical set of called functions, so anything charCodeAt costs shows up as a difference, while the runtime prologue both programs share stays out of it. Pinning an exact call list instead would have failed the moment the prologue changed, and testing only the answer would have passed just as happily when it WAS a call -- the answer was never what was wrong. `scripts/leak_stress.sh` clean across all 29 programs.
+
+**Full suite:** `python3 -m pytest tests -q`: **2397 passed, 14 skipped, 0 failed** in 525.02s (8:45).
+
+259. A THROW OUT OF A RUNTIME CALLBACK NO LONGER STRANDS THE RUNTIME FRAME'S OWN MEMORY
+
+The last open item from #236, and the last leak this project's own memory model knew about and had not closed. #236's cleanup stack releases every FESTINA-side local of every intermediate frame a throw passes through. What it could not reach was memory a RUNTIME C frame had allocated for itself and was still holding when the Festina callback it invoked threw: the longjmp goes straight to the catching try, so that frame's own `free()` never executes.
+
+**Measured before touching anything.** 50 iterations of a `try { xs.sort(cmpThatThrows) } catch`, under LeakSanitizer:
+
+```
+Direct leak of 6400 byte(s) in 50 object(s) allocated from:
+    #1 festina_array_sort runtime/festina_runtime.c:5252
+```
+
+128 bytes per throw, exactly `festina_array_sort`'s merge scratch, exactly once per throw. Real, and precisely the size todo.md predicted.
+
+**The audit found only one such frame, which is the more useful result.** Every runtime function that calls back into Festina code was checked for whether it (a) allocates and (b) can have a Festina `try` sitting beneath it:
+
+| callback site | allocates? | a try beneath it? |
+|---|---|---|
+| `festina_array_sort` (`.sort(cmp)`) | **yes** -- merge scratch | yes |
+| `festina_map_for_each` (`.forEach(fn)`) | no | yes |
+| `festina_fire_expired_timers` | no | **no** |
+| mouse/key/resize/close handlers | no | **no** |
+| `on request` / socket / `on message` | no | **no** |
+
+Everything below the first two rows is dispatched from an EVENT-LOOP frame, and no Festina `try` can be live under one -- a try body at top level has already run to completion (and popped its own catch frame) long before the loop starts. Confirmed by running it: a `throw` from inside a `setTimeout` callback scheduled inside a `try` does not reach that catch at all, it ends the program with `fail: from a timer`, exit 1. So there is nothing to unwind there and nothing to strand. todo.md listed "`.forEach(fn)`, `.sort(cmp)`, a timer"; of those, only `.sort` was ever actually leaking.
+
+**The fix is four lines and reuses the mechanism that already exists.** `festina_array_sort` registers its scratch on the same cleanup stack generated code uses for its own in-flight values, pushed once outside the merge loops (one push per sort, not per comparison) and popped immediately before the ordinary `free`. `free` already matches the stack's `void (*)(void *)` release signature exactly, so no wrapper is needed. On the throwing path `festina_throw` releases it along with everything else above the catching frame's recorded depth; on the ordinary path the pop removes it and the existing `free` runs. Both paths free it exactly once, and neither frees it twice.
+
+**A nested sort was the case worth thinking about, and it is fine by construction:** a comparator that itself calls `.sort()` pushes and pops its own entry entirely inside the outer one's, so the stack stays balanced and the outer entry is still on top when the outer pop runs. So is a comparator that CATCHES ITS OWN throw -- the outer sort never sees one and completes on the ordinary path.
+
+**Verified.** `tests/stress/callback_throw_churn.f`, 2,000 iterations of both runtime callback frames plus both of those shapes, with managed locals live across each throw so the cleanup stack has real work above the scratch entry rather than the scratch entry alone. ASan/LeakSanitizer clean -- and confirmed to FAIL without the fix at 208,000 bytes in 4,000 objects, which is what makes it a regression guard rather than a passing no-op. Two pytest tests pin the visible contract the sanitizer cannot see: a thrown-through array is still readable afterwards and re-sorts correctly, and a nested sort still produces the right answer.
+
+**todo.md's Memory model section loses this bullet entirely.** What is left open there is now the `rows()[0]` array leak and the cycle-collector deferred-root buffer.
+
+**Full suite:** `python3 -m pytest tests -q`: **2400 passed, 14 skipped, 0 failed** in 539.22s (8:59); `scripts/leak_stress.sh`: all 30 programs clean. The first run of the suite failed one test -- `test_graceful_shutdown.py::test_an_in_flight_connection_still_completes_before_exit`, a SIGTERM race with a 0.2s sleep in it and nothing to do with sorting -- and it reproduced once in isolation, which is why it was checked properly rather than waved off: the same test passes on a stash of these changes, passes six times in a row with them, and passes in the clean full run above. A flake, confirmed as one rather than assumed to be.
+
+260. `rows()[0]`'S ARRAY LEAK IS CLOSED -- AND THE FIX IS SMALLER THAN #224 SCOPED IT AS
+
+The project's own longest-standing documented leak, deliberate since #85, re-documented by #119, and scoped by #224 as a `TableType`-ownership project "comparable in size to claude.md #11-16" -- six rounds of copy-on-alias plumbing for a second header-less type. It turned out not to need any of that.
+
+**#224's plan was right about the blocker and wrong about the only way past it.** A row has no refcount header (the array owns it outright), so `_mint_and_release_computed` cannot do for `rows()[0]` what it does for every other element type: retain, then release the container. #224 concluded the answer was to COPY the whole row -- which then needs scope-exit ownership for `TableType` locals to free the copy, which is the six-round project. And #224 explicitly checked and rejected copy-at-the-extraction-site alone, correctly: without that scope-exit half it turns an array leak into a per-access row leak, which is worse.
+
+**The third option neither of those considered: don't mint the row at all -- park the ARRAY on the enclosing member chain.** `_release_member_chain` (#108/#117) already exists to answer exactly this question one link further out, where the type of the value that actually escapes is finally known. `rows()[0].name` copies the name FIRST (`festina_text_own`) and releases the array after; `rows()[0].someBlob` retains the blob first and nets +1 the same way; `rows()[0].id` needs neither, because an i64 owes the row nothing. The row itself is never minted, never copied, and stays exactly as borrowed as it has always been. Four lines in `_mint_and_release_computed`, no runtime change, no new per-table function, and no `TableType` ownership model.
+
+**Parked only when there is a chain to drain it,** decided by the same AST node IDENTITY test `_begin_member_chain` already uses: `self._chain_receiver is expr` means the frame above set this very node as the receiver it is about to emit, so whatever is parked is what that frame will drain. Parking unconditionally would be worse than the leak -- the entry would either sit on a list nobody drains, or be released by a frame that never owned it, which is a use-after-free rather than a leak. So `People p = rows()[0]` (bound straight to a row local), a row passed as an argument, or a row returned all still leak their array exactly as documented, and #224's scoping stays the accurate description of what a full fix for THOSE shapes would take.
+
+**Measured, before and after:**
+
+| | before | after |
+|---|---|---|
+| 200x `text got = rows()[0].name` | 24,800 bytes, 800 allocations | **clean** |
+| 200x `People p = boundArray[0]` (control) | clean | clean |
+
+**Verified.** `tests/stress/row_chain_churn.f` -- 500 iterations of every position the shape appears in (a plain binding, a scalar column, a discarded result, an interpolation, a comparison, a call argument) plus the already-fine name-bound control, ASan-clean and confirmed to FAIL without the fix. Three pytest tests, including one that reads several columns off several such arrays and prints them all afterwards, so a use-after-free would show up as wrong OUTPUT and not only as a sanitizer report.
+
+**A separate, pre-existing bug found on the way, NOT fixed here, and worth the care it did not get.** `X().someBlob.length` leaks: the `.length` branch drains its parked chain only for an ARRAY receiver, and drops it for blob/text/ascii ones. Measured on the UNMODIFIED compiler at 201 allocations over 200 iterations, so it has nothing to do with this entry. It is not a one-line fix, because the drop is currently masking an over-release: `_is_owning_refcounted_source(X().someBlob)` answers True (a chain whose base is a Call) while the inner `_emit_member_load` link never actually minted anything, so `_release_owned_receiver` releases a blob it does not own -- and gets away with it only because the leaked struct's cascade never runs to release it a second time. Draining the parked entry without also fixing that predicate mismatch converts a leak into a DOUBLE FREE. Recorded in todo.md with that trap spelled out, rather than patched at the end of a session.
+
+**Two canaries retired by this, both replaced deliberately.** `test_the_harness_can_actually_fail` was leaning on this exact leak -- the third canary in a row the compiler has fixed out from under it (the chained call result by #108/#117, the reference cycle by #120, this one now). Three is enough of a pattern to stop drawing canaries from the "known bug, not yet fixed" pile: the new one is a `text?` never freed, a leak by CONTRACT (#202/#257) that no future round can quietly fix, so if it ever stops leaking the loud failure is correct rather than a fourth retirement.
+
+**Full suite:** `python3 -m pytest tests -q`: **2403 passed, 14 skipped, 0 failed**; `scripts/leak_stress.sh`: all 31 programs clean.
+
+261. A FLAKY TEST, MEASURED RATHER THAN RERUN UNTIL GREEN
+
+`test_graceful_shutdown.py::test_an_in_flight_connection_still_completes_before_exit` failed twice in four full-suite runs while #259/#260 were being verified, and passed six times in a row in isolation. The tempting read is "flake, rerun it". The actual cause is a real race in the test, and it took one measurement to find.
+
+The test connected to the server, signalled SIGTERM, then sent the request. But a completed `connect()` only means the KERNEL finished the TCP handshake and queued the connection in the listen backlog -- not that the server process has `accept()`ed it. Signal first and the shutdown path closes the listener with that connection still unaccepted, so the client gets an RST instead of a response. Under load the server is less likely to be scheduled in time, which is exactly why it only failed inside a full suite run.
+
+**Quantified rather than argued.** The same scenario, 20 runs each, under deliberate CPU load (one spinning process per core): the old shape failed 2 of 20, the new one 0 of 20.
+
+**The fix makes the test stricter, not looser.** It now sends a PARTIAL request before the signal and completes it after, so the connection is genuinely mid-request when shutdown is triggered -- which is the state the grace period actually exists for, and a stronger property than "a socket sitting in a backlog gets served". It also removes the race by construction: the server has readable data waiting, so its poll() wakes and accepts immediately, and the sleep that follows gives that accept room before the signal lands. Recorded because "rerun until green" would have left a real 10%-under-load race in the suite and taught nothing.
+
+262. `.length` OFF A NON-ARRAY MEMBER CHAIN -- A LEAK THAT WAS MASKING A USE-AFTER-FREE
+
+Found while closing #260, recorded in todo.md rather than patched at the end of that session, and fixed here on its own.
+
+**The leak.** `.length` has participated in the member chain since #108, but only its `arr[T]` case ever DRAINED the chain -- the `blob`, `text` and `ascii` cases dropped the parked bases on the floor. #251's own comment states the reasoning it did so on: *"blob has no further sub-fields to chain through (no `make().someBlob.length` shape exists the way `make().inner.items.length` does for arr[T])"*. Any struct with a blob, text or ascii field is that shape, and so is any table row with such a column. Measured on the unmodified compiler: **201 allocations over 200 iterations** of `mk().b.length`.
+
+**The trap, and why this got its own round rather than a one-line drain.** The drop was MASKING an over-release in the other direction. `_release_owned_receiver`, which those branches called instead, tests `_is_owning_refcounted_source` -- which answers True for `mk().b` (a chain whose base is a `Call`) even though the inner `_emit_member_load` link was NESTED and therefore never minted anything. So it released a field the expression did not own, and got away with it purely because the leaked struct's cascade never ran to release it a second time. Two bugs cancelling.
+
+**Confirmed, not inferred.** Draining the chain while leaving that release in place, then running the probe:
+
+```
+ERROR: AddressSanitizer: heap-use-after-free
+SUMMARY: heap-use-after-free festina_runtime.c:4584 in festina_release_check
+```
+
+Exactly the prediction todo.md recorded. Worth writing down that the prediction was tested: it would have been just as easy to state it and move on, and the whole point of the note was that the naive fix is dangerous.
+
+**The fix is a discriminator, not a new predicate.** A non-empty `pending` can only happen when an inner `_emit_member_load` frame ran, which can only happen when the direct receiver is itself a `Member` -- an alias INTO the parked graph, freed by that graph's own cascade. So:
+
+- `pending` non-empty: release only the parked owning bases, through the same `isinstance(e, ast.Call) or id(e) in _minted_values` filter `_release_member_chain` has always used (now shared as `_owning_chain_receivers`, so no drain site can reach for a different rule again). The direct receiver is not released at all.
+- `pending` empty: the existing single-receiver release, unchanged -- which is what keeps `getBlob().length` and, importantly, `(cond ? a : b).length` working. A Ternary is "owning" to `_is_owning_refcounted_source` (#173 normalizes whichever branch ran into a real +1) but is NOT in the chain filter, so routing everything through `_release_member_chain` would have quietly leaked it. That near-miss is why the fix discriminates instead of unifying.
+
+**Verified.** `tests/stress/chain_length_churn.f`, 2,000 iterations of one-link and two-link chains across all four field types, plus the no-chain owning and borrowed receivers. ASan-clean; **1,580,000 bytes in 66,000 allocations without the fix**. The struct field is a SHARED blob read back after the loop, deliberately, so the over-release direction shows up as a use-after-free rather than as nothing. One pytest test pins the answers for all six shapes plus that read-back. Answers are byte-identical to the old build across every shape -- only the ownership traffic changed.
+
+**Full suite:** `python3 -m pytest tests -q`: **2405 passed, 14 skipped, 0 failed** in 548.12s (9:08); `scripts/leak_stress.sh`: all 32 programs clean.
+
+263. ANSWERED: ASan/LeakSanitizer FOR wasm32-wasi -- THE TOOLCHAIN HAS NONE, AND IT DOES NOT MATTER
+
+todo.md carried "AddressSanitizer/LeakSanitizer coverage for the target" as open-but-not-blocking, and wasm.md said whether sanitizer builds work there "has not been investigated". Investigated now, and it closes rather than opens work.
+
+**The toolchain refuses the flag.** `clang --target=wasm32-wasi -fsanitize=address` fails with *"unsupported option '-fsanitize=address' for target 'wasm32-unknown-wasi'"* -- not a link error to work around, a front-end rejection. And the package this target's own compiler-rt comes from (`libclang-rt-18-dev-wasm32`, one of cli.py's own wasm dependencies) contains exactly one library: `libclang_rt.builtins-wasm32.a`. There is no sanitizer runtime for the target to link even if the driver accepted the flag.
+
+**The more useful half: there is nothing wasm-specific to sanitize.** The entire runtime compiles from the same C source for every target, and the whole `__wasi__`-guarded delta is ABSENCES -- `festina_throw` is a stub (wasi-libc has no setjmp/longjmp), `festina_run_argv` is a stub (WASI has no process model), signal handling is compiled out (wasi-libc's `<signal.h>` is an unconditional `#error`) -- none of which allocate anything. The one `__wasi__` branch that touches allocation at all shares Linux's `malloc_usable_size`. So every allocation `scripts/leak_stress.sh` exercises natively is the identical code a wasm build runs, and the target-specific surface that a wasm-only sanitizer run could newly cover is empty.
+
+**What was considered and rejected as the alternative.** A crude leak signal IS possible without a sanitizer -- a wasm module's linear memory only grows, so churning a program under a WASI host and watching `memory.size` across iterations would surface an allocator-visible leak. Not worth building: it would be re-testing the same allocator calls the native runs already prove, at far lower resolution (page granularity, no allocation site, no double-free detection at all), for a target whose only unique code allocates nothing.
+
+**Closed rather than carried.** todo.md's Platforms section no longer lists it as open; wasm.md's bullet now states the toolchain finding and the shared-source argument instead of "not investigated". No code changed.
+
+264. RETURNING A TABLE ROW WAS A USE-AFTER-FREE -- NOW A BOUNDED LEAK
+
+Found while sizing what #260 deliberately left open (the shapes where the ROW itself escapes, not a column read off it). Probing all ten of them turned up something worse than the leak that item is about: two of them **crash**.
+
+```
+People func firstOwned() {
+    arr[People] r = sqlite('SELECT * FROM People')
+    return r[0]                       // exit 245
+}
+```
+
+ASan says exactly what it is:
+
+```
+ERROR: AddressSanitizer: heap-use-after-free
+READ of size 8 ... in main
+freed by thread T0 here: ... in firstOwned
+previously allocated by: ... festina_sqlite_collect_rows
+```
+
+The function releases its local array on the way out, the array's cascade frees every row it owns (#85 -- rows have no header, the array owns them outright), and the caller then reads the row it was handed. **Pre-existing, and not from this session**: reproduced identically at `HEAD~40`, forty commits back.
+
+**The full matrix, because "returning a row" is not one thing.** Ten shapes probed individually:
+
+| shape | before |
+|---|---|
+| `return r[0]`, `r` a LOCAL array | **crash** |
+| `People p = r[0]  return p`, `r` a LOCAL array | **crash** |
+| `return xs[0]`, `xs` a PARAMETER array | fine -- the caller owns it |
+| `return gRows[0]`, a GLOBAL array | fine -- outlives everything |
+| `return rows()[0]`, a call-result array | fine -- that array leaks, so the row stays valid |
+| a row bound, passed as an argument, pushed into an array, stored in a struct field or a map value | all fine |
+
+Only a FUNCTION-LOCAL array is released early enough to strand the row it hands back. Everything that "works" today either owns the array elsewhere or leaks it.
+
+**The fix trades corruption for a leak, deliberately, and says so.** Inside a function whose return type is a table row, a local that could own rows is not tracked for scope-exit release at all. It is a one-line gate in `_track_local`, and it is safe by CONSTRUCTION rather than by analysis: it can only ever release LESS, so no amount of being wrong about which array the row came from can produce a dangling pointer -- the worst case is a leak. That leak is the same bounded, already-documented row-array residual todo.md carries for every other borrowed-row shape (measured: 96 bytes, 2 allocations, one array, not per-iteration).
+
+**Only an `arr[Table]` can own rows, and the predicate says why rather than guessing.** A `map[Table]` cannot -- its release gate is `_is_refcounted(value) or value == TEXT`, and a row is neither, so map values are never released. Nor can a struct field of row type. But both own rows INDIRECTLY when they hold an `arr[Table]`, so `_can_own_table_rows` recurses through arrays, map values and struct fields (bounded by a `seen` set, since #17 allows self-referencing structs) rather than checking one level.
+
+**What this is NOT.** It is not #224's ownership model, which would COPY the row on the way out and make the whole family work properly. It is not a compile-time rejection either -- that was considered and needs a real borrow analysis to avoid rejecting the parameter and global cases, which work today and are legitimate. This is the difference between a leak and memory corruption, nothing more, and todo.md now says so under the same bullet #224 already owns.
+
+**One self-inflicted mistake worth recording.** The first attempt inserted the new method immediately after the line it was guarding, which ORPHANED `_track_local`'s remaining two lines -- the cleanup-stack push -- into the new method's body, after its `return`. Every `festina_cleanup_push` in every program vanished. Caught immediately by three tests, one of which (`test_a_program_with_try_registers_every_tracked_local`) exists precisely to count those pushes and reported `[]` against an expected 6. A reminder that inserting a method inside another one's body is a silent, valid-Python way to delete code.
+
+**Verified.** All ten shapes give the right answer and exit 0. Under ASan, the two former crashes now report a bounded leak and nothing else; the parameter and global cases stay completely clean, which is the check that says the gate did not overreach. Two pytest tests, one per direction. No stress-suite entry: this program leaks BY DESIGN now, and `scripts/leak_stress.sh` requires clean.
+
+**Full suite:** `python3 -m pytest tests -q`: **2407 passed, 14 skipped, 0 failed** in 549.75s (9:09); `scripts/leak_stress.sh`: all 32 programs clean.
+
+265. A TABLE ROW IS AN ORDINARY REFCOUNTED VALUE -- #85's PREMISE WAS TRUE ONCE AND STOPPED BEING TRUE
+
+The whole borrowed-row family -- #85's original "the array owns its rows outright", #119's minting exception, #224's six-round copy plan, #260's chain-parking, #264's containment of a use-after-free -- rested on one sentence: a row has no refcount header. Asked to take #224, the first thing that had to be checked was whether that is still a constraint or just an old decision nobody had re-opened.
+
+**It was an old decision.** Two findings changed the plan before any code was written.
+
+**First: rows ALIAS today, so #224's copy-on-bind plan was a visible semantic break, not just a memory fix.**
+
+```
+People p = rows[0]
+p.name = 'CHANGED'
+log(rows[0].name)   // CHANGED -- a row local is a genuine alias
+People q = p
+q.name = 'AGAIN'
+log(p.name)         // AGAIN
+```
+
+Copying on bind would have silently turned that into value semantics. #224 never said so, because #224 was reasoning about lifetimes, not about what a row IS to a program using one.
+
+**Second: the surface #85 assumed was too large is three functions.**
+
+| | |
+|---|---|
+| producers | **one** -- `festina_sqlite_collect_rows` |
+| freers | **two**, both generated -- `_emit_table_row_release_fn`, `_emit_row_to_struct_fn` |
+| field access | every offset measured from the payload pointer -- a header in FRONT changes nothing |
+| `festina_row_undefined` | payload-relative too -- unchanged |
+| thread clone | none exists: a table value cannot cross a thread boundary at all (#195) |
+
+That is the same closed world #256 gave `ascii` a header in, and nothing like `text`'s four provenances (#83), which is the case #85 was really generalizing from. So a row gets the standard i64 refcount header at `payload - 8`: `festina_retain`/`festina_release_check` work on one unchanged, every field GEP is untouched, and the count starts at 1 with the result array owning it.
+
+**Everything else fell out rather than being built.** `_is_refcounted` gained `TableType`; `_release_fn_for` dispatches it to the per-table wrapper that already existed (now a release rather than an unconditional free); the VarDecl binding and tracking branches gained it on exactly blob's terms. Then:
+
+- **#260's chain-parking: deleted.** A row element is minted like any other refcounted element now -- retain, release the container, net one reference.
+- **#264's containment: deleted**, along with `_can_own_table_rows` and the `_current_func_returns_row` flag. A returned row is retained on the way out; the local array's release drops one of its two references and the caller owns the other.
+- **`_release_fn_for_array`'s TableType special case: deleted.** `_release_fn_for` answers with the same function, so there is no case left to split.
+
+Net: the change ADDS a header and REMOVES three special cases, two of them written earlier the same night.
+
+**Every one of the ten row-escaping shapes #264 enumerated is now clean under ASan** -- including the two that were use-after-frees and the one that leaked its array on every access. Not contained: clean.
+
+**One real bug on the way, found by a test written years earlier for exactly this.** With the header in but the VarDecl branches not yet widened, `People first = rows[0]` did not retain, so `free first` dropped the ARRAY's reference and the array's own cascade then released a row already freed. The `table_rows` per-type isolation program reported it as a heap-use-after-free on the first run. That program exists to pin one type alone so a regression names the type in the test id, and that is precisely what it did -- the failure said `[table_rows]` and nothing else was red.
+
+**Verified.** `tests/stress/row_ownership_churn.f`: 500 iterations of every shape -- returned from a function that owned the array, returned through a local, bound off a call-result array, outliving its array by an explicit `free`, borrowed from a caller-owned array, aliased and mutated through the alias, passed as an argument both borrowed and fresh, stored into an `arr` and a `map` that outlive the query, and columns read straight off call-result rows. ASan-clean, and confirmed to FAIL without the change with a heap-use-after-free. It is a double-free test as much as a leak test: one release too many frees a row the array is still going to release. Aliasing re-checked byte-for-byte against the old build.
+
+**What is still true.** `text` still has no header and never will (#83's four provenances are real and unchanged). The `struct_query` path is untouched: a struct-query row is converted once, immediately after collection, before anything can alias it, so it is freed outright rather than released.
+
+**todo.md loses the whole bullet.** The Memory model section's remaining open item is the cycle-collector deferred-root buffer.
+
+**Full suite:** `python3 -m pytest tests -q`: **2408 passed, 14 skipped, 0 failed** in 541.28s (9:01); `scripts/leak_stress.sh`: all 33 programs clean.
+
+266. EVERY LEXER ERROR WAS A PYTHON TRACEBACK
+
+Found by a probe whose only purpose was to check nested template literals. The nesting turned out not to matter -- what surfaced was that `festina run` on a source with ANY unexpected character printed a twenty-line Python stack trace ending in `SyntaxError: <string>:1:11: unexpected character '$'`, instead of the `file:line:col: error: ...` diagnostic every other compile error produces.
+
+**Why it escaped.** `parser.parse` has always wrapped a lexer `SyntaxError` into a `CompileError`. But `imports.py`'s `_scan_import_paths` tokenizes the file FIRST, to find its `import` statements, before the parser ever sees it -- and it called `lexer_mod.tokenize(source)` bare, with no wrapping and no filename. So the parser's guard was unreachable for the one thing it was guarding.
+
+**Every unexpected character reached it**, not some rare corner: a stray `@`, a `$` outside a template, and -- the one a beginner is most likely to hit -- an unterminated string, since the lexer's string patterns only match a CLOSED string and an unpartnered quote therefore never matches at all.
+
+**Fixed at the source rather than at the caller.** The lexer raises a real `CompileError` with this file's own line and column, so both callers get it right and neither has to remember to wrap. Two hints were added where the raw "unexpected character" is technically true and useless: an unterminated string names itself, and a `$` outside a template says where `${...}` actually works. `imports.py` passes the real path through (it was reporting `<string>`) and keeps a `SyntaxError` arm as a backstop.
+
+One wrong turn worth recording: the first version of the quote hint said Festina strings use single quotes. They do not -- `"double"` works too, and the probe that suggested otherwise had simply left its string unterminated. Checked before shipping the hint, which is the only reason it says the right thing now.
+
+267. A JSON-PARSED STRUCT WAS NOT A VALID MEMBER OF ITS OWN ENUM
+
+The best find of the hunt, and it took a delta-debugger to isolate: a probe combining enums, first-class functions, regexes and try/catch aborted with `free(): invalid pointer`, while every one of those parts passed on its own. Reducing it section by section left a program whose crashing part did not crash in isolation -- the difference turned out to be a declaration that was never used.
+
+**The minimal case is four lines.**
+
+```
+struct A { x:int  s:text }
+struct B { y:text }
+enum E = A, B          // never used below -- but it changes A's layout
+try { A p = 'not json'.toStruct(A) } catch (e:text) { log('caught') }
+```
+
+claude.md #176 widens the header of a struct that is a member of a pure-struct enum, from `{refcount}` to `{tag, refcount}`, so the payload starts at `base+16` and the tag sits at `payload-16`. Every construction site passes the tag -- the clone path, the VarDecl path. The from-JSON builder did not, and it was the only one.
+
+**Both directions were broken by the one omission**, which is what makes it worth more than a leak:
+
+- a **successful** parse produced an untagged struct. Reading its fields worked, so it looked fine; using it as its enum read a tag that was never written. Exit 245.
+- a **failing** parse released the half-built value -- correctly registered on #233's cleanup stack -- through the TAGGED release function, which frees `payload - 16` of an allocation that only reached `payload - 8`. ASan: *attempting free on address which was not malloc()-ed*.
+
+`.toStruct(T)` was, in other words, the one way to build a T that was not a valid E.
+
+**The fix is one line**: pass `type_tag` to `_emit_fresh_heap_header`, exactly as the other two sites do. `.toArr(T)` shares the same per-struct function and was fixed by the same line.
+
+**Verified.** `tests/stress/enum_json_churn.f`, 500 iterations alternating good and bad input so both paths run every time, using each parsed value AS its enum so a missing tag cannot pass unnoticed -- ASan-clean, and a heap-buffer-overflow without the fix. Two pytest tests, one per direction.
+
+**What this says about the hunt.** Both of tonight's finds came from combining features that are individually well-tested, not from any single feature's own coverage. The enum tests never parse JSON; the JSON tests never declare an enum. Neither suite was wrong; the interaction simply had no owner.
+
+268. OPTIMIZATION CHECK: THREE CANDIDATES MEASURED, NONE WORTH TAKING
+
+Asked for an optimization pass alongside the bug hunt. Three candidates, each measured rather than argued, and the honest result is that none of them earns a change.
+
+**`s[i]` on an `ascii` is still a runtime call** (#258 inlined `charCodeAt` but deliberately not this). Measured over ~418,000 characters: 3.6 ms against 2.2 ms for the same scan through `charCodeAt` -- about 3.3 ns per character. Real, but inlining it means hard-coding the 128-entry singleton table's C struct layout into emitted IR, which is the ABI coupling #258 declined for a gap this size. Unchanged, now with a number attached.
+
+**A top-level variable is an external-linkage global**, which looked like it should stop LLVM promoting it to a register in a hot loop -- `loop_sum`, the one benchmark where Festina trails Go. Tested directly by hand-editing `@total` to `internal` and rebuilding: **499.7 ms against 496.9 ms**, 0.5%, reproduced twice. LLVM already promotes it; the linkage is not the cost. The gap to Go is Go's own code generation, and Festina is at parity with Rust here (497 ms against Rust's 501 ms in the same run).
+
+**The divide-by-zero guard is emitted even for a literal non-zero divisor** -- `icmp eq i64 1000000007, 0` and three basic blocks around it, in every `/` and `%`. LLVM folds it before it reaches the back end, so the runtime cost is zero; folding it in codegen would shrink emitted IR and shave compile time only. Recorded, not done: it optimizes the compiler's output size rather than the compiled program.
+
+A measurement that says "leave it alone" is worth the same as one that says "change it", provided it was actually taken.
+
+269. WINDOWS CI HAD NO `git`, SO THE NEW `festina update` TESTS COULD NOT RUN
+
+The first CI round after `festina update` landed (claude.md #249) came back green on linux and macos and red on windows, with five failures -- every `TestUpdate` case that shells out to real `git`, and only those. The one case that never calls git, `test_refuses_a_non_git_installation`, passed.
+
+The failure was `FileNotFoundError: [WinError 2]` sixty frames deep inside `subprocess`, which says nothing about what was missing. What was missing was `git` itself: the windows job runs pytest inside MSYS2's UCRT64 environment, and `msys2/setup-msys2@v2`'s default `path-type: minimal` deliberately keeps the native Windows PATH out of that shell. The runner *does* have Git for Windows -- `actions/checkout` shells out to `C:\Program Files\Git\bin\git.exe` in the same job's log -- but that path is invisible from inside MSYS2, and MSYS2 ships no `git` of its own unless asked.
+
+**The fix is one word in the pacman list.** `git` joins clang/python/sqlite3/pkgconf/libsystre/mpg123/cairo/libjpeg-turbo, for the reason the job's own comment already gives for all of them: exactly one PATH to reason about, rather than a native Windows tool reached across the environment boundary.
+
+**Deliberately not a skip.** The conftest mechanism macOS Phase 0 built (`compile_file_or_skip`, `_require_c_compiler`, the Xvfb and wasm gates) turns *absent optional tooling* into a clean skip, and `FESTINA_STRICT_DEPS=1` forbids those on linux so coverage cannot quietly shrink. `git` is not that kind of dependency: these tests exist to drive real git subprocesses, and a checkout with no git is a broken environment, not a tier a platform lacks. Skipping them would have turned the job green while deleting exactly the coverage the job exists to provide. `_run_git` now fails fast with a one-line reason instead -- the same red, legible in one line rather than sixty.
+
+**One portability seam closed while here.** `_make_origin_and_clone` passed the clone's source and destination as absolute paths, which on that runner means native `C:\...` strings handed to an msys2-runtime `git` build with POSIX path semantics. Both are now names relative to the cwd the helper already sets; everything else in these tests reaches its repo through `-C` or `cwd`, which the runtime converts.
+
+**Verified by reproducing it first**: running `TestUpdate` with `git` removed from PATH reproduces the exact CI shape -- the same five failures, the same one pass -- and the full `tests/test_cli.py` passes with git present.
+
+270. THE X11 READINESS POLL THAT NEVER POLLED
+
+CI came back red on linux -- one failure, `test_the_window_is_really_decorated_under_a_real_window_manager`, `IndexError: list index out of range` on `extents.split("=", 1)[1]`. Nothing in the commit under test touched graphics; the test had been passing for many rounds.
+
+**`xprop` reports an absent property on stdout, with exit status 0.** That is the whole bug. Both of its absent forms echo the property name straight back:
+
+```
+_NET_FRAME_EXTENTS:  no such atom on any window.     (nothing has ever set it)
+_NET_FRAME_EXTENTS:  not found.                      (the atom exists, not on this window)
+```
+
+So a poll written as `if probe.returncode == 0 and "_NET_FRAME_EXTENTS" in probe.stdout` matches on the *first* probe, always, whether or not the property is there. The ten-second wait around it was dead code from the day it was written. The test then split on an "=" that only the present form contains, and raised.
+
+**The same broken condition was in `x_display_with_wm`'s own readiness wait**, on `_NET_SUPPORTING_WM_CHECK`, and that is the deeper of the two: the fixture declared openbox ready on probe 1 every single time, so *every* test taking that fixture has been racing openbox's startup rather than waiting for it. The decoration test is simply the one that reads a property openbox has to publish, so it is the one that noticed. Measured directly: on probe 1 the old condition says ready while openbox is not yet up; the correct condition becomes true on probe 2, 0.11s later, on an idle machine. On a loaded CI runner that window is wider, and that is the entire failure.
+
+**Two different fixes, because the two properties print differently.** `_NET_FRAME_EXTENTS` is a CARDINAL list -- `_NET_FRAME_EXTENTS(CARDINAL) = 0, 26, 0, 0` -- so testing for the `"="` is both correct and exactly the precondition the next line's `split("=")` needs. `_NET_SUPPORTING_WM_CHECK` is a WINDOW -- `_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x20011f` -- with no `"="` anywhere in it, so the same fix there would have turned a poll that never waited into one that always timed out. That one tests for the absent forms instead. (I wrote the `"="` version there first and caught it by checking the real output before shipping, not after.)
+
+**The lesson worth keeping**: a readiness poll whose success condition can be satisfied by the failure output is not a poll, and it fails silently in exactly the direction that hides it -- everything passes on a fast machine, forever, until a slow one. The condition has to be something only the success case can produce. Checking a probe's exit status is not enough when the tool reports "absent" as a successful answer to a well-formed question.
+
+**Verified**: the absent-form behaviour reproduced against a real X server (exit 0, name echoed, no "="), the old condition shown accepting it and the split then raising the exact CI IndexError; the readiness wait shown becoming true one probe later than the old one claimed; all six WM-dependent tests passing three runs in a row, and `tests/test_codegen.py` green in full (1067 passed).

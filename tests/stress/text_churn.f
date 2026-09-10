@@ -67,4 +67,41 @@ while j < 300 {
     extra = extra + rx.length
     j = j + 1
 }
+
+// claude.md #249: charCodeAt()/toChar() -- charCodeAt's receiver is a
+// computed (call-result) text on every iteration, so a missed free
+// there is one leak per pass; toChar()'s result is a fresh, minted
+// one-character text every time, so a discarded one (never bound to
+// anything) is the other half of the same question. Multi-byte
+// codepoints (the accented characters in `decorate`'s own '!' suffix
+// text plus a literal one here) and both the null-producing
+// (out-of-range/invalid) and real-value paths are all exercised, on
+// computed receivers throughout -- not just literals, which would
+// constant-fold in Python and never touch the runtime path at all.
+int k = 0
+while k < 500 {
+    // claude.md #251: word.length now exists -- a computed (call-
+    // result) text receiver every iteration, so a missed free here is
+    // one leak per pass, same shape as charCodeAt's own receiver just
+    // below. `k % word.length` keeps the charCodeAt index in real
+    // bounds every iteration (word is at least 6 code points --
+    // c-a-f-é plus 1-3 digits plus '!' -- and never zero), with the
+    // fixed 9999 below still covering the null/out-of-range path on
+    // its own.
+    text word = decorate(`café${k}`)
+    int wlen = word.length
+    if wlen < 6 { log('unreachable') }
+    int cp = word.charCodeAt(k % wlen)
+    text back = cp.toChar()
+    if back == null { log('unreachable') }
+    log(back.charCodeAt(0) == cp)
+    // Chained straight off a template literal and straight into
+    // toChar(), consumed as a call ARGUMENT rather than bound to
+    // anything -- nothing in this expression owns the intermediate
+    // charCodeAt() int (nothing to free, it's not refcounted) or the
+    // minted toChar() text except the log() call site itself.
+    log((`x${k}`.charCodeAt(0)).toChar())
+    log((word.charCodeAt(9999) == null))
+    k = k + 1
+}
 log(extra)

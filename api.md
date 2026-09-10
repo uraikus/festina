@@ -8,7 +8,7 @@ spec this compiler is built against, see [`claude.md`](claude.md).
 
 ## CLI
 
-Four subcommands (`festina/cli.py`), not a single bare `festina file.f`
+Five subcommands (`festina/cli.py`), not a single bare `festina file.f`
 — that would leave `festina run` (which executes the compiled result)
 ambiguous with `festina compile` (which never does) without inventing a
 flag to distinguish them:
@@ -19,6 +19,7 @@ flag to distinguish them:
 | `festina run entry.f` | Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the *compiled program's own* exit code, so `festina run x.f && ...` composes the same way `go run`/`cargo run` do. The temp binary is always cleaned up afterward. `--target=wasm32-wasi` runs the compiled `.wasm` through Node's built-in WASI support instead of executing it directly. |
 | `festina doctor` | Checks every dependency the compiler itself needs (a C compiler, `pkg-config`, sqlite3/cairo-xlib/alsa dev headers, `libLLVM`) and reports what's missing and how to install it — the same install hints a real compile failure would give, just checked proactively instead of only on failure. Also reports whether `festina` itself is resolvable on `PATH`, and if not, exactly how to add it (the checkout's `bin/` directory, or a packaged binary — see [setup.md](setup.md)). Exits 0 if every *required* dependency is present — graphics/audio are optional, since a compiler that can't build a graphics program is still a fully working compiler for everything else (see [security.md](security.md#slim-binaries)). |
 | `festina doctor --fix` | Same report, then actually fixes what it found instead of leaving the printed hint for a human to act on by hand: installs whatever dependencies are missing (required and optional both) via the detected package manager — `apt` on Linux, Homebrew on macOS, MSYS2's `pacman` on Windows — and, if `festina` itself isn't resolving on `PATH`, adds it (a symlink for a packaged binary, an `export PATH=...` line appended to `~/.bashrc`/`~/.zshrc` for a checkout, `setx` on Windows). Prints the exact command/change first and asks for confirmation (`--yes`/`-y` skips that, for every prompt this can raise); refuses to guess for any other package manager, overwrite something unrelated already on disk, or run non-interactively without `--yes`, rather than doing nothing or making a change nobody agreed to. The exit code reflects the dependency side only — not being on `PATH` has never been a required check. |
+| `festina update` | Pulls the latest source into this installation's own git checkout and fast-forwards to it (`git fetch` + `git merge --ff-only`) — there's no separate release pipeline or package to fetch (install.sh's own approach), the running `festina` *is* this checkout, so updating it is exactly this. Refuses, with a clear message and no changes made, when the working tree has uncommitted changes, when HEAD is detached, or when local history has genuinely diverged from origin (never force-resets over local work the way install.sh's own first-time bootstrap does — that runs against a fresh clone with nothing to lose, this runs against a checkout someone may actually be living in). Not available for a packaged (PyInstaller) binary, which has no source tree of its own to pull into. |
 | `festina help` | Prints this same command list. |
 
 ```bash
@@ -196,6 +197,12 @@ rather than crashing:
 float divided = 10 / 0   // null -- / always returns float
 int remainder = 10 % 0    // null -- % still returns int for two ints
 ```
+
+Testing for that `null` works for the `int` result but **not** the
+`float` one: a null `float` is a real NaN, and IEEE-754 says every
+comparison against a NaN is false, so `divided == null` and
+`divided != null` are *both* `false`. `remainder == null` is `true` as
+you would expect. See [the null representations](#types) above.
 
 `int`/`float`/`bool` also each have `.toText()`, returning the same
 text template interpolation already produces for that value implicitly
@@ -415,6 +422,130 @@ answers `null` rather than reading past the buffer. Read-only —
 `s[0] = 'x'` is a compile-time error, the same way `environment.NAME =
 ...` is.
 
+### Length
+
+```festina
+log('hello'.length)   // 5
+log('café'.length)    // 4 -- code points, not bytes ('é' is 2 bytes)
+log(''.length)        // 0
+```
+
+`text.length` is the number of UTF-8 **code points** — the same unit
+`s[i]`/`charCodeAt`/`split('')` already use, not a byte count. Because
+UTF-8 is variable-width, this is a real scan, not a stored count —
+unlike [`blob.length`](#files), which counts bytes exactly and is
+O(1). Read-only, like `arr[T].length`.
+
+### charCodeAt() and toChar()
+
+```festina
+int fortyTwo = 42
+text char = fortyTwo.toChar()          // '*'
+int numberAgain = char.charCodeAt(0)   // 42
+
+log('a'.charCodeAt(0))    // 97
+log(42.toChar())          // '*'
+log('café'.charCodeAt(3)) // 233 -- the 'é', by code point, not byte
+log(233.toChar())         // 'é'
+```
+
+`text.charCodeAt(i)` reads the Unicode scalar value of the `i`-th
+**code point** (not byte, and not a UTF-16 code unit the way
+JavaScript's own `charCodeAt` sometimes is — Festina's text indexing is
+code-point-based everywhere, and this matches `s[i]`/`.length`).
+`int.toChar()` is the inverse: it UTF-8 encodes a code point into a
+one-character `text`. Both follow the same "test, don't fail" rule as
+`s[i]`: an out-of-range or negative index into `charCodeAt` answers
+`null`, and a code point `toChar()` can't represent — negative, above
+`0x10FFFF`, or inside the UTF-16 surrogate range `0xD800`–`0xDFFF` —
+answers `null` rather than crashing.
+
+## `ascii` — one byte per character
+
+`text` is UTF-8, so a character can be one to four bytes. That makes
+`text.length` a real scan and `s[i]` a walk from the start of the
+string, and it is the right trade for text that has to hold any
+language. But it is the wrong trade for a scanner — a lexer reads every
+character by index, and a walk per read is quadratic over the whole
+input.
+
+`ascii` is the other trade. One byte per character means the character
+count *is* the byte count, so it lives in the value's own header and
+both `.length` and `s[i]` are O(1) reads:
+
+```festina
+ascii src = 'int x = 1'
+log(src.length)          // 9   -- a stored count, not a scan
+log(src[4])              // 'x' -- a byte offset, not a walk
+log(src.charCodeAt(4))   // 120
+log(src.slice(0, 3))     // 'int'
+log(src == 'int x = 1')  // true
+```
+
+Both types coexist; neither replaces the other. Use `text` for anything
+a person types or reads, and `ascii` where the input really is one byte
+per character and you index it heavily — source code, protocol headers,
+CSV fields.
+
+### Converting
+
+A quoted literal is a `text` literal. Assigning one to an `ascii`
+converts it at compile time, so a literal that isn't ASCII fails to
+build rather than deferring to a runtime null:
+
+```festina
+ascii ok = 'let'          // fine
+ascii bad = 'café'        // compile error: 'é' is not an ascii character
+```
+
+At runtime the conversion has to be checked, so it answers `null` for
+anything not representable one byte per character — the same "test,
+don't fail" rule `s[i]` and `toInt()` already follow:
+
+```festina
+blob f = 'input.txt'
+ascii scan = f.toText().toAscii()   // null if the file isn't ascii
+if scan == null { fail('expected ascii input') }
+
+text back = scan.toText()        // always works, always a copy
+```
+
+### Cost
+
+`.length`, `s[i]` and `charCodeAt(i)` are O(1). Indexing allocates
+nothing at all: a one-character `ascii` comes from a table of 128
+immortal single-character values rather than a fresh buffer, so a
+character-by-character scan does no allocation whatsoever.
+
+`.length` and `charCodeAt(i)` cost no function call either — both
+compile to loads off the value's own header, inline in the loop that
+uses them, so a scan loop's body contains no call at all.
+
+`slice()` and `+` copy, because an `ascii` owns its bytes.
+
+The difference this makes to a scanner is not small. Counting
+identifiers character by character over the same input:
+
+| input | `text` | `ascii` |
+|---|---|---|
+| 10.4 KB | 50 ms | — |
+| 20.8 KB | 201 ms | — |
+| 41.6 KB | 800 ms | — |
+| 4.16 MB | — | 21.5 ms |
+
+`text` quadruples when the input doubles (a walk per index, over every
+index); `ascii` doubles. At 41.6 KB `text` needs 800 ms; `ascii` scans
+4.16 MB — a hundred times more input — in 21.5 ms.
+
+Against other languages on the same scan, `ascii` is competitive rather
+than merely better than `text`: see
+[`char_scan`](benchmark.md#char_scan), where Festina finishes ahead of
+equivalent Rust and Go loops indexing raw bytes.
+
+An `ascii` is reference counted, so `ascii b = a` shares one buffer
+rather than copying it, and `b` is not a snapshot: see
+[`T?`](#t-manually-managed-values) for what `ascii?` means.
+
 ## Logging and rendering
 
 `log()` and `${}` interpolation accept any value that has a text form —
@@ -617,11 +748,12 @@ that rebuilds a string each iteration (`` s = `${s}x` ``) frees the
 previous buffer every time instead of accumulating them.
 
 Query results are reclaimed too: the rows an `arr[Table]` holds, and
-each row's own text columns, are freed when that array is — so
-repeated queries don't grow memory without bound. A single
-row read out of one (`People p = rows[0]`) borrows from the array
-rather than owning a copy, so it stays valid exactly as long as the
-array does.
+each row's own text columns, are freed when that array is — so repeated
+queries don't grow memory without bound. A row is reference counted
+like a struct, so a single row read out of one (`People p = rows[0]`)
+holds its own reference and stays valid even if the array goes away
+first. Rows alias rather than copy: writing `p.name = 'x'` is visible
+through every binding of that row, including the array's own element.
 
 `img`, `aud` and `regex` handles are reference counted exactly like
 structs: every binding — aliased, escaping, or a `/pattern/` literal's
@@ -725,6 +857,66 @@ if typeof shape == 'Circle' {
     log(shape.area)
 }
 ```
+
+### `match`
+
+The `if typeof shape == '...'` chain above written as a statement of
+its own, exhaustiveness-checked against every member of the enum:
+
+```festina
+int func extractShapeMetric(shape:Shape) {
+    int result = 0
+    match shape {
+        'Circle' { result = shape.radius }
+        'Square' { result = shape.area }
+    }
+    return result
+}
+```
+
+Each arm is a quoted tag — the exact same text `typeof` itself
+returns — followed by a `{ }` block; no `case`/`:`. `default { }`
+covers everything the written arms don't:
+
+```festina
+match shape {
+    'Circle' { log('a circle') }
+    default { log('something else') }
+}
+```
+
+Leaving a member uncovered with no `default` is a compile error naming
+the missing one, not a silent gap:
+
+```festina
+match shape {
+    'Circle' { log('a circle') }
+}
+// error: match on 'Shape' does not cover 'Square' -- add a case or a default
+```
+
+An arm tag that isn't a real member, or a tag repeated across two arms,
+is also a compile error — a typo or a copy-paste duplicate is caught
+before it can silently do nothing. `match` works on any expression, not
+only an enum — `match n { 'int' { ... } }` — with the same
+exhaustiveness rule applied to its one static type.
+
+`match`'s subject must be a plain variable or field access
+(`shape`, `w.shape`) — not a call, a computed index, or any other
+expression that could run code or allocate:
+
+```festina
+match nextShape() { ... }
+// error: match's subject must be a plain variable or field access --
+// bind a call result to a name first
+```
+
+Bind it to a name first (`Shape s = nextShape(); match s { ... }`), the
+same idiom `typeof`'s own examples already use. This is what makes
+`match` free: it desugars entirely, at compile time, into the identical
+`typeof`/`if`/`else if` chain shown above — the subject is evaluated
+exactly once regardless of how many arms exist, and the compiled
+program has no `match`-specific code path to pay for at all.
 
 ### Representation and cost
 
@@ -1387,13 +1579,11 @@ accept a further optional trailing `borderColor`, after the fill
 color — paints the border with it for that one call only, leaving the
 current `borderColor()` untouched for every other shape, the same
 "this call only, then restore" contract the fill-color argument
-already has. `drawCircle` gained BOTH trailing forms here — it
-previously had no per-call color override at all. This is the direct
-fix for global draw style silently leaking between unrelated shapes:
-a border color left over from a previous, unrelated `drawRect`/
-`drawCircle` call no longer has to be reset with `borderColor()` or
-`saveState()`/`restoreState()` by hand before every shape that needs
-its own.
+already has. This is what keeps global draw style from silently leaking
+between unrelated shapes: a border color left over from an earlier,
+unrelated `drawRect`/`drawCircle` call needs no `borderColor()` or
+`saveState()`/`restoreState()` reset by hand before every shape that
+wants its own.
 
 `getPixelColor(x, y)` reads one pixel back off the canvas, and
 `img.getPixelColor(x, y)` reads one back off an `img`'s own surface —
@@ -2123,11 +2313,17 @@ notes.append(' world')                // -> bool
 text body = notes.toText()            // -> the bytes, as text
 bool there = notes.exists()           // -> bool
 notes.delete()                        // -> bool; deletes the FILE
+int size = notes.length               // -> int; the byte count
 
 notes.save()                          // -> bool; write the bytes to its path
 notes.save('other.txt')               // -> bool; adopt that path, then write
 notes.saveCopy('backup.txt')          // -> bool; write there, keep its own path
 ```
+
+`.length` is the exact **byte** count — unlike `text.length`
+([Strings](#strings)), a blob has no UTF-8 structure to walk, so this
+is a plain stored count, not a scan. An unreadable path is `0`, the
+same "empty blob" answer `.exists()`/`.toText()` already give it.
 
 The path may be any text expression, like `img` and `aud`:
 `blob save = saveDir + 'slot1.dat'`.
@@ -2567,10 +2763,10 @@ where it's easiest to trip over: forwarding a REAL request's own
 `req.headers` into an outbound one (`'headers': req.headers`) already
 carries the ORIGINAL `Host`, and forwarding a REAL response's own
 `headers` back out (`res.headers = upstream.headers`) already carries
-its `Content-Length`/`Connection` — sending those through unfiltered
-used to produce a request or response with the SAME header name
-twice, which a strict server (Go's `net/http`, which hard-rejects a
-request with two `Host` lines) refuses outright.
+its `Content-Length`/`Connection`. Sending those through unfiltered
+would produce a request or response with the SAME header name twice,
+which a strict server (Go's `net/http`, which hard-rejects a request
+with two `Host` lines) refuses outright.
 
 **Same-host requests reuse a connection instead of opening a fresh one
 every time** (plain `http://`, POSIX only — an `https://` request and
@@ -2954,8 +3150,8 @@ void func consume(c:Circle?) {
 ```
 
 **Crossing a `thread` boundary shares the reference, never clones
-it** — `postMessage`/`on message` deep-clone every other value type
-(claude.md #195), but a manually-managed one crosses by handing the
+it** — `postMessage`/`on message` deep-clone every other value type, but a
+manually-managed one crosses by handing the
 raw reference straight to the other side, exactly like an ordinary
 alias within one thread does. Both directions work the same way:
 
@@ -2981,7 +3177,7 @@ Worker.postMessage(c)
 
 This is sound for the identical reason `T?`'s own automatic-management
 opt-out is sound in the first place: the whole safety argument behind
-deep-cloning everything else (claude.md #195) is that this runtime's
+deep-cloning everything else is that this runtime's
 retain/release counters are non-atomic, correct only because exactly
 one thread ever touches a given value's refcount. A manually-managed
 value's refcount is *never* touched by either side's automatic
@@ -3008,7 +3204,8 @@ free spritesheet                       // the sheet goes now, not at exit
 `free name` releases whatever the binding holds and sets the binding to
 `null`. It works on **every type**:
 
-- **struct / `arr[T]` / `map[T]` / `blob` / `img` / `aud` / `regex`** —
+- **struct / `arr[T]` / `map[T]` / query row / `blob` / `img` / `aud` /
+  `regex`** —
   a reference-count *decrement*, not a forced free. A value something
   else still points at survives until its last reference drops; freeing
   an array releases each element the same way, so a shared element
@@ -3019,8 +3216,6 @@ free spritesheet                       // the sheet goes now, not at exit
   it. A `/pattern/` literal's process-lifetime cache is immortal, so
   `free` on a binding aliasing one is a safe no-op.
 - **`text`** — the buffer is freed (a text is exclusively owned).
-- **a query row** — the binding is nulled *without* freeing: the row is
-  owned by the array it came from. Free the array.
 - **`int` / `float` / `bool`** — nothing to release; `free x` is `x = null`.
 
 `free` composes with automatic reclamation: freeing twice is a no-op,
@@ -3478,10 +3673,8 @@ field) is unavailable inside a thread body** — its callback always
 runs on the *main* program's own OS thread, regardless of which thread
 dispatched the request, so a thread handing it a closure over its own
 private state would be a real cross-thread violation. (`exec()` has no
-such hazard any more — claude.md #221 removed its own non-blocking
-`exec(args, callback)` form for exactly this reason, so only the
-always-safe blocking `exec(args)` remains, usable freely from any
-thread body.)
+such hazard: it is the blocking `exec(args)` only, usable freely from
+any thread body.)
 
 ### A thread's own database: `DatabaseURL`
 
@@ -3767,8 +3960,8 @@ all; an ordinary, auto-managed `req:http` is rejected outright, since
 main's own end-of-handler cleanup would still release it out from
 under the thread it was just handed to. **There is no compile-time
 check that main's own code never touches `r` again after handing it
-off** — the same accepted-risk contract `T?` itself already carries
-(claude.md #202): once handed off, the connection belongs entirely to
+off** — the same accepted-risk contract `T?` itself already carries: once
+handed off, the connection belongs entirely to
 the receiving thread, and reading or writing `r` afterward is
 undefined. In exchange, this costs nothing to make safe at the
 value level: a manually-managed value was never auto-retained or
@@ -4102,17 +4295,14 @@ normally from inside either a `try` or a `catch` body, and a caught
 `catch` body can itself `throw` again (a rethrow, or a different error
 entirely) to propagate out to whatever `try` encloses *that*.
 
-**A throw leaks nothing on its way out (0.43, claude.md #236).**
-`throw` unwinds by jumping directly to the catching `try` (not by
-returning normally through every call frame in between), which used to
-mean that a function which merely *called* something that eventually
-threw — no `throw` or `try` of its own — never ran its scope-exit
-cleanup, and its `struct`/`arr`/`map`/`text`/etc. locals leaked. Not
-any more: in a program that contains a `try` anywhere, every managed
-local is registered on a per-thread *cleanup stack* in the runtime as
-it is bound (the same stack `.toStruct()`/`.toArr()` already use for
-their half-built values), and a `throw` releases every entry above the
-catching `try`, newest first — the throwing function's own locals,
+**A throw leaks nothing on its way out.** `throw` unwinds by jumping
+directly to the catching `try`, not by returning normally through every
+call frame in between — so nothing between the two runs its ordinary
+scope-exit cleanup. In a program that contains a `try` anywhere, every
+managed local is instead registered on a per-thread *cleanup stack* in
+the runtime as it is bound (the same stack `.toStruct()`/`.toArr()` use
+for their half-built values), and a `throw` releases every entry above
+the catching `try`, newest first — the throwing function's own locals,
 every intermediate frame's, the argument temporaries each call site on
 the chain was holding for its callee (a literal `[1, 2, 3]`, a template
 text, a call result), and a catch variable of a frame that rethrows.
@@ -4128,6 +4318,17 @@ text, two arrays and a struct and does nothing else (2 million calls:
 0.25 s to 0.33 s), and lost in the noise on anything that does real
 work with them.
 
+That covers the runtime's own frames too. A `.sort()` comparator is
+ordinary Festina code and can `throw`; the throw jumps past the
+runtime's sorting frame, and the scratch buffer that frame allocated is
+released on the way out like anything else. The array being sorted is
+sorted *in place*, so after a comparator throws it still holds some
+permutation of its own elements — never freed, never corrupted — and
+sorts correctly if you sort it again. `.forEach()` allocates nothing and never had the
+problem. A `throw` from a timer or an event handler is a different
+case: those fire from the event loop, where no `try` can be live, so
+such a throw ends the program exactly as an uncaught one does.
+
 **Not available under `--target=wasm32-wasi`.** wasi-libc has no
 setjmp/longjmp support at all — rejected at compile time; see
 [wasm.md](wasm.md). A program that never writes `try`/`catch`/`throw`
@@ -4137,9 +4338,7 @@ enclosing try" case above — prints and exits(1) — since that was
 always the fallback for an uncaught throw anyway); what's actually
 unavailable is catching one. Every native target — Linux, macOS and
 Windows — has it: a `try` is a direct call to libc's own `setjmp` and
-a `throw` is libc's `longjmp` (0.43, claude.md #235; earlier versions
-used LLVM's SjLj intrinsics, which have no AArch64 lowering — so macOS
-rejected `try` outright — and a broken x86_64 Windows one).
+a `throw` is libc's `longjmp`.
 
 ## `.toStruct()` / `.toArr()` — parsing JSON
 
@@ -4206,17 +4405,15 @@ supported (raw, un-escaped non-ASCII UTF-8 bytes in a JSON string are
 unaffected and parse completely normally — this only affects a
 producer that specifically chooses to `\u`-escape).
 
-**A parse that fails partway through leaks nothing (claude.md #223,
-redone in #233).** A JSON value that fails to parse *partway through*
-being built — a struct whose third field turns out to be the wrong
-type, having already parsed the first two; an array whose fourth
-element fails, having already collected three; a complete value
-followed by trailing data — used to leak whatever was already built for
-that one call, the same structural class as `throw`'s own
-intermediate-frame limitation above. It no longer does: every generated
-parsing function registers the value it is building (and each JSON key
-it has read but not yet freed) on a per-thread *cleanup stack* in the
-runtime, and the `.toStruct()`/`.toArr()` call site registers its own
+**A parse that fails partway through leaks nothing.** A JSON value can
+fail to parse *partway through* being built — a struct whose third
+field turns out to be the wrong type, having already parsed the first
+two; an array whose fourth element fails, having already collected
+three; a complete value followed by trailing data. Whatever was built
+so far is still reclaimed: every generated parsing function registers
+the value it is building (and each JSON key it has read but not yet
+freed) on a per-thread *cleanup stack* in the runtime, and the
+`.toStruct()`/`.toArr()` call site registers its own
 cursor, the receiver's temporary text and the finished value; a `throw`
 releases every one of them, newest first, on its way to the catching
 `try`. This is plain runtime C — no `setjmp` of its own — which is why
@@ -4232,11 +4429,8 @@ self-referencing struct, malformed syntax, a duplicate `text` key whose
 second value fails, trailing data after a complete value, and
 2000-level nesting — 0 bytes lost and 0 invalid frees
 (`tests/valgrind_stress/json_parse_fail_churn.f`, run by
-`scripts/valgrind_stress.sh`; since 0.43 the same program also runs
-clean under `scripts/leak_stress.sh`'s AddressSanitizer build — the
-Valgrind tier originally existed only because ASan could not
-instrument through the LLVM SjLj intrinsics `try` used to be built on,
-which claude.md #235 replaced with libc's own `setjmp`/`longjmp`).
+`scripts/valgrind_stress.sh`), and the same program runs clean under
+`scripts/leak_stress.sh`'s AddressSanitizer build.
 
 ## Error format
 

@@ -4,6 +4,8 @@
 import bisect
 import re
 
+from .errors import CompileError
+
 # claude.md #4: Festina source files use the .f extension.
 SOURCE_EXTENSION = ".f"
 
@@ -29,6 +31,18 @@ SPEC_KEYWORDS = frozenset({
     "thread",  # claude.md #195: thread NAME { ... } -- an isolated
                # background worker with its own OS thread, message
                # queues, and (optionally) its own sqlite handle.
+    "match",  # claude.md #252: match EXPR { 'Tag' { ... } ... } --
+              # sugar over typeof + if/else-if, desugared away entirely
+              # in semantic analysis before codegen ever sees it. Safe
+              # to reserve globally (unlike #246's contextual `use`):
+              # Parser.eat_name already accepts any keyword as a member
+              # name (the same reason `free`/`delete` don't break
+              # `blob.delete()`), so `'x'.match(regex)` is unaffected.
+    "ascii",  # claude.md #256: a one-byte-per-character string type,
+              # parallel to `text` rather than a replacement for it.
+              # One byte per character is what makes `.length` and
+              # `s[i]` O(1) reads off its own header, which `text`
+              # (UTF-8, variable width, headerless) cannot be.
 })
 
 # Extra control tokens the parser needs distinct token types for, so it
@@ -47,7 +61,7 @@ _EXTRA_KEYWORDS = frozenset({"return", "var", "let", "throw", "free", "delete"})
 # present, not that nothing else is.
 KEYWORDS = SPEC_KEYWORDS | _EXTRA_KEYWORDS
 
-PRIMITIVE_TYPE_KEYWORDS = frozenset({"int", "float", "bool", "text", "blob"})
+PRIMITIVE_TYPE_KEYWORDS = frozenset({"int", "float", "bool", "text", "blob", "ascii"})
 
 TOKEN_SPEC = [
     ("WS", r"[ \t\r\n]+"),
@@ -276,7 +290,25 @@ def tokenize(source, filename="<string>"):
         m = MASTER_RE.match(source, pos)
         if not m:
             line, col = loc(pos)
-            raise SyntaxError(f"{filename}:{line}:{col}: unexpected character {source[pos]!r}")
+            # claude.md #266: a real CompileError, with this file's own
+            # line and column -- not a bare Python SyntaxError. The
+            # parser wrapped one of those into a CompileError, but
+            # imports.py tokenizes BEFORE the parser ever runs, so the
+            # most ordinary typo there (a stray character, or `"` where
+            # Festina wants `'`) escaped as a Python traceback.
+            ch = source[pos]
+            hint = ""
+            if ch in "'\"`":
+                # The string patterns only match a CLOSED string, so an
+                # opening quote with no partner never matches at all and
+                # lands here as an "unexpected character" -- which is
+                # true but useless. Name the real problem.
+                hint = " -- unterminated string (no closing " + ch + ")"
+            elif ch == "$":
+                hint = " -- ${...} interpolation only works inside a `template` string"
+            raise CompileError(
+                f"unexpected character {ch!r}{hint}",
+                file=filename, line=line, column=col, category="invalid syntax")
         kind = m.lastgroup
         text = m.group()
         line, col = loc(pos)

@@ -223,6 +223,7 @@ _FLOAT = types_mod.PrimitiveType("float")
 _NUMERIC_TYPES = (_INT, _FLOAT)
 _TEXT = types_mod.PrimitiveType("text")
 _BLOB = types_mod.PrimitiveType("blob")
+_ASCII = types_mod.PrimitiveType("ascii")
 _BOOL = types_mod.PrimitiveType("bool")
 
 
@@ -240,6 +241,16 @@ def _is_blob_type(t):
     `T`'s; only the handful of sites that gate AUTOMATIC bookkeeping
     care about the flag at all."""
     return isinstance(t, types_mod.PrimitiveType) and t.name == "blob"
+
+
+def _is_ascii_type(t):
+    """claude.md #256: `ascii`'s own counterpart to _is_blob_type just
+    above -- same reason, same rule. `ascii` is refcounted and so `T?`
+    means something real for it, which makes `t == _ASCII` wrong at
+    every site dispatching by VALUE SHAPE rather than by whether
+    automatic bookkeeping is on."""
+    return isinstance(t, types_mod.PrimitiveType) and t.name == "ascii"
+
 
 # claude.md #202: `T?` -- the exact set of resolved types
 # `manually_managed` means something real for, mirroring
@@ -276,6 +287,11 @@ def apply_manually_managed(resolved_type, manually_managed):
         return dataclasses.replace(resolved_type, manually_managed=True)
     if resolved_type == _BLOB:
         return types_mod.PrimitiveType("blob", manually_managed=True)
+    # claude.md #256: `ascii` is refcounted exactly like blob is, so
+    # `ascii?` means the same real thing -- the identical PrimitiveType
+    # special case, for the identical reason (no dedicated dataclass).
+    if resolved_type == _ASCII:
+        return types_mod.PrimitiveType("ascii", manually_managed=True)
     return resolved_type
 
 
@@ -1550,6 +1566,21 @@ def analyze(program, filename="<string>"):
         # stops working for `blob?` specifically.
         if _is_blob_type(declared) and actual == _TEXT:
             return
+        # claude.md #256: `ascii tok = 'let'` -- the same
+        # one-directional text -> X allowance blob has just above, and
+        # for the same reason (there is no separate ascii-literal
+        # syntax). Unlike blob's, this one is a REAL conversion in
+        # codegen: an ascii carries a {length, refcount} header a bare
+        # text has nothing to fill in, so a literal becomes an inline
+        # .rodata constant and anything else goes through
+        # festina_ascii_from_text, which validates. The reverse
+        # direction is allowed too -- an ascii is always representable
+        # as text, so `text t = someAscii` is total where the forward
+        # direction is not.
+        if _is_ascii_type(declared) and actual == _TEXT:
+            return
+        if declared == _TEXT and _is_ascii_type(actual):
+            return
         # claude.md #91: `color red = 'red'` / `font body = '13px arial'`
         # -- a colour and a font are written as text because that is what
         # reads well, and resolved to their compiled form at the
@@ -1886,6 +1917,21 @@ def analyze(program, filename="<string>"):
                     file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                     category="invalid assignment",
                 )
+            # claude.md #251: text.length/blob.length are read-only too,
+            # same placement/reasoning as arr[T]'s own .length just
+            # above (a runtime call, not a real addressable field --
+            # `_is_blob_type`, not `== _BLOB`, so `blob?` is covered the
+            # same way it already reads .length identically to plain
+            # blob, per that helper's own doc comment).
+            if (isinstance(expr.target, ast.Member) and not expr.target.computed
+                    and expr.target.prop == "length"
+                    and (infer(expr.target.obj, scope) == _TEXT
+                         or _is_blob_type(infer(expr.target.obj, scope)))):
+                raise CompileError(
+                    "'.length' is read-only and cannot be assigned to",
+                    file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                    category="invalid assignment",
+                )
             # claude.md #39/#139/#181: clientWidth/clientHeight/
             # screenWidth/screenHeight/devicePixelRatio are read-only
             # too -- same reasoning and same "catch it before the
@@ -2116,6 +2162,18 @@ def analyze(program, filename="<string>"):
                     # included -- the int side is coerced to float, the
                     # same as every other binary operator.
                     or (left in _NUMERIC_TYPES and right in _NUMERIC_TYPES)
+                    # claude.md #256: ascii and text compare freely.
+                    # `tok == 'let'` is the single most common thing a
+                    # lexer does, and a literal is exactly the case
+                    # that costs nothing -- codegen resolves it to an
+                    # immortal ascii constant at compile time. A
+                    # non-literal text operand is a real conversion
+                    # (and so allocates), which is why the comparison
+                    # is expressed this way round rather than by
+                    # widening the ascii side to text.
+                    or (_is_ascii_type(left) and right == _TEXT)
+                    or (left == _TEXT and _is_ascii_type(right))
+                    or (_is_ascii_type(left) and _is_ascii_type(right))
                 )
                 # claude.md #216: `worker:thread` is never `null` any
                 # more (claude.md #208's own "null when sent by main"
@@ -2255,6 +2313,21 @@ def analyze(program, filename="<string>"):
                         category="invalid operand type",
                     )
                 return obj_type.value
+            if _is_ascii_type(obj_type):
+                # claude.md #256: s[i] -> a one-character ascii, or
+                # null past either end -- the same "answer null, don't
+                # crash" choice text[i] makes just below. Unlike
+                # text[i] this costs nothing at runtime: one byte IS
+                # one character, so the byte at offset i IS the answer,
+                # handed back as one of the 128 immortal
+                # single-character singletons rather than allocated.
+                if idx_type is not None and idx_type is not NULL and idx_type != _INT:
+                    raise CompileError(
+                        f"ascii index must be int, found {types_mod.type_name(idx_type)}",
+                        file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
+                return _ASCII
             if obj_type == _TEXT:
                 # claude.md #150: s[i] -> a single UTF-8 code point, the
                 # same unit split('') already uses -- or null (not a
@@ -2373,6 +2446,46 @@ def analyze(program, filename="<string>"):
                     category="invalid field access",
                 )
             return types_mod.PrimitiveType("int")
+        if _is_ascii_type(obj_type):
+            # claude.md #256: ascii.length -> int. Same shape as text's
+            # just below, but a stored count read straight out of the
+            # value's own header rather than a walk -- one byte per
+            # character is exactly what makes that possible.
+            if expr.prop != "length":
+                raise CompileError(
+                    f"ascii has no field '{expr.prop}' (did you mean '.length'?)",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            return _INT
+        if obj_type == _TEXT:
+            # claude.md #251: text.length -> int, the number of UTF-8
+            # CODE POINTS -- the same unit s[i]/charCodeAt/split('')
+            # already use, not a byte count. The one other readable
+            # thing on `text` (besides `[i]`, handled in the computed
+            # branch above) is this, so anything else is a hard error,
+            # matching ArrayType's own strict `.length`-or-nothing
+            # branch just above.
+            if expr.prop != "length":
+                raise CompileError(
+                    f"text has no field '{expr.prop}' (did you mean '.length'?)",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            return _INT
+        if _is_blob_type(obj_type):
+            # claude.md #251: blob.length -> int, the byte count (an
+            # exact count, unlike text's -- a blob is raw bytes with no
+            # UTF-8 structure to walk). `_is_blob_type`, not `==_BLOB`,
+            # so `blob?` reads it identically to plain `blob` (see that
+            # helper's own doc comment).
+            if expr.prop != "length":
+                raise CompileError(
+                    f"blob has no field '{expr.prop}' (did you mean '.length'?)",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            return _INT
         if isinstance(obj_type, types_mod.ImageType):
             # claude.md #92: img has exactly two readable properties.
             # Strict, like ArrayType's own `.length` handling just above
@@ -3350,16 +3463,100 @@ def analyze(program, filename="<string>"):
             # site in this language already answers with) when nothing
             # parseable is found at all, never a compile-time-only or
             # runtime failure.
-            if callee.prop == "toInt" and not expr.args and infer(callee.obj, scope) == _TEXT:
+            if callee.prop == "toInt" and not expr.args and (
+                    infer(callee.obj, scope) == _TEXT
+                    or _is_ascii_type(infer(callee.obj, scope))):
                 return _INT
+            # claude.md #249: text.charCodeAt(i:int) -> int -- the
+            # Unicode CODE POINT at code-point index i (the same unit
+            # text[i] already uses), null for i<0 or past the last
+            # code point, mirroring text[i]'s own answer to the
+            # identical question.
+            # claude.md #256: an ascii receiver answers the identical
+            # question -- one byte per character means the byte at
+            # offset i IS the code point -- so it shares this branch
+            # rather than duplicating the arity/argument rules. The
+            # difference is entirely in codegen: a load, not a walk.
+            if callee.prop == "charCodeAt" and (
+                    infer(callee.obj, scope) == _TEXT
+                    or _is_ascii_type(infer(callee.obj, scope))):
+                if len(expr.args) != 1:
+                    raise CompileError(
+                        f"charCodeAt() expects exactly 1 argument, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                arg_type = infer(expr.args[0], scope)
+                if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                    raise CompileError(
+                        f"charCodeAt() expects an int argument, found {types_mod.type_name(arg_type)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return _INT
+            # claude.md #249: int.toChar() -> text -- the inverse of
+            # charCodeAt(): UTF-8 encodes this int as a single Unicode
+            # code point's own one-character text, null for a code
+            # point with no valid UTF-8 encoding (see
+            # festina_int_to_char's own doc comment for the exact
+            # rejected ranges).
+            if callee.prop == "toChar" and not expr.args and infer(callee.obj, scope) == _INT:
+                return _TEXT
             # int/float/bool.toText() -> text -- an explicit spelling of
             # the same stringification template interpolation already
             # does implicitly for these three types (see codegen.py's
             # _to_text); the receiver check is against the SAME three
             # types _to_text itself handles, kept in sync deliberately.
+            # claude.md #256: ascii.slice(start, end) -> ascii,
+            # end-exclusive, both ends clamped into range so an
+            # inverted or out-of-range pair yields an empty ascii
+            # rather than failing -- the same "answer something, don't
+            # crash" posture s[i] and a missing map key already take.
+            # Copies: an ascii owns its bytes.
+            if callee.prop == "slice" and _is_ascii_type(infer(callee.obj, scope)):
+                if len(expr.args) != 2:
+                    raise CompileError(
+                        f"slice() expects exactly 2 arguments, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                for arg in expr.args:
+                    arg_type = infer(arg, scope)
+                    if arg_type is not None and arg_type is not NULL and arg_type != _INT:
+                        raise CompileError(
+                            f"slice() expects int arguments, found "
+                            f"{types_mod.type_name(arg_type)}",
+                            file=filename, line=callee.line, column=callee.column,
+                            category="invalid function argument type",
+                        )
+                return _ASCII
+            # claude.md #256: text.toAscii() -> ascii, validating. Null
+            # when the text is not representable one-byte-per-character,
+            # matching toInt()'s own "null when the input does not
+            # answer the question" convention rather than throwing --
+            # "is this text ascii" has a real negative answer. A LITERAL
+            # never needs this (codegen resolves `ascii x = 'lit'` at
+            # compile time and rejects non-ascii outright); this is for
+            # text whose contents are only known at runtime.
+            if callee.prop == "toAscii" and not expr.args:
+                recv = infer(callee.obj, scope)
+                if recv is not None and recv is not NULL and recv != _TEXT:
+                    raise CompileError(
+                        f"toAscii() can only be called on text, found "
+                        f"{types_mod.type_name(recv)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid method call",
+                    )
+                return _ASCII
             if callee.prop == "toText" and not expr.args:
                 recv = infer(callee.obj, scope)
                 if recv in (_INT, _FLOAT, types_mod.PrimitiveType("bool")):
+                    return _TEXT
+                # claude.md #256: ascii.toText() -- always a real copy
+                # (a text is a bare char* with no header in front of
+                # it), and always total, since every ascii byte is a
+                # valid single-byte UTF-8 code point.
+                if _is_ascii_type(recv):
                     return _TEXT
                 # claude.md #114: containers render JSON-like, so their
                 # explicit .toText() types as text too. (blob's own
@@ -4427,7 +4624,7 @@ def analyze(program, filename="<string>"):
         if isinstance(declared_type, types_mod.TableType) and decl.init is None:
             raise CompileError(
                 f"'{decl.name}' ({declared_type.name}) requires an initializer -- "
-                f"a table row is a borrowed handle onto one row of a query result, "
+                f"a table row is one row of a query result, "
                 f"never independently constructed (assign an existing row, e.g. "
                 f"`{declared_type.name} {decl.name} = rows[0]`); to build a value "
                 f"by hand, declare a struct with the same fields instead (see "
@@ -4535,8 +4732,20 @@ def analyze(program, filename="<string>"):
                 # is what actually gets bound below, same as every
                 # other branch here.
                 actual_type = infer(decl.init, scope)
+                # claude.md #257: keyed on whether the declared type
+                # actually CARRIES the flag, not on whether it is one of
+                # the manually-manageable dataclasses. The isinstance
+                # check this replaces missed `PrimitiveType` entirely --
+                # which is blob's category (blob has no dedicated
+                # dataclass of its own, the same gap `_is_blob_type`
+                # exists for) and now ascii's too. So the flag survived
+                # into check_assignable and `blob? x = makeBlob()` was
+                # rejected, even though #204's own doc comment names
+                # exactly that shape as what it was written to allow.
+                # Broken for blob since #204; found by measuring what
+                # `?` does per type rather than by reading the code.
                 bare_declared = (dataclasses.replace(declared_type, manually_managed=False)
-                                  if isinstance(declared_type, _MANUALLY_MANAGEABLE_TYPES)
+                                  if getattr(declared_type, "manually_managed", False)
                                   else declared_type)
                 check_assignable(bare_declared, actual_type, decl)
             else:
@@ -4928,7 +5137,111 @@ def analyze(program, filename="<string>"):
         finally:
             _current_thread[0] = None
 
+    def _is_simple_match_subject(expr):
+        """claude.md #252: True for an expression `match` can safely
+        re-evaluate once per arm with no side effects and no extra
+        cost -- a bare Identifier, or a chain of non-computed Member
+        accesses rooted in one (`node.kind`, `req.headers`... well,
+        `.headers` itself resolves to a map, but the point stands for
+        any plain dotted path). False for anything that could run
+        code or allocate (a Call, a computed index, any operator) --
+        match requires those to be bound to a plain variable first,
+        the same idiom this language's own typeof examples already
+        use (`Shape shape = c` before `typeof shape`, api.md's own
+        enum section)."""
+        if isinstance(expr, ast.Identifier):
+            return True
+        if isinstance(expr, ast.Member) and not expr.computed:
+            return _is_simple_match_subject(expr.obj)
+        return False
+
+    def _desugar_match(stmt, scope):
+        """claude.md #252: validates a MatchStmt (subject simplicity,
+        every arm tag a real member, no duplicate tags, exhaustive
+        coverage) then rewrites it into the exact `IfStmt`/
+        `TypeofExpr`/`BinOp` chain a hand-written `if typeof(subject)
+        == 'tag' { ... } else if ... else { default }` would already
+        produce -- the SAME `stmt.subject` AST node reused in every
+        `TypeofExpr`, safe only because `_is_simple_match_subject`
+        already confirmed re-evaluating it has no side effects. Tag
+        strings are compared against `types_mod.type_name(member)` --
+        the exact same formatter `_enum_tag_const` (codegen.py) feeds
+        into the runtime tag constant `typeof` reads back at runtime,
+        so this check is against the identical strings the compiled
+        program would actually see, entirely at compile time.
+
+        Returns the desugared `IfStmt`. `analyze_statement` reassigns
+        its own local `stmt` to this return value BEFORE the ordinary
+        big if/elif dispatch below even runs, so the SAME call falls
+        straight through into the existing `ast.IfStmt` branch --
+        nothing downstream, including codegen (which never sees a
+        `MatchStmt` at all), needs any awareness sugar was involved."""
+        if not _is_simple_match_subject(stmt.subject):
+            raise CompileError(
+                "match's subject must be a plain variable or field access "
+                "-- bind a call result to a name first, e.g. "
+                "'Shape s = f()' then 'match s { ... }'",
+                file=filename, line=stmt.line, column=stmt.column,
+                category="invalid match",
+            )
+        subject_type = infer(stmt.subject, scope)
+        if isinstance(subject_type, types_mod.EnumType):
+            info = enums.get(subject_type.name)
+            expected = {types_mod.type_name(m) for m in info.members} if info else set()
+            type_desc = subject_type.name
+        elif subject_type is not None:
+            expected = {types_mod.type_name(subject_type)}
+            type_desc = types_mod.type_name(subject_type)
+        else:
+            expected = set()
+            type_desc = "null"
+        seen = set()
+        for tag, _body in stmt.arms:
+            if tag not in expected:
+                raise CompileError(
+                    f"match has no case '{tag}' on '{type_desc}'",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid match",
+                )
+            if tag in seen:
+                raise CompileError(
+                    f"match already has a case for '{tag}'",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid match",
+                )
+            seen.add(tag)
+        if stmt.default is None:
+            missing = expected - seen
+            if missing:
+                raise CompileError(
+                    f"match on '{type_desc}' does not cover "
+                    f"'{sorted(missing)[0]}' -- add a case or a default",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="invalid match",
+                )
+        # Right-nested IfStmt chain, built tail (rightmost/default)
+        # first so each earlier arm's `orelse` is the chain built so
+        # far -- exactly the shape parse_if's own `else if` produces.
+        orelse = stmt.default
+        for tag, body in reversed(stmt.arms):
+            test = ast.BinOp("==", ast.TypeofExpr(stmt.subject, stmt.line, stmt.column),
+                              ast.StringLit(tag), stmt.line, stmt.column)
+            orelse = ast.IfStmt(test, body, orelse, stmt.line, stmt.column)
+        if orelse is None:
+            # Only reachable when `expected` itself was empty (a
+            # subject whose type infer() couldn't pin down) -- every
+            # OTHER zero-coverage case already raised above. A no-op
+            # statement is the honest answer to "match nothing, cover
+            # nothing", not a crash.
+            orelse = ast.IfStmt(ast.BoolLit(False), ast.Block([]), None,
+                                 stmt.line, stmt.column)
+        if hasattr(stmt, "file"):
+            orelse.file = stmt.file
+        return orelse
+
     def analyze_statement(stmt, scope, return_type, loop_depth=0):
+        if isinstance(stmt, ast.MatchStmt):
+            stmt = _desugar_match(stmt, scope)
         if isinstance(stmt, ast.ImportDecl):
             imports.append(stmt.path)
         elif isinstance(stmt, ast.StructDecl):
@@ -4958,7 +5271,13 @@ def analyze(program, filename="<string>"):
             analyze_block(stmt.then, scope, return_type, loop_depth)
             if stmt.orelse is not None:
                 if isinstance(stmt.orelse, ast.IfStmt):
-                    analyze_statement(stmt.orelse, scope, return_type, loop_depth)
+                    # claude.md #252: write back, matching analyze_block's
+                    # own reasoning -- stmt.orelse can never actually BE a
+                    # MatchStmt (an `else match { }` isn't grammar this
+                    # parser produces), so this is always a same-node
+                    # round trip today, but the contract stays correct
+                    # regardless of what analyze_statement returns.
+                    stmt.orelse = analyze_statement(stmt.orelse, scope, return_type, loop_depth)
                 else:
                     analyze_block(stmt.orelse, scope, return_type, loop_depth)
         elif isinstance(stmt, ast.WhileStmt):
@@ -5161,11 +5480,18 @@ def analyze(program, filename="<string>"):
                         category="invalid declaration",
                     )
         # unrecognized statement kinds are ignored (no-op)
+        return stmt
 
     def analyze_block(block, parent_scope, return_type, loop_depth=0):
+        # claude.md #252: indexed write-back, not a plain `for stmt in
+        # block.body` -- analyze_statement's return value is `stmt`
+        # unchanged for every ordinary statement, but a MatchStmt comes
+        # back as its own desugared IfStmt, and codegen (which re-walks
+        # this SAME block.body list later) must see that replacement,
+        # not the original MatchStmt it has no handling for at all.
         scope = Scope(parent_scope)
-        for stmt in block.body:
-            analyze_statement(stmt, scope, return_type, loop_depth)
+        for i, stmt in enumerate(block.body):
+            block.body[i] = analyze_statement(stmt, scope, return_type, loop_depth)
 
     # claude.md #220: `thread NAME[] { ... }` -- empty brackets, no
     # literal N -- resolves its own pool size HERE, before anything
@@ -5240,7 +5566,7 @@ def analyze(program, filename="<string>"):
         for func_decl in _iter_func_decls([stmt]):
             register_func_signature(func_decl)
 
-    for stmt in program.body:
+    for i, stmt in enumerate(program.body):
         # claude.md #6: a multi-file program (festina.imports.build_program)
         # is one merged ast.Program, but errors should still point at
         # whichever source file a statement actually came from. Every
@@ -5255,7 +5581,11 @@ def analyze(program, filename="<string>"):
         # (see build_program), so this is a no-op change of behavior for
         # today's single-file callers.
         filename = getattr(stmt, "file", filename)
-        analyze_statement(stmt, global_scope, None)
+        # claude.md #252: write back -- a top-level `match` desugars
+        # into an IfStmt here exactly like analyze_block's own indexed
+        # loop does one level down; codegen re-walks this SAME
+        # program.body list later and has no MatchStmt handling at all.
+        program.body[i] = analyze_statement(stmt, global_scope, None)
 
     # claude.md #70: DatabaseURL = <expr> -- festina.imports.build_program
     # already validated *position* (first statement of the entry file,

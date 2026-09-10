@@ -56,7 +56,7 @@ BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 WASM_MD = os.path.join(REPO_ROOT, "wasm.md")
 RUN_WASI_MJS = os.path.join(REPO_ROOT, "runtime", "wasm", "run_wasi.mjs")
 
-BENCHMARKS = ["hello", "fib", "loop_sum", "array_sum", "string_concat"]
+BENCHMARKS = ["hello", "fib", "loop_sum", "array_sum", "string_concat", "char_scan"]
 RUNS_PER_BENCHMARK = 7  # same as run_benchmarks.py, same rationale
 
 

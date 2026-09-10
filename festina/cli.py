@@ -2073,6 +2073,86 @@ def _run_doctor_fix(assume_yes=False):
     return deps_code
 
 
+def _run_update():
+    """`festina update` -- claude.md #249: this project has no release
+    pipeline (install.sh's own top comment: no prebuilt binary exists
+    anywhere for a script to fetch) -- the running `festina` IS a git
+    checkout (bin/festina's own wrapper execs festina/cli.py straight
+    out of REPO_ROOT, computed the identical way _data_root() computes
+    it here), so "update" means exactly one thing: bring THIS checkout's
+    working tree up to what its origin remote's current branch tip now
+    has. Nothing to download, nothing to reinstall -- once the source
+    is current, every subsequent `festina compile`/`run` already picks
+    it up (the runtime C sources are recompiled into the object-file
+    cache lazily anyway -- see _RUNTIME_C and friends above -- so an
+    update needs no separate rebuild step of its own).
+
+    Deliberately more conservative than install.sh's own bootstrap-time
+    `git reset --hard`: that runs against a FRESH clone with nothing
+    local to lose; this runs against a checkout someone may genuinely
+    be living in (a local hack, a WIP commit of their own) -- so this
+    only ever fast-forwards, refusing clearly (never guessing, never
+    discarding) when the working tree is dirty or history has actually
+    diverged."""
+    repo_root = _data_root()
+    if not os.path.isdir(os.path.join(repo_root, ".git")):
+        print(
+            "festina update: this installation isn't a git checkout, so there's "
+            "nothing here for 'festina update' to pull into (a packaged/PyInstaller "
+            "build has no separate source tree of its own).\n"
+            "Reinstall with:\n"
+            "  curl -fsSL https://raw.githubusercontent.com/uraikus/festina/main/install.sh | sh",
+            file=sys.stderr,
+        )
+        return 1
+    if not shutil.which("git"):
+        print("festina update: git is required but not found on PATH.", file=sys.stderr)
+        return 1
+
+    def git(*args):
+        return subprocess.run(["git", "-C", repo_root, *args], capture_output=True, text=True)
+
+    status = git("status", "--porcelain")
+    if status.returncode != 0:
+        print(f"festina update: 'git status' failed:\n{status.stderr}", file=sys.stderr)
+        return 1
+    if status.stdout.strip():
+        print(
+            "festina update: this checkout has uncommitted changes -- commit, "
+            "stash, or discard them first, then run 'festina update' again.",
+            file=sys.stderr,
+        )
+        return 1
+
+    branch_result = git("rev-parse", "--abbrev-ref", "HEAD")
+    branch = branch_result.stdout.strip()
+    if branch_result.returncode != 0 or not branch or branch == "HEAD":
+        print(
+            "festina update: this checkout isn't on a branch (detached HEAD) -- "
+            f"check out a real branch first, e.g. 'git -C {repo_root} checkout main'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Fetching the latest '{branch}'...")
+    fetch = subprocess.run(["git", "-C", repo_root, "fetch", "origin", branch])
+    if fetch.returncode != 0:
+        return fetch.returncode
+
+    merge = subprocess.run(["git", "-C", repo_root, "merge", "--ff-only", f"origin/{branch}"])
+    if merge.returncode != 0:
+        print(
+            f"festina update: could not fast-forward -- this checkout's history has "
+            f"diverged from origin/{branch} (local commits of its own?). Merge or "
+            f"rebase manually, then re-run.",
+            file=sys.stderr,
+        )
+        return merge.returncode
+
+    print("\nfestina is up to date. Run 'festina doctor' to check for any new dependencies.")
+    return 0
+
+
 def _build_arg_parser():
     default_cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc") or "clang"
     cc_help = "C compiler/linker to invoke (default: clang, gcc, or cc, whichever is found first)"
@@ -2111,6 +2191,7 @@ def _build_arg_parser():
                                 "package manager (apt/Homebrew/MSYS2 pacman)")
     doctor_p.add_argument("--yes", "-y", action="store_true",
                            help="with --fix, don't prompt for confirmation before installing")
+    sub.add_parser("update", help="pull the latest festina source into this checkout")
     sub.add_parser("help", help="show this help message")
     return ap
 
@@ -2131,6 +2212,9 @@ def main(argv=None):
         if args.fix:
             return _run_doctor_fix(assume_yes=args.yes)
         return _run_doctor()
+
+    if args.command == "update":
+        return _run_update()
 
     if args.command == "run":
         try:

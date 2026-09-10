@@ -93,14 +93,35 @@ class TestHttpGracefulShutdown:
         on request(req:http) { req.send({'code': 200, 'body': 'still here'}) }
         openPort(__PORT__)
         """)
-        # Connect BEFORE the signal, but don't send the request until
-        # after it -- simulates a connection that was already open
-        # (accepted) at the moment shutdown was triggered.
+        # Start the request BEFORE the signal and finish it after, so
+        # the connection is genuinely mid-request when shutdown is
+        # triggered -- which is the state the grace period exists for.
+        #
+        # claude.md #261: this used to only CONNECT before the signal
+        # and send the whole request after, which was racy: a completed
+        # connect() means the kernel finished the TCP handshake and put
+        # the connection in the listen backlog, NOT that the server
+        # process has accept()ed it. Signal first and the server closes
+        # its listener with that connection still unaccepted, so the
+        # client gets an RST rather than a response. Measured, under
+        # deliberate CPU load: the old shape failed 2 of 20 runs, this
+        # one 0 of 20 (and it flaked twice in four full-suite runs
+        # before this, which is what prompted looking).
+        #
+        # Sending a PARTIAL request first fixes it two ways: the server
+        # has readable data waiting, so its poll() wakes and accepts
+        # immediately, and the sleep that follows gives that accept room
+        # to happen before the signal lands. It also makes the test
+        # assert something stronger than it used to -- a request the
+        # server is already mid-read of, not merely a socket sitting in
+        # a backlog.
         sock = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        sock.settimeout(5)
+        sock.sendall(b"GET / HTTP/1.1\r\n")
+        time.sleep(0.2)  # let the server accept and read what's there
         server.process.send_signal(signal.SIGTERM)
         time.sleep(0.2)  # let the signal actually get noticed
-        sock.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-        sock.settimeout(5)
+        sock.sendall(b"Host: x\r\n\r\n")
         # claude.md #235: the status line + headers and the body are
         # two separate send() calls (festina_http_send's own comment),
         # so a single recv() can legitimately return just the headers

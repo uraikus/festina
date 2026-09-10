@@ -2816,8 +2816,9 @@ writes, map sets, delete, festina_map_delete's C-side entry removal)
 — a stale edge would let markGray double-remove a count and free a
 value still held. The struct_self leak program closes into a real
 cycle and runs leak-free every test run; the harness canary, formerly
-a cycle, is now the #119 row-array residual — the one deliberate leak
-left. Verified under ASan: self/pair/array-routed/map-routed cycles
+a cycle, is now (since #260 closed the #119 row-array residual too) a
+`text?` never freed — a leak by contract rather than by omission, so no
+future round can quietly fix it out from under the canary. Verified under ASan: self/pair/array-routed/map-routed cycles
 reclaimed, held cycles intact; ~34ms for 20k dropped 21-node cycles.
 `tests/test_codegen.py::TestCycleCollection` (6 tests).
 
@@ -2834,8 +2835,11 @@ element TYPE (a struct element retains; a table row cannot — the array
 owns its rows), the emission records what it minted (_minted_values)
 and the predicates read that back instead of walking syntax — the
 predicate/emission agreement #117 demanded, made structural. The row
-case stays borrowed and its array-leak residual is renamed in todo.md
-to its true size; the row's columns verified intact under ASan.
+case stays borrowed; claude.md #260 later closed its array-leak
+residual for the shape with an enclosing member chain to drain it
+(`rows()[0].name`), by parking the array on that chain instead of
+minting the row — leaving only the shapes where the ROW itself escapes.
+The row's columns verified intact under ASan.
 `tests/test_codegen.py::TestComputedIndexAndArgumentOwnership` (5 tests).
 
 **claude.md #118**: refcount headers for img/aud/regex; regex() memoized.
@@ -3225,7 +3229,7 @@ call site's owning argument temporaries are registered on the
 runtime's cleanup stack, and `festina_throw` releases everything above
 the catching frame. Leak-freedom is measured by
 `tests/stress/throw_unwind_churn.f` under ASan (`scripts/leak_stress.sh`,
-29 programs now) and Valgrind -- every kind of local through three
+34 programs now) and Valgrind -- every kind of local through three
 frames, a rethrow, a JSON failure two frames down, 400 balanced
 non-throwing calls; behaviour and IR shape by `tests/test_try_catch.py::
 TestThrowUnwindsIntermediateFrames` (8 tests, including that a program
@@ -3233,6 +3237,109 @@ with no `try` generates byte-identical code and that a worker thread
 unwinds on its own stack). The JSON depth cap moved onto the parser's
 cursor (`tests/test_json_parse.py`'s deep-nesting test pins the new
 1000-level message).
+
+**claude.md #259** (a throw out of a runtime callback): the same
+cleanup stack now also carries `festina_array_sort`'s merge scratch, so
+a `throw` out of a `.sort()` comparator -- which jumps past that
+runtime frame and skips its own `free()` -- no longer strands it.
+Measured by `tests/stress/callback_throw_churn.f` under ASan/
+LeakSanitizer: clean with the fix, 208,000 bytes in 4,000 objects
+without it, over 2,000 iterations of both runtime frames that can have
+a Festina `try` beneath them (array sort; map `forEach`, which
+allocates nothing and never leaked) plus a nested sort inside a
+comparator and a comparator that catches its own throw. Behaviour by
+`tests/test_codegen.py::TestArraySort` -- a thrown-through array is
+still readable and re-sorts correctly, and a nested sort still gives
+the right answer. Timers and event handlers are not affected: they fire
+from the event loop, where no `try` is live, so a throw there ends the
+program as an uncaught one always did.
+
+**claude.md #260** (`rows()[0].name` no longer leaks its array): a
+table-row element cannot be minted the way every other element type is
+-- a row has no refcount header -- so the array is PARKED on the
+enclosing member chain instead, and `_release_member_chain` releases it
+once the escaping column has been copied (text) or retained (blob).
+Only when there is such a chain, decided by the same AST-node identity
+test `_begin_member_chain` uses; a row bound straight to a local, passed
+or returned still keeps its array alive (todo.md). Measured by
+`tests/stress/row_chain_churn.f` under ASan: clean with the fix, failing
+without it, over 500 iterations of every position the shape appears in
+plus the name-bound control. Behaviour by
+`tests/test_codegen.py::TestComputedIndexAndArgumentOwnership` -- three
+tests, one of which reads several columns off several such arrays and
+prints them all afterwards, so a use-after-free shows up as wrong output
+and not only as a sanitizer report.
+
+**claude.md #262** (`.length` off a non-array member chain): the
+`blob`/`text`/`ascii` cases dropped the chain's parked bases where the
+`arr[T]` case drained them, leaking the struct or row the field came
+from. The drop was masking an over-release of the field itself, so a
+naive drain is a heap-use-after-free -- confirmed under ASan before the
+fix. Fixed by discriminating on whether a base was parked at all (a
+parked base means the direct receiver is an alias into it) and sharing
+one owning-receiver filter, `_owning_chain_receivers`, across every
+drain site. Measured by `tests/stress/chain_length_churn.f`: clean with
+the fix, 66,000 allocations without, and the shared blob it reads back
+after the loop is what catches the over-release direction.
+`tests/test_codegen.py::TestTextAndBlobLength` pins the answers.
+
+**claude.md #264** (returning a table row): a function returning a row
+read out of its own local query-result array released that array on the
+way out, freeing the row it handed back -- a heap-use-after-free that
+crashed (exit 245), pre-existing and reproduced forty commits back. All
+ten row-escaping shapes were probed individually; only a FUNCTION-LOCAL
+array is released early enough to strand the row, while parameter,
+global and call-result arrays were always safe. Contained by not
+tracking row-owning locals for scope-exit release inside a row-returning
+function -- safe by construction rather than by analysis, since it can
+only ever release less, so the worst case is the bounded row-array leak
+todo.md already carries (measured at 96 bytes, one array, not
+per-iteration). Not a fix: #224's ownership model would copy the row on
+the way out. Pinned by two `TestComputedIndexAndArgumentOwnership` tests
+-- one that the former crashes now return real data, one that the
+parameter and global cases are untouched, so a future tightening cannot
+quietly break them. No stress-suite entry: those programs now leak by
+design, and `scripts/leak_stress.sh` requires clean.
+
+**claude.md #265** (a query row is refcounted): the borrowed-row family
+-- #85's premise, #119's minting exception, #224's copy plan, #260's
+chain-parking, #264's containment -- all rested on "a row has no
+refcount header". The audit found one producer
+(`festina_sqlite_collect_rows`), two freers (both generated), every
+field offset measured from the payload pointer, and no thread-clone path
+at all, so a row gets the standard header at `payload - 8` and becomes
+an ordinary refcounted value. #260's parking, #264's containment and
+`_release_fn_for_array`'s TableType special case are all deleted.
+Measured by `tests/stress/row_ownership_churn.f` over 500 iterations of
+every escaping shape -- returned from a function that owned the array,
+returned through a local, bound off a call-result array, outliving its
+array by an explicit `free`, aliased and mutated through the alias,
+passed as an argument, stored in an `arr`/`map` outliving the query, and
+columns read off call-result rows. ASan-clean; a heap-use-after-free
+without the change. Aliasing (`p.name = 'x'` visible through every
+binding) re-verified byte-for-byte against the old build. The
+`table_rows` per-type isolation program caught the one real bug on the
+way -- an un-widened VarDecl branch skipping the retain -- and named the
+type in the failure, which is exactly what those programs are for.
+
+**claude.md #266** (lexer errors): `imports.py` tokenizes a file before
+the parser does, so the parser's SyntaxError-to-CompileError wrapper was
+unreachable for every lexer error -- a stray character printed a Python
+traceback. The lexer raises a real CompileError with its own line and
+column now, with hints for an unterminated string and for `$` outside a
+template. Pinned by `tests/test_errors.py`'s own diagnostic-shape tests.
+
+**claude.md #267** (a JSON-parsed enum member): the from-JSON builder
+was the one construction site that did not write the self-tag claude.md
+#176 gives an enum member's widened header, so a successful parse
+produced a struct that crashed when used as its enum and a failing one
+freed the half-built value at `payload-16` of an allocation reaching
+only `payload-8`. Measured by `tests/stress/enum_json_churn.f` over 500
+iterations alternating good and bad input, each parsed value used AS its
+enum: ASan-clean, heap-buffer-overflow without the fix. Behaviour by two
+`TestEnums` tests, one per direction. Found by combining features whose
+own suites never meet -- the enum tests never parse JSON, the JSON tests
+never declare an enum.
 
 **claude.md #237** (a compiled `.wasm` in a browser): the project's own
 WASI Preview 1 host (`runtime/wasm/festina_wasi_browser.js`) is verified

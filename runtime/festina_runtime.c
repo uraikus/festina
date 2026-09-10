@@ -1843,6 +1843,114 @@ char *festina_text_char_at(const char *s, int64_t index) {
     return NULL;  /* index >= the text's own code point count */
 }
 
+/* text.charCodeAt(i) -> the Unicode CODE POINT (not a UTF-16 code
+ * unit the way JS's own charCodeAt reads one half of a surrogate pair
+ * for anything outside the Basic Multilingual Plane) at the i-th
+ * character -- the identical "index means the i-th code point" unit
+ * text[i]/split('') already established just above, decoded straight
+ * from the same UTF-8 bytes that walk already locates rather than
+ * building a substring first and parsing it back out. festina_null_int()
+ * for a negative or past-the-end index, mirroring festina_text_char_at's
+ * own NULL answer to the identical question -- see that function's own
+ * doc comment for why this is a separate walk rather than a shared one
+ * (this one decodes a codepoint where that one copies bytes). */
+int64_t festina_text_char_code_at(const char *s, int64_t index) {
+    if (!s) s = "";
+    if (index < 0) return festina_null_int();
+    const unsigned char *c = (const unsigned char *)s;
+    int64_t i = 0;
+    while (*c) {
+        const unsigned char *start = c;
+        c++;
+        while ((*c & 0xC0) == 0x80) c++;
+        if (i == index) {
+            size_t len = (size_t)(c - start);
+            switch (len) {
+                case 1:
+                    return start[0];
+                case 2:
+                    return ((int64_t)(start[0] & 0x1F) << 6)
+                         | (start[1] & 0x3F);
+                case 3:
+                    return ((int64_t)(start[0] & 0x0F) << 12)
+                         | ((int64_t)(start[1] & 0x3F) << 6)
+                         | (start[2] & 0x3F);
+                default:
+                    return ((int64_t)(start[0] & 0x07) << 18)
+                         | ((int64_t)(start[1] & 0x3F) << 12)
+                         | ((int64_t)(start[2] & 0x3F) << 6)
+                         | (start[3] & 0x3F);
+            }
+        }
+        i++;
+    }
+    return festina_null_int();  /* index >= the text's own code point count */
+}
+
+/* int.toChar() -> text -- the inverse of charCodeAt(): UTF-8 encodes
+ * one Unicode code point into its own single-character text (the
+ * identical 1-4-byte encoding festina_json_parse_string's own \u
+ * escape handling already uses for the same job, just not factored
+ * out into a shared helper -- that one writes directly into a
+ * growing JSON-string buffer mid-parse, this one always produces a
+ * fresh, freestanding text, different enough call shapes that
+ * sharing would cost more clarity than it saves). NULL (this
+ * runtime's own text-typed "no value" answer, exactly like an out-
+ * of-range text[i]/charCodeAt already give) for a code point with no
+ * valid UTF-8 encoding: negative, past the last real Unicode scalar
+ * value (0x10FFFF), or inside the UTF-16 surrogate range
+ * (0xD800-0xDFFF) -- those are reserved for surrogate PAIRS in
+ * UTF-16 and are never a real character on their own. */
+char *festina_int_to_char(int64_t cp) {
+    if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return NULL;
+    unsigned char buf[4];
+    size_t n;
+    if (cp < 0x80) {
+        buf[0] = (unsigned char)cp;
+        n = 1;
+    } else if (cp < 0x800) {
+        buf[0] = (unsigned char)(0xC0 | (cp >> 6));
+        buf[1] = (unsigned char)(0x80 | (cp & 0x3F));
+        n = 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (unsigned char)(0xE0 | (cp >> 12));
+        buf[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (unsigned char)(0x80 | (cp & 0x3F));
+        n = 3;
+    } else {
+        buf[0] = (unsigned char)(0xF0 | (cp >> 18));
+        buf[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[3] = (unsigned char)(0x80 | (cp & 0x3F));
+        n = 4;
+    }
+    char *out = malloc(n + 1);
+    if (!out) festina_fail("out of memory in int.toChar()");
+    memcpy(out, buf, n);
+    out[n] = '\0';
+    return out;
+}
+
+/* claude.md #251: text.length -- counts UTF-8 CODE POINTS, the same
+ * unit festina_text_char_at/festina_text_char_code_at already walk by
+ * (one code point can be 1-4 bytes, so this is a real O(n) walk, not a
+ * stored count -- text carries no header to cache one in, and doing so
+ * would go stale the instant any in-place append (claude.md #243) grew
+ * the buffer underneath it). A NULL receiver is treated as "" (length
+ * 0), mirroring festina_text_char_at's own "null text behaves like
+ * empty text" contract. */
+int64_t festina_text_length(const char *s) {
+    if (!s) return 0;
+    int64_t count = 0;
+    const char *c = s;
+    while (*c) {
+        c++;
+        while ((*c & 0xC0) == 0x80) c++;
+        count++;
+    }
+    return count;
+}
+
 /* ---- claude.md #150: argv ---- */
 
 void *festina_argv_array(int argc, char **argv) {
@@ -2201,6 +2309,185 @@ char *festina_text_own(const char *s) {
     return out;
 }
 
+/* ---- claude.md #256: the `ascii` string type ----
+ *
+ * A one-byte-per-character string, parallel to `text` rather than a
+ * replacement for it. That single property is the whole point: when a
+ * character IS a byte, the character count IS the byte count, so both
+ * `.length` and `s[i]` become O(1) reads instead of the UTF-8 walks
+ * `text` is stuck with (festina_text_length / festina_text_char_at
+ * above -- see their own comments on why `text` can cache neither).
+ *
+ * Layout, chosen to reuse the existing refcount machinery verbatim:
+ *
+ *     base+0    int64_t length     <- payload - 16
+ *     base+8    int64_t refcount   <- payload - 8
+ *     base+16   the bytes, always NUL-terminated at [length]
+ *
+ * This is exactly claude.md #176's tagged-struct shape, for exactly
+ * #176's reason: the refcount stays at precisely `payload - 8`, so
+ * festina_retain/festina_release_check work on an ascii with ZERO
+ * changes, while the length sits one word further back where only
+ * ascii's own code ever looks. A NEGATIVE refcount is the standard
+ * immortal sentinel, unchanged -- which is what lets a literal (an
+ * inline header emitted straight into .rodata by codegen) and the
+ * single-character singletons below be handed around as ordinary
+ * ascii values that retain/release simply no-op on.
+ *
+ * Unlike text (claude.md #83: copy on alias, free unconditionally),
+ * ascii is REFERENCE COUNTED -- `ascii b = a` retains instead of
+ * copying, which is the case a lexer hits constantly. */
+
+#define FESTINA_ASCII_HEADER (2 * sizeof(int64_t))
+
+int64_t festina_ascii_length(void *payload) {
+    if (!payload) return 0;
+    return *(int64_t *)((char *)payload - FESTINA_ASCII_HEADER);
+}
+
+/* An uninitialized ascii of exactly `len` bytes, refcount 1, already
+ * NUL-terminated -- the caller fills payload[0..len). */
+char *festina_ascii_alloc(int64_t len) {
+    if (len < 0) len = 0;
+    char *raw = malloc(FESTINA_ASCII_HEADER + (size_t)len + 1);
+    if (!raw) festina_fail("out of memory allocating an ascii");
+    *(int64_t *)raw = len;
+    *(int64_t *)(raw + sizeof(int64_t)) = 1;
+    char *payload = raw + FESTINA_ASCII_HEADER;
+    payload[len] = '\0';
+    return payload;
+}
+
+void festina_ascii_release(void *payload) {
+    if (!payload) return;
+    if (!festina_release_check(payload)) return;
+    free((char *)payload - FESTINA_ASCII_HEADER);
+}
+
+/* claude.md #256: `s[i]` hands back a one-character ascii WITHOUT
+ * allocating -- one immortal singleton per ASCII code, built into
+ * .data at compile time rather than lazily (a lazy table would race
+ * between Festina threads; these are constant, so there is nothing to
+ * initialize). The negative refcount is the same immortal sentinel
+ * every other immortal value uses, so retain/release/free on one are
+ * already no-ops through festina_release_check's own check.
+ *
+ * The struct's first two words ARE the header, so `.bytes` sits at
+ * exactly offset 16 -- the same payload-relative layout a heap ascii
+ * has, which is what makes a singleton indistinguishable from one. */
+typedef struct {
+    int64_t length;
+    int64_t refcount;
+    char bytes[2];
+} FestinaAsciiChar;
+
+#define FESTINA_AC(c) { 1, -1, { (char)(c), '\0' } }
+#define FESTINA_AC16(n) \
+    FESTINA_AC((n) + 0),  FESTINA_AC((n) + 1),  FESTINA_AC((n) + 2),  FESTINA_AC((n) + 3),  \
+    FESTINA_AC((n) + 4),  FESTINA_AC((n) + 5),  FESTINA_AC((n) + 6),  FESTINA_AC((n) + 7),  \
+    FESTINA_AC((n) + 8),  FESTINA_AC((n) + 9),  FESTINA_AC((n) + 10), FESTINA_AC((n) + 11), \
+    FESTINA_AC((n) + 12), FESTINA_AC((n) + 13), FESTINA_AC((n) + 14), FESTINA_AC((n) + 15)
+
+static FestinaAsciiChar g_festina_ascii_chars[128] = {
+    FESTINA_AC16(0),  FESTINA_AC16(16), FESTINA_AC16(32),  FESTINA_AC16(48),
+    FESTINA_AC16(64), FESTINA_AC16(80), FESTINA_AC16(96),  FESTINA_AC16(112)
+};
+
+#undef FESTINA_AC16
+#undef FESTINA_AC
+
+/* s[i] -> a one-character ascii, or NULL for a negative/past-the-end
+ * index, mirroring festina_text_char_at's own answer to the identical
+ * question. O(1) and allocation-free: index the singleton table. */
+char *festina_ascii_char_at(void *payload, int64_t index) {
+    if (!payload) return NULL;
+    int64_t len = festina_ascii_length(payload);
+    if (index < 0 || index >= len) return NULL;
+    unsigned char c = (unsigned char)((char *)payload)[index];
+    if (c > 127) return NULL;  /* not reachable for a validated ascii */
+    return g_festina_ascii_chars[c].bytes;
+}
+
+/* s.charCodeAt(i) has NO runtime function, deliberately (claude.md
+ * #258): the whole operation is a null check, a header load, a bounds
+ * check and a byte load, and codegen emits all four inline -- see
+ * _emit_ascii_char_code_at in codegen.py. A function here would only
+ * exist to be called once per character, which is precisely the cost
+ * the char_scan benchmark caught. */
+
+char *festina_ascii_concat(void *a, void *b) {
+    int64_t la = festina_ascii_length(a), lb = festina_ascii_length(b);
+    char *out = festina_ascii_alloc(la + lb);
+    if (la) memcpy(out, a, (size_t)la);
+    if (lb) memcpy(out + la, b, (size_t)lb);
+    return out;
+}
+
+/* Length first, then memcmp -- never strlen/strcmp: both lengths are
+ * already known, and an ascii may legitimately contain a NUL byte
+ * (s[0] of a NUL is a valid one-character ascii). */
+int8_t festina_ascii_eq(void *a, void *b) {
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    int64_t la = festina_ascii_length(a), lb = festina_ascii_length(b);
+    if (la != lb) return 0;
+    return memcmp(a, b, (size_t)la) == 0 ? 1 : 0;
+}
+
+/* s.slice(start, end) -- end-exclusive, both clamped into range, so an
+ * inverted or out-of-range pair yields an empty ascii rather than a
+ * fault. Copies: an ascii owns its bytes. */
+char *festina_ascii_slice(void *payload, int64_t start, int64_t end) {
+    int64_t len = festina_ascii_length(payload);
+    if (start < 0) start = 0;
+    if (end > len) end = len;
+    if (end < start) end = start;
+    int64_t n = end - start;
+    char *out = festina_ascii_alloc(n);
+    if (n) memcpy(out, (char *)payload + start, (size_t)n);
+    return out;
+}
+
+char *festina_ascii_to_text(void *payload) {
+    if (!payload) return NULL;
+    int64_t len = festina_ascii_length(payload);
+    char *out = malloc((size_t)len + 1);
+    if (!out) festina_fail("out of memory in festina_ascii_to_text");
+    memcpy(out, payload, (size_t)len);
+    out[len] = '\0';
+    return out;
+}
+
+/* text.toAscii() -- validates, then copies. NULL for a NULL input or
+ * for any byte above 127, matching toInt()'s own "null when the input
+ * does not answer the question" convention rather than throwing:
+ * "is this text representable as ascii" is a question with a real
+ * negative answer, not an error. */
+char *festina_ascii_from_text(const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    for (size_t i = 0; i < len; i++) {
+        if ((unsigned char)s[i] > 127) return NULL;
+    }
+    char *out = festina_ascii_alloc((int64_t)len);
+    memcpy(out, s, len);
+    return out;
+}
+
+/* claude.md #195/#198: the thread boundary is a deep clone, so an
+ * ascii crossing it gets its own buffer -- never a shared pointer,
+ * which is what keeps every retain/release in this runtime safely
+ * non-atomic. Always a fresh heap copy, even of an immortal literal
+ * or singleton (cloning one as immortal would be correct but pointless
+ * -- the receiving thread would just hold the same .rodata). */
+char *festina_ascii_clone(void *payload) {
+    if (!payload) return NULL;
+    int64_t len = festina_ascii_length(payload);
+    char *out = festina_ascii_alloc(len);
+    if (len) memcpy(out, payload, (size_t)len);
+    return out;
+}
+
 /* ---- claude.md #93: math, files and time ----
  *
  * Everything here is libc or libm, both already on every link line
@@ -2508,6 +2795,16 @@ const void *festina_blob_bytes(void *payload, int64_t *out_len) {
     FestinaBlob *b = (FestinaBlob *)payload;
     if (out_len) *out_len = b->length;
     return b->bytes;
+}
+
+/* claude.md #251: blob.length -- an O(1) read of the same `length`
+ * field festina_blob_bytes already exposes via its out-param, trimmed
+ * to a single return value since the field-access codegen site never
+ * needs the bytes pointer alongside it. */
+int64_t festina_blob_length(void *payload) {
+    if (!payload) return 0;
+    FestinaBlob *b = (FestinaBlob *)payload;
+    return b->length;
 }
 
 /* Replaces the in-memory bytes as well as the file, so .toText()
@@ -3337,9 +3634,21 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
          * existing field offset is untouched. +1 more, only when
          * want_rowid, for the rowid slot right after THAT -- so a
          * struct-query row (want_rowid always false) allocates exactly
-         * what it always has. */
-        int64_t *row = malloc(((size_t)col_count + 1 + (want_rowid ? 1 : 0)) * sizeof(int64_t));
-        if (!row) festina_fail("out of memory in festina_sqlite_collect_rows");
+         * what it always has.
+         *
+         * claude.md #265: and one i64 IN FRONT, the standard refcount
+         * header every other refcounted value carries. `row` stays the
+         * PAYLOAD pointer, so every column write below, every field GEP
+         * codegen emits, and festina_row_undefined's own presence-mask
+         * read are all untouched -- exactly the property that made this
+         * possible at all (see #256's ascii header for the same
+         * reasoning). The count starts at 1: the result array owns the
+         * row, and anything else that wants to outlive the array takes
+         * its own reference. */
+        int64_t *raw = malloc((1 + (size_t)col_count + 1 + (want_rowid ? 1 : 0)) * sizeof(int64_t));
+        if (!raw) festina_fail("out of memory in festina_sqlite_collect_rows");
+        raw[0] = 1;
+        int64_t *row = raw + 1;
         uint64_t present = 0;
 
         for (int32_t c = 0; c < col_count; c++) {
@@ -4954,6 +5263,19 @@ void festina_array_sort(void *hdr, int64_t elem_size,
     char *base = (char *)a->data;
     char *scratch = malloc((size_t)(n * elem_size));
     if (!scratch) festina_fail("out of memory sorting an array");
+    /* claude.md #259: `cmp` below is ordinary Festina code and can
+     * THROW. A throw longjmps straight past this frame to the catching
+     * try, so the free() at the bottom never runs -- which used to
+     * strand this buffer, the one leak claude.md #236 left open and
+     * todo.md listed. Registering it on the cleanup stack is the same
+     * mechanism generated code already uses for its own in-flight
+     * values, and festina_throw releases everything above the catching
+     * frame's recorded depth on its way out, so a throw out of a
+     * comparator now frees this exactly once. Pushed OUTSIDE the loops
+     * (one push per sort, not per comparison) and popped immediately
+     * before the ordinary free, so both paths free it exactly once and
+     * neither frees it twice. */
+    festina_cleanup_push(scratch, free);
     for (int64_t width = 1; width < n; width *= 2) {
         for (int64_t lo = 0; lo < n; lo += 2 * width) {
             int64_t mid = lo + width < n ? lo + width : n;
@@ -4985,6 +5307,7 @@ void festina_array_sort(void *hdr, int64_t elem_size,
         }
         memcpy(base, scratch, (size_t)(n * elem_size));
     }
+    festina_cleanup_pop();
     free(scratch);
 }
 

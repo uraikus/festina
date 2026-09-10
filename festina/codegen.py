@@ -334,6 +334,9 @@ INT = types_mod.PrimitiveType("int")
 FLOAT = types_mod.PrimitiveType("float")
 TEXT = types_mod.PrimitiveType("text")
 BLOB = types_mod.PrimitiveType("blob")
+# claude.md #256: one byte per character, so the character count IS the
+# byte count -- both live in the value's own header. See _llvm_type.
+ASCII = types_mod.PrimitiveType("ascii")
 REGEX = types_mod.RegexType()
 AUDIO = types_mod.AudioType()
 
@@ -490,12 +493,33 @@ def _is_refcounted(t):
     # alias/release-on-reassignment/release-at-scope-exit treatment
     # every other refcounted type already gets, with no special-casing
     # needed anywhere else in this generic protocol.
+    # claude.md #265: a table ROW joined the family last, and it is the
+    # one that took an audit to justify rather than a paragraph. #85
+    # ruled a header out because a row is built by the runtime as a
+    # bare malloc with nothing in front of it -- but that runtime is
+    # this project's, and the audit found exactly ONE producer
+    # (festina_sqlite_collect_rows) and TWO freers (both generated:
+    # _emit_table_row_release_fn and _emit_row_to_struct_fn), every
+    # field offset measured from the payload pointer so a header in
+    # front of it changes no access at all, and no thread-clone path
+    # whatsoever (a table value cannot cross a thread boundary, #195).
+    # That is the same closed world #256 gave `ascii` a header in, and
+    # it lets a row be an ordinary refcounted value here instead of the
+    # borrowed special case every ownership decision in this file used
+    # to have to route around.
     return (isinstance(t, (types_mod.StructType, types_mod.ArrayType,
                            types_mod.MapType, types_mod.ImageType,
                            types_mod.AudioType, types_mod.RegexType,
                            types_mod.HttpType, types_mod.SocketType,
-                           types_mod.UrlType, types_mod.EnumType))
-            or t == BLOB)
+                           types_mod.UrlType, types_mod.EnumType,
+                           types_mod.TableType))
+            or t == BLOB
+            # claude.md #256: ascii carries the identical i64 refcount
+            # at payload-8 (its length sits one word further back), so
+            # every generic part of the protocol -- festina_retain,
+            # festina_release_check, retain-then-release on reassign --
+            # already works on it unchanged, exactly as for blob.
+            or t == ASCII)
 
 
 def _is_manually_managed(t):
@@ -712,7 +736,11 @@ def _llvm_type(t):
         # transiently wherever LLVM itself requires one -- see
         # _bool_cond and every zext-to-i8-immediately-after site.
         return {"int": "i64", "float": "double", "bool": "i8",
-                "text": "ptr", "blob": "ptr"}[t.name]
+                "text": "ptr", "blob": "ptr",
+                # claude.md #256: a `ptr` to the payload, exactly like
+                # every other headered type -- the {length, refcount}
+                # header sits behind it at payload-16/payload-8.
+                "ascii": "ptr"}[t.name]
     if isinstance(t, types_mod.StructType):
         return "ptr"
     if isinstance(t, types_mod.EnumType):
@@ -926,6 +954,8 @@ class _StackArrayOrMap:
         self.type_ = type_
 
 
+
+
 class CodeGen:
     def __init__(self, analyzed, filename="main.f", target="native", host_platform=None):
         self.analyzed = analyzed
@@ -1004,6 +1034,9 @@ class CodeGen:
                                                 # never by an arbitrary TableType-typed binding, which
                                                 # would double-free a row the array still owns.
         self.extra_globals = []                # globals discovered while emitting main() (e.g. table column arrays)
+        # claude.md #256: interned ascii literals -- text -> the constant
+        # GEP expression naming its payload. See ascii_const.
+        self.ascii_constants = {}
         self.entry_stmts = []                  # top-level statements for __festina_main
         self.func_decls = {}                   # name -> ast.FuncDecl (for signatures)
         self.cur_block = None                  # label of the block currently being emitted into
@@ -1411,6 +1444,113 @@ class CodeGen:
         self.string_constants[text] = name
         return name
 
+    def ascii_const(self, text):
+        """claude.md #256: a text literal in an ascii-typed position,
+        emitted straight into .rodata with its own INLINE
+        {length, refcount} header -- exactly the shape _global_var_defs
+        already uses for struct/arr/map globals (`{i64 -1, T}` plus a
+        getelementptr past the header). The refcount is the standard
+        immortal sentinel, so retain, release and `free` on a literal
+        are all no-ops through the same checks every other immortal
+        value goes through, and the payload pointer handed out is
+        indistinguishable from a heap ascii's -- which is the whole
+        reason ascii can have a header where text cannot (claude.md
+        #83's four provenances have no equivalent here: every ascii in
+        existence is built by this compiler or by festina_ascii_alloc).
+
+        Non-ASCII is rejected HERE rather than at the runtime boundary
+        because a literal's bytes are known at compile time -- there is
+        no reason to defer to a null at runtime what can simply fail to
+        build."""
+        for ch in text:
+            if ord(ch) > 127:
+                raise CodegenError(
+                    f"'{ch}' is not an ascii character -- an ascii literal "
+                    f"must be one byte per character (use text for unicode, "
+                    f"or .toAscii() to convert and check at runtime)")
+        if text in self.ascii_constants:
+            return self.ascii_constants[text]
+        encoded, length = _encode_c_string(text)
+        name = f"@.astr.{len(self.ascii_constants)}"
+        ty = f"{{i64, i64, [{length} x i8]}}"
+        self.extra_globals.append(
+            f'{name} = private unnamed_addr constant {ty} '
+            f'{{i64 {length - 1}, i64 -1, [{length} x i8] c"{encoded}"}}')
+        ref = f"getelementptr inbounds ({ty}, ptr {name}, i32 0, i32 2)"
+        self.ascii_constants[text] = ref
+        return ref
+
+    def _emit_ascii_char_code_at(self, payload_val, idx_val, lines):
+        """claude.md #258: `s.charCodeAt(i)` on an ascii, emitted INLINE.
+        There is no runtime function for it at all -- the one that used
+        to exist was deleted, because this is the only caller it ever
+        had and nothing about the operation needs a call.
+
+        This is the loop body of every scanner ever written, and a call
+        per character is what the char_scan benchmark measured Festina
+        losing to Rust and Go on: they index raw bytes in the loop, we
+        called out to do a null check, a length load, a bounds check and
+        a return. The type already put the length at a fixed offset in
+        the value's own header, so there is nothing in that function a
+        compiler cannot emit directly.
+
+        Emitted BRANCHLESS, deliberately -- no new basic blocks, so the
+        expression stays a straight-line value the surrounding emitter
+        can keep treating as one, and so LLVM can hoist the loop-
+        invariant length load without having to prove a guard. Both
+        loads are made unconditionally safe by substitution rather than
+        by control flow:
+
+          - a null payload is replaced by the interned EMPTY ascii
+            literal, whose .rodata header reads length 0 -- so a null
+            receiver falls into the out-of-range case below and answers
+            null, which is what the deleted runtime function did with
+            its own explicit `if (!payload)`.
+          - an out-of-range index is replaced by 0 for the byte load
+            only. Offset 0 is always readable: festina_ascii_alloc
+            always allocates len+1 bytes and NUL-terminates, and the
+            empty literal is one NUL byte, so even an empty ascii has a
+            valid byte at 0. The loaded byte is then discarded by the
+            final select.
+
+        Semantics are identical to the runtime function it replaces --
+        null receiver, negative index and index >= length all answer
+        INT_NULL_CONST, verified by diffing both builds' output over
+        every one of those cases before the function was deleted.
+
+        Only charCodeAt is inlined. `s[i]` still calls
+        @festina_ascii_char_at: its result is a pointer into the
+        128-entry immortal singleton table, and reaching that table from
+        here would mean hard-coding the C struct's layout into emitted
+        IR -- real ABI coupling, for an operation no measured workload
+        has put in a hot loop."""
+        empty = self.ascii_const("")
+        is_null = self.tmp()
+        safe_ptr = self.tmp()
+        lines.append(f"  {is_null} = icmp eq ptr {payload_val}, null")
+        lines.append(f"  {safe_ptr} = select i1 {is_null}, ptr {empty}, ptr {payload_val}")
+        len_ptr = self.tmp()
+        length = self.tmp()
+        lines.append(f"  {len_ptr} = getelementptr i8, ptr {safe_ptr}, i64 -16")
+        lines.append(f"  {length} = load i64, ptr {len_ptr}")
+        too_low = self.tmp()
+        too_high = self.tmp()
+        out_of_range = self.tmp()
+        lines.append(f"  {too_low} = icmp slt i64 {idx_val}, 0")
+        lines.append(f"  {too_high} = icmp sge i64 {idx_val}, {length}")
+        lines.append(f"  {out_of_range} = or i1 {too_low}, {too_high}")
+        safe_idx = self.tmp()
+        byte_ptr = self.tmp()
+        byte = self.tmp()
+        code = self.tmp()
+        out = self.tmp()
+        lines.append(f"  {safe_idx} = select i1 {out_of_range}, i64 0, i64 {idx_val}")
+        lines.append(f"  {byte_ptr} = getelementptr i8, ptr {safe_ptr}, i64 {safe_idx}")
+        lines.append(f"  {byte} = load i8, ptr {byte_ptr}")
+        lines.append(f"  {code} = zext i8 {byte} to i64")
+        lines.append(f"  {out} = select i1 {out_of_range}, i64 {INT_NULL_CONST}, i64 {code}")
+        return out
+
     # ---- struct layout ----
     def struct_llvm_name(self, name):
         return f"%struct.{name}"
@@ -1596,6 +1736,20 @@ class CodeGen:
             "declare ptr @festina_str_from_float(double)",
             "declare ptr @festina_str_from_bool(i8)",
             "declare ptr @festina_str_concat(ptr, ptr)",
+            # claude.md #256: the `ascii` type. Only the operations
+            # that need real work are calls -- `.length`, `s[i]` and
+            # `charCodeAt` are emitted as direct loads with no call at
+            # all, which is the entire point of the type.
+            "declare i64 @festina_ascii_length(ptr)",
+            "declare ptr @festina_ascii_alloc(i64)",
+            "declare void @festina_ascii_release(ptr)",
+            "declare ptr @festina_ascii_char_at(ptr, i64)",
+            "declare ptr @festina_ascii_concat(ptr, ptr)",
+            "declare i8 @festina_ascii_eq(ptr, ptr)",
+            "declare ptr @festina_ascii_slice(ptr, i64, i64)",
+            "declare ptr @festina_ascii_to_text(ptr)",
+            "declare ptr @festina_ascii_from_text(ptr)",
+            "declare ptr @festina_ascii_clone(ptr)",
             # claude.md #243: in-place append for `s = `${s}...`` / `s = s + ...`
             "declare ptr @festina_text_append(ptr, i64, ptr, i64, ptr)",
             # claude.md #83: text values are copy-managed, not
@@ -1734,6 +1888,8 @@ class CodeGen:
             "declare void @festina_blob_release(ptr)",
             "declare ptr @festina_blob_to_text(ptr)",
             "declare ptr @festina_blob_bytes(ptr, ptr)",
+            # claude.md #251: blob.length.
+            "declare i64 @festina_blob_length(ptr)",
             "declare i8 @festina_blob_write(ptr, ptr)",
             "declare i8 @festina_blob_append(ptr, ptr)",
             "declare i8 @festina_blob_exists(ptr)",
@@ -1762,6 +1918,11 @@ class CodeGen:
             # claude.md #150: text.toInt()/text[i], argv, exec().
             "declare i64 @festina_text_to_int(ptr)",
             "declare ptr @festina_text_char_at(ptr, i64)",
+            # claude.md #249: text.charCodeAt(i)/int.toChar().
+            "declare i64 @festina_text_char_code_at(ptr, i64)",
+            "declare ptr @festina_int_to_char(i64)",
+            # claude.md #251: text.length.
+            "declare i64 @festina_text_length(ptr)",
             "declare ptr @festina_argv_array(i32, ptr)",
             "declare i64 @festina_process_exec(ptr)",
             "declare i64 @strlen(ptr)",
@@ -2527,7 +2688,14 @@ class CodeGen:
         at binding time -- a local reassigned before the throw releases
         what it holds THEN (the ordinary scope-exit semantics), and one
         nulled by `free` releases nothing (every release is null-safe,
-        see _emit_free)."""
+        see _emit_free).
+
+        claude.md #265: a table ROW is refcounted now, so a row-owning
+        local is tracked exactly like every other refcounted one --
+        #264's deliberate "do not track it inside a row-returning
+        function" exception is gone, along with the use-after-free it
+        was containing and the leak it traded for it.
+        """
         self._active_free_locals[-1].append((ref, type_))
         if self.program_has_try:
             lines.append(f"  call void @festina_cleanup_push(ptr {ref}, ptr {self._unwind_fn_for(type_)})")
@@ -4566,8 +4734,10 @@ class CodeGen:
                 lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
             elif ttype == TEXT:
                 lines.append(f"  call void @free(ptr {old})")
-            # TableType (a borrowed query row) and any other ptr-backed
-            # value: nothing released, only the binding dropped.
+            # Any other ptr-backed value: nothing released, only the
+            # binding dropped. claude.md #265: a table row is no longer
+            # in that group -- it is refcounted, so `free row` is an
+            # ordinary release above.
             lines.append(f"  store ptr null, ptr {ref}")
         elif llvm_ty == "i64":
             lines.append(f"  store i64 {INT_NULL_CONST}, ptr {ref}")
@@ -4805,10 +4975,24 @@ class CodeGen:
                                 # does. See _StackStructFieldsOnly's own
                                 # comment.
                                 self._track_local(ref, _StackStructFieldsOnly(type_), lines)
-                        elif type_ == BLOB or type_ == REGEX or isinstance(
+                        elif type_ == BLOB or type_ == REGEX or type_ == ASCII or isinstance(
                                 type_, (types_mod.ImageType, types_mod.AudioType,
                                        types_mod.HttpType, types_mod.SocketType,
-                                       types_mod.UrlType, types_mod.EnumType)):
+                                       types_mod.UrlType, types_mod.EnumType,
+                                       types_mod.TableType)):
+                            # claude.md #256: ascii joins this branch on
+                            # exactly blob's terms -- always scheduled
+                            # for release, no escaping-ness or
+                            # fresh-source test, because every ascii
+                            # BINDING owns one counted reference however
+                            # it was produced (a fresh slice/concat
+                            # starts at 1; an aliasing bind retains; an
+                            # immortal literal or singleton no-ops on
+                            # both). Omitting it leaked exactly the
+                            # three heap-allocated locals per iteration
+                            # that tests/stress/ascii_churn.f allocates,
+                            # caught by leak_stress before this branch
+                            # existed.
                             # claude.md #197: EnumType/HttpType/
                             # SocketType/UrlType join this branch too --
                             # see the matching widening (and its own,
@@ -4913,7 +5097,17 @@ class CodeGen:
             if type_ == BLOB or type_ == REGEX or isinstance(
                     type_, (types_mod.ImageType, types_mod.AudioType,
                             types_mod.HttpType, types_mod.SocketType,
-                            types_mod.UrlType, types_mod.EnumType)):
+                            types_mod.UrlType, types_mod.EnumType,
+                            types_mod.TableType)):
+                # claude.md #265: a table row takes this branch too, on
+                # exactly blob's terms. `People p = rows[0]` aliases a
+                # row the array still owns, so it needs its own +1 --
+                # without one, `free p` would drop the array's reference
+                # and the array's own cascade would then release a row
+                # already freed. That is not hypothetical: it is what
+                # the table_rows isolation program reported the moment
+                # rows became refcounted and this branch had not been
+                # widened yet.
                 # claude.md #109: `blob save = 'save.dat'` reads the file
                 # and hands back a fresh handle with a refcount of 1;
                 # `blob other = save` aliases the same handle and needs
@@ -5296,7 +5490,21 @@ class CodeGen:
                 lines.append("  ret void")
             else:
                 val, vtype = self._emit_value_for(stmt.value, env, lines, return_type)
-                val = self._coerce(val, vtype, return_type, lines)
+                # claude.md #251: source_expr=stmt.value -- every OTHER
+                # _coerce call site that can hit the text->blob/img/aud
+                # load conversions just below threads its own source
+                # expression through so _free_text_temp can tell a fresh
+                # path (a template literal, a `+` concat, a call result)
+                # from a borrowed one (a plain variable) and free only
+                # the former. This call site was the one exception,
+                # always passing None -- which _is_owning_text_source
+                # treats as "not owning," so the text festina_blob_open/
+                # festina_load_image/festina_load_audio strdup'd from
+                # (all three copy internally) was silently never freed
+                # for `return <text-expr>` in a blob/img/aud func. Found
+                # via #251's own stress-test coverage, confirmed
+                # independent of `.length` before fixing here.
+                val = self._coerce(val, vtype, return_type, lines, source_expr=stmt.value)
                 # claude.md #77 (widened further): a struct being handed
                 # back to the caller gets the exact same owning/aliasing
                 # treatment _emit_local_retain_release already
@@ -5771,6 +5979,25 @@ class CodeGen:
         # built per iteration is the ordinary way to use one. Measured
         # at 1,029 bytes over 49 iterations for `img s = `${dir}x.png``
         # before this existed.
+        # claude.md #256: `ascii tok = 'let'`. A literal is resolved
+        # entirely at compile time into an immortal .rodata constant --
+        # no allocation, no validation, no call. Anything else is a
+        # real runtime conversion that has to validate, and answers
+        # null for non-ascii input the way toInt() answers null for
+        # unparseable text.
+        if to_type == ASCII and from_type == TEXT:
+            if isinstance(source_expr, ast.StringLit):
+                return self.ascii_const(source_expr.value)
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_ascii_from_text(ptr {val})")
+            self._free_text_temp(source_expr, val, TEXT, lines)
+            return out
+        # claude.md #256: the other direction -- always a real copy,
+        # since a text is a bare char* with no header in front of it.
+        if to_type == TEXT and from_type == ASCII:
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_ascii_to_text(ptr {val})")
+            return out
         if to_type == BLOB and from_type == TEXT:
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_blob_open(ptr {val})")
@@ -6076,6 +6303,67 @@ class CodeGen:
                         self._release_member_chain(pending, expr.obj, obj_val,
                                                    obj_type, INT, lines)
                     return out, INT
+                # claude.md #251: text.length -- a runtime call (an
+                # O(n) UTF-8 walk, unlike arr[T]'s stored-count GEP
+                # just above), so the receiver is a genuine temporary
+                # to release, not a field to load. text is not in
+                # _is_refcounted's family (claude.md #83: copy-on-
+                # alias, free-unconditionally, no header to retain), so
+                # this deliberately does NOT go through
+                # _release_member_chain (whose own call_receivers
+                # filter is `_is_refcounted(t)` -- a text receiver
+                # would never match it and so would silently leak) --
+                # _free_text_temp is the same direct-free helper
+                # charCodeAt's own receiver already uses (claude.md
+                # #249) for exactly this reason.
+                # claude.md #262: each of the three branches below ends
+                # the same way -- `pending` is the chain's parked owning
+                # bases, and dropping it (which all three used to do) is
+                # a leak. When there IS a parked base the direct
+                # receiver is necessarily a Member, an alias INTO that
+                # base's graph, so only the base may be released;
+                # releasing the alias too is a double free, which is
+                # exactly what the per-receiver helpers below would do
+                # if left in place. See _release_chain_bases.
+                if obj_type == ASCII:
+                    # claude.md #256: the length is already sitting in
+                    # the value's own header at payload-16 -- a load,
+                    # not a call, and certainly not text's walk. This
+                    # is the entire reason the type exists.
+                    len_ptr = self.tmp()
+                    out = self.tmp()
+                    lines.append(f"  {len_ptr} = getelementptr i8, ptr {obj_val}, i64 -16")
+                    lines.append(f"  {out} = load i64, ptr {len_ptr}")
+                    if pending:
+                        self._release_chain_bases(pending, lines)
+                    else:
+                        self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+                    return out, INT
+                if obj_type == TEXT:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i64 @festina_text_length(ptr {obj_val})")
+                    if pending:
+                        self._release_chain_bases(pending, lines)
+                    else:
+                        self._free_text_temp(expr.obj, obj_val, obj_type, lines)
+                    return out, INT
+                # claude.md #251: blob.length -- blob IS refcounted
+                # (claude.md #109). This used to reason that the chain
+                # machinery was unnecessary here because "no
+                # `make().someBlob.length` shape exists the way
+                # `make().inner.items.length` does for arr[T]".
+                # claude.md #262: it does -- any struct with a blob
+                # field, or a table row with a blob column -- and the
+                # single-receiver release left the whole object behind
+                # (measured: 201 allocations over 200 iterations).
+                if obj_type == BLOB:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i64 @festina_blob_length(ptr {obj_val})")
+                    if pending:
+                        self._release_chain_bases(pending, lines)
+                    else:
+                        self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+                    return out, INT
             if expr.computed:
                 # claude.md #26/#72: arr[i] / map[key] -- expr.obj is
                 # emitted exactly once here, then branched on by type,
@@ -6117,7 +6405,7 @@ class CodeGen:
                     out = self._mint_and_release_computed(
                         expr, out[0], obj_val, obj_type, obj_type.value, lines)
                     return out, obj_type.value
-                if obj_type == TEXT:
+                if obj_type == TEXT or obj_type == ASCII:
                     # claude.md #150: unlike arr[text][i] (a BORROWED
                     # pointer into the array's own storage, see
                     # _mint_and_release_computed's own "a scalar element
@@ -6136,6 +6424,18 @@ class CodeGen:
                     # NO leak either way.
                     idx_val, _ = self._emit_expr(expr.prop, env, lines)
                     out = self.tmp()
+                    if obj_type == ASCII:
+                        # claude.md #256: one of the 128 immortal
+                        # single-character singletons -- O(1) and no
+                        # allocation, where text[i] both walks and
+                        # mallocs. NOT added to _minted_values: the
+                        # result is immortal, so treating it as an
+                        # owning temporary would emit a release that is
+                        # a no-op at best and misleading at worst.
+                        lines.append(
+                            f"  {out} = call ptr @festina_ascii_char_at(ptr {obj_val}, i64 {idx_val})")
+                        self._release_owned_receiver(expr.obj, obj_val, obj_type, lines)
+                        return out, ASCII
                     lines.append(f"  {out} = call ptr @festina_text_char_at(ptr {obj_val}, i64 {idx_val})")
                     self._free_text_temp(expr.obj, obj_val, obj_type, lines)
                     self._minted_values.add(id(expr))
@@ -6286,6 +6586,13 @@ class CodeGen:
             lines.append(f"  {sb} = call ptr @festina_sb_new()")
             lines.append(f"  call void {fn}(ptr {val}, ptr {sb}, i64 0)")
             lines.append(f"  {out} = call ptr @festina_sb_finish(ptr {sb})")
+        elif type_ == ASCII:
+            # claude.md #256: the characters, as a fresh text buffer --
+            # always total, since every ascii byte is a valid
+            # single-byte UTF-8 code point. This is also what
+            # ascii.toText() compiles to, and the two must not
+            # disagree, exactly as for blob just below.
+            lines.append(f"  {out} = call ptr @festina_ascii_to_text(ptr {val})")
         elif type_ == BLOB:
             # claude.md #115: the contents. A binary blob renders its
             # bytes up to the first NUL -- which is exactly what its
@@ -6861,7 +7168,20 @@ class CodeGen:
 
         body = [f"define ptr {fn_name}(ptr %cursor) {{", "entry:"]
         struct_ty = self.struct_llvm_name(struct_type.name)
-        out = self._emit_fresh_heap_header(struct_ty, body)
+        # claude.md #267: the type tag, when this struct is a member of
+        # a pure-struct enum. Every other construction site passes it
+        # (the clone path, the VarDecl path); this one did not, which
+        # made `.toStruct(A)` the one way to build an A that was NOT a
+        # valid E. Both directions were broken by it: a SUCCESSFUL parse
+        # produced an untagged struct that crashed the moment it was
+        # used as its enum, and a FAILING one had its half-built value
+        # released through the tagged release function, which frees
+        # `payload - 16` where the untagged allocation only reached
+        # `payload - 8` -- an invalid free, caught by ASan as "attempting
+        # free on address which was not malloc()-ed".
+        type_tag = (self._enum_tag_const(struct_type)
+                    if struct_type.name in self._tagged_structs else None)
+        out = self._emit_fresh_heap_header(struct_ty, body, type_tag=type_tag)
         # claude.md #233: `out` sits on the cleanup stack for the whole
         # field-reading loop below (see _emit_json_cleanup_push). It is
         # a fully zero-initialized header at this point, so a throw's
@@ -8235,11 +8555,7 @@ class CodeGen:
         Call-base walk, which computed bases made insufficient.
         Returns the (possibly replaced) result value."""
         receivers = list(pending) + [(obj_expr, obj_val, obj_type)]
-        call_receivers = [
-            (e, v, t) for e, v, t in receivers
-            if (isinstance(e, ast.Call) or id(e) in self._minted_values)
-            and _is_refcounted(t)
-        ]
+        call_receivers = self._owning_chain_receivers(receivers)
         if not call_receivers:
             return out
         if out is not None and _is_refcounted(ftype):
@@ -8255,6 +8571,46 @@ class CodeGen:
         for _, v, t in call_receivers:
             lines.append(f"  call void {self._release_fn_for(t)}(ptr {v})")
         return out
+
+    def _owning_chain_receivers(self, receivers):
+        """The subset of a member chain's receivers that this expression
+        actually owns a reference to, and so may release.
+
+        A receiver qualifies only if its emission MINTED ownership -- a
+        Call's fresh result, or (claude.md #119) anything recorded in
+        _minted_values. An intermediate link's value (`.inner` in
+        `make().inner.n`) is an alias INTO the base call's graph,
+        reached exactly once by that base's own release cascade, so
+        releasing it directly too would double-free. That exclusion is
+        the whole point of the filter, and it is why every drain site
+        must go through here rather than testing ownership its own way.
+
+        Split out by claude.md #262 so the .length branches can share
+        it: they used to drop their parked chain entirely for a non-
+        array receiver, and reaching for a per-receiver predicate
+        instead of this one is exactly how that hole turned into a
+        double free."""
+        return [
+            (e, v, t) for e, v, t in receivers
+            if (isinstance(e, ast.Call) or id(e) in self._minted_values)
+            and _is_refcounted(t)
+        ]
+
+    def _release_chain_bases(self, pending, lines):
+        """claude.md #262: releases the OWNING bases a member chain
+        parked, and nothing else -- for the `.length` branches, whose
+        receiver type (`blob`/`text`/`ascii`) is not the one whose value
+        escapes, so there is nothing to mint and _release_member_chain's
+        full retain-then-release dance does not apply.
+
+        Deliberately does NOT include the direct receiver. A non-empty
+        `pending` means an inner _emit_member_load frame ran, which can
+        only happen when the direct receiver is itself a Member -- an
+        alias into the parked graph, freed by that graph's own cascade.
+        Releasing it here as well is the double free this exists to
+        avoid."""
+        for _, v, t in self._owning_chain_receivers(pending):
+            lines.append(f"  call void {self._release_fn_for(t)}(ptr {v})")
 
     def _mint_and_release_computed(self, expr, out, obj_val, obj_type,
                                    elem_type, lines):
@@ -8273,21 +8629,19 @@ class CodeGen:
         ownership predicate downstream agrees the +1 exists.
 
         A scalar element needs no minting (its loaded value survives
-        the container by copy), so the container is simply released. A
-        TABLE-ROW element is the one shape that still cannot be fixed
-        this way: a row has no refcount header of its own -- the array
-        owns its rows outright (#85) -- so there is nothing to retain,
-        and releasing the array would free the row out from under the
-        expression. That case deliberately keeps #117's documented
-        leak (todo.md), and stays UNRECORDED here so the predicates
-        keep treating the row as borrowed -- a text column read off it
-        is still copied at its binding, exactly as before.
+        the container by copy), so the container is simply released.
+
+        A TABLE ROW is no longer the exception it was for #119, #224 and
+        #260. claude.md #265 gave rows the ordinary refcount header, so
+        `rows()[0]` retains the row, the array is released, and the
+        array's own cascade decrements the row straight back to the one
+        reference this expression owns -- the identical two-instruction
+        answer every other refcounted element type gets, with nothing
+        row-shaped left here at all.
 
         Returns the (possibly replaced) element value."""
         if not (_is_refcounted(obj_type)
                 and self._is_owning_refcounted_source(expr.obj)):
-            return out
-        if isinstance(elem_type, types_mod.TableType):
             return out
         if _is_refcounted(elem_type):
             lines.append(f"  call void @festina_retain(ptr {out})")
@@ -9281,6 +9635,13 @@ class CodeGen:
             return self._release_fn_for_array(type_)
         if isinstance(type_, types_mod.MapType):
             return self._release_fn_for_map(type_)
+        if isinstance(type_, types_mod.TableType):
+            # claude.md #265: the same per-table wrapper an arr[Table]'s
+            # own cascade already used -- it is a release now rather
+            # than an unconditional free, so it is safe to reach from
+            # every ordinary ownership site too, not just from a
+            # container tearing its elements down.
+            return self._emit_table_row_release_fn(type_)
         if type_ == BLOB:
             # claude.md #109: a blob carries the ordinary refcount
             # header, so the only thing generic @festina_release cannot
@@ -9329,6 +9690,11 @@ class CodeGen:
             # with openPort()/on request/fetch() and must not force
             # uses_http on a program that only ever parses a URL.
             return "@festina_release_url"
+        if type_ == ASCII:
+            # claude.md #256: unlike text just below, ascii IS
+            # refcounted -- its destructor frees at payload-16, the
+            # base of its {length, refcount} header.
+            return "@festina_ascii_release"
         if type_ == TEXT:
             # claude.md #83: text has no refcount header to dispatch
             # through -- "releasing" one is always just a plain,
@@ -9562,24 +9928,23 @@ class CodeGen:
         # per-element cascade wrapper below already dispatches each
         # element through _release_fn_for, which handles all of them;
         # _is_refcounted is the exact "has a reference to drop" test,
-        # plus TableType (its rows are owned, cascaded specially below)
-        # and TEXT (copied, not refcounted, but still needs freeing).
-        if not (_is_refcounted(elem_type)
-                or isinstance(elem_type, types_mod.TableType)
-                or elem_type == TEXT):
+        # plus TEXT (copied, not refcounted, but still needs freeing).
+        # claude.md #265: TableType used to need naming here separately;
+        # it is inside _is_refcounted now.
+        if not (_is_refcounted(elem_type) or elem_type == TEXT):
             return "@festina_release_array"
         key = types_mod.type_name(type_)
         if key in self._array_release_fns:
             return self._array_release_fns[key]
         fn_name = f"@__festina_release_array_{self._unique()}"
         self._array_release_fns[key] = fn_name
-        # claude.md #85: an arr[Table] owns its rows outright (they have
-        # no refcount header of their own to share), so its cascade
-        # frees each one directly instead of releasing a reference.
-        if isinstance(elem_type, types_mod.TableType):
-            elem_release_fn = self._emit_table_row_release_fn(elem_type)
-        else:
-            elem_release_fn = self._release_fn_for(elem_type)
+        # claude.md #265: an arr[Table]'s cascade RELEASES each row now
+        # rather than freeing it outright -- rows carry the ordinary
+        # refcount header, so a row something else still holds survives
+        # its array. _release_fn_for dispatches TableType to the same
+        # per-table wrapper this used to name directly, so there is no
+        # longer a case to split here at all.
+        elem_release_fn = self._release_fn_for(elem_type)
         elem_llvm_ty = _llvm_type(elem_type)
         cyclic = self._is_cyclic_type(type_)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
@@ -9653,6 +10018,27 @@ class CodeGen:
         self._table_row_release_fns[key] = fn_name
         cols = self.tables[table_type.name]
         body = [f"define void {fn_name}(ptr %row) {{", "entry:"]
+        # claude.md #265: a row is REFERENCE COUNTED now -- this is a
+        # release, not an unconditional free. Null-guarded first (a
+        # TableType local reads null until assigned, and `free` nulls its
+        # slot), then the standard festina_release_check: it decrements
+        # and answers non-zero only on the last reference, exactly as
+        # every other refcounted type's wrapper does. Everything below
+        # therefore runs at most once per row, which is what makes the
+        # column frees safe now that more than one binding can hold one.
+        null_label = self.label("relrow.null")
+        check_label = self.label("relrow.check")
+        free_label = self.label("relrow.free")
+        is_null = self.tmp()
+        body.append(f"  {is_null} = icmp eq ptr %row, null")
+        body.append(f"  br i1 {is_null}, label %{null_label}, label %{check_label}")
+        body.append(f"{check_label}:")
+        should_free = self.tmp()
+        body.append(f"  {should_free} = call i8 @festina_release_check(ptr %row)")
+        cond = self.tmp()
+        body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{null_label}")
+        body.append(f"{free_label}:")
         # claude.md #109: blob joins these -- a blob column is a real
         # handle now, so freeing it with plain @free would leak its path
         # and byte buffer and skip its refcount entirely.
@@ -9669,7 +10055,14 @@ class CodeGen:
             # not free() -- an img owns a Cairo surface and an aud owns
             # its decoded PCM, neither of which a plain free() releases.
             body.append(f"  call void {media_free.get(col_type, '@free')}(ptr {val})")
-        body.append("  call void @free(ptr %row)")
+        # claude.md #265: the allocation starts one i64 BEFORE the
+        # payload every field offset is measured from -- free the base,
+        # never the payload.
+        base = self.tmp()
+        body.append(f"  {base} = getelementptr i8, ptr %row, i64 -8")
+        body.append(f"  call void @free(ptr {base})")
+        body.append(f"  br label %{null_label}")
+        body.append(f"{null_label}:")
         body.append("  ret void")
         body.append("}")
         body.append("")
@@ -10654,6 +11047,42 @@ class CodeGen:
             left_val, left_type = self._emit_expr(expr.left, env, lines)
             right_val, right_type = self._emit_expr(expr.right, env, lines)
 
+        # claude.md #256: ascii == / != / + . A text operand on either
+        # side is coerced UP to ascii rather than the other way round,
+        # which is what makes `tok == 'let'` free: a literal resolves to
+        # an immortal .rodata constant at compile time, so the common
+        # lexer comparison allocates nothing at all. (A non-literal text
+        # operand does allocate, via festina_ascii_from_text -- the
+        # honest cost of validating that it is representable.)
+        if left_type == ASCII or right_type == ASCII:
+            if left_type == TEXT:
+                left_val = self._coerce(left_val, TEXT, ASCII, lines, expr.left)
+                left_type = ASCII
+            if right_type == TEXT:
+                right_val = self._coerce(right_val, TEXT, ASCII, lines, expr.right)
+                right_type = ASCII
+            if expr.op in ("==", "!="):
+                out = self.tmp()
+                lines.append(f"  {out} = call i8 @festina_ascii_eq(ptr {left_val}, ptr {right_val})")
+                if expr.op == "!=":
+                    neg = self.tmp()
+                    lines.append(f"  {neg} = xor i8 {out}, 1")
+                    result = neg
+                else:
+                    result = out
+                self._release_owned_receiver(expr.left, left_val, ASCII, lines)
+                self._release_owned_receiver(expr.right, right_val, ASCII, lines)
+                return result, BOOL
+            if expr.op == "+":
+                out = self.tmp()
+                lines.append(f"  {out} = call ptr @festina_ascii_concat("
+                             f"ptr {left_val}, ptr {right_val})")
+                self._release_owned_receiver(expr.left, left_val, ASCII, lines)
+                self._release_owned_receiver(expr.right, right_val, ASCII, lines)
+                self._minted_values.add(id(expr))
+                return out, ASCII
+            raise CodegenError(
+                f"'{expr.op}' is not supported between ascii values")
         if left_type == TEXT or right_type == TEXT:
             if expr.op in ("==", "!="):
                 out = self.tmp()
@@ -11011,6 +11440,16 @@ class CodeGen:
                         f"log() only supports primitive values right now, "
                         f"found {types_mod.type_name(vtype)}",
                         file=self.filename, line=callee.line)
+                if vtype == ASCII:
+                    # claude.md #256: rendered as its characters, via
+                    # the same _to_text path ascii.toText() uses, so
+                    # the two can never disagree -- exactly how blob
+                    # and the containers are logged.
+                    rendered = self._to_text(val, vtype, lines)
+                    lines.append(f"  call void @festina_log_text(ptr {rendered})")
+                    lines.append(f"  call void @free(ptr {rendered})")
+                    self._release_owned_receiver(expr.args[0], val, vtype, lines)
+                    return "0", None
                 fn = {"int": "festina_log_int", "float": "festina_log_float",
                       "bool": "festina_log_bool", "text": "festina_log_text"}[vtype.name]
                 ty = _llvm_type(vtype)
@@ -11766,6 +12205,70 @@ class CodeGen:
                     lines.append(f"  {out} = call i64 @festina_text_to_int(ptr {val})")
                     self._free_text_temp(callee.obj, val, vtype, lines)
                     return out, INT
+            # claude.md #249: text.charCodeAt(i) -> int -- the Unicode
+            # code point at code-point index i, mirroring text[i]'s own
+            # receiver-freeing shape (the int argument itself needs no
+            # freeing, unlike a text/regex one -- see .match()'s own
+            # shape just below for that comparison).
+            if callee.prop == "charCodeAt":
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == ASCII:
+                    # claude.md #256: this is the request that started
+                    # the whole type -- an O(1) charCodeAt. One byte per
+                    # character means the byte at offset i IS the code
+                    # point, so this is a bounds check and a load where
+                    # text's own version below has to walk from byte
+                    # zero counting code points. claude.md #258: and
+                    # that bounds-check-and-load is emitted inline here
+                    # rather than called, so a scan loop costs no call
+                    # at all -- see _emit_ascii_char_code_at.
+                    idx_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    out = self._emit_ascii_char_code_at(val, idx_val, lines)
+                    self._release_owned_receiver(callee.obj, val, vtype, lines)
+                    return out, INT
+                if vtype == TEXT:
+                    idx_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call i64 @festina_text_char_code_at(ptr {val}, i64 {idx_val})")
+                    self._free_text_temp(callee.obj, val, vtype, lines)
+                    return out, INT
+            # claude.md #256: ascii.slice(start, end) -- clamped both
+            # ends in the runtime, so nothing here needs to check.
+            if callee.prop == "slice":
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == ASCII:
+                    a_val, _ = self._emit_expr(expr.args[0], env, lines)
+                    b_val, _ = self._emit_expr(expr.args[1], env, lines)
+                    out = self.tmp()
+                    lines.append(f"  {out} = call ptr @festina_ascii_slice("
+                                 f"ptr {val}, i64 {a_val}, i64 {b_val})")
+                    self._release_owned_receiver(callee.obj, val, vtype, lines)
+                    self._minted_values.add(id(expr))
+                    return out, ASCII
+                self._release_owned_receiver(callee.obj, val, vtype, lines)
+            # claude.md #256: text.toAscii() -- validating, and null for
+            # anything not representable one byte per character.
+            if callee.prop == "toAscii" and not expr.args:
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                out = self.tmp()
+                lines.append(f"  {out} = call ptr @festina_ascii_from_text(ptr {val})")
+                self._free_text_temp(callee.obj, val, vtype, lines)
+                self._minted_values.add(id(expr))
+                return out, ASCII
+            # claude.md #249: int.toChar() -> text -- the inverse of
+            # charCodeAt(); the result is a fresh, exclusively-owned
+            # one-character buffer (festina_int_to_char always mallocs
+            # its own), so this is marked minted exactly like
+            # text[i]'s own festina_text_char_at result just above --
+            # see that call site's own comment for what that buys.
+            if callee.prop == "toChar" and not expr.args:
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == INT:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call ptr @festina_int_to_char(i64 {val})")
+                    self._minted_values.add(id(expr))
+                    return out, TEXT
             # int/float/bool.toText() -> text -- an explicit spelling of
             # exactly the stringification template interpolation already
             # does under the hood (_to_text, shared with _emit_template),
@@ -11776,6 +12279,13 @@ class CodeGen:
                 val, vtype = self._emit_expr(callee.obj, env, lines)
                 if vtype in (INT, FLOAT, BOOL):
                     return self._to_text(val, vtype, lines), TEXT
+                if vtype == ASCII:
+                    # claude.md #256: a real copy into a bare char*,
+                    # since a text has no header to carry. Total -- an
+                    # ascii byte is always a valid one-byte code point.
+                    out = self._to_text(val, vtype, lines)
+                    self._release_owned_receiver(callee.obj, val, vtype, lines)
+                    return out, TEXT
                 # claude.md #114: the explicit spelling of the rendering
                 # log()/`${}` now do implicitly for containers.
                 if isinstance(vtype, (types_mod.StructType, types_mod.TableType,
@@ -13764,7 +14274,16 @@ class CodeGen:
             fp = self.tmp()
             body.append(f"  {fp} = getelementptr {struct_ty}, ptr {payload}, i32 0, i32 {idx}")
             body.append(f"  store {f_llvm} {v}, ptr {fp}")
-        body.append("  call void @free(ptr %row)")
+        # claude.md #265: the row buffer starts one i64 before the
+        # payload pointer now (the refcount header every row carries).
+        # This path is the row's ONLY other freer -- a struct-query row
+        # is converted here exactly once, immediately after collection,
+        # and never enters the refcounted world at all (nothing can
+        # alias it before this runs), so it is freed outright rather
+        # than released.
+        row_base = self.tmp()
+        body.append(f"  {row_base} = getelementptr i8, ptr %row, i64 -8")
+        body.append(f"  call void @free(ptr {row_base})")
         body.append(f"  ret ptr {payload}")
         body.append("}")
         body.append("")

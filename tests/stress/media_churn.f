@@ -12,6 +12,18 @@ table Asset {
 
 sqlite('DELETE FROM Asset')
 
+blob func reload(i:int) {
+    // claude.md #251: `return `save_${i % 4}.dat`` directly -- this
+    // exact line is what surfaced the return-site text->blob
+    // conversion leak fixed in the same entry (the intermediate
+    // template-literal text was never freed after festina_blob_open
+    // copied its path). Kept as the direct-return shape, not routed
+    // through a local, specifically so this loop keeps exercising the
+    // fixed path rather than only the VarDecl path `save` below
+    // already covered on its own.
+    return `save_${i % 4}.dat`
+}
+
 int total = 0
 int i = 0
 while i < 120 {
@@ -92,6 +104,12 @@ while i < 120 {
     if alsoSave.exists() {
         total = total + 1
     }
+    // claude.md #251: blob.length -- an aliased (`save`, borrowed,
+    // needs no release of its own) and a computed (`reload()`, a
+    // fresh call-result blob) receiver both, so a missed release on
+    // the computed one is one leak per pass.
+    total = total + save.length
+    total = total + reload(i).length
     save = 'save_other.dat'          // releases the old handle
     save.write('other')
 

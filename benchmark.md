@@ -10,14 +10,14 @@ catch regressions and track progress over time, run against the same
 few workloads on every change that plausibly affects performance
 (codegen, runtime, or the standard library), not as a marketing claim.
 
-These same five programs are also benchmarked cross-compiled to
+These same programs are also benchmarked cross-compiled to
 `wasm32-wasi` (against C and Go, also compiled to wasm) — see
 [wasm.md](wasm.md#benchmarks).
 
 ## Methodology
 
-Five programs, each implemented equivalently in Festina, Rust, Go, and
-Bun (source in [`benchmarks/`](benchmarks/)), plus a sixth comparing
+Six programs, each implemented equivalently in Festina, Rust, Go, and
+Bun (source in [`benchmarks/`](benchmarks/)), plus one comparing
 Festina's canvas against a browser's and MonoGame's — see
 [Canvas](#canvas-festina-vs-an-html-canvas-vs-monogame) at the end:
 
@@ -27,7 +27,7 @@ Festina's canvas against a browser's and MonoGame's — see
 | `fib` | Recursive function-call overhead and raw compute throughput — naive recursive `fib(32)` (no memoization), ~7 million calls. Deliberately not reducible to a closed form by an optimizer (unlike a linear sum), so this actually measures generated-code quality, not the compiler's algebra. |
 | `loop_sum` | Tight-loop / branch-free arithmetic throughput — a 100,000,000-iteration polynomial-hash accumulation (`total = (total * 1000003 + i) % 1000000007`), each iteration depending on the last so it can't be folded into a closed-form constant either — a plain running-sum version of this loop optimizes away entirely, running in ~2ms regardless of iteration count (see `loop_sum.f`'s own comment). |
 | `array_sum` | Allocation-heavy throughput — 2,000,000 iterations, each building a fresh 8-element `arr[int]` literal (never escaping, so Festina reclaims it at that iteration's own scope-exit — see [todo.md](todo.md#memory-model)) and summing its elements into a running total. Directly exercises automatic memory management: every iteration is a genuine allocate-fill-read cycle, not just arithmetic. Each element's value depends on the *previous* iteration's own running total, the same closed-form-resistance trick `loop_sum` already uses. The hot loop lives inside a `void func run(...)`, not bare top-level code — escape analysis only ever analyzes a function/handler's own body, never the top-level statement sequence, so this is what lets Festina prove `nums` never escapes (see `array_sum.f`'s own comment). |
-| `string_concat` | String-heavy throughput — 15,000 iterations of repeated concatenation (`` s = `${s}x` ``/`s = s + "x"`), `s` growing by one character each time. Written as the textbook O(n²) naive-concatenation pattern; since claude.md #243 Festina compiles that exact shape as an in-place append onto `s`'s own buffer (amortized O(1) each), so its row now measures that path rather than a quadratic copy. |
+| `string_concat` | String-heavy throughput — 15,000 iterations of repeated concatenation (`` s = `${s}x` ``/`s = s + "x"`), `s` growing by one character each time. Written as the textbook O(n²) naive-concatenation pattern; Festina compiles that exact shape as an in-place append onto `s`'s own buffer (amortized O(1) each), so its row measures that path rather than a quadratic copy. |
 
 Each language uses its own normal toolchain and optimization settings
 (`festina program.f -o program`, `rustc -O`, `go build`, `bun run` —
@@ -74,52 +74,61 @@ failing — see [setup.md](setup.md) for what each one needs.
 ## Results
 
 <!-- BENCHMARK_RESULTS_START -->
-_Last run: 2026-09-03 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-09-10 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.6 ms | 80.0 ms | 1.49 MB |
-| Rust | 1.9 ms | 97.8 ms | 3.77 MB |
-| Go | 1.3 ms | 189.2 ms | 2.11 MB |
-| Bun | 12.8 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.5 ms | 93.7 ms | 1.49 MB |
+| Rust | 1.7 ms | 110.2 ms | 3.77 MB |
+| Go | 1.7 ms | 224.0 ms | 2.11 MB |
+| Bun | 12.6 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `fib`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 8.0 ms | 84.5 ms | 1.49 MB |
-| Rust | 8.5 ms | 107.8 ms | 3.77 MB |
-| Go | 14.7 ms | 190.3 ms | 2.11 MB |
-| Bun | 31.5 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 9.1 ms | 99.7 ms | 1.49 MB |
+| Rust | 9.9 ms | 118.7 ms | 3.77 MB |
+| Go | 14.5 ms | 215.4 ms | 2.11 MB |
+| Bun | 35.7 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `loop_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 524.2 ms | 86.0 ms | 1.49 MB |
-| Rust | 530.9 ms | 101.9 ms | 3.77 MB |
-| Go | 464.6 ms | 189.1 ms | 2.11 MB |
-| Bun | 9109.4 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 526.6 ms | 105.5 ms | 1.49 MB |
+| Rust | 501.3 ms | 125.5 ms | 3.77 MB |
+| Go | 460.8 ms | 214.9 ms | 2.11 MB |
+| Bun | 9213.8 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `array_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 93.7 ms | 108.7 ms | 1.49 MB |
-| Rust | 90.9 ms | 203.2 ms | 3.77 MB |
-| Go | 89.6 ms | 182.7 ms | 2.11 MB |
-| Bun | 2456.0 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 86.4 ms | 122.4 ms | 1.49 MB |
+| Rust | 86.6 ms | 159.6 ms | 3.77 MB |
+| Go | 88.0 ms | 214.0 ms | 2.11 MB |
+| Bun | 2674.1 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `string_concat`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.9 ms | 84.5 ms | 1.49 MB |
-| Rust | 1.7 ms | 123.8 ms | 3.77 MB |
-| Go | 38.9 ms | 181.5 ms | 2.11 MB |
+| Festina | 1.7 ms | 109.8 ms | 1.50 MB |
+| Rust | 1.7 ms | 144.0 ms | 3.77 MB |
+| Go | 32.3 ms | 198.4 ms | 2.11 MB |
 | Bun | 14.2 ms | n/a (JIT, no separate build step) | n/a |
+
+### `char_scan`
+
+| Language | Run time (min of 7 runs) | Build time | Binary size |
+|---|---|---|---|
+| Festina | 13.6 ms | 166.9 ms | 1.50 MB |
+| Rust | 16.3 ms | 184.8 ms | 3.77 MB |
+| Go | 14.8 ms | 182.0 ms | 2.11 MB |
+| Bun | 40.6 ms | n/a (JIT, no separate build step) | n/a |
 
 <!-- BENCHMARK_RESULTS_END -->
 
@@ -152,15 +161,14 @@ _Last run: 2026-09-03 on this machine -- see benchmark.md's "Methodology" sectio
   give a fixed-size `alloca`). The remaining, small gap is ordinary
   codegen-maturity noise, not an allocation-strategy gap.
 - **`string_concat`** is where Festina's `text` ownership model shows up
-  directly. A text binding's buffer is exclusively its own (claude.md
-  #83), so `` s = `${s}x` `` is an assignment that is about to free the
-  very buffer it is copying from — and since claude.md #243 the
-  compiler treats it as what it is: an append onto `s`'s own buffer,
-  grown in place with a length the compiler tracks, amortized O(1) per
-  step instead of a fresh copy of the whole string. That is the same
-  idea Rust's `String` `+` uses (reusing the left operand's spare
-  capacity, like `Vec`), which is why the two now land together; before
-  #243 Festina did the full O(n²) copy and sat about 2.4x behind Rust.
+  directly. A text binding's buffer is exclusively its own,
+  so `` s = `${s}x` `` is an assignment that is about to free the very
+  buffer it is copying from — and the compiler treats it as what it is:
+  an append onto `s`'s own buffer, grown in place with a length the
+  compiler tracks, amortized O(1) per step instead of a fresh copy of
+  the whole string. That is the same idea Rust's `String` `+` uses
+  (reusing the left operand's spare capacity, like `Vec`), which is why
+  the two land together.
   Go's `+` on immutable strings has no spare capacity to grow into,
   which is why it does the quadratic copy; Bun's V8 backend uses
   rope/cons-string representations internally, deferring the copy until
@@ -168,6 +176,20 @@ _Last run: 2026-09-03 on this machine -- see benchmark.md's "Methodology" sectio
   naive-looking source. None of this is a bug in any of the four — it's
   exactly the kind of language/runtime difference this benchmark exists
   to surface.
+- **`char_scan`** is the workload `ascii` exists for: walk a ~1.7MB
+  buffer character by character, counting identifier runs. On a `text`
+  this is quadratic — UTF-8 is variable-width, so `s[i]` walks from byte
+  zero on every index — which is why the Festina version uses `ascii`,
+  where one byte per character puts the length in the value's own header
+  and makes `.length`/`s[i]`/`charCodeAt(i)` O(1). `charCodeAt(i)` is
+  emitted inline — a null check, a header load, a bounds check and a
+  byte load, right where the expression is used — so the scan loop makes
+  no call per character, which is what puts it level with Rust and Go
+  rather than behind them.
+  The Go and Rust implementations deliberately index `[]byte`/
+  `as_bytes()` rather than ranging a string or using `char_indices`,
+  both of which decode UTF-8 and would measure decoding instead of
+  scanning.
 - **The canvas comparison** (below) is the one benchmark here that
   isn't against another *language*. It's against the thing a 2D game
   would otherwise most likely be written on: an HTML `<canvas>`. Circles
@@ -239,11 +261,11 @@ circles cost 76 ms, because `cairo_arc` + `cairo_fill` tessellates the
 curve into Beziers and scan-converts a general polygon every single
 time. Rasterizing each radius once into an alpha mask and stamping it
 thereafter -- what a glyph cache does -- took circles to 20 ms and the
-frame from 90 ms to 31 ms (claude.md #104), leaving 11 ms of rectangles
-and 20 ms of circles.
+frame from 90 ms to 31 ms, leaving 11 ms of rectangles and 20 ms of
+circles.
 
-The second change (claude.md #240) noticed that neither of those needs
-a rasterizer at all. An opaque flat-colour rectangle at integer
+The second change noticed that neither of those needs a rasterizer at
+all. An opaque flat-colour rectangle at integer
 coordinates covers whole pixels, so its result is the colour written
 into each of them; an opaque circle's per-pixel coverage is the same
 for every circle of that radius, so Cairo rasterizes it once and the
@@ -392,9 +414,8 @@ The section above measures Festina's single HTTP event loop against
 other languages' own single-threaded raw-socket servers -- a
 deliberately fair, apples-to-apples comparison. This section instead
 compares Festina against **itself**: what a `thread pool[N] { on
-request(req:http) { ... } }` (claude.md #212's own private per-thread
-HTTP context) plus `NAME.giveRequest(r)` (claude.md #213's own live
-connection hand-off) actually buys a program that does real CPU-bound
+request(req:http) { ... } }` (a private per-thread HTTP context) plus
+`NAME.giveRequest(r)` (a live connection hand-off) actually buys a program that does real CPU-bound
 work per request, the pattern `examples/threaded_http_server.f`
 demonstrates.
 
@@ -469,7 +490,7 @@ _Last run: 2026-09-01 on this machine (4 CPUs), `wrk -t4 -c50 -d5s` per route, p
   `os.cpu_count()` for exactly this reason.
 - **Every handed-off request pays a small, real hand-off latency** --
   a receive-only worker thread's own combined loop polls on a bounded
-  timeout (claude.md #212's own `FESTINA_THREAD_HTTP_POLL_MS`, 20ms)
+  timeout (`FESTINA_THREAD_HTTP_POLL_MS`, 20ms)
   rather than waking instantly the way a dedicated OS thread blocked
   on `accept()` would, so under LOW concurrency (one request at a
   time, nothing else queued) a handed-off request can be slightly
@@ -502,8 +523,7 @@ shares its reference across `postMessage` instead of cloning it, and a
 Worker's `transferToImageBitmap()` is a genuine ownership transfer, not
 a copy. Compositing the finished layers onto one final surface IS a
 real per-pixel blend on both sides (the canvas `drawImage()` on each,
-which since claude.md #241 takes an `img?` layer directly on the
-Festina side) and both runs time it, not just the parallel drawing --
+which takes an `img?` layer directly on the Festina side) and both runs time it, not just the parallel drawing --
 see
 [`run_layered_canvas_benchmark.py`](benchmarks/layered_canvas/run_layered_canvas_benchmark.py)
 for the rest of what makes this comparison fair, the same three rules
@@ -531,23 +551,21 @@ layers are NOT equal-sized (8,000/9,000/11,000/12,000 draws), so four
 threads finish in roughly however long the heaviest layer takes, not in
 a quarter of the single-threaded time — this measures what four
 genuinely independent, unevenly-loaded workers buy on real hardware, not
-an idealized 4x. And on the Festina side the parallel part is now
-small: after claude.md #240 the 40,000 draw calls take about 4 ms on
-one thread, so the serial work both runs share — clearing the canvas
-and compositing four full-surface layers onto it — is a real fraction
-of either number, and no amount of threading touches it. (Until
-claude.md #241 each layer also had to be `clip()`-copied into a plain
-`img` before `drawImage()` would take it — four 1.92 MB copies per
-frame, as much time as all the drawing; `drawImage()` accepts an
-`img?` source directly now.)
+an idealized 4x. And on the Festina side the parallel part is small:
+the 40,000 draw calls take about 4 ms on one thread, so the serial work
+both runs share — clearing the canvas and compositing four
+full-surface layers onto it — is a real fraction of either number, and
+no amount of threading touches it. `drawImage()` accepts an `img?`
+source directly, so a layer needs no `clip()` copy into a plain `img`
+first.
 
-When this benchmark was first written (claude.md #239) Festina drew it
-in 84 ms single-threaded and 62 ms with four threads, and the browser's
-Workers were 1.2x faster than Festina's threads. Measuring where those
-62 ms went found two things (claude.md #240). Circles onto an `img` were
-tessellated by Cairo on every call, 32–40 ms per layer; they are now
-stamped from a cached per-radius coverage mask, blended directly into
-the pixels, and byte-identical. And the four threads were not running
+An earlier version of this benchmark drew the frame in 84 ms
+single-threaded and 62 ms with four threads, with the browser's Workers
+1.2x faster than Festina's threads. Measuring where those 62 ms went
+found two things. Circles onto an `img` were tessellated by Cairo on
+every call, 32–40 ms per layer; they are now stamped from a cached
+per-radius coverage mask, blended directly into the pixels, and
+byte-identical. And the four threads were not running
 in parallel at all: each painted a freshly allocated 1.92 MB surface,
 and the page faults that materialize fresh memory on first touch
 serialize across threads inside one process, so four threads' worth of

@@ -847,7 +847,23 @@ def x_display_with_wm(x_display):
                 env=dict(os.environ, DISPLAY=x_display),
                 capture_output=True, text=True,
             )
-            if probe.returncode == 0 and "_NET_SUPPORTING_WM_CHECK" in probe.stdout:
+            # claude.md #270: the property NAME is the one thing that
+            # can't be the condition. xprop exits 0 whether or not the
+            # property exists and echoes the name back in both its
+            # absent forms ("_NET_SUPPORTING_WM_CHECK:  no such atom on
+            # any window." before any client sets it, "not found." once
+            # the atom exists elsewhere), so matching the name declared
+            # openbox ready on the first probe every time -- this whole
+            # readiness wait was a no-op, and every test taking this
+            # fixture ran against a display where openbox might not be
+            # up yet. Testing for the absent forms rather than for a
+            # "=" because this property is a WINDOW, printed as
+            # "_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x20011f"
+            # -- no "=" anywhere in it (only the CARDINAL-list form,
+            # e.g. _NET_FRAME_EXTENTS, prints one).
+            absent = ("no such atom" in probe.stdout
+                      or "not found" in probe.stdout)
+            if probe.returncode == 0 and not absent:
                 ready = True
                 break
         else:

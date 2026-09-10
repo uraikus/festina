@@ -97,6 +97,19 @@ class TestIndividualExamples:
         result = _run_example(cli_mod, tmp_path, "multifile.f")
         assert result.stdout.splitlines() == ["(0, 0)", "(3, 4)"]
 
+    def test_ascii_scan_counts_words_and_converts_at_the_boundary(
+            self, cli_mod, tmp_path):
+        # claude.md #256: the example exists to show where `ascii` is
+        # the right tool -- scanning character by character, which is
+        # linear on an ascii and quadratic on a text.
+        result = _run_example(cli_mod, tmp_path, "ascii_scan.f")
+        lines = result.stdout.splitlines()
+        assert lines[0] == "9 words"
+        assert lines[1] == "longest: quick (5 characters)"
+        assert lines[2] == "q"          # line[4], a one-character ascii
+        assert lines[3] == "17"         # 'parsed at runtime'.toAscii().length
+        assert lines[4] == "true"       # non-ascii text -> toAscii() is null
+
     def test_regex_demo_runs_correctly(self, cli_mod, tmp_path):
         result = _run_example(cli_mod, tmp_path, "regex.f")
         assert result.stdout.splitlines() == [

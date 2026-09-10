@@ -6,17 +6,18 @@ category from a name -- callers construct the specific type they mean.
 """
 from dataclasses import dataclass
 
-PRIMITIVE_NAMES = frozenset({"int", "float", "bool", "text", "blob"})
+PRIMITIVE_NAMES = frozenset({"int", "float", "bool", "text", "blob", "ascii"})
 
 
 @dataclass(frozen=True)
 class PrimitiveType:
-    """claude.md #202: `manually_managed` (default False) is only ever
-    actually SET True for `name == "blob"` -- the one primitive that
-    carries a refcount header (see codegen._is_refcounted) and so is
-    the one primitive `T?` means anything real for. For
-    `int`/`float`/`bool`/`text`, semantic.py's own resolution never
-    sets this field at all regardless of whether the source wrote `?`
+    """claude.md #202, widened by #256: `manually_managed` (default
+    False) is only ever actually SET True for `name == "blob"` and
+    `name == "ascii"` -- the primitives that carry a refcount header
+    (see codegen._is_refcounted) and so are the ones `T?` means
+    anything real for. For `int`/`float`/`bool`/`text`, semantic.py's
+    own resolution never sets this field at all regardless of whether
+    the source wrote `?`
     -- `int?`/`int` both resolve to the identical `PrimitiveType("int")`
     (this field stays its own default, False), fully interchangeable,
     so `?` on a scalar is accepted grammar with zero type-level effect,

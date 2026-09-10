@@ -523,6 +523,84 @@ class TestBlob:
             semantic.analyze(program)
 
 
+class TestReturnTextToHandleConversion:
+    """claude.md #251: `return <text-expr>` from a `blob`/`img`/`aud`
+    func -- the implicit text-to-handle load conversion at a RETURN
+    site specifically. Found leaking the intermediate text (a fresh
+    template-literal/concat result, never freed after
+    festina_blob_open/festina_load_image/festina_load_audio strdup'd
+    what they needed from it) while adding `.length`'s own stress-test
+    coverage; the fix was a one-line `source_expr=stmt.value` this
+    Return branch's own `_coerce` call was the sole exception to
+    passing (every other _coerce call site that can hit these three
+    conversions already threads its source expression through).
+    These are correctness tests -- leak-freedom itself is what
+    `scripts/leak_stress.sh` on `tests/stress/media_churn.f` (a
+    computed blob receiver returned this way) actually proves; not
+    re-proven here since an ordinary pytest run has no ASan under it.
+    """
+
+    def test_a_blob_func_returning_a_computed_path_works(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        source = f"""
+        blob func reload() {{ return '{path}' }}
+        log(reload().toText())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hello"
+
+    def test_a_blob_func_returning_a_template_literal_path_works(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        source = f"""
+        blob func reload(dir:text) {{ return `${{dir}}/data.txt` }}
+        log(reload('{tmp_path}').toText())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hello"
+
+    def test_a_blob_func_returning_a_bound_variable_still_works(self, compile_and_run, tmp_path):
+        # The other half of the same fix: `return p` (a bare local, an
+        # ALIASING source, not an owning one) must NOT be freed by the
+        # coercion itself -- ordinary scope-exit release still owns it.
+        # Getting this wrong the other way would double-free.
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        source = f"""
+        blob func reload() {{
+            text p = '{path}'
+            return p
+        }}
+        log(reload().toText())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "hello"
+
+    def test_an_img_func_returning_a_computed_path_works(self, compile_and_run, tmp_path):
+        shutil.copy(_JPEG_FIXTURE, tmp_path / "gradient.jpg")
+        source = """
+        img func loadTile(dir:text) { return `${dir}/gradient.jpg` }
+        log(loadTile('.').width > 0)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
+    def test_an_aud_func_returning_a_computed_path_works(self, compile_and_run, tmp_path):
+        shutil.copy(_MP3_FIXTURE, tmp_path / "tone.mp3")
+        source = """
+        aud func loadClip(dir:text) { return `${dir}/tone.mp3` }
+        log(loadClip('.').isPlaying())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "false"
+
+
 class TestStructs:
     """claude.md #27: structs are native in-memory objects with typed,
     assignable fields."""
@@ -5957,7 +6035,14 @@ class TestFullscreenAndDecorations:
                     ["xprop", "-id", wid, "_NET_FRAME_EXTENTS"],
                     env=env, capture_output=True, text=True,
                 )
-                if probe.returncode == 0 and "_NET_FRAME_EXTENTS" in probe.stdout:
+                # claude.md #270: the condition has to be the "=", not the
+                # property NAME. xprop exits 0 either way and prints the
+                # name back in both its absent forms too --
+                # "_NET_FRAME_EXTENTS:  no such atom on any window." and
+                # "_NET_FRAME_EXTENTS:  not found." -- so matching the
+                # name accepted the very first probe, before openbox had
+                # reparented, and this poll never actually polled.
+                if probe.returncode == 0 and "=" in probe.stdout:
                     extents = probe.stdout
                     break
                 time.sleep(0.1)
@@ -8015,11 +8100,13 @@ class TestComputedIndexAndArgumentOwnership:
         assert result.returncode == 0
         assert result.stdout.strip() == str(sum(range(50)) + 10 + 50)
 
-    def test_a_table_row_element_stays_borrowed(self, compile_and_run, tmp_path):
-        # The one computed-index shape that deliberately does NOT mint:
-        # rows have no refcount header (the array owns them outright),
-        # so the container is left alive -- leaked, per todo.md -- and
-        # a column read off the row is still copied at its binding.
+    def test_a_table_row_element_is_minted_like_any_other(self, compile_and_run, tmp_path):
+        # claude.md #265: a row carries the ordinary refcount header, so
+        # a computed-index row off an owning array is minted exactly
+        # like every other refcounted element -- retained, then the
+        # array released, netting the one reference this expression
+        # owns. Leak-freedom is tests/stress/row_ownership_churn.f's
+        # job; this pins that the value read back is real.
         db = tmp_path / "t.sqlite"
         source = f"""
         DatabaseURL = '{db}'
@@ -8035,6 +8122,111 @@ class TestComputedIndexAndArgumentOwnership:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "row"
+
+    def test_a_column_read_off_a_call_result_row_outlives_the_array(
+            self, compile_and_run, tmp_path):
+        # claude.md #260: the array (and so the row inside it) is
+        # released as soon as the chain has the column, so the copy that
+        # escapes must be genuinely independent -- not a pointer into
+        # the freed row. Reading several columns off several such
+        # arrays, then printing them all afterwards, is what would
+        # surface a use-after-free as wrong output rather than a
+        # sanitizer report.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'ada'])
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [2, 'grace'])
+        arr[People] func rows() {{
+            arr[People] r = sqlite('SELECT * FROM People ORDER BY id')
+            return r
+        }}
+        text first = rows()[0].name
+        text second = rows()[1].name
+        int n = rows()[1].id
+        log(`${{first}} ${{second}} ${{n}}`)
+        log(rows()[0].name == 'ada')
+        log(`${{rows()[1].name}}!`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ada grace 2\ntrue\ngrace!\n"
+
+    def test_returning_a_row_borrowed_from_a_local_array_does_not_crash(
+            self, compile_and_run, tmp_path):
+        # BOTH of these used to be a use-after-free that crashed (exit
+        # 245, confirmed under ASan): the function released its local
+        # array on the way out, freeing the very row it was handing
+        # back. claude.md #264 contained that by leaking the array
+        # instead; #265 fixed it outright -- the returned row is
+        # retained on the way out, so the array's release just drops one
+        # of its two references and the caller owns the other. Nothing
+        # leaks and nothing dangles.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'ada'])
+        People func direct() {{
+            arr[People] r = sqlite('SELECT * FROM People')
+            return r[0]
+        }}
+        People func viaLocalRow() {{
+            arr[People] r = sqlite('SELECT * FROM People')
+            People p = r[0]
+            return p
+        }}
+        log(direct().name)
+        log(viaLocalRow().id)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ada\n1\n"
+
+    def test_returning_a_row_borrowed_from_a_parameter_or_global_is_unaffected(
+            self, compile_and_run, tmp_path):
+        # These two -- a row off an array the caller owns, and one off
+        # an array that lives until exit -- were safe even before
+        # claude.md #265 made every row shape safe, precisely because
+        # nothing released the array early. They stay here as the
+        # control: a row's own reference must not make the ARRAY's
+        # lifetime any shorter than it was.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'ada'])
+        arr[People] gRows = sqlite('SELECT * FROM People')
+        People func fromParam(xs:arr[People]) {{ return xs[0] }}
+        People func fromGlobal() {{ return gRows[0] }}
+        arr[People] held = sqlite('SELECT * FROM People')
+        log(fromParam(held).name)
+        log(fromGlobal().name)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ada\nada\n"
+
+    def test_a_row_bound_to_a_name_still_borrows_from_its_array(
+            self, compile_and_run, tmp_path):
+        # The ordinary shape, and the one that has always worked: the
+        # array is bound to a name and reclaimed at scope exit, and the
+        # row read out of it holds its own reference until then
+        # (claude.md #265).
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'ada'])
+        arr[People] rows = sqlite('SELECT * FROM People')
+        People p = rows[0]
+        log(p.name)
+        log(rows.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ada\n1\n"
 
 
 class TestCycleCollection:
@@ -15619,6 +15811,59 @@ class TestArraySort:
         assert result.returncode == 0
         assert result.stdout == "[1.5,2.5,3.5]\n[false,false,true,true]\n"
 
+    def test_a_comparator_may_throw_and_the_sort_stays_usable(self, compile_and_run):
+        # claude.md #259: the comparator is ordinary Festina code, so it
+        # can throw, and the throw longjmps straight past
+        # festina_array_sort's own frame. The leak that used to strand
+        # (its merge scratch) is proven fixed by
+        # tests/stress/callback_throw_churn.f under LeakSanitizer; what
+        # this pins is the visible contract around it -- the throw is
+        # caught normally, the partly-sorted array is still readable
+        # (in-place, so it holds SOME permutation of its elements, never
+        # freed or corrupted), and the same array sorts correctly
+        # afterwards with a comparator that doesn't throw.
+        source = """
+        int func explode(a:int, b:int) {
+            if (a == 7) { throw 'comparator gave up' }
+            return a - b
+        }
+        int func byAsc(a:int, b:int) { return a - b }
+        arr[int] xs = [5, 3, 7, 1]
+        try {
+            xs.sort(explode)
+            log('no throw')
+        } catch (error:text) {
+            log(error)
+        }
+        log(xs.length)
+        xs.sort(byAsc)
+        log(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "comparator gave up\n4\n[1,3,5,7]\n"
+
+    def test_a_nested_sort_inside_a_comparator_still_sorts(self, compile_and_run):
+        # claude.md #259 pushes the scratch buffer onto the cleanup
+        # stack, so a sort running INSIDE another sort's comparator has
+        # to leave that stack balanced -- an unbalanced push would show
+        # up as a wrong answer here, not just as bytes under a
+        # sanitizer.
+        source = """
+        int func byAsc(a:int, b:int) { return a - b }
+        int func viaInner(a:int, b:int) {
+            arr[int] inner = [3, 1, 2]
+            inner.sort(byAsc)
+            return (a - b) * inner[0]
+        }
+        arr[int] xs = [5, 3, 8, 1]
+        xs.sort(viaInner)
+        log(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "[1,3,5,8]\n"
+
     def test_arbitrary_expression_callback_not_just_a_bare_name(self, compile_and_run):
         # claude.md #165/#171's own permissive rule -- unlike setTimeout's
         # older bare-name-only convention, any func-typed EXPRESSION works.
@@ -16271,6 +16516,426 @@ class TestTextIndexing:
         assert result.stdout == "abcdef\n"
 
 
+class TestCharCodeAtAndToChar:
+    """claude.md #249: text.charCodeAt(i:int):int and int.toChar():text
+    -- charCodeAt reads the Unicode CODE POINT at CODE POINT index i,
+    the same unit text[i]/split('') already use (not a UTF-16 code
+    unit the way JS's own charCodeAt works, which would read half of a
+    surrogate pair for anything outside the Basic Multilingual Plane);
+    toChar() is its exact inverse, UTF-8 encoding one code point back
+    into its own one-character text. Both null (never a crash) on an
+    invalid question -- an out-of-range/negative index, or a code
+    point with no valid UTF-8 encoding -- mirroring text[i]'s own
+    "test, don't fail" answer to the identical shape of question."""
+
+    def test_a_middle_character(self, compile_and_run):
+        result = compile_and_run("log('hello'.charCodeAt(1))")
+        assert result.returncode == 0
+        assert result.stdout == "101\n"  # 'e'
+
+    def test_round_trips_through_toChar(self, compile_and_run):
+        source = """
+        int fortyTwo = 42
+        text char = fortyTwo.toChar()
+        int numberAgain = char.charCodeAt(0)
+        log(char)
+        log(numberAgain == fortyTwo)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "*\n" + "true\n"
+
+    def test_a_literal_int_toChar(self, compile_and_run):
+        result = compile_and_run("log(42.toChar())")
+        assert result.returncode == 0
+        assert result.stdout == "*\n"
+
+    def test_multibyte_utf8_codepoint_not_byte(self, compile_and_run):
+        # 'café' -- 'é' is U+00E9 (233), a 2-byte UTF-8 sequence at
+        # CODE POINT index 3 (not byte offset 3, which would land
+        # mid-character) -- the identical unit
+        # TestTextIndexing::test_multibyte_utf8_is_indexed_by_codepoint_not_byte
+        # already pins for plain text[i].
+        result = compile_and_run("log('café'.charCodeAt(3))\nlog(233.toChar())")
+        assert result.returncode == 0
+        assert result.stdout == "233\né\n"
+
+    def test_out_of_range_index_is_null_not_a_crash(self, compile_and_run):
+        source = """
+        text s = 'hi'
+        log(s.charCodeAt(100) == null)
+        log(s.charCodeAt(-1) == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+    def test_invalid_codepoints_toChar_is_null_not_a_crash(self, compile_and_run):
+        source = """
+        log((-1).toChar() == null)
+        log(1114112.toChar() == null)
+        log(55296.toChar() == null)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\ntrue\n"
+
+    def test_a_dynamic_receiver_and_index_go_through_the_runtime_path(self, compile_and_run):
+        source = """
+        text func makeText() { return 'ab' + 'cd' }
+        int func idx() { return 1 + 1 }
+        log(makeText().charCodeAt(idx()))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "99\n"  # 'c'
+
+    def test_wrong_arg_count_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("log('hi'.charCodeAt())")
+        with pytest.raises(errors.CompileError, match="charCodeAt"):
+            semantic.analyze(program)
+
+    def test_wrong_arg_type_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse("log('hi'.charCodeAt('x'))")
+        with pytest.raises(errors.CompileError, match="charCodeAt"):
+            semantic.analyze(program)
+
+
+class TestAscii:
+    """claude.md #256: the `ascii` type -- one byte per character.
+
+    That single property is the whole point. When a character IS a
+    byte, the character count IS the byte count, so it can live in a
+    header (at payload-16, with the refcount at payload-8 exactly where
+    festina_retain/festina_release_check already look) and both
+    `.length` and `s[i]` become O(1) reads. `text` cannot have any of
+    this: it is UTF-8, variable width, and a bare `char *` with four
+    different provenances (heap, .rodata literal, getenv's environ
+    pointer, an X11 stack buffer), so there is nowhere to put a header
+    and nothing to cache. The two types coexist rather than one
+    replacing the other.
+    """
+
+    def test_length_is_the_character_count(self, compile_and_run):
+        result = compile_and_run("ascii s = 'hello'\nlog(s.length)")
+        assert result.returncode == 0
+        assert result.stdout == "5\n"
+
+    def test_empty_ascii_has_zero_length(self, compile_and_run):
+        result = compile_and_run("ascii s = ''\nlog(s.length)")
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_indexing_returns_a_one_character_ascii(self, compile_and_run):
+        result = compile_and_run("ascii s = 'hello'\nlog(s[1])\nlog(s[1].length)")
+        assert result.returncode == 0
+        assert result.stdout == "e\n1\n"
+
+    def test_out_of_range_index_is_null_not_a_crash(self, compile_and_run):
+        # The same "answer null, don't crash" choice text[i] makes --
+        # and deliberately NOT arr[T]'s unchecked indexing.
+        result = compile_and_run(
+            "ascii s = 'hi'\nlog(s[99] == null)\nlog(s[0 - 1] == null)")
+        assert result.returncode == 0
+        assert result.stdout == "true\ntrue\n"
+
+    def test_char_code_at_reads_the_byte(self, compile_and_run):
+        result = compile_and_run("ascii s = 'hello'\nlog(s.charCodeAt(0))")
+        assert result.returncode == 0
+        assert result.stdout == "104\n"
+
+    def test_char_code_at_out_of_range_is_null(self, compile_and_run):
+        result = compile_and_run("ascii s = 'hi'\nlog(s.charCodeAt(99) == null)")
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_char_code_at_emits_no_call(self, parser, semantic, codegen):
+        # claude.md #258: the whole point -- a scan loop must not cost a
+        # call per character. Asserted on the emitted IR rather than only
+        # on the answer, because the answer was already right when it WAS
+        # a call: what changed is the cost, and the cost is what a
+        # regression here would quietly undo.
+        def calls(body):
+            source = ("ascii s = 'hello'\n"
+                      "int total = 0\n"
+                      "for int i = 0, i < s.length, i++ {\n"
+                      f"    {body}\n"
+                      "}\n"
+                      "log(total)\n")
+            program = parser.parse(source, filename="main.f")
+            analyzed = semantic.analyze(program, filename="main.f")
+            ir = codegen.generate_ir(program, analyzed, filename="main.f")
+            assert "festina_ascii_char_code_at" not in ir
+            return sorted(line.strip().split("@", 1)[1].split("(", 1)[0]
+                          for line in ir.splitlines()
+                          if " call " in f" {line.strip()} " and "@" in line)
+
+        # Differential rather than a pinned list: the same loop with the
+        # charCodeAt swapped for plain arithmetic must emit the SAME
+        # calls. Anything charCodeAt costs would show up as a difference,
+        # and the runtime prologue both share stays out of it.
+        assert calls("total = total + s.charCodeAt(i)") == calls("total = total + i")
+
+    def test_char_code_at_answers_null_on_every_edge(self, compile_and_run):
+        # claude.md #258: the inline sequence is branchless -- a null
+        # receiver and an out-of-range index are both handled by
+        # substituting a safe pointer/offset and then discarding the
+        # loaded byte. These are the cases where that substitution has to
+        # produce exactly what the explicit `if` it replaced produced.
+        result = compile_and_run(
+            "ascii s = 'AbZ'\n"
+            "log(s.charCodeAt(0))\n"
+            "log(s.charCodeAt(2))\n"
+            "log(s.charCodeAt(3) == null)\n"
+            "log(s.charCodeAt(0 - 1) == null)\n"
+            "ascii e = ''\n"
+            "log(e.charCodeAt(0) == null)\n"
+            "text bad = 'café'\n"
+            "ascii? missing = bad.toAscii()\n"
+            "log(missing.charCodeAt(0) == null)\n")
+        assert result.returncode == 0
+        assert result.stdout == "65\n90\ntrue\ntrue\ntrue\ntrue\n"
+
+    def test_char_code_at_on_a_call_result_receiver(self, compile_and_run):
+        # The receiver is an owning temporary here, so the inline
+        # sequence has to leave it in a state _release_owned_receiver can
+        # still release -- including when the call answered null.
+        result = compile_and_run(
+            "ascii func pick(t:text) { return t.toAscii() }\n"
+            "log(pick('ok').charCodeAt(1))\n"
+            "log(pick('nöt').charCodeAt(0) == null)\n")
+        assert result.returncode == 0
+        assert result.stdout == "107\ntrue\n"
+
+    def test_slice_is_end_exclusive(self, compile_and_run):
+        result = compile_and_run("ascii s = 'hello'\nlog(s.slice(1, 4))")
+        assert result.returncode == 0
+        assert result.stdout == "ell\n"
+
+    def test_slice_clamps_instead_of_failing(self, compile_and_run):
+        # Inverted and out-of-range pairs both answer something rather
+        # than faulting -- an empty ascii, and the whole thing.
+        result = compile_and_run(
+            "ascii s = 'hello'\nlog(s.slice(4, 1).length)\nlog(s.slice(0 - 5, 99))")
+        assert result.returncode == 0
+        assert result.stdout == "0\nhello\n"
+
+    def test_concatenation(self, compile_and_run):
+        result = compile_and_run(
+            "ascii a = 'hello'\nascii b = a + ' world'\nlog(b)\nlog(b.length)")
+        assert result.returncode == 0
+        assert result.stdout == "hello world\n11\n"
+
+    def test_equality_against_a_literal(self, compile_and_run):
+        # The single most common thing a lexer does, and the case that
+        # costs nothing: the literal resolves to an immortal .rodata
+        # constant at compile time.
+        result = compile_and_run(
+            "ascii s = 'let'\nlog(s == 'let')\nlog(s == 'nope')\nlog(s != 'let')")
+        assert result.returncode == 0
+        assert result.stdout == "true\nfalse\nfalse\n"
+
+    def test_round_trip_through_text(self, compile_and_run):
+        result = compile_and_run(
+            "ascii s = 'hello'\ntext t = s.toText()\nlog(t)\nlog(t.length)\n"
+            "ascii back = t.toAscii()\nlog(back == s)")
+        assert result.returncode == 0
+        assert result.stdout == "hello\n5\ntrue\n"
+
+    def test_to_ascii_is_null_for_non_ascii_text(self, compile_and_run):
+        # Built at runtime so the compiler cannot fold it -- toAscii()
+        # answers null the way toInt() does for unparseable text,
+        # rather than throwing.
+        result = compile_and_run(
+            "text t = 'caf'\nt = t + 'é'\nascii a = t.toAscii()\nlog(a == null)")
+        assert result.returncode == 0
+        assert result.stdout == "true\n"
+
+    def test_a_non_ascii_literal_is_a_compile_error(self, compile_and_run):
+        # Known at compile time, so it fails to build rather than
+        # deferring to a null at runtime.
+        with pytest.raises(Exception) as exc_info:
+            compile_and_run("ascii bad = 'café'\nlog(bad)")
+        assert "not an ascii character" in str(exc_info.value)
+
+    def test_length_is_bytes_where_text_length_is_codepoints(self, compile_and_run):
+        # The two types answer differently on purpose, and this pins
+        # that difference down.
+        result = compile_and_run(
+            "text t = 'caf'\nt = t + 'é'\nlog(t.length)\n"
+            "ascii a = 'cafe'\nlog(a.length)")
+        assert result.returncode == 0
+        assert result.stdout == "4\n4\n"
+
+    def test_ascii_has_no_field_other_than_length(self, parser, semantic, errors):
+        program = parser.parse("ascii s = 'hi'\nlog(s.nope)")
+        with pytest.raises(errors.CompileError, match="ascii has no field"):
+            semantic.analyze(program)
+
+    def test_indexing_in_a_loop_does_not_leak(self, compile_and_run):
+        # The singleton path: 5,000 reads that must allocate nothing at
+        # all. A regression shows up as a leak under
+        # scripts/leak_stress.sh (tests/stress/ascii_churn.f); this
+        # keeps the behavior pinned in the ordinary suite too.
+        result = compile_and_run(
+            "ascii s = 'abcde'\nint total = 0\n"
+            "for int i = 0, i < 5000, i++ {\n"
+            "    total = total + s.charCodeAt(i % 5)\n"
+            "}\nlog(total)")
+        assert result.returncode == 0
+        assert result.stdout == "495000\n"
+
+
+class TestTextAndBlobLength:
+    """claude.md #251: text.length:int and blob.length:int.
+
+    text.length is the number of UTF-8 CODE POINTS (the same unit
+    s[i]/charCodeAt/split('') already index by), not bytes -- 'café' is
+    4, not 5. blob.length is the byte count exactly, since a blob has
+    no UTF-8 structure to walk (an O(1) stored-field read, unlike
+    text's O(n) walk). Neither is settable: `.length = ...` on either
+    stays a compile error, the same way it already is for arr[T].
+    """
+
+    def test_ascii_text_length(self, compile_and_run):
+        result = compile_and_run("log('hello'.length)")
+        assert result.returncode == 0
+        assert result.stdout == "5\n"
+
+    def test_multibyte_text_length_counts_codepoints_not_bytes(self, compile_and_run):
+        # 'café' is 5 bytes UTF-8-encoded ('é' is 2 bytes) but 4 code
+        # points -- the same distinction
+        # TestCharCodeAtAndToChar::test_multibyte_utf8_codepoint_not_byte
+        # already pins for charCodeAt.
+        result = compile_and_run("log('café'.length)")
+        assert result.returncode == 0
+        assert result.stdout == "4\n"
+
+    def test_empty_text_length_is_zero(self, compile_and_run):
+        result = compile_and_run("log(''.length)")
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_a_null_text_receiver_reads_as_length_zero(self, compile_and_run):
+        # claude.md #150's own null-text convention (a missing regex
+        # match, here) -- treated as "" the same way
+        # festina_text_char_at already treats a NULL receiver, not a
+        # crash.
+        source = """
+        text nope = 'xyz'.match(/[0-9]+/)
+        log(nope == null)
+        log(nope.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "true\n0\n"
+
+    def test_a_computed_text_receiver_goes_through_the_runtime_path(self, compile_and_run):
+        source = """
+        text func decorate(s:text) { return s + '!' }
+        log(decorate('hi').length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "3\n"
+
+    def test_text_length_is_not_settable(self, parser, semantic, errors):
+        program = parser.parse("text s = 'hi'\ns.length = 5")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_blob_length_is_the_byte_count(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        result = compile_and_run(f"blob b = '{path}'\nlog(b.length)")
+        assert result.returncode == 0
+        assert result.stdout == "5\n"
+
+    def test_blob_length_counts_bytes_not_codepoints(self, compile_and_run, tmp_path):
+        # 'café' is 5 UTF-8 bytes -- unlike text.length's 4 code points
+        # for the identical content, pinning the byte-vs-codepoint
+        # split between the two types explicitly.
+        path = tmp_path / "data.txt"
+        path.write_bytes("café".encode("utf-8"))
+        result = compile_and_run(f"blob b = '{path}'\nlog(b.length)")
+        assert result.returncode == 0
+        assert result.stdout == "5\n"
+
+    def test_a_missing_path_is_an_empty_blob_length_zero(self, compile_and_run):
+        result = compile_and_run("blob b = '/nonexistent/nowhere.txt'\nlog(b.length)")
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_a_computed_blob_receiver_goes_through_the_runtime_path(self, compile_and_run, tmp_path):
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        source = f"""
+        blob func makeBlob() {{ return '{path}' }}
+        log(makeBlob().length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "5\n"
+
+    def test_length_off_a_field_of_a_call_result(self, compile_and_run, tmp_path):
+        # claude.md #262: `make().someBlob.length` and its text/ascii
+        # siblings. The `.length` branch used to drain its member chain
+        # only for an ARRAY receiver and drop it for these three, which
+        # leaked the whole struct the field came from. Fixing that
+        # required removing the per-receiver release that was ALSO
+        # running -- it released a field the expression never owned, and
+        # only escaped notice because the leaked struct's cascade never
+        # ran a second time. So this reads the shared blob back
+        # afterwards: an over-release shows up there as a
+        # use-after-free, not as a leak.
+        path = tmp_path / "data.txt"
+        path.write_text("hello")
+        source = f"""
+        struct Inner {{ b:blob  t:text  a:ascii  xs:arr[int] }}
+        struct Outer {{ inner:Inner  label:text }}
+        blob shared = '{path}'
+        Inner func mkInner() {{
+            Inner x
+            x.b = shared
+            x.t = 'hello there'
+            x.a = 'abcd'
+            x.xs = [1, 2, 3]
+            return x
+        }}
+        Outer func mkOuter() {{
+            Outer o
+            o.inner = mkInner()
+            o.label = 'outer'
+            return o
+        }}
+        log(mkInner().b.length)
+        log(mkInner().t.length)
+        log(mkInner().a.length)
+        log(mkInner().xs.length)
+        log(mkOuter().inner.b.length)
+        log(mkOuter().label.length)
+        log(shared.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "5\n11\n4\n3\n5\n5\n5\n"
+
+    def test_blob_length_is_not_settable(self, parser, semantic, errors):
+        program = parser.parse("blob b = 'x.txt'\nb.length = 5")
+        with pytest.raises(errors.CompileError):
+            semantic.analyze(program)
+
+    def test_wrong_field_name_on_text_mentions_length(self, parser, semantic, errors):
+        program = parser.parse("log('hi'.bogus)")
+        with pytest.raises(errors.CompileError, match="length"):
+            semantic.analyze(program)
+
+    def test_wrong_field_name_on_blob_mentions_length(self, parser, semantic, errors):
+        program = parser.parse("blob b = 'x.txt'\nlog(b.bogus)")
+        with pytest.raises(errors.CompileError, match="length"):
+            semantic.analyze(program)
+
+
 class TestEnums:
     """claude.md #176: enum + typeof end to end -- both representations
     (pure-struct self-tagging, mixed heap-boxed), typeof, coercion,
@@ -16379,6 +17044,55 @@ class TestEnums:
         result = compile_and_run(source)
         assert result.returncode == 1
         assert "field 'radius' is only valid when this Shape value is a Circle" in result.stderr
+
+    def test_a_json_parsed_struct_is_a_valid_enum_member(self, compile_and_run):
+        # claude.md #267: `.toStruct(T)`/`.toArr(T)` were the one way to
+        # build a T that was NOT a valid member of its enum -- the JSON
+        # builder allocated the plain {refcount} header where every other
+        # construction site allocates the widened {tag, refcount} one
+        # (claude.md #176). The parse itself looked fine; using the
+        # result as its enum crashed. Both builders share the per-struct
+        # function, so both are pinned here.
+        source = """
+        struct Point { x:int  label:text }
+        struct Tag { name:text }
+        enum Shape = Point, Tag
+        Point p = '{"x": 7, "label": "hi"}'.toStruct(Point)
+        log(p.x)
+        Shape s
+        s = p
+        log(typeof s)
+        arr[Point] many = '[{"x": 1}, {"x": 2}]'.toArr(Point)
+        Shape fromArr
+        fromArr = many[1]
+        log(typeof fromArr)
+        log(many[1].x)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "7\nPoint\nPoint\n2\n"
+
+    def test_a_failed_json_parse_of_an_enum_member_is_caught_cleanly(
+            self, compile_and_run):
+        # claude.md #267's other direction: the half-built struct sits on
+        # the cleanup stack, so a throw part-way through releases it --
+        # through the TAGGED release function, which frees payload-16.
+        # With the untagged allocation that was an invalid free (ASan:
+        # "attempting free on address which was not malloc()-ed"), and
+        # the program aborted instead of reaching its own catch.
+        source = """
+        struct Point { x:int  label:text }
+        struct Tag { name:text }
+        enum Shape = Point, Tag
+        try {
+            Point bad = '{"x": 1, "label": '.toStruct(Point)
+            log('no throw')
+        } catch (e:text) { log('caught') }
+        log('still running')
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "caught\nstill running\n"
 
     def test_typeof_on_a_null_enum_value_fails_loudly(self, compile_and_run):
         # claude.md #176: an enum-typed value defaults to null until
@@ -16518,6 +17232,189 @@ class TestEnums:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "done"
+
+
+class TestMatchStatement:
+    """claude.md #252: `match EXPR { 'Tag' { ... } ... default { ... }
+    }` -- pure sugar over `typeof`/`if`, exhaustiveness-checked against
+    the subject's type, desugared away entirely in semantic.py before
+    codegen ever runs (codegen.py has zero MatchStmt-specific code at
+    all -- these are all behavioral tests of the desugared result,
+    which is provably the same `IfStmt`/`TypeofExpr` shape the existing
+    `typeof`-based dispatch tests already cover)."""
+
+    _SHAPE = """
+    struct Circle { radius:int }
+    struct Square { area:int }
+    enum Shape = Circle, Square
+    """
+
+    def test_the_apimd_example_dispatches_by_variant(self, compile_and_run):
+        source = self._SHAPE + """
+        int func extractShapeMetric(shape:Shape) {
+            int result = 0
+            match shape {
+                'Circle' { result = shape.radius }
+                'Square' { result = shape.area }
+            }
+            return result
+        }
+        Circle c
+        c.radius = 5
+        log(extractShapeMetric(c))
+        Square sq
+        sq.area = 42
+        log(extractShapeMetric(sq))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["5", "42"]
+
+    def test_default_arm_catches_the_rest(self, compile_and_run):
+        source = self._SHAPE + """
+        text func describe(shape:Shape) {
+            text out = ''
+            match shape {
+                'Circle' { out = 'a circle' }
+                default { out = 'something else' }
+            }
+            return out
+        }
+        Circle c
+        c.radius = 1
+        Square sq
+        sq.area = 1
+        log(describe(c))
+        log(describe(sq))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["a circle", "something else"]
+
+    def test_a_mixed_non_struct_enum(self, compile_and_run):
+        source = """
+        enum Json = int, text, bool
+        text func describe(j:Json) {
+            text out = ''
+            match j {
+                'int' { out = 'int' }
+                'text' { out = 'text' }
+                'bool' { out = 'bool' }
+            }
+            return out
+        }
+        log(describe(5))
+        log(describe('hi'))
+        log(describe(true))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == ["int", "text", "bool"]
+
+    def test_a_non_enum_subject_matches_its_own_static_type(self, compile_and_run):
+        source = """
+        int n = 5
+        match n {
+            'int' { log('it is an int') }
+            default { log('unreachable') }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "it is an int"
+
+    def test_a_field_access_subject_is_simple_and_allowed(self, compile_and_run):
+        source = self._SHAPE + """
+        struct Wrapper { shape:Shape }
+        Wrapper w
+        Circle c
+        c.radius = 7
+        w.shape = c
+        match w.shape {
+            'Circle' { log(w.shape.radius) }
+            'Square' { log(w.shape.area) }
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "7"
+
+    def test_non_exhaustive_without_default_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse(self._SHAPE + """
+        Circle c
+        Shape shape = c
+        match shape {
+            'Circle' { log('circle') }
+        }
+        """)
+        with pytest.raises(errors.CompileError, match="does not cover"):
+            semantic.analyze(program)
+
+    def test_an_unknown_case_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse(self._SHAPE + """
+        Circle c
+        Shape shape = c
+        match shape {
+            'Circle' { log('a') }
+            'Triangle' { log('b') }
+            default { log('c') }
+        }
+        """)
+        with pytest.raises(errors.CompileError, match="no case 'Triangle'"):
+            semantic.analyze(program)
+
+    def test_a_duplicate_case_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse(self._SHAPE + """
+        Circle c
+        Shape shape = c
+        match shape {
+            'Circle' { log('a') }
+            'Circle' { log('b') }
+            default { log('c') }
+        }
+        """)
+        with pytest.raises(errors.CompileError, match="already has a case"):
+            semantic.analyze(program)
+
+    def test_a_non_simple_subject_is_a_compile_error(self, parser, semantic, errors):
+        program = parser.parse(self._SHAPE + """
+        Shape func makeShape() { Circle c ; return c }
+        match makeShape() {
+            'Circle' { log('a') }
+            default { log('b') }
+        }
+        """)
+        with pytest.raises(errors.CompileError, match="plain variable or field access"):
+            semantic.analyze(program)
+
+    def test_a_second_default_is_a_parse_error(self, parser, errors):
+        with pytest.raises(errors.CompileError, match="already has a 'default'"):
+            parser.parse(self._SHAPE + """
+            Circle c
+            Shape shape = c
+            match shape {
+                'Circle' { log('a') }
+                default { log('b') }
+                default { log('c') }
+            }
+            """)
+
+    def test_match_regex_method_call_still_parses_as_the_existing_method(self, compile_and_run):
+        # claude.md #252: `match` is a genuine reserved keyword now, but
+        # Parser.eat_name already accepts any keyword as a member name
+        # (the same reason free/delete don't break blob.delete()), so
+        # 'x'.match(regex) must be completely unaffected.
+        result = compile_and_run("log('hello world'.match(/world/))")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "world"
+
+    def test_default_is_still_an_ordinary_identifier_elsewhere(self, compile_and_run):
+        # `default` is deliberately NOT a reserved word globally (only
+        # recognized by value inside a match block) -- confirm it still
+        # works as a plain variable name.
+        result = compile_and_run("int default = 5\nlog(default)")
+        assert result.returncode == 0
+        assert result.stdout.strip() == "5"
 
 
 class TestThreads:

@@ -215,11 +215,11 @@ sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'row'])
 int total = 0
 for int i = 0, i < 200, i++ {
     arr[People] rows = sqlite('SELECT * FROM People')
-    People first = rows[0]   // borrowed
+    People first = rows[0]   // its own reference (claude.md #265)
     total = total + first.id
     if rows[0].undefined('name') { log('unreachable') }
-    free first               // drops the binding only
-    free rows
+    free first               // drops this binding's reference
+    free rows                // drops the array's, and the row with it
 }
 log(total)
 """,
@@ -340,29 +340,31 @@ class TestLeakStress:
         file.ll` silently produces an UNinstrumented object, so a harness
         built the obvious way passes everything and proves nothing.
 
-        The canary leaks on purpose and the harness must say so. It is
-        the row-array residual claude.md #119 documents as deliberate: a
-        table-row element off a call-result array (`rows()[0]`) cannot
-        retain its row past the array (rows have no header of their
-        own), so the array is knowingly leaked -- see todo.md. Two
+        The canary leaks on purpose and the harness must say so. THREE
         previous canaries were retired because the compiler fixed them
-        (the chained call result by claude.md #108/#117, the reference
-        cycle by claude.md #120), which is exactly the failure mode a
-        canary is supposed to have: it stops leaking, this test fails
-        loudly, and nobody discovers months later that the harness had
-        been vacuous.
+        -- the chained call result by claude.md #108/#117, the reference
+        cycle by #120, and the row-array residual (`rows()[0].name`,
+        deliberate since #85/#119) by #260 -- which is exactly the
+        failure mode a canary is supposed to have: it stops leaking,
+        this test fails loudly, and nobody discovers months later that
+        the harness had been vacuous.
+
+        Three retirements is enough of a pattern to stop picking
+        canaries from the "known bug, not yet fixed" pile. This one is a
+        `text?` built in a loop and never freed: a leak by CONTRACT
+        rather than by omission (claude.md #202/#257 -- `?` means the
+        compiler manages nothing, and `free` is the only release), so a
+        future round cannot quietly fix it out from under this test. If
+        THIS ever stops leaking, `?` itself is broken and the loud
+        failure is the correct outcome rather than a retirement.
         """
         canary = tmp_path / "canary.f"
         canary.write_text(
-            "table People { id:int name:text }\n"
-            "sqlite('DELETE FROM People')\n"
-            "sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'row'])\n"
-            "arr[People] func rows() {\n"
-            "    arr[People] r = sqlite('SELECT * FROM People')\n"
-            "    return r\n"
-            "}\n"
             "int i = 0\n"
-            "while i < 200 { text got = rows()[0].name i = i + 1 }\n"
+            "while i < 200 {\n"
+            "    text? held = `leaked ${i}`\n"
+            "    i = i + 1\n"
+            "}\n"
             "log('done')\n"
         )
         result = _run_harness(str(canary))
@@ -441,6 +443,13 @@ class TestLeakStress:
             "regex_and_files_churn.f",  # regex compilation, file and time text
             "structs_and_rows_churn.f", # structs, query rows, scope exits
             "text_churn.f",             # text, the copy-managed one
+            # claude.md #256: the `ascii` type -- a REFCOUNTED string,
+            # so a genuinely different ownership shape from
+            # text_churn.f's copy-managed one just above, and the only
+            # type whose indexing hands back an IMMORTAL value (one of
+            # the 128 single-character singletons) that must never be
+            # freed however many times it is dropped.
+            "ascii_churn.f",
             # claude.md #130: splice's own 3rd-argument insertion --
             # element-range retain/copy into a SEPARATE array's buffer,
             # a genuinely different ownership shape than push/unshift's
@@ -637,6 +646,69 @@ class TestLeakStress:
             # leak claude.md #157 documented. Only runnable under ASan
             # at all since claude.md #235 (libc setjmp/longjmp).
             "throw_unwind_churn.f",
+            # claude.md #259: a throw that crosses one of the RUNTIME's
+            # own C frames -- the case #236's cleanup stack left open,
+            # since a longjmp past festina_array_sort skips that frame's
+            # own free() of its merge scratch. Churns both runtime
+            # functions that call back into Festina from under a
+            # reachable try (array sort, map forEach), plus a nested
+            # sort inside a comparator and a comparator that catches its
+            # own throw -- the shapes that unbalance the cleanup stack
+            # rather than merely leak. Verified to FAIL without the fix
+            # (4,000 stranded scratch buffers).
+            "callback_throw_churn.f",
+            # claude.md #260: a table-row column read off a CALL-RESULT
+            # array (`rows()[0].name`) -- the project's own
+            # longest-standing documented leak (#85/#119/#224), closed
+            # by parking the array on the enclosing member chain. Every
+            # position that shape appears in: a plain binding, a scalar
+            # column, a discarded result, an interpolation, a
+            # comparison, a call argument, plus the already-fine
+            # name-bound control. A text column must be COPIED and a
+            # blob column RETAINED before the array (and the row inside
+            # it) dies, so getting this wrong is a use-after-free or a
+            # double free, not a leak -- which is why it runs under
+            # ASan, not LeakSanitizer alone. Verified to FAIL without
+            # the fix.
+            "row_chain_churn.f",
+            # claude.md #265: a table row carries the ordinary refcount
+            # header now, so it is an ordinary refcounted value
+            # everywhere -- bound, aliased, passed, returned, stored in
+            # a container, freed by hand, and outliving the array it
+            # came from. Every shape here was broken before that: two
+            # CRASHED (a row returned from a function that owned its
+            # array), one leaked its array on every access, and the rest
+            # only worked because the array was leaked rather than
+            # reclaimed. A double-free test as much as a leak test --
+            # one release too many frees a row the array is still going
+            # to release. Verified to FAIL without the change, with a
+            # heap-use-after-free.
+            "row_ownership_churn.f",
+            # claude.md #267: a struct that is a member of an enum,
+            # built by the JSON parser. Every other construction site
+            # tags such a struct in a WIDENED header (claude.md #176);
+            # the from-JSON builder did not, so a successful parse
+            # produced an untagged struct that crashed when used as its
+            # enum, and a failing one released the half-built value
+            # through the TAGGED release function -- freeing payload-16
+            # of an allocation that only reached payload-8. A
+            # memory-corruption test first: good and bad input alternate
+            # so both paths run every iteration, and the parsed value is
+            # used AS its enum so a missing tag cannot pass unnoticed.
+            # Verified to FAIL without the fix (heap-buffer-overflow).
+            "enum_json_churn.f",
+            # claude.md #262: `.length` off a member chain whose
+            # receiver is NOT an array -- a blob/text/ascii field of a
+            # call-result struct. Those three cases dropped the chain's
+            # parked bases entirely, leaking the whole object the field
+            # came from. A use-after-free test first and a leak test
+            # second: the drop was masking an over-release of the field
+            # itself, so draining without removing that release is a
+            # heap-use-after-free (confirmed under ASan before the fix
+            # was written). The shared blob read back after the loop is
+            # what catches that direction. Verified to FAIL without the
+            # fix (66,000 allocations).
+            "chain_length_churn.f",
             # claude.md #245: pool.postMessage(x) with no index --
             # main plus 3 feeder threads all auto-selecting against the
             # SAME handles array and round-robin counter at once, 12,000
