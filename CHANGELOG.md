@@ -100,6 +100,16 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **A `throw` out of a `.sort()` comparator no longer leaks the sort's
+  scratch buffer.** The comparator is ordinary Festina code, so it can
+  throw, and the throw jumps straight past the runtime's own sorting
+  frame — skipping that frame's `free()`. Festina-side locals were
+  already released on the way out; this was the one piece of memory the
+  runtime itself was still holding. `.forEach()` was audited too and
+  never leaked (it allocates nothing), and a throw out of a timer or
+  event handler cannot reach a `try` at all — it ends the program, as
+  before. Error-path only; nothing changes on a sort that doesn't throw.
+
 - **`T? x = <a fresh call>` now compiles for `blob` and `ascii`.** The
   fresh-construction escape hatch stripped the `?` off the declared
   type only for the manually-manageable dataclasses, missing

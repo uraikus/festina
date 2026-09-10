@@ -5251,6 +5251,19 @@ void festina_array_sort(void *hdr, int64_t elem_size,
     char *base = (char *)a->data;
     char *scratch = malloc((size_t)(n * elem_size));
     if (!scratch) festina_fail("out of memory sorting an array");
+    /* claude.md #259: `cmp` below is ordinary Festina code and can
+     * THROW. A throw longjmps straight past this frame to the catching
+     * try, so the free() at the bottom never runs -- which used to
+     * strand this buffer, the one leak claude.md #236 left open and
+     * todo.md listed. Registering it on the cleanup stack is the same
+     * mechanism generated code already uses for its own in-flight
+     * values, and festina_throw releases everything above the catching
+     * frame's recorded depth on its way out, so a throw out of a
+     * comparator now frees this exactly once. Pushed OUTSIDE the loops
+     * (one push per sort, not per comparison) and popped immediately
+     * before the ordinary free, so both paths free it exactly once and
+     * neither frees it twice. */
+    festina_cleanup_push(scratch, free);
     for (int64_t width = 1; width < n; width *= 2) {
         for (int64_t lo = 0; lo < n; lo += 2 * width) {
             int64_t mid = lo + width < n ? lo + width : n;
@@ -5282,6 +5295,7 @@ void festina_array_sort(void *hdr, int64_t elem_size,
         }
         memcpy(base, scratch, (size_t)(n * elem_size));
     }
+    festina_cleanup_pop();
     free(scratch);
 }
 

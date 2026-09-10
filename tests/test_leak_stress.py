@@ -644,6 +644,17 @@ class TestLeakStress:
             # leak claude.md #157 documented. Only runnable under ASan
             # at all since claude.md #235 (libc setjmp/longjmp).
             "throw_unwind_churn.f",
+            # claude.md #259: a throw that crosses one of the RUNTIME's
+            # own C frames -- the case #236's cleanup stack left open,
+            # since a longjmp past festina_array_sort skips that frame's
+            # own free() of its merge scratch. Churns both runtime
+            # functions that call back into Festina from under a
+            # reachable try (array sort, map forEach), plus a nested
+            # sort inside a comparator and a comparator that catches its
+            # own throw -- the shapes that unbalance the cleanup stack
+            # rather than merely leak. Verified to FAIL without the fix
+            # (4,000 stranded scratch buffers).
+            "callback_throw_churn.f",
             # claude.md #245: pool.postMessage(x) with no index --
             # main plus 3 feeder threads all auto-selecting against the
             # SAME handles array and round-robin counter at once, 12,000

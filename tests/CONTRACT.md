@@ -3225,7 +3225,7 @@ call site's owning argument temporaries are registered on the
 runtime's cleanup stack, and `festina_throw` releases everything above
 the catching frame. Leak-freedom is measured by
 `tests/stress/throw_unwind_churn.f` under ASan (`scripts/leak_stress.sh`,
-29 programs now) and Valgrind -- every kind of local through three
+30 programs now) and Valgrind -- every kind of local through three
 frames, a rethrow, a JSON failure two frames down, 400 balanced
 non-throwing calls; behaviour and IR shape by `tests/test_try_catch.py::
 TestThrowUnwindsIntermediateFrames` (8 tests, including that a program
@@ -3233,6 +3233,22 @@ with no `try` generates byte-identical code and that a worker thread
 unwinds on its own stack). The JSON depth cap moved onto the parser's
 cursor (`tests/test_json_parse.py`'s deep-nesting test pins the new
 1000-level message).
+
+**claude.md #259** (a throw out of a runtime callback): the same
+cleanup stack now also carries `festina_array_sort`'s merge scratch, so
+a `throw` out of a `.sort()` comparator -- which jumps past that
+runtime frame and skips its own `free()` -- no longer strands it.
+Measured by `tests/stress/callback_throw_churn.f` under ASan/
+LeakSanitizer: clean with the fix, 208,000 bytes in 4,000 objects
+without it, over 2,000 iterations of both runtime frames that can have
+a Festina `try` beneath them (array sort; map `forEach`, which
+allocates nothing and never leaked) plus a nested sort inside a
+comparator and a comparator that catches its own throw. Behaviour by
+`tests/test_codegen.py::TestArraySort` -- a thrown-through array is
+still readable and re-sorts correctly, and a nested sort still gives
+the right answer. Timers and event handlers are not affected: they fire
+from the event loop, where no `try` is live, so a throw there ends the
+program as an uncaught one always did.
 
 **claude.md #237** (a compiled `.wasm` in a browser): the project's own
 WASI Preview 1 host (`runtime/wasm/festina_wasi_browser.js`) is verified

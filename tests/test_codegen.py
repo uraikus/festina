@@ -15697,6 +15697,59 @@ class TestArraySort:
         assert result.returncode == 0
         assert result.stdout == "[1.5,2.5,3.5]\n[false,false,true,true]\n"
 
+    def test_a_comparator_may_throw_and_the_sort_stays_usable(self, compile_and_run):
+        # claude.md #259: the comparator is ordinary Festina code, so it
+        # can throw, and the throw longjmps straight past
+        # festina_array_sort's own frame. The leak that used to strand
+        # (its merge scratch) is proven fixed by
+        # tests/stress/callback_throw_churn.f under LeakSanitizer; what
+        # this pins is the visible contract around it -- the throw is
+        # caught normally, the partly-sorted array is still readable
+        # (in-place, so it holds SOME permutation of its elements, never
+        # freed or corrupted), and the same array sorts correctly
+        # afterwards with a comparator that doesn't throw.
+        source = """
+        int func explode(a:int, b:int) {
+            if (a == 7) { throw 'comparator gave up' }
+            return a - b
+        }
+        int func byAsc(a:int, b:int) { return a - b }
+        arr[int] xs = [5, 3, 7, 1]
+        try {
+            xs.sort(explode)
+            log('no throw')
+        } catch (error:text) {
+            log(error)
+        }
+        log(xs.length)
+        xs.sort(byAsc)
+        log(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "comparator gave up\n4\n[1,3,5,7]\n"
+
+    def test_a_nested_sort_inside_a_comparator_still_sorts(self, compile_and_run):
+        # claude.md #259 pushes the scratch buffer onto the cleanup
+        # stack, so a sort running INSIDE another sort's comparator has
+        # to leave that stack balanced -- an unbalanced push would show
+        # up as a wrong answer here, not just as bytes under a
+        # sanitizer.
+        source = """
+        int func byAsc(a:int, b:int) { return a - b }
+        int func viaInner(a:int, b:int) {
+            arr[int] inner = [3, 1, 2]
+            inner.sort(byAsc)
+            return (a - b) * inner[0]
+        }
+        arr[int] xs = [5, 3, 8, 1]
+        xs.sort(viaInner)
+        log(xs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "[1,3,5,8]\n"
+
     def test_arbitrary_expression_callback_not_just_a_bare_name(self, compile_and_run):
         # claude.md #165/#171's own permissive rule -- unlike setTimeout's
         # older bare-name-only convention, any func-typed EXPRESSION works.

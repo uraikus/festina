@@ -101,13 +101,6 @@ open:
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.
-- **A `throw` out of a runtime-driven callback** (`.forEach(fn)`,
-  `.sort(cmp)`, a timer) crosses the runtime's own C frame on the way
-  to the catching `try`. Festina-side locals are released (claude.md
-  #236); whatever that C frame itself held mid-operation — `qsort`'s
-  scratch buffer, an iteration cursor — is not. Error-path-only,
-  bounded per throw. (The general "intermediate frame" leak that used
-  to be listed here is closed: claude.md #236.)
 
 ## Deliberate behavior (documented, not planned work)
 

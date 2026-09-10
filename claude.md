@@ -4931,3 +4931,38 @@ Just under 2x, and Festina is now the fastest of the four rather than the slowes
 **Verified.** Three new tests in `tests/test_codegen.py::TestAscii`: the edge sweep above, the call-result-receiver form, and -- the one that actually guards the point of this entry -- a DIFFERENTIAL IR check. The same loop with `charCodeAt` swapped for plain arithmetic must emit the identical set of called functions, so anything charCodeAt costs shows up as a difference, while the runtime prologue both programs share stays out of it. Pinning an exact call list instead would have failed the moment the prologue changed, and testing only the answer would have passed just as happily when it WAS a call -- the answer was never what was wrong. `scripts/leak_stress.sh` clean across all 29 programs.
 
 **Full suite:** `python3 -m pytest tests -q`: **2397 passed, 14 skipped, 0 failed** in 525.02s (8:45).
+
+259. A THROW OUT OF A RUNTIME CALLBACK NO LONGER STRANDS THE RUNTIME FRAME'S OWN MEMORY
+
+The last open item from #236, and the last leak this project's own memory model knew about and had not closed. #236's cleanup stack releases every FESTINA-side local of every intermediate frame a throw passes through. What it could not reach was memory a RUNTIME C frame had allocated for itself and was still holding when the Festina callback it invoked threw: the longjmp goes straight to the catching try, so that frame's own `free()` never executes.
+
+**Measured before touching anything.** 50 iterations of a `try { xs.sort(cmpThatThrows) } catch`, under LeakSanitizer:
+
+```
+Direct leak of 6400 byte(s) in 50 object(s) allocated from:
+    #1 festina_array_sort runtime/festina_runtime.c:5252
+```
+
+128 bytes per throw, exactly `festina_array_sort`'s merge scratch, exactly once per throw. Real, and precisely the size todo.md predicted.
+
+**The audit found only one such frame, which is the more useful result.** Every runtime function that calls back into Festina code was checked for whether it (a) allocates and (b) can have a Festina `try` sitting beneath it:
+
+| callback site | allocates? | a try beneath it? |
+|---|---|---|
+| `festina_array_sort` (`.sort(cmp)`) | **yes** -- merge scratch | yes |
+| `festina_map_for_each` (`.forEach(fn)`) | no | yes |
+| `festina_fire_expired_timers` | no | **no** |
+| mouse/key/resize/close handlers | no | **no** |
+| `on request` / socket / `on message` | no | **no** |
+
+Everything below the first two rows is dispatched from an EVENT-LOOP frame, and no Festina `try` can be live under one -- a try body at top level has already run to completion (and popped its own catch frame) long before the loop starts. Confirmed by running it: a `throw` from inside a `setTimeout` callback scheduled inside a `try` does not reach that catch at all, it ends the program with `fail: from a timer`, exit 1. So there is nothing to unwind there and nothing to strand. todo.md listed "`.forEach(fn)`, `.sort(cmp)`, a timer"; of those, only `.sort` was ever actually leaking.
+
+**The fix is four lines and reuses the mechanism that already exists.** `festina_array_sort` registers its scratch on the same cleanup stack generated code uses for its own in-flight values, pushed once outside the merge loops (one push per sort, not per comparison) and popped immediately before the ordinary `free`. `free` already matches the stack's `void (*)(void *)` release signature exactly, so no wrapper is needed. On the throwing path `festina_throw` releases it along with everything else above the catching frame's recorded depth; on the ordinary path the pop removes it and the existing `free` runs. Both paths free it exactly once, and neither frees it twice.
+
+**A nested sort was the case worth thinking about, and it is fine by construction:** a comparator that itself calls `.sort()` pushes and pops its own entry entirely inside the outer one's, so the stack stays balanced and the outer entry is still on top when the outer pop runs. So is a comparator that CATCHES ITS OWN throw -- the outer sort never sees one and completes on the ordinary path.
+
+**Verified.** `tests/stress/callback_throw_churn.f`, 2,000 iterations of both runtime callback frames plus both of those shapes, with managed locals live across each throw so the cleanup stack has real work above the scratch entry rather than the scratch entry alone. ASan/LeakSanitizer clean -- and confirmed to FAIL without the fix at 208,000 bytes in 4,000 objects, which is what makes it a regression guard rather than a passing no-op. Two pytest tests pin the visible contract the sanitizer cannot see: a thrown-through array is still readable afterwards and re-sorts correctly, and a nested sort still produces the right answer.
+
+**todo.md's Memory model section loses this bullet entirely.** What is left open there is now the `rows()[0]` array leak and the cycle-collector deferred-root buffer.
+
+**Full suite:** `python3 -m pytest tests -q`: **2400 passed, 14 skipped, 0 failed** in 539.22s (8:59); `scripts/leak_stress.sh`: all 30 programs clean. The first run of the suite failed one test -- `test_graceful_shutdown.py::test_an_in_flight_connection_still_completes_before_exit`, a SIGTERM race with a 0.2s sleep in it and nothing to do with sorting -- and it reproduced once in isolation, which is why it was checked properly rather than waved off: the same test passes on a stash of these changes, passes six times in a row with them, and passes in the clean full run above. A flake, confirmed as one rather than assumed to be.

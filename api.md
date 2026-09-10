@@ -4319,6 +4319,18 @@ text, two arrays and a struct and does nothing else (2 million calls:
 0.25 s to 0.33 s), and lost in the noise on anything that does real
 work with them.
 
+That covers the runtime's own frames too (0.44, claude.md #259). A
+`.sort()` comparator is ordinary Festina code and can `throw`; the
+throw jumps past the runtime's sorting frame, which used to strand the
+merge scratch buffer that frame had allocated. It is now released on
+the way out like anything else. The array being sorted is sorted *in
+place*, so after a comparator throws it still holds some permutation of
+its own elements — never freed, never corrupted — and sorts correctly
+if you sort it again. `.forEach()` allocates nothing and never had the
+problem. A `throw` from a timer or an event handler is a different
+case: those fire from the event loop, where no `try` can be live, so
+such a throw ends the program exactly as an uncaught one does.
+
 **Not available under `--target=wasm32-wasi`.** wasi-libc has no
 setjmp/longjmp support at all — rejected at compile time; see
 [wasm.md](wasm.md). A program that never writes `try`/`catch`/`throw`
