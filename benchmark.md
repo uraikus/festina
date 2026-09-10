@@ -74,52 +74,61 @@ failing — see [setup.md](setup.md) for what each one needs.
 ## Results
 
 <!-- BENCHMARK_RESULTS_START -->
-_Last run: 2026-09-03 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
+_Last run: 2026-09-09 on this machine -- see benchmark.md's "Methodology" section for how to reproduce; absolute numbers vary by hardware, relative ordering is the point._
 
 ### `hello`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.6 ms | 80.0 ms | 1.49 MB |
-| Rust | 1.9 ms | 97.8 ms | 3.77 MB |
-| Go | 1.3 ms | 189.2 ms | 2.11 MB |
-| Bun | 12.8 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.6 ms | 95.6 ms | 1.49 MB |
+| Rust | 1.6 ms | 101.8 ms | 3.77 MB |
+| Go | 1.6 ms | 187.8 ms | 2.11 MB |
+| Bun | 13.4 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `fib`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 8.0 ms | 84.5 ms | 1.49 MB |
-| Rust | 8.5 ms | 107.8 ms | 3.77 MB |
-| Go | 14.7 ms | 190.3 ms | 2.11 MB |
-| Bun | 31.5 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 9.5 ms | 104.0 ms | 1.49 MB |
+| Rust | 9.3 ms | 107.2 ms | 3.77 MB |
+| Go | 13.8 ms | 204.6 ms | 2.11 MB |
+| Bun | 36.7 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `loop_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 524.2 ms | 86.0 ms | 1.49 MB |
-| Rust | 530.9 ms | 101.9 ms | 3.77 MB |
-| Go | 464.6 ms | 189.1 ms | 2.11 MB |
-| Bun | 9109.4 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 528.6 ms | 125.1 ms | 1.49 MB |
+| Rust | 496.7 ms | 101.8 ms | 3.77 MB |
+| Go | 461.6 ms | 190.3 ms | 2.11 MB |
+| Bun | 9259.6 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `array_sum`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 93.7 ms | 108.7 ms | 1.49 MB |
-| Rust | 90.9 ms | 203.2 ms | 3.77 MB |
-| Go | 89.6 ms | 182.7 ms | 2.11 MB |
-| Bun | 2456.0 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 86.6 ms | 120.4 ms | 1.50 MB |
+| Rust | 86.0 ms | 123.4 ms | 3.77 MB |
+| Go | 87.2 ms | 178.0 ms | 2.11 MB |
+| Bun | 2723.7 ms | n/a (JIT, no separate build step) | n/a |
 
 ### `string_concat`
 
 | Language | Run time (min of 7 runs) | Build time | Binary size |
 |---|---|---|---|
-| Festina | 1.9 ms | 84.5 ms | 1.49 MB |
-| Rust | 1.7 ms | 123.8 ms | 3.77 MB |
-| Go | 38.9 ms | 181.5 ms | 2.11 MB |
-| Bun | 14.2 ms | n/a (JIT, no separate build step) | n/a |
+| Festina | 1.7 ms | 96.6 ms | 1.50 MB |
+| Rust | 1.7 ms | 125.5 ms | 3.77 MB |
+| Go | 48.0 ms | 205.2 ms | 2.11 MB |
+| Bun | 16.2 ms | n/a (JIT, no separate build step) | n/a |
+
+### `char_scan`
+
+| Language | Run time (min of 7 runs) | Build time | Binary size |
+|---|---|---|---|
+| Festina | 24.8 ms | 108.8 ms | 1.50 MB |
+| Rust | 15.5 ms | 165.0 ms | 3.77 MB |
+| Go | 14.4 ms | 209.5 ms | 2.11 MB |
+| Bun | 42.0 ms | n/a (JIT, no separate build step) | n/a |
 
 <!-- BENCHMARK_RESULTS_END -->
 
@@ -168,6 +177,24 @@ _Last run: 2026-09-03 on this machine -- see benchmark.md's "Methodology" sectio
   naive-looking source. None of this is a bug in any of the four — it's
   exactly the kind of language/runtime difference this benchmark exists
   to surface.
+- **`char_scan`** is the workload `ascii` exists for (claude.md #256):
+  walk a ~1.7MB buffer character by character, counting identifier runs.
+  On a `text` this is quadratic — UTF-8 is variable-width, so `s[i]`
+  walks from byte zero on every index — which is why the Festina version
+  uses `ascii`, where one byte per character puts the length in the
+  value's own header and makes `.length`/`s[i]`/`charCodeAt(i)` O(1).
+  Festina lands behind Rust and Go here (roughly 1.7x), and the reason
+  is specific rather than general: `charCodeAt(i)` compiles to a CALL
+  into the runtime per character (null check, length load, bounds check,
+  return), where Rust and Go index raw bytes inline in the loop body.
+  Since the length sits at a fixed offset in the header, codegen could
+  emit that whole sequence inline instead of calling out — a contained
+  change, and the obvious next optimization. Recorded as measured rather
+  than adjusted for: the type removed an asymptotic problem, and a
+  constant-factor gap remains. The Go and Rust implementations
+  deliberately index `[]byte`/`as_bytes()` rather than ranging a string
+  or using `char_indices`, both of which decode UTF-8 and would measure
+  decoding instead of scanning.
 - **The canvas comparison** (below) is the one benchmark here that
   isn't against another *language*. It's against the thing a 2D game
   would otherwise most likely be written on: an HTML `<canvas>`. Circles
