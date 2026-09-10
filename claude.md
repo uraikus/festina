@@ -5258,3 +5258,34 @@ That check immediately earned its place. The FIRST `division_vs_regex.f` put one
 **Verified.** 2494 passed, 17 skipped, 1 xfailed, full suite. Two independent negative controls (break longest-match on `++`: 17 files differ, pinpointing `OP|++` vs `OP|+`; delete the regex denylist: `OP|/` vs `REGEX| 2 |`).
 
 **Where this leaves bootstrapping.** The parser is the natural next step and needs none of the four findings fixed. Semantic analysis and codegen should wait for the `?` cell model, which is a documented breaking change to shipped `?` semantics and would otherwise land underneath a half-ported compiler.
+
+272. THREE LANGUAGE FIXES THE LEXER PORT ASKED FOR, AND A FOURTH IT FOUND ON THE WAY
+
+claude.md #271 wrote Festina's lexer in Festina and recorded four limits it hit. Three of them were asked to be fixed. All three are, and the fix for the first turned out to be smaller and better placed than the "new `bytes` primitive" todo.md had been carrying.
+
+**1. `blob.byteAt(i)` and `blob.slice(a, b)` -- the read half of a byte buffer, on the type that already IS bytes.**
+
+The problem: `bootstrap/lexer.f` could not read 3 of this repository's own 69 `.f` files. `text.toAscii()` validates, so one non-ASCII byte anywhere -- in a comment, in a string literal -- made the whole file unreadable. A lexer for a UTF-8 language never has to *interpret* those bytes; it has to carry them through untouched.
+
+The obvious answer was a new `bytes` primitive, which todo.md had already priced ("a full new primitive type costs surface area from the lexer through to the runtime") and which the `ascii` work (#256, four phases) had just demonstrated the cost of. It is not needed. `blob` is already "a file's bytes": it holds `char *bytes` and an exact `int64_t length`, and `.length` has been an O(1) read of that field since #251. It wanted two accessors, not a parallel type.
+
+- `byteAt(i)` -> `int`, `0`..`255`, null out of range. The cast through `unsigned char` is what makes it a BYTE read: plain `char` is signed on x86, so `0xC3` would otherwise answer `-61` instead of `195`.
+- `slice(start, end)` -> **`text`**, not another blob. A blob is a FILE -- it carries the path it was loaded from and `.save()` writes back to it -- so a slice of one has no meaningful path. Answering text keeps the file/bytes distinction intact and sidesteps the question entirely.
+
+Bounds behavior follows blob's own existing rule rather than `arr[T]`'s: byteAt answers null, slice clamps. The buffer's length is not something the program chose, so "test, don't fail" is right here in a way it deliberately is not for an array index (api.md's own "Indexing is not bounds-checked" section).
+
+**2. The `\0` escape is rejected at compile time.** `text` is NUL-terminated, so `'a\0b'` lexed to a three-character value the language could never hold: `.length` answered 1, and everything past the NUL silently vanished. The alternatives were giving `text` a length -- exactly the change #83 ruled out, and for the same four-provenances reason -- or not producing the value. Accepting an escape whose result the language cannot represent is worse than rejecting it, so `\0` is now a compile error naming the truncation. `'a\\0b'` (escaped backslash, ordinary `0`) is untouched; nothing in the repository used the real escape.
+
+**3. `text.trim()`.** Leading and trailing whitespace, the seven bytes C's `isspace()` answers in the "C" locale -- the same set Python's `str.strip()` removes for ASCII input. Byte-oriented, which is safe on UTF-8 without decoding because every byte of a multi-byte sequence has its high bit set and so can never be mistaken for one of those seven. `'  café  '.trim()` is `'café'`; U+00A0 is not stripped. An `ascii` receiver is deliberately not accepted -- it would have to answer an `ascii`, a second runtime function for a case nothing has asked for.
+
+Finding 4 (`int / int` promotes to float) is left alone: it is #61's rule working as designed, and the port's forward-only line cursor is a fine answer to it.
+
+**THE FOURTH THING, which is the interesting one: a column is a CHARACTER offset, not a byte offset.**
+
+Reworking the lexer onto `blob` bytes made all 69 files readable, and immediately produced two diffs -- `50:79` against `50:80`, on the two files that had been unreadable. Python's lexer indexes `str`, whose unit is the code point, so `pos - line_start + 1` counts characters there for free. Counting bytes gives a different, wrong answer on any line with a non-ASCII character before the token.
+
+This is not cosmetic: that column is what every compile error a user reads points at, and a byte column silently misplaces the caret in exactly the files most likely to already be confusing. The fix counts UTF-8 lead bytes (`b < 0x80 || b >= 0xC0` -- continuation bytes are `10xxxxxx` and do not start a character). **The differential test found this; nothing else would have.** Neither lexer was "wrong" in isolation -- both produced plausible columns -- and only running them against each other over real non-ASCII source made the disagreement visible.
+
+**Result: 85 files match, 0 differ, 0 known divergences, 0 skipped.** The `KNOWN_DIVERGENCES` table #271 introduced is now empty -- its one entry (`'a\0b'`) was fixed in the language rather than tolerated in the harness -- and kept, rather than deleted, so a future divergence has an honest place to be recorded instead of a commit message.
+
+**Verified.** 23 new pytest tests; `tests/stress/bytes_trim_churn.f` under ASan/LeakSanitizer, mixing a named receiver read repeatedly (must NOT be released) with a call-result receiver (must be), over a non-ASCII file so `slice()` really copies multi-byte sequences. Negative control: deleting the receiver release from the new codegen branch leaks **340,000 bytes in 12,000 allocations**, so the program tests what it claims to. Three differential negative controls, including a new one for the column fix, which differs on exactly the two non-ASCII files.

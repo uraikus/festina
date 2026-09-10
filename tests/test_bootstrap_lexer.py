@@ -42,13 +42,11 @@ class TestBootstrapLexerMatchesPython:
     def test_token_stream_matches_the_python_lexer(self, lexer_binary, rel):
         path = os.path.join(difftest.REPO_ROOT, rel)
         status, detail = difftest.compare(lexer_binary, path)
-        if status == "skipped-non-ascii":
-            pytest.skip(
-                "non-ASCII source -- text.toAscii() answers null, so the "
-                "Festina lexer cannot read this file at all (claude.md #271)")
         if status == "known-divergence":
-            reason = detail[0]
-            pytest.xfail(reason)
+            # claude.md #272 emptied this table -- the one entry it held
+            # was fixed in the language rather than tolerated here. Kept
+            # so a future divergence has an honest place to be recorded.
+            pytest.xfail(detail[0])
         assert status == "match", (
             f"{rel}: token {detail[0]}\n"
             f"  python:  {detail[1]}\n"

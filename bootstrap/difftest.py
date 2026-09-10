@@ -53,20 +53,17 @@ def _esc(s):
     return "".join(out)
 
 
-# claude.md #271. One real, recorded divergence, kept visible rather than
-# edited out of the corpus: Festina's `text` is NUL-terminated, so a
-# string literal's `\0` escape truncates the value the moment a Festina
-# program builds it. The Python lexer produces the full three-character
-# "a\0b"; bootstrap/lexer.f can only ever produce "a". That is a limit of
-# the LANGUAGE, not a bug in the port -- `'a\0b'.length` is 1 in any
-# Festina program -- so the port cannot be fixed to agree here, and
-# pretending otherwise by dropping the case would hide it.
-KNOWN_DIVERGENCES = {
-    "bootstrap/cases/strings_and_escapes.f": (
-        "text is NUL-terminated: a \\0 escape truncates the literal, so the "
-        "Festina lexer cannot represent the value the Python lexer produces"
-    ),
-}
+# claude.md #272: the one divergence this harness used to carry is gone.
+# It was `'a\0b'`: Festina's `text` is NUL-terminated, so the port could
+# not reproduce the three-character value the Python lexer produced. The
+# fix was to stop producing it -- the `\0` escape is now a compile error
+# on both sides (bootstrap/cases/err_nul_escape.f), since accepting an
+# escape whose value the language cannot hold is worse than rejecting it.
+#
+# Kept as an (empty) table rather than deleted: a differential test wants
+# somewhere honest to record a divergence it cannot fix, and burying that
+# decision in a commit message is how such things get lost.
+KNOWN_DIVERGENCES = {}
 
 
 def _number_value(value):
@@ -124,17 +121,15 @@ def python_dump(source):
 def festina_dump(binary, path):
     """The Festina lexer's token stream, in the canonical form.
 
-    Returns None for a source the Festina lexer cannot read at all --
-    today that means any file with a non-ASCII byte in it, since
-    `text.toAscii()` answers null rather than lexing it (claude.md #271
-    records this as the port's first real finding).
+    claude.md #272: there is no longer a "cannot read this file at all"
+    answer. bootstrap/lexer.f scans the source blob by byte offset, so a
+    non-ASCII byte is carried through rather than rejected -- the three
+    files that used to be skipped here now lex like any other.
     """
     result = subprocess.run([binary, path], capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         raise RuntimeError(f"{binary} {path} exited {result.returncode}: {result.stderr}")
     body = result.stdout
-    if body.strip() == "NONASCII":
-        return None
     return body.split("\n") if body else []
 
 
@@ -163,14 +158,11 @@ def corpus():
 def compare(binary, path):
     """(status, detail) for one file.
 
-    status is "match", "differ", "known-divergence", or
-    "skipped-non-ascii".
+    status is "match", "differ", or "known-divergence".
     """
     with open(path, encoding="utf-8") as f:
         source = f.read()
     got = festina_dump(binary, path)
-    if got is None:
-        return "skipped-non-ascii", None
     want = python_dump(source)
 
     # The Festina side ends with log()'s own trailing newline.

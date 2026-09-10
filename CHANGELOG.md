@@ -11,20 +11,42 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ## [0.44] - 2026-09-02
 
+### Removed
+
+- **The `\0` string escape.** A `text` is NUL-terminated and cannot hold
+  a NUL, so `'a\0b'` lexed to a three-character value the language could
+  never represent and silently truncated to `'a'` — `.length` answered
+  `1`. It is a compile error now, naming the truncation. `'a\\0b'` (an
+  escaped backslash followed by an ordinary `0`) is unaffected.
+
 ### Added
 
+- **`text.trim()`** — leading and trailing whitespace removed (space,
+  tab, newline, carriage return, vertical tab, form feed). Byte-oriented
+  and so safe on UTF-8: `'  café  '.trim()` is `'café'`.
+- **`blob.byteAt(i)` and `blob.slice(start, end)`** — the read half of a
+  byte buffer, on the type that already holds a file's bytes. `byteAt`
+  is an O(1) raw byte (`0`–`255`, `null` out of range); `slice` is the
+  half-open byte range as `text`, clamped rather than checked. Answering
+  `text` and not another blob is deliberate: a blob carries the path it
+  was loaded from, and a slice of one has no path of its own. Together
+  they let a scanner read a UTF-8 file the compiler never has to
+  validate first, which `ascii` cannot do.
 - **`bootstrap/` — Festina's lexer, written in Festina.**
   `bootstrap/lexer.f` reproduces `festina/lexer.py`'s token stream
   exactly; `bootstrap/difftest.py` and `tests/test_bootstrap_lexer.py`
   prove it by diffing both lexers over every `.f` file in the
-  repository (80 match, 0 differ, 1 recorded divergence, 3 skipped).
-  Nothing in the shipped compiler depends on it — this is the first
-  step of self-hosting, and a real consumer that surfaced four concrete
-  limits of the language itself (see `bootstrap/README.md` and
-  claude.md #271): `ascii` cannot read non-ASCII source, `text` cannot
-  hold a NUL, `text` has no `.trim()`, and `int / int` promotes to
-  float so there is no integer midpoint to binary-search with.
-
+  repository — 85 files, all matching. Nothing in the shipped compiler
+  depends on it: this is the first step of self-hosting, and a real
+  consumer that surfaced four concrete limits of the language itself
+  (see `bootstrap/README.md` and claude.md #271/#272). Three are fixed
+  above — `blob.byteAt`/`blob.slice` for reading non-ASCII source,
+  `text.trim()`, and the rejected `\0` escape. The fourth (`int / int`
+  promotes to float, so there is no integer midpoint to binary-search
+  with) is #61's rule working as designed and is left alone. The
+  differential test also found a bug neither lexer showed alone: a
+  column is a *character* offset, and counting bytes misplaces the caret
+  in every compile error on a line containing non-ASCII text.
 - **`ascii` — a one-byte-per-character string type,** alongside `text`
   rather than replacing it. Because a character is a byte, the
   character count *is* the byte count, so it lives in the value's own

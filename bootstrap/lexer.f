@@ -1,18 +1,25 @@
 // Festina's lexer, written in Festina -- the first step of bootstrapping
-// the compiler in its own language (claude.md #271).
+// the compiler in its own language (claude.md #271, #272).
 //
 // This is a PORT of festina/lexer.py, not a redesign: it reproduces that
 // file's token stream exactly, and `bootstrap/difftest.py` proves it by
 // running both over every .f file in the repository and diffing. Where
 // the Python lexer leans on `re` (one master pattern with named groups
 // and `lastgroup`), this is a hand-written character scanner -- Festina's
-// own regex is POSIX ERE with no named groups, and a scanner is what the
-// `ascii` type (claude.md #256) was added for in the first place.
+// own regex is POSIX ERE with no named groups.
+//
+// It scans a `blob` by BYTE OFFSET rather than converting the source to
+// `ascii` first (claude.md #272). The first version did convert, and
+// could not read 3 of this repository's own .f files: text.toAscii()
+// validates, so one non-ASCII byte anywhere -- inside a comment, inside
+// a string literal -- made the whole file unreadable. A lexer never has
+// to INTERPRET those bytes, only carry them through, which is exactly
+// what blob.byteAt()/blob.slice() give it.
 //
 // The alternation order of festina/lexer.py's TOKEN_SPEC is load-bearing:
-// Python's `re` alternation is leftmost-FIRST, not longest-match, so
-// `scanOne` below tries the same kinds in the same order. Getting that
-// order wrong is how `x++` becomes `+` `+` and `12.5` becomes `12` `.` `5`.
+// Python's `re` alternation is leftmost-FIRST, not longest-match, so the
+// scan below tries the same kinds in the same order. Getting that order
+// wrong is how `x++` becomes `+` `+` and `12.5` becomes `12` `.` `5`.
 //
 // Output is one token per line, in a canonical form difftest.py emits
 // from the Python side too:
@@ -29,15 +36,20 @@ struct Tok {
     col:int
 }
 
+// A template segment, as a HALF-OPEN BYTE RANGE into the source blob
+// rather than extracted text -- so an interpolation's own tokens can be
+// produced by re-entering tokenize() on that range in place, with no
+// copy and no second buffer to index into.
 struct Seg {
     isExpr:bool
-    txt:text
+    start:int
+    end:int
 }
 
 // ---------------------------------------------------------------------
 // Character classes. The Python lexer gets these from `re`'s own \d and
 // [A-Za-z_]; here they are explicit code-point tests against the byte
-// `ascii.charCodeAt` hands back.
+// blob.byteAt hands back.
 
 bool func isDigit(c:int) {
     return c >= 48 && c <= 57
@@ -70,116 +82,107 @@ text KW_SRC = 'int float bool text blob arr struct table img aud null true false
 text EE_SRC = 'IDENT NUMBER STRING TSTRING_END RPAREN RBRACK true false null log fail sqlite'
 
 // ---------------------------------------------------------------------
-// Escape handling. _ESCAPES in the Python lexer; an unknown escape
-// resolves to the escaped character itself, which is what makes \q a
-// literal 'q' rather than an error.
+// Escape handling, over a raw byte range. _ESCAPES in the Python lexer;
+// an unknown escape resolves to the escaped character itself, which is
+// what makes \q a literal 'q' rather than an error.
+//
+// Bytes that are not part of an escape are copied through by SLICING,
+// never by rebuilding from a code point -- that is what carries a
+// multi-byte UTF-8 sequence across untouched.
 
-text func unescape(a:ascii) {
+text func unescape(src:blob, from:int, to:int) {
     text out = ''
-    int i = 0
-    int n = a.length
-    while i < n {
-        int c = a.charCodeAt(i)
-        if c == 92 && i + 1 < n {
-            int nx = a.charCodeAt(i + 1)
+    int i = from
+    int runStart = from
+    while i < to {
+        int c = src.byteAt(i)
+        if c == 92 && i + 1 < to {
+            if i > runStart { out = out + src.slice(runStart, i) }
+            int nx = src.byteAt(i + 1)
             if nx == 110 { out = out + 10.toChar() }
             else if nx == 116 { out = out + 9.toChar() }
             else if nx == 114 { out = out + 13.toChar() }
-            else if nx == 48 { out = out + 0.toChar() }
-            else { out = out + nx.toChar() }
+            else { out = out + src.slice(i + 1, i + 2) }
             i = i + 2
+            runStart = i
             continue
         }
-        out = out + c.toChar()
         i++
     }
+    if i > runStart { out = out + src.slice(runStart, i) }
     return out
 }
 
-// Python's str.strip(), which `text` has no equivalent of -- the import
-// path is stripped for the token's value even though `pos` still
-// advances past the whitespace that was removed.
-text func trim(s:text) {
-    ascii a = s.toAscii()
-    if a == null { return s }
-    int start = 0
-    int end = a.length
-    while start < end && isWs(a.charCodeAt(start)) { start++ }
-    while end > start && isWs(a.charCodeAt(end - 1)) { end = end - 1 }
-    return a.slice(start, end).toText()
+// claude.md #272: `\0` is no longer an accepted escape -- a `text` is
+// NUL-terminated and cannot hold one. festina/lexer.py rejects it with a
+// CompileError; this reports the same rejection as a LEXERR at the
+// string token's own start, which is the position Python reports too.
+bool func hasNulEscape(src:blob, from:int, to:int) {
+    int i = from
+    while i < to {
+        if src.byteAt(i) == 92 && i + 1 < to {
+            if src.byteAt(i + 1) == 48 { return true }
+            i = i + 2
+            continue
+        }
+        i++
+    }
+    return false
 }
 
 // Canonical escaping for the dump format: backslash, the three control
 // characters that would break the one-token-per-line shape, and the '|'
-// field separator itself.
+// field separator itself. Works in CODE POINTS (text's own unit), and
+// re-encodes anything non-special with toChar(), which round-trips a
+// valid UTF-8 token value exactly.
 text func esc(s:text) {
-    ascii a = s.toAscii()
-    if a == null { return '<<NON-ASCII>>' }
     text out = ''
     int i = 0
-    int n = a.length
+    int n = s.length
     while i < n {
-        int c = a.charCodeAt(i)
+        int c = s.charCodeAt(i)
         if c == 92 { out = out + '\\\\' }
         else if c == 10 { out = out + '\\n' }
         else if c == 9 { out = out + '\\t' }
         else if c == 13 { out = out + '\\r' }
         else if c == 124 { out = out + '\\p' }
-        // A NUL can't survive being appended to a `text` at all (it is
-        // NUL-terminated), so it is escaped here rather than silently
-        // truncating the dump line -- see claude.md #271's note on the
-        // one recorded divergence, which is exactly this.
-        else if c == 0 { out = out + '\\z' }
         else { out = out + c.toChar() }
         i++
     }
     return out
 }
 
-// A float literal is compared against Python's repr(), so 1.50 and 1.5
-// have to agree. Trailing zeros go, but never the last digit: 127.0
-// stays 127.0, matching repr(127.0) rather than becoming "127.".
-text func normalizeFloat(lex:text) {
-    ascii a = lex.toAscii()
-    int end = a.length
-    while end > 0 {
-        int c = a.charCodeAt(end - 1)
-        if c == 48 { end = end - 1 }
-        else { break }
-    }
-    // Never strip past "N." -- keep one digit after the point.
-    if end > 0 && a.charCodeAt(end - 1) == 46 { end = end + 1 }
-    return a.slice(0, end).toText()
-}
-
 // ---------------------------------------------------------------------
-// Template splitting -- festina/lexer.py's _split_template. Alternating
-// literal/expression segments, with ${...} nesting tracked by brace
-// depth so `${ m['}'] }` doesn't end the interpolation early.
+// Template splitting -- festina/lexer.py's _split_template, as byte
+// ranges. Alternating literal/expression segments, with ${...} nesting
+// tracked by brace depth.
+//
+// Like the Python original this counts braces without knowing about
+// string literals, so a '}' inside a string closes the interpolation
+// early. That is a shared limitation, pinned by
+// bootstrap/cases/err_brace_in_interpolation.f so it stays shared.
 
-arr[Seg] func splitTemplate(raw:ascii) {
+arr[Seg] func splitTemplate(src:blob, from:int, to:int) {
     arr[Seg] segs = []
-    text buf = ''
-    int i = 0
-    int n = raw.length
-    while i < n {
-        int c = raw.charCodeAt(i)
-        if c == 92 && i + 1 < n {
-            buf = buf + raw.slice(i, i + 2).toText()
+    int i = from
+    int litStart = from
+    while i < to {
+        int c = src.byteAt(i)
+        if c == 92 && i + 1 < to {
             i = i + 2
             continue
         }
-        if c == 36 && i + 1 < n && raw.charCodeAt(i + 1) == 123 {
+        if c == 36 && i + 1 < to && src.byteAt(i + 1) == 123 {
             Seg lit
             lit.isExpr = false
-            lit.txt = buf
+            lit.start = litStart
+            lit.end = i
             segs.push(lit)
-            buf = ''
             i = i + 2
             int depth = 1
-            int start = i
-            while i < n && depth > 0 {
-                int d = raw.charCodeAt(i)
+            int exprStart = i
+            while i < to && depth > 0 {
+                int d = src.byteAt(i)
                 if d == 123 { depth++ }
                 else if d == 125 {
                     depth--
@@ -189,17 +192,19 @@ arr[Seg] func splitTemplate(raw:ascii) {
             }
             Seg ex
             ex.isExpr = true
-            ex.txt = raw.slice(start, i).toText()
+            ex.start = exprStart
+            ex.end = i
             segs.push(ex)
             i++
+            litStart = i
             continue
         }
-        buf = buf + c.toChar()
         i++
     }
     Seg tail
     tail.isExpr = false
-    tail.txt = buf
+    tail.start = litStart
+    tail.end = to
     segs.push(tail)
     return segs
 }
@@ -210,6 +215,28 @@ arr[Seg] func splitTemplate(raw:ascii) {
 // start of every ${...} sub-tokenize, which is a fresh expression
 // context for exactly the same reason.
 
+// A column is a CHARACTER offset, not a byte offset. Python's lexer
+// indexes str, whose unit is the code point, so `pos - line_start + 1`
+// counts characters there for free; scanning bytes, it has to be counted.
+//
+// This is not cosmetic. The column lands in every compile error a user
+// reads, and getting it wrong misplaces the caret on any line with a
+// non-ASCII character before the token -- which is exactly what the two
+// files that used to be unreadable here turned out to contain.
+//
+// UTF-8 continuation bytes are 10xxxxxx: not < 0x80, not >= 0xC0. Those
+// are the bytes that do NOT start a new character.
+int func colAt(src:blob, from:int, lineStart:int, pos:int) {
+    int chars = 0
+    int i = lineStart
+    while i < pos {
+        int b = src.byteAt(from + i)
+        if b < 128 || b >= 192 { chars++ }
+        i++
+    }
+    return chars + 1
+}
+
 bool func regexMayStart(prevKind:text, prevVal:text) {
     if prevKind == '' { return true }
     if EXPR_ENDING[prevKind] != null { return false }
@@ -219,10 +246,17 @@ bool func regexMayStart(prevKind:text, prevVal:text) {
 
 // ---------------------------------------------------------------------
 // The scanner proper.
+//
+// Tokenizes the half-open byte range [from, to) of `src`. Line and
+// column are relative to `from`, not to the file: a ${...} fragment is
+// re-entered here as its own range, and festina/lexer.py's own recursive
+// tokenize() call sees a fresh string starting at line 1, column 1. The
+// coordinates it produces for those sub-tokens are relative in exactly
+// the same way, so this reproduces them rather than "fixing" them.
 
-arr[Tok] func tokenize(src:ascii) {
+arr[Tok] func tokenize(src:blob, from:int, to:int) {
     arr[Tok] toks = []
-    int n = src.length
+    int n = to - from
 
     // Line starts, walked with a cursor that only ever moves forward --
     // the Python lexer binary-searches this with bisect, but every
@@ -233,7 +267,7 @@ arr[Tok] func tokenize(src:ascii) {
     lineStarts.push(0)
     int k = 0
     while k < n {
-        if src.charCodeAt(k) == 10 { lineStarts.push(k + 1) }
+        if src.byteAt(from + k) == 10 { lineStarts.push(k + 1) }
         k++
     }
     int lineIdx = 0
@@ -249,45 +283,48 @@ arr[Tok] func tokenize(src:ascii) {
             lineIdx++
         }
         int line = lineIdx + 1
-        int col = pos - lineStarts[lineIdx] + 1
+        int col = colAt(src, from, lineStarts[lineIdx], pos)
 
-        int c0 = src.charCodeAt(pos)
+        int c0 = src.byteAt(from + pos)
 
         // --- regex literal, before anything else can claim the '/' ---
         if c0 == 47 && regexMayStart(prevKind, prevVal) {
             bool isComment = false
             if pos + 1 < n {
-                int c1 = src.charCodeAt(pos + 1)
+                int c1 = src.byteAt(from + pos + 1)
                 if c1 == 47 || c1 == 42 { isComment = true }
             }
             if isComment == false {
                 int i = pos + 1
                 text pat = ''
+                int runStart = i
                 bool ok = true
                 while i < n {
-                    int c = src.charCodeAt(i)
+                    int c = src.byteAt(from + i)
                     if c == 47 { break }
                     if c == 10 { ok = false break }
                     if c == 92 && i + 1 < n {
-                        int nx = src.charCodeAt(i + 1)
+                        int nx = src.byteAt(from + i + 1)
+                        if i > runStart { pat = pat + src.slice(from + runStart, from + i) }
                         // \/ is JS's delimiter escape; POSIX regcomp never
                         // wants it, so it unescapes to a bare '/'.
                         if nx == 47 { pat = pat + '/' }
-                        else { pat = pat + 92.toChar() + nx.toChar() }
+                        else { pat = pat + src.slice(from + i, from + i + 2) }
                         i = i + 2
+                        runStart = i
                         continue
                     }
-                    pat = pat + c.toChar()
                     i++
                 }
-                if ok && i < n && src.charCodeAt(i) == 47 {
+                if ok && i < n && src.byteAt(from + i) == 47 {
+                    if i > runStart { pat = pat + src.slice(from + runStart, from + i) }
                     i++
                     int flagStart = i
-                    while i < n && isAlpha(src.charCodeAt(i)) { i++ }
+                    while i < n && isAlpha(src.byteAt(from + i)) { i++ }
                     Tok t
                     t.kind = 'REGEX'
                     t.val = pat
-                    t.extra = src.slice(flagStart, i).toText()
+                    t.extra = src.slice(from + flagStart, from + i)
                     t.line = line
                     t.col = col
                     toks.push(t)
@@ -303,20 +340,20 @@ arr[Tok] func tokenize(src:ascii) {
 
         // --- whitespace ---
         if isWs(c0) {
-            while pos < n && isWs(src.charCodeAt(pos)) { pos++ }
+            while pos < n && isWs(src.byteAt(from + pos)) { pos++ }
             continue
         }
 
         // --- comments ---
-        if c0 == 47 && pos + 1 < n && src.charCodeAt(pos + 1) == 47 {
-            while pos < n && src.charCodeAt(pos) != 10 { pos++ }
+        if c0 == 47 && pos + 1 < n && src.byteAt(from + pos + 1) == 47 {
+            while pos < n && src.byteAt(from + pos) != 10 { pos++ }
             continue
         }
-        if c0 == 47 && pos + 1 < n && src.charCodeAt(pos + 1) == 42 {
+        if c0 == 47 && pos + 1 < n && src.byteAt(from + pos + 1) == 42 {
             int i = pos + 2
             bool closed = false
             while i + 1 < n {
-                if src.charCodeAt(i) == 42 && src.charCodeAt(i + 1) == 47 {
+                if src.byteAt(from + i) == 42 && src.byteAt(from + i + 1) == 47 {
                     closed = true
                     break
                 }
@@ -335,27 +372,36 @@ arr[Tok] func tokenize(src:ascii) {
             int i = pos + 1
             bool closed = false
             while i < n {
-                int c = src.charCodeAt(i)
+                int c = src.byteAt(from + i)
                 if c == 92 && i + 1 < n { i = i + 2 continue }
                 if c == 96 { closed = true break }
                 i++
             }
             if closed {
-                ascii raw = src.slice(pos + 1, i)
-                arr[Seg] segs = splitTemplate(raw)
-                arr[text] exprs = []
-                arr[text] strs = []
+                if hasNulEscape(src, from + pos + 1, from + i) {
+                    Tok bad
+                    bad.kind = 'LEXERR'
+                    bad.val = ''
+                    bad.extra = ''
+                    bad.line = line
+                    bad.col = col
+                    toks.push(bad)
+                    return toks
+                }
+                arr[Seg] segs = splitTemplate(src, from + pos + 1, from + i)
+                arr[Seg] exprs = []
+                arr[Seg] strs = []
                 int si = 0
                 while si < segs.length {
                     Seg s = segs[si]
-                    if s.isExpr { exprs.push(s.txt) }
-                    else { strs.push(s.txt) }
+                    if s.isExpr { exprs.push(s) }
+                    else { strs.push(s) }
                     si++
                 }
                 if exprs.length == 0 {
                     Tok t
                     t.kind = 'STRING'
-                    t.val = unescape(strs[0].toAscii())
+                    t.val = unescape(src, strs[0].start, strs[0].end)
                     t.extra = ''
                     t.line = line
                     t.col = col
@@ -365,18 +411,14 @@ arr[Tok] func tokenize(src:ascii) {
                 } else {
                     Tok st
                     st.kind = 'TSTRING_START'
-                    st.val = unescape(strs[0].toAscii())
+                    st.val = unescape(src, strs[0].start, strs[0].end)
                     st.extra = ''
                     st.line = line
                     st.col = col
                     toks.push(st)
                     int e = 0
                     while e < exprs.length {
-                        // A fresh expression context: sub-token line and
-                        // column are relative to the interpolation text,
-                        // exactly as the Python lexer's own recursive
-                        // tokenize() call leaves them.
-                        arr[Tok] sub = tokenize(exprs[e].toAscii())
+                        arr[Tok] sub = tokenize(src, exprs[e].start, exprs[e].end)
                         // An error inside the interpolation has to
                         // propagate, not be swallowed: the Python lexer's
                         // recursive tokenize() RAISES, so the whole lex
@@ -396,7 +438,7 @@ arr[Tok] func tokenize(src:ascii) {
                         Tok mid
                         if e == exprs.length - 1 { mid.kind = 'TSTRING_END' }
                         else { mid.kind = 'TSTRING_MID' }
-                        mid.val = unescape(strs[e + 1].toAscii())
+                        mid.val = unescape(src, strs[e + 1].start, strs[e + 1].end)
                         mid.extra = ''
                         mid.line = line
                         mid.col = col
@@ -416,15 +458,25 @@ arr[Tok] func tokenize(src:ascii) {
             int i = pos + 1
             bool closed = false
             while i < n {
-                int c = src.charCodeAt(i)
+                int c = src.byteAt(from + i)
                 if c == 92 && i + 1 < n { i = i + 2 continue }
                 if c == c0 { closed = true break }
                 i++
             }
             if closed {
+                if hasNulEscape(src, from + pos + 1, from + i) {
+                    Tok bad
+                    bad.kind = 'LEXERR'
+                    bad.val = ''
+                    bad.extra = ''
+                    bad.line = line
+                    bad.col = col
+                    toks.push(bad)
+                    return toks
+                }
                 Tok t
                 t.kind = 'STRING'
-                t.val = unescape(src.slice(pos + 1, i))
+                t.val = unescape(src, from + pos + 1, from + i)
                 t.extra = ''
                 t.line = line
                 t.col = col
@@ -441,20 +493,26 @@ arr[Tok] func tokenize(src:ascii) {
         // --- number ---
         if isDigit(c0) {
             int i = pos
-            while i < n && isDigit(src.charCodeAt(i)) { i++ }
+            while i < n && isDigit(src.byteAt(from + i)) { i++ }
             bool isFloat = false
-            if i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1)) {
+            if i + 1 < n && src.byteAt(from + i) == 46 && isDigit(src.byteAt(from + i + 1)) {
                 isFloat = true
                 i++
-                while i < n && isDigit(src.charCodeAt(i)) { i++ }
+                while i < n && isDigit(src.byteAt(from + i)) { i++ }
             }
-            text lex = src.slice(pos, i).toText()
             Tok t
             t.kind = 'NUMBER'
             if isFloat {
-                t.val = 'float ' + normalizeFloat(lex)
+                // A float is compared against Python's repr(), so 1.50
+                // and 1.5 have to agree. Trailing zeros go, but never
+                // the last digit: 127.0 stays 127.0, matching
+                // repr(127.0) rather than becoming "127.".
+                int end = i
+                while end > pos && src.byteAt(from + end - 1) == 48 { end = end - 1 }
+                if end > pos && src.byteAt(from + end - 1) == 46 { end = end + 1 }
+                t.val = 'float ' + src.slice(from + pos, from + end)
             } else {
-                t.val = 'int ' + `${lex.toInt()}`
+                t.val = 'int ' + `${src.slice(from + pos, from + i).toInt()}`
             }
             t.extra = ''
             t.line = line
@@ -491,11 +549,11 @@ arr[Tok] func tokenize(src:ascii) {
         // --- operators, longest alternative first ---
         text op = ''
         if pos + 2 < n {
-            text three = src.slice(pos, pos + 3).toText()
+            text three = src.slice(from + pos, from + pos + 3)
             if three == '===' || three == '!==' { op = three }
         }
         if op == '' && pos + 1 < n {
-            text two = src.slice(pos, pos + 2).toText()
+            text two = src.slice(from + pos, from + pos + 2)
             if two == '==' || two == '!=' || two == '<=' || two == '>='
                     || two == '=>' || two == '&&' || two == '||'
                     || two == '++' || two == '--' {
@@ -527,8 +585,8 @@ arr[Tok] func tokenize(src:ascii) {
         // --- identifiers and keywords ---
         if isIdentStart(c0) {
             int i = pos
-            while i < n && isIdentPart(src.charCodeAt(i)) { i++ }
-            text word = src.slice(pos, i).toText()
+            while i < n && isIdentPart(src.byteAt(from + i)) { i++ }
+            text word = src.slice(from + pos, from + i)
             pos = i
 
             if word == 'import' {
@@ -546,11 +604,12 @@ arr[Tok] func tokenize(src:ascii) {
                 // advances, which is the whole match including the spaces
                 // the strip removed.
                 int p = pos
-                while p < n && (src.charCodeAt(p) == 32 || src.charCodeAt(p) == 9) { p++ }
+                while p < n && (src.byteAt(from + p) == 32 || src.byteAt(from + p) == 9) { p++ }
                 int ps = p
-                while p < n && src.charCodeAt(p) != 10 && src.charCodeAt(p) != 59 { p++ }
-                text rawPath = src.slice(ps, p).toText()
-                text trimmed = trim(rawPath)
+                while p < n && src.byteAt(from + p) != 10 && src.byteAt(from + p) != 59 { p++ }
+                // claude.md #272: text.trim() -- this used to be a
+                // hand-written helper here, for want of one.
+                text trimmed = src.slice(from + ps, from + p).trim()
                 if trimmed != '' {
                     while lineIdx + 1 < lineStarts.length && lineStarts[lineIdx + 1] <= pos {
                         lineIdx++
@@ -560,7 +619,7 @@ arr[Tok] func tokenize(src:ascii) {
                     pt.val = trimmed
                     pt.extra = ''
                     pt.line = lineIdx + 1
-                    pt.col = pos - lineStarts[lineIdx] + 1
+                    pt.col = colAt(src, from, lineStarts[lineIdx], pos)
                     toks.push(pt)
                     prevKind = 'PATH'
                     prevVal = trimmed
@@ -601,7 +660,7 @@ arr[Tok] func tokenize(src:ascii) {
     eof.val = ''
     eof.extra = ''
     eof.line = lineIdx + 1
-    eof.col = n - lineStarts[lineIdx] + 1
+    eof.col = colAt(src, from, lineStarts[lineIdx], n)
     toks.push(eof)
     return toks
 }
@@ -622,39 +681,33 @@ while ei < ees.length {
     ei++
 }
 
-blob srcFile = argv[1]
-text rawText = srcFile.toText()
-ascii source = rawText.toAscii()
-if source == null {
-    log('NONASCII')
-} else {
-    arr[Tok] toks = tokenize(source)
-    text out = ''
-    // A failed lex reports ONLY where it failed. The Python lexer raises
-    // a CompileError and produces no token list at all, so emitting the
-    // tokens that happened to precede the bad character would be a
-    // difference in the harness rather than in the lexers.
-    int errAt = 0 - 1
-    int e = 0
-    while e < toks.length {
-        if toks[e].kind == 'LEXERR' { errAt = e break }
-        e++
-    }
-    if errAt >= 0 {
-        Tok bad = toks[errAt]
-        log(`${bad.line}:${bad.col}|LEXERR|${esc(bad.val)}`)
-        close(0)
-    }
-    int i = 0
-    while i < toks.length {
-        Tok t = toks[i]
-        if t.kind == 'REGEX' {
-            out = out + `${t.line}:${t.col}|REGEX|${esc(t.val)}|${esc(t.extra)}`
-        } else {
-            out = out + `${t.line}:${t.col}|${t.kind}|${esc(t.val)}`
-        }
-        out = out + 10.toChar()
-        i++
-    }
-    log(out)
+blob source = argv[1]
+arr[Tok] toks = tokenize(source, 0, source.length)
+text out = ''
+// A failed lex reports ONLY where it failed. The Python lexer raises a
+// CompileError and produces no token list at all, so emitting the tokens
+// that happened to precede the bad character would be a difference in the
+// harness rather than in the lexers.
+int errAt = 0 - 1
+int e = 0
+while e < toks.length {
+    if toks[e].kind == 'LEXERR' { errAt = e break }
+    e++
 }
+if errAt >= 0 {
+    Tok bad = toks[errAt]
+    log(`${bad.line}:${bad.col}|LEXERR|${esc(bad.val)}`)
+    close(0)
+}
+int i = 0
+while i < toks.length {
+    Tok t = toks[i]
+    if t.kind == 'REGEX' {
+        out = out + `${t.line}:${t.col}|REGEX|${esc(t.val)}|${esc(t.extra)}`
+    } else {
+        out = out + `${t.line}:${t.col}|${t.kind}|${esc(t.val)}`
+    }
+    out = out + 10.toChar()
+    i++
+}
+log(out)

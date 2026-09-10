@@ -37,35 +37,16 @@ stubs. Nothing open here.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately: each new
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
-- **A raw byte-buffer type** — a generalized, writable `blob`, or a
-  new `bytes` type, with `[i] =` assignment and
-  `text.toBytes()`/`bytes.toText()` conversions at the boundary. This
-  was filed as "open but unmotivated"; **it now has a motivation.**
-  `bootstrap/lexer.f` (claude.md #271) cannot read 3 of the 69 `.f`
-  files in this repository, because `text.toAscii()` validates and
-  answers `null` for non-ASCII input. A lexer for a UTF-8 language
-  never needs to *interpret* those bytes, but it must carry them
-  through string literals untouched, and `ascii` is a validated ASCII
-  string rather than a byte view. An unvalidated byte sequence with
-  O(1) indexing is what that job actually wants.
-
-  The argument that *used* to be made for this one — skipping a
-  shell-out to clang on textual LLVM IR — is still not it:
-  `llvm_backend.py` parses the generated IR in-process via libLLVM's C
-  API whenever it is available, with `clang`/`cc` only a fallback, and
-  in-place string append makes building that IR text cheap as a plain
-  `text` (measured: 160k appends, ~4 MB, in 24 ms — linear).
-
-- **`text.trim()`**, matching Python's `str.strip()`. `bootstrap/lexer.f`
-  carries its own because the import-path rule needs exactly those
-  semantics and `text` has no equivalent.
-
-- **A `text` cannot hold a NUL**, since it is NUL-terminated —
-  `'a\0b'.length` is `1`, silently. The lexer accepts the `\0` escape
-  and produces a three-character value no Festina program can hold
-  (claude.md #271). Either the escape should be rejected at compile
-  time or `text` needs a length, and the second is the change #83 ruled
-  out. Rejecting `\0` in a literal is the small, honest fix.
+- **A raw byte-buffer type** — the *read* half of this shipped as
+  `blob.byteAt(i)`/`blob.slice(a, b)` (claude.md #272), on the type that
+  already is a file's bytes, rather than as a new primitive. What is
+  still open is the **write** half: `[i] =` assignment into a mutable,
+  indexable buffer, for binary protocol and data construction. Still
+  unmotivated — nothing in the repository needs it, and the case that
+  motivated the read half (a lexer carrying non-ASCII bytes through) is
+  answered. `blob.slice` answering `text` rather than a blob is the
+  deliberate part: a blob is a *file*, carrying its own path, so a slice
+  of one has no path to carry.
 
 ## Memory model
 

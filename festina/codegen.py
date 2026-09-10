@@ -1890,6 +1890,8 @@ class CodeGen:
             "declare ptr @festina_blob_bytes(ptr, ptr)",
             # claude.md #251: blob.length.
             "declare i64 @festina_blob_length(ptr)",
+            "declare i64 @festina_blob_byte_at(ptr, i64)",
+            "declare ptr @festina_blob_slice(ptr, i64, i64)",
             "declare i8 @festina_blob_write(ptr, ptr)",
             "declare i8 @festina_blob_append(ptr, ptr)",
             "declare i8 @festina_blob_exists(ptr)",
@@ -1917,6 +1919,7 @@ class CodeGen:
             "declare i8 @festina_str_eq(ptr, ptr)",
             # claude.md #150: text.toInt()/text[i], argv, exec().
             "declare i64 @festina_text_to_int(ptr)",
+            "declare ptr @festina_text_trim(ptr)",
             "declare ptr @festina_text_char_at(ptr, i64)",
             # claude.md #249: text.charCodeAt(i)/int.toChar().
             "declare i64 @festina_text_char_code_at(ptr, i64)",
@@ -12205,6 +12208,16 @@ class CodeGen:
                     lines.append(f"  {out} = call i64 @festina_text_to_int(ptr {val})")
                     self._free_text_temp(callee.obj, val, vtype, lines)
                     return out, INT
+            # claude.md #272: text.trim() -> text. Hands back a fresh
+            # owned copy, so the receiver is released the same way every
+            # other text-returning method's is.
+            if callee.prop == "trim" and not expr.args:
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == TEXT:
+                    out = self.tmp()
+                    lines.append(f"  {out} = call ptr @festina_text_trim(ptr {val})")
+                    self._free_text_temp(callee.obj, val, vtype, lines)
+                    return out, TEXT
             # claude.md #249: text.charCodeAt(i) -> int -- the Unicode
             # code point at code-point index i, mirroring text[i]'s own
             # receiver-freeing shape (the int argument itself needs no
@@ -12691,6 +12704,33 @@ class CodeGen:
             # blob handle, which already holds the path -- so these are
             # single runtime calls with no path argument to thread
             # through, unlike the free functions they replace.
+            # claude.md #272: blob's two byte-level readers. Kept out of
+            # the dict-driven branch just below because that one threads
+            # at most one argument and passes it as a ptr; these take
+            # i64s, and slice() takes two.
+            if callee.prop in ("byteAt", "slice"):
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if obj_type == BLOB:
+                    arg_vals = []
+                    for arg in expr.args:
+                        arg_val, _ = self._emit_expr(arg, env, lines)
+                        arg_vals.append(arg_val)
+                    out = self.tmp()
+                    if callee.prop == "byteAt":
+                        lines.append(
+                            f"  {out} = call i64 @festina_blob_byte_at"
+                            f"(ptr {obj_val}, i64 {arg_vals[0]})")
+                        ret_type = INT
+                    else:
+                        lines.append(
+                            f"  {out} = call ptr @festina_blob_slice"
+                            f"(ptr {obj_val}, i64 {arg_vals[0]}, i64 {arg_vals[1]})")
+                        ret_type = TEXT
+                    # byteAt answers a scalar and slice answers an owned
+                    # copy -- neither points into the handle, so the
+                    # receiver is released exactly like toText()'s.
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return out, ret_type
             if callee.prop in ("toText", "write", "append", "exists", "delete"):
                 obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
                 if obj_type == BLOB:

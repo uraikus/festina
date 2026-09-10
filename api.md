@@ -358,6 +358,24 @@ text found = 'room 42'.match(/[0-9]+/)   // null if no match
 
 arr[text] words = sentence.split(' ')    // or a regex: .split(/\s+/g)
 sentence = words.join('\t')              // join works on text/int/float/bool arrays
+text tidy = '  padded  '.trim()          // 'padded'
+```
+
+`trim()` removes leading and trailing whitespace — space, tab, newline,
+carriage return, vertical tab and form feed — and nothing in the middle.
+It works on bytes, which is safe on UTF-8 because every byte of a
+multi-byte character has its high bit set and so can never be mistaken
+for one of those seven: `'  café  '.trim()` is `'café'`. Unicode
+whitespace (U+00A0 and friends) is *not* stripped.
+
+**There is no `\0` escape.** A `text` is NUL-terminated, so it cannot
+hold a NUL at all — writing `'a\0b'` used to lex to a three-character
+value the language could never represent, and silently truncated to
+`'a'`. It is a compile error now:
+
+```festina
+text bad = 'a\0b'     // error: the \0 escape is not supported
+text fine = 'a\\0b'   // four characters: a, \, 0, b -- unaffected
 ```
 
 `split` keeps empty pieces between adjacent separators
@@ -2318,6 +2336,46 @@ int size = notes.length               // -> int; the byte count
 notes.save()                          // -> bool; write the bytes to its path
 notes.save('other.txt')               // -> bool; adopt that path, then write
 notes.saveCopy('backup.txt')          // -> bool; write there, keep its own path
+
+int b = notes.byteAt(0)               // -> int; one raw byte, 0-255
+text head = notes.slice(0, 16)        // -> text; a byte range
+```
+
+### Reading a blob byte by byte
+
+`byteAt(i)` is an O(1) read of one **raw byte**, `0`–`255`, and `null`
+for a negative or past-the-end index — the same "test, don't fail"
+answer `text.charCodeAt` gives. It is a byte, not a character: in a
+UTF-8 file, `'café'.byteAt(3)` territory gives you `195`, the first half
+of the `é`, not the code point.
+
+`slice(start, end)` is the half-open byte range `[start, end)` as a
+fresh `text`. The range is **clamped**, not checked — an inverted or
+out-of-range range answers `''` rather than reading past the buffer,
+the same rule `splice()` follows and the opposite of
+[`arr[T]` indexing](#indexing-is-not-bounds-checked). It answers `text`
+rather than another `blob` deliberately: a blob is a *file*, carrying
+the path it was loaded from, and a slice of one has no path of its own.
+
+Together these let you scan a file the compiler never has to validate
+first — which is exactly what [`ascii`](#ascii--one-byte-per-character)
+cannot do, since `text.toAscii()` answers `null` for any input with a
+non-ASCII byte anywhere in it. A scanner over source code needs to
+*carry* those bytes, not interpret them:
+
+```festina
+blob src = 'main.f'
+int i = 0
+while i < src.length {
+    int c = src.byteAt(i)
+    if c == 39 {                      // a quote: copy the literal whole
+        int start = i
+        i++
+        while i < src.length && src.byteAt(i) != 39 { i++ }
+        log(src.slice(start, i + 1))  // multi-byte characters intact
+    }
+    i++
+}
 ```
 
 `.length` is the exact **byte** count — unlike `text.length`

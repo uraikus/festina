@@ -24,12 +24,12 @@ python bootstrap/difftest.py examples/hello.f       # just these files
 Both sides print one token per line in the same canonical form:
 
 ```
-line:col|KIND|value            # value escaped: \\ \n \t \r \p (|) \z (NUL)
+line:col|KIND|value            # value escaped: \\ \n \t \r \p (|)
 line:col|REGEX|pattern|flags
 line:col|LEXERR|char           # a rejected source reports only this
 ```
 
-Current state: **80 files match, 0 differ, 1 known divergence, 3 skipped.**
+Current state: **85 files match, 0 differ, 0 known divergences, 0 skipped.**
 
 ## Why a port, not a rewrite
 
@@ -61,30 +61,40 @@ put one `/` per line, which passes whether or not the denylist works at
 all — a failed regex attempt falls back to division on its own. Two `/`
 on one line is what actually tests it.
 
-## The one known divergence
-
-`cases/strings_and_escapes.f` contains `'a\0b'`. The Python lexer
-produces the full three-character value; `lexer.f` produces `a`.
-
-This is not a bug in the port and cannot be fixed there: Festina's
-`text` is NUL-terminated, so `'a\0b'.length` is `1` in *any* Festina
-program. The port can only be as expressive as the language it is
-written in, and this is the first place that bites. `difftest.py` records
-it in `KNOWN_DIVERGENCES` and the pytest suite xfails it, so it stays
-visible instead of being quietly dropped from the corpus.
-
 ## What this told us about the language
 
-Findings are recorded in full in claude.md #271. In short:
+Four limits, recorded in full in claude.md #271. Three are now fixed
+(claude.md #272), which is what this exercise was for:
 
-- **`ascii` cannot read 3 of the 69 corpus files.** `text.toAscii()`
+- **`ascii` could not read 3 of the 69 corpus files.** `text.toAscii()`
   validates and answers `null` for non-ASCII, but a lexer for a UTF-8
-  language must carry non-ASCII bytes through string literals untouched.
-  This is the single biggest obstacle to going further.
-- **`text` cannot hold a NUL**, as above.
-- **`text` has no `.trim()`** — `lexer.f` carries its own.
+  language must carry those bytes through string literals untouched.
+  **Fixed:** `blob.byteAt(i)`/`blob.slice(a, b)` give the read half of a
+  byte buffer on the type that already holds a file's bytes, and
+  `lexer.f` now scans the source blob by byte offset. All 69 files lex.
+- **`text` could not hold a NUL**, so it could not represent a value its
+  own lexer produced (`'a\0b'.length` answered 1). **Fixed:** the `\0`
+  escape is a compile error now.
+- **`text` had no `.trim()`.** **Fixed:** it does.
 - **`int / int` promotes to float**, so there is no integer midpoint to
-  binary-search with; `lexer.f` uses a forward-only line cursor instead.
+  binary-search with. *Not* fixed — that is claude.md #61's rule working
+  as designed; `lexer.f` walks a forward-only line cursor instead.
+
+And one the differential test found that neither lexer showed alone:
+
+- **A column is a *character* offset, not a byte offset.** Python's
+  lexer indexes `str`, so it counts code points for free. Scanning bytes
+  gives a different answer on any line with non-ASCII before the token —
+  and that column is what every compile error's caret points at. Only
+  running both lexers against real non-ASCII source made it visible.
+
+## Recording a divergence
+
+`difftest.KNOWN_DIVERGENCES` is empty, and kept rather than deleted. It
+held exactly one entry — the `\0` case above — which was fixed in the
+language instead of tolerated here. If a future divergence genuinely
+cannot be fixed, that table is where it goes, so the decision lives next
+to the test rather than in a commit message.
 
 ## Next
 

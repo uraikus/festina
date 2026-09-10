@@ -187,8 +187,40 @@ class Token:
 
 _ESCAPES = {
     "n": "\n", "t": "\t", "r": "\r", "\\": "\\",
-    "'": "'", '"': '"', "`": "`", "0": "\0",
+    "'": "'", '"': '"', "`": "`",
 }
+
+
+def _reject_nul_escape(raw, filename, line, column):
+    """claude.md #272: `\\0` used to be an accepted escape producing a real
+    NUL, and a `text` cannot hold one -- it is NUL-terminated, so
+    `'a\\0b'.length` answered 1 and everything past the NUL silently
+    vanished. Accepting an escape whose value the language cannot
+    represent is worse than rejecting it, so this is now a compile error
+    naming the truncation directly.
+
+    Found by bootstrap/lexer.f (claude.md #271): the Festina port could
+    not reproduce the Python lexer's own three-character `a\\0b`, because
+    no Festina program can hold that value. Giving `text` a length is the
+    alternative, and that is exactly the change claude.md #83 ruled out.
+
+    Scans the same way _unescape does, so `\\\\0` -- an escaped backslash
+    followed by an ordinary '0' -- is untouched, and only a real `\\0`
+    escape is rejected."""
+    i = 0
+    n = len(raw)
+    while i < n:
+        if raw[i] == "\\" and i + 1 < n:
+            if raw[i + 1] == "0":
+                raise CompileError(
+                    "the \\0 escape is not supported -- text is "
+                    "NUL-terminated, so a NUL would silently truncate the "
+                    "string at that point",
+                    file=filename, line=line, column=column,
+                    category="invalid syntax")
+            i += 2
+            continue
+        i += 1
 
 
 def _unescape(text):
@@ -338,11 +370,13 @@ def tokenize(source, filename="<string>"):
             continue
 
         if kind == "STRING":
+            _reject_nul_escape(text[1:-1], filename, line, col)
             tokens.append(Token("STRING", _unescape(text[1:-1]), line, col))
             prev_significant = tokens[-1]
             continue
 
         if kind == "TEMPLATE":
+            _reject_nul_escape(text[1:-1], filename, line, col)
             segments = _split_template(text[1:-1])
             expr_parts = [t for is_expr, t in segments if is_expr]
             str_parts = [t for is_expr, t in segments if not is_expr]
