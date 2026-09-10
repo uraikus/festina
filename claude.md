@@ -5224,3 +5224,37 @@ So a poll written as `if probe.returncode == 0 and "_NET_FRAME_EXTENTS" in probe
 **The lesson worth keeping**: a readiness poll whose success condition can be satisfied by the failure output is not a poll, and it fails silently in exactly the direction that hides it -- everything passes on a fast machine, forever, until a slow one. The condition has to be something only the success case can produce. Checking a probe's exit status is not enough when the tool reports "absent" as a successful answer to a well-formed question.
 
 **Verified**: the absent-form behaviour reproduced against a real X server (exit 0, name echoed, no "="), the old condition shown accepting it and the split then raising the exact CI IndexError; the readiness wait shown becoming true one probe later than the old one claimed; all six WM-dependent tests passing three runs in a row, and `tests/test_codegen.py` green in full (1067 passed).
+
+271. THE LEXER, WRITTEN IN FESTINA -- AND WHAT IT FOUND
+
+Asked whether bootstrapping is worth doing now, the honest answer was "not as a replacement yet, but the lexer alone, as a differential test." This entry is that step: `bootstrap/lexer.f` reproduces `festina/lexer.py`'s token stream exactly, and `bootstrap/difftest.py` proves it over every `.f` file in the repository.
+
+**Result: 80 files match, 0 differ, 1 known divergence, 3 skipped.** The Festina lexer also lexes itself.
+
+**Why a port and not a rewrite.** The only claim worth making about a reimplementation is that it AGREES with the original, so this is a deliberate translation -- same token kinds, same keyword sets, same precedence -- with one structural difference forced by the language: `festina/lexer.py` uses one master regex with named groups and `lastgroup`, and Festina's `regex` is POSIX ERE with neither, so this is a hand-written character scanner. That is what `ascii` (#256) was added for.
+
+The subtlety worth writing down: `TOKEN_SPEC`'s alternation order is load-bearing because Python's `re` alternation is leftmost-FIRST, not longest-match. The scanner tries the same kinds in the same order. Getting it wrong is how `x++` lexes as `+` `+`.
+
+**Four findings about the LANGUAGE, which is the point of doing this from a real consumer rather than guessing:**
+
+**1. `ascii` cannot read 3 of the 69 corpus files.** `text.toAscii()` validates and answers `null` for anything non-ASCII -- correct for what it was specified to do, and fatal for a lexer. A lexer for a UTF-8 language does not need to *interpret* non-ASCII, but it must carry those bytes through string literals untouched. `ascii` as it stands is a validated ASCII string, not a byte view, so `examples/ascii_scan.f` (among others) is simply unreadable to a Festina lexer. This is the single biggest obstacle to going further, and it is an argument for the byte-buffer type todo.md already carries as "open but unmotivated" -- it now has a motivation.
+
+**2. `text` cannot hold a NUL, so it cannot represent a value its own lexer produces.** `festina/lexer.py` accepts `\0` in a string literal and yields the three-character `a\0b`; `'a\0b'.length` in any Festina program is `1`. This is the one recorded divergence, kept in `KNOWN_DIVERGENCES` and xfailed rather than deleted from the corpus, because the port cannot be fixed here -- only the language can. Worth noting separately that this means `'a\0b'` in ordinary Festina code silently truncates.
+
+**3. `text` has no `.trim()`.** Small, but the import-path rule needs Python's `.strip()` semantics exactly; `lexer.f` carries its own.
+
+**4. `int / int` promotes to float** (`7 / 2` is `3.5`, per #61's rule, working as designed). No integer midpoint means no ordinary binary search, so where the Python lexer bisects a line-starts index, `lexer.f` walks a forward-only cursor instead. Not a bug -- but a real ergonomic cost for exactly the integer-index code a compiler is made of.
+
+Notably absent from that list: the `ascii` method parity the plan filed as Part 3 (`split`, `replace`, `match`, `toInt`). The lexer needed `.length`, `[i]`, `charCodeAt`, `slice` and `toText` -- all shipped -- and nothing else. Part 3 is less urgent than it looked from the outside.
+
+**A bug in the port, caught by the test, worth recording because it is a shape that recurs.** The Python lexer's template handling calls `tokenize()` recursively on each `${...}` fragment and drops the sub-EOF. Errors propagate because the recursive call RAISES. The Festina port returns an array instead, whose last element is the EOF -- or, on failure, the LEXERR. Dropping "the last token" therefore threw away exactly the error, and a malformed interpolation lexed as if nothing were wrong. Returning a value where the original raises silently converts "propagate" into "discard" at every such site.
+
+**Two things about the oracle itself, because a differential test that cannot fail is worth nothing.**
+
+The corpus is strong for ordinary code and weak at the edges: it contains **no ambiguous `/` at all**, and block comments appear in exactly one file (the new lexer's own). `bootstrap/cases/` closes that, and its coverage is verified rather than assumed -- deleting the regex-vs-division denylist from `lexer.f` must make the test fail.
+
+That check immediately earned its place. The FIRST `division_vs_regex.f` put one `/` per line, and deleting the denylist still passed: a regex attempt that runs to end-of-line fails and falls back to division on its own, so such a line proves nothing. Two `/` on one line is what actually tests it. `TestTheDifferentialTestCanFail` pins both the general discipline and this specific shape -- the same reasoning as `test_leak_stress.py`'s own harness canary, arrived at the same way, by watching a test pass when it should not have.
+
+**Verified.** 2494 passed, 17 skipped, 1 xfailed, full suite. Two independent negative controls (break longest-match on `++`: 17 files differ, pinpointing `OP|++` vs `OP|+`; delete the regex denylist: `OP|/` vs `REGEX| 2 |`).
+
+**Where this leaves bootstrapping.** The parser is the natural next step and needs none of the four findings fixed. Semantic analysis and codegen should wait for the `?` cell model, which is a documented breaking change to shipped `?` semantics and would otherwise land underneath a half-ported compiler.

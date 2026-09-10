@@ -13,6 +13,18 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Added
 
+- **`bootstrap/` — Festina's lexer, written in Festina.**
+  `bootstrap/lexer.f` reproduces `festina/lexer.py`'s token stream
+  exactly; `bootstrap/difftest.py` and `tests/test_bootstrap_lexer.py`
+  prove it by diffing both lexers over every `.f` file in the
+  repository (80 match, 0 differ, 1 recorded divergence, 3 skipped).
+  Nothing in the shipped compiler depends on it — this is the first
+  step of self-hosting, and a real consumer that surfaced four concrete
+  limits of the language itself (see `bootstrap/README.md` and
+  claude.md #271): `ascii` cannot read non-ASCII source, `text` cannot
+  hold a NUL, `text` has no `.trim()`, and `int / int` promotes to
+  float so there is no integer midpoint to binary-search with.
+
 - **`ascii` — a one-byte-per-character string type,** alongside `text`
   rather than replacing it. Because a character is a byte, the
   character count *is* the byte count, so it lives in the value's own
