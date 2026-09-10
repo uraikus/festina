@@ -6035,7 +6035,14 @@ class TestFullscreenAndDecorations:
                     ["xprop", "-id", wid, "_NET_FRAME_EXTENTS"],
                     env=env, capture_output=True, text=True,
                 )
-                if probe.returncode == 0 and "_NET_FRAME_EXTENTS" in probe.stdout:
+                # claude.md #270: the condition has to be the "=", not the
+                # property NAME. xprop exits 0 either way and prints the
+                # name back in both its absent forms too --
+                # "_NET_FRAME_EXTENTS:  no such atom on any window." and
+                # "_NET_FRAME_EXTENTS:  not found." -- so matching the
+                # name accepted the very first probe, before openbox had
+                # reparented, and this poll never actually polled.
+                if probe.returncode == 0 and "=" in probe.stdout:
                     extents = probe.stdout
                     break
                 time.sleep(0.1)

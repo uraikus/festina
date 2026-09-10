@@ -5203,3 +5203,24 @@ The failure was `FileNotFoundError: [WinError 2]` sixty frames deep inside `subp
 **One portability seam closed while here.** `_make_origin_and_clone` passed the clone's source and destination as absolute paths, which on that runner means native `C:\...` strings handed to an msys2-runtime `git` build with POSIX path semantics. Both are now names relative to the cwd the helper already sets; everything else in these tests reaches its repo through `-C` or `cwd`, which the runtime converts.
 
 **Verified by reproducing it first**: running `TestUpdate` with `git` removed from PATH reproduces the exact CI shape -- the same five failures, the same one pass -- and the full `tests/test_cli.py` passes with git present.
+
+270. THE X11 READINESS POLL THAT NEVER POLLED
+
+CI came back red on linux -- one failure, `test_the_window_is_really_decorated_under_a_real_window_manager`, `IndexError: list index out of range` on `extents.split("=", 1)[1]`. Nothing in the commit under test touched graphics; the test had been passing for many rounds.
+
+**`xprop` reports an absent property on stdout, with exit status 0.** That is the whole bug. Both of its absent forms echo the property name straight back:
+
+```
+_NET_FRAME_EXTENTS:  no such atom on any window.     (nothing has ever set it)
+_NET_FRAME_EXTENTS:  not found.                      (the atom exists, not on this window)
+```
+
+So a poll written as `if probe.returncode == 0 and "_NET_FRAME_EXTENTS" in probe.stdout` matches on the *first* probe, always, whether or not the property is there. The ten-second wait around it was dead code from the day it was written. The test then split on an "=" that only the present form contains, and raised.
+
+**The same broken condition was in `x_display_with_wm`'s own readiness wait**, on `_NET_SUPPORTING_WM_CHECK`, and that is the deeper of the two: the fixture declared openbox ready on probe 1 every single time, so *every* test taking that fixture has been racing openbox's startup rather than waiting for it. The decoration test is simply the one that reads a property openbox has to publish, so it is the one that noticed. Measured directly: on probe 1 the old condition says ready while openbox is not yet up; the correct condition becomes true on probe 2, 0.11s later, on an idle machine. On a loaded CI runner that window is wider, and that is the entire failure.
+
+**Two different fixes, because the two properties print differently.** `_NET_FRAME_EXTENTS` is a CARDINAL list -- `_NET_FRAME_EXTENTS(CARDINAL) = 0, 26, 0, 0` -- so testing for the `"="` is both correct and exactly the precondition the next line's `split("=")` needs. `_NET_SUPPORTING_WM_CHECK` is a WINDOW -- `_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x20011f` -- with no `"="` anywhere in it, so the same fix there would have turned a poll that never waited into one that always timed out. That one tests for the absent forms instead. (I wrote the `"="` version there first and caught it by checking the real output before shipping, not after.)
+
+**The lesson worth keeping**: a readiness poll whose success condition can be satisfied by the failure output is not a poll, and it fails silently in exactly the direction that hides it -- everything passes on a fast machine, forever, until a slow one. The condition has to be something only the success case can produce. Checking a probe's exit status is not enough when the tool reports "absent" as a successful answer to a well-formed question.
+
+**Verified**: the absent-form behaviour reproduced against a real X server (exit 0, name echoed, no "="), the old condition shown accepting it and the split then raising the exact CI IndexError; the readiness wait shown becoming true one probe later than the old one claimed; all six WM-dependent tests passing three runs in a row, and `tests/test_codegen.py` green in full (1067 passed).
