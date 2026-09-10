@@ -3229,7 +3229,7 @@ call site's owning argument temporaries are registered on the
 runtime's cleanup stack, and `festina_throw` releases everything above
 the catching frame. Leak-freedom is measured by
 `tests/stress/throw_unwind_churn.f` under ASan (`scripts/leak_stress.sh`,
-32 programs now) and Valgrind -- every kind of local through three
+33 programs now) and Valgrind -- every kind of local through three
 frames, a rethrow, a JSON failure two frames down, 400 balanced
 non-throwing calls; behaviour and IR shape by `tests/test_try_catch.py::
 TestThrowUnwindsIntermediateFrames` (8 tests, including that a program
@@ -3300,6 +3300,27 @@ the way out. Pinned by two `TestComputedIndexAndArgumentOwnership` tests
 parameter and global cases are untouched, so a future tightening cannot
 quietly break them. No stress-suite entry: those programs now leak by
 design, and `scripts/leak_stress.sh` requires clean.
+
+**claude.md #265** (a query row is refcounted): the borrowed-row family
+-- #85's premise, #119's minting exception, #224's copy plan, #260's
+chain-parking, #264's containment -- all rested on "a row has no
+refcount header". The audit found one producer
+(`festina_sqlite_collect_rows`), two freers (both generated), every
+field offset measured from the payload pointer, and no thread-clone path
+at all, so a row gets the standard header at `payload - 8` and becomes
+an ordinary refcounted value. #260's parking, #264's containment and
+`_release_fn_for_array`'s TableType special case are all deleted.
+Measured by `tests/stress/row_ownership_churn.f` over 500 iterations of
+every escaping shape -- returned from a function that owned the array,
+returned through a local, bound off a call-result array, outliving its
+array by an explicit `free`, aliased and mutated through the alias,
+passed as an argument, stored in an `arr`/`map` outliving the query, and
+columns read off call-result rows. ASan-clean; a heap-use-after-free
+without the change. Aliasing (`p.name = 'x'` visible through every
+binding) re-verified byte-for-byte against the old build. The
+`table_rows` per-type isolation program caught the one real bug on the
+way -- an un-widened VarDecl branch skipping the retain -- and named the
+type in the failure, which is exactly what those programs are for.
 
 **claude.md #237** (a compiled `.wasm` in a browser): the project's own
 WASI Preview 1 host (`runtime/wasm/festina_wasi_browser.js`) is verified

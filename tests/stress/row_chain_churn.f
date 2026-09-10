@@ -1,21 +1,14 @@
-// claude.md #260: a table-row element read off a CALL-RESULT array --
-// `rows()[0].name` -- and every position that shape can appear in.
+// A table-row column read off a CALL-RESULT array -- `rows()[0].name`
+// -- in every position that shape can appear in.
 //
-// This was the project's own longest-standing documented leak (#85,
-// #119, #224): a row has no refcount header, so the array owns it
-// outright, and minting the row the way every other element type is
-// minted is impossible. The fix parks the array on the enclosing member
-// chain instead, so the column that escapes is copied/retained first
-// and the array released after -- the treatment `make().inner.n` has
-// had since #108/#117.
-//
-// Every loop below reads a column off a freshly-built array that is
-// never bound to a name. Each column type exercises a different half of
-// _release_member_chain: a text column must be COPIED before the array
-// (and its row) dies, a blob column must be RETAINED, and an int column
-// needs neither. Getting any of them wrong is a use-after-free or a
-// double free, not a leak -- which is why this runs under ASan and not
-// only LeakSanitizer.
+// Rows carry the ordinary refcount header, so a row read out of an
+// owning array is retained and the array released, netting the one
+// reference the expression owns. Each column type exercises a different
+// half of that: a text column must be COPIED before the row's own
+// reference could go, a blob column RETAINED, and an int column needs
+// neither. Getting any of them wrong is a use-after-free or a double
+// free, not a leak -- which is why this runs under ASan and not only
+// LeakSanitizer.
 
 table People { id:int  name:text }
 

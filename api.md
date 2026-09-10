@@ -3199,7 +3199,8 @@ free spritesheet                       // the sheet goes now, not at exit
 `free name` releases whatever the binding holds and sets the binding to
 `null`. It works on **every type**:
 
-- **struct / `arr[T]` / `map[T]` / `blob` / `img` / `aud` / `regex`** —
+- **struct / `arr[T]` / `map[T]` / query row / `blob` / `img` / `aud` /
+  `regex`** —
   a reference-count *decrement*, not a forced free. A value something
   else still points at survives until its last reference drops; freeing
   an array releases each element the same way, so a shared element
@@ -3210,8 +3211,6 @@ free spritesheet                       // the sheet goes now, not at exit
   it. A `/pattern/` literal's process-lifetime cache is immortal, so
   `free` on a binding aliasing one is a safe no-op.
 - **`text`** — the buffer is freed (a text is exclusively owned).
-- **a query row** — the binding is nulled *without* freeing: the row is
-  owned by the array it came from. Free the array.
 - **`int` / `float` / `bool`** — nothing to release; `free x` is `x = null`.
 
 `free` composes with automatic reclamation: freeing twice is a no-op,

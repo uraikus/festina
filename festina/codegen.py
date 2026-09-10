@@ -493,11 +493,26 @@ def _is_refcounted(t):
     # alias/release-on-reassignment/release-at-scope-exit treatment
     # every other refcounted type already gets, with no special-casing
     # needed anywhere else in this generic protocol.
+    # claude.md #265: a table ROW joined the family last, and it is the
+    # one that took an audit to justify rather than a paragraph. #85
+    # ruled a header out because a row is built by the runtime as a
+    # bare malloc with nothing in front of it -- but that runtime is
+    # this project's, and the audit found exactly ONE producer
+    # (festina_sqlite_collect_rows) and TWO freers (both generated:
+    # _emit_table_row_release_fn and _emit_row_to_struct_fn), every
+    # field offset measured from the payload pointer so a header in
+    # front of it changes no access at all, and no thread-clone path
+    # whatsoever (a table value cannot cross a thread boundary, #195).
+    # That is the same closed world #256 gave `ascii` a header in, and
+    # it lets a row be an ordinary refcounted value here instead of the
+    # borrowed special case every ownership decision in this file used
+    # to have to route around.
     return (isinstance(t, (types_mod.StructType, types_mod.ArrayType,
                            types_mod.MapType, types_mod.ImageType,
                            types_mod.AudioType, types_mod.RegexType,
                            types_mod.HttpType, types_mod.SocketType,
-                           types_mod.UrlType, types_mod.EnumType))
+                           types_mod.UrlType, types_mod.EnumType,
+                           types_mod.TableType))
             or t == BLOB
             # claude.md #256: ascii carries the identical i64 refcount
             # at payload-8 (its length sits one word further back), so
@@ -1326,11 +1341,6 @@ class CodeGen:
                                                 # "instance-level stack, not threaded through ctx" shape as
                                                 # _loop_targets, for the same reason: it needs to keep
                                                 # working correctly through arbitrary nesting depth.
-        # claude.md #264: is the function currently being emitted one
-        # whose return type is a table ROW? A row is a borrow into an
-        # array that owns it, so such a function must not release a
-        # local that could free rows -- see _track_local.
-        self._current_func_returns_row = False
         self._current_func_frame_base = 0      # claude.md #140: the self._active_free_locals index of
                                                 # the OUTERMOST frame belonging to the function/handler
                                                 # currently being emitted -- normally 0, since
@@ -2680,71 +2690,15 @@ class CodeGen:
         nulled by `free` releases nothing (every release is null-safe,
         see _emit_free).
 
-        claude.md #264: one deliberate exception. A table ROW is a
-        borrowed handle into an array that owns it outright (#85 -- a
-        row has no refcount header of its own), so a function that
-        RETURNS a row hands its caller a pointer into some array. If
-        that array is this function's own local, releasing it here
-        frees the row the caller is about to read: a use-after-free,
-        crashing before this. So inside a row-returning function, a
-        local that could own rows is not tracked at all -- it leaks
-        instead. Strictly safer, because it can only ever release LESS,
-        and the leak is the same bounded, already-documented row-array
-        residual todo.md carries for the other borrowed-row shapes. The
-        real fix is #224's ownership model, which would COPY the row on
-        the way out instead; until then this is the difference between
-        a leak and memory corruption."""
-        if self._current_func_returns_row and self._can_own_table_rows(type_):
-            return
+        claude.md #265: a table ROW is refcounted now, so a row-owning
+        local is tracked exactly like every other refcounted one --
+        #264's deliberate "do not track it inside a row-returning
+        function" exception is gone, along with the use-after-free it
+        was containing and the leak it traded for it.
+        """
         self._active_free_locals[-1].append((ref, type_))
         if self.program_has_try:
             lines.append(f"  call void @festina_cleanup_push(ptr {ref}, ptr {self._unwind_fn_for(type_)})")
-
-    def _can_own_table_rows(self, type_, seen=None):
-        """claude.md #264: could releasing a local of this type FREE a
-        table row?
-
-        Only an `arr[Table]` ever owns rows outright -- that is the one
-        release path that cascades into _emit_table_row_release_fn (see
-        _release_fn_for_array). A `map[Table]` does not: its own gate is
-        `_is_refcounted(value) or value == TEXT`, and a row is neither,
-        so a map's values are never released. Nor does a struct field of
-        row type. But both can own rows INDIRECTLY, by holding an
-        `arr[Table]` -- `map[arr[People]]` releases each value through
-        the array wrapper, and a struct's cascade releases its array
-        field the same way -- so this recurses rather than checking one
-        level.
-
-        Answers for the wrapper kinds _active_free_locals actually
-        stores, not just bare types: a stack arr/map and a stack struct
-        with struct fields both arrive wrapped, and a _TryFrameMarker is
-        not a local at all. Struct recursion is bounded by `seen`, since
-        claude.md #17 allows a struct to reference its own type.
-
-        Conservative in the LEAKING direction on purpose: the only
-        caller uses this to decide NOT to release something, so a false
-        positive costs a bounded leak inside one row-returning function
-        while a false negative is the use-after-free it exists to
-        prevent."""
-        if seen is None:
-            seen = set()
-        if isinstance(type_, _StackArrayOrMap):
-            return self._can_own_table_rows(type_.type_, seen)
-        if isinstance(type_, _StackStructFieldsOnly):
-            return self._can_own_table_rows(type_.struct_type, seen)
-        if isinstance(type_, types_mod.ArrayType):
-            if isinstance(type_.element, types_mod.TableType):
-                return True
-            return self._can_own_table_rows(type_.element, seen)
-        if isinstance(type_, types_mod.MapType):
-            return self._can_own_table_rows(type_.value, seen)
-        if isinstance(type_, types_mod.StructType):
-            if type_.name in seen:
-                return False
-            seen.add(type_.name)
-            return any(self._can_own_table_rows(f, seen)
-                       for f in self.structs.get(type_.name, {}).values())
-        return False
 
     def _guard_call_arg_temps(self, arg_temps, lines):
         """claude.md #236: the call-site half of throw unwinding. A
@@ -3225,11 +3179,6 @@ class CodeGen:
         # function's still-live locals, not just its own empty frame).
         saved_func_frame_base = self._current_func_frame_base
         self._current_func_frame_base = len(self._active_free_locals)
-        # claude.md #264: see _track_local. Saved/restored around the
-        # body for the same reason the frame base is -- a nested
-        # FuncDecl must answer for ITSELF, not for whatever encloses it.
-        saved_returns_row = self._current_func_returns_row
-        self._current_func_returns_row = isinstance(return_type, types_mod.TableType)
         self._active_free_locals.append([])
         escaping = self._emit_param_bindings(decl, param_types, body_env, body_lines)
 
@@ -3264,7 +3213,6 @@ class CodeGen:
                 block["lines"].append(f"  ret {_llvm_type(return_type)} {self._zero_value(return_type)}")
         self._active_free_locals.pop()
         self._current_func_frame_base = saved_func_frame_base
-        self._current_func_returns_row = saved_returns_row
 
         func = [f"define {llvm_ret} {symbol}({params_ir}) {{"]
         func.extend(block["lines"])
@@ -4786,8 +4734,10 @@ class CodeGen:
                 lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
             elif ttype == TEXT:
                 lines.append(f"  call void @free(ptr {old})")
-            # TableType (a borrowed query row) and any other ptr-backed
-            # value: nothing released, only the binding dropped.
+            # Any other ptr-backed value: nothing released, only the
+            # binding dropped. claude.md #265: a table row is no longer
+            # in that group -- it is refcounted, so `free row` is an
+            # ordinary release above.
             lines.append(f"  store ptr null, ptr {ref}")
         elif llvm_ty == "i64":
             lines.append(f"  store i64 {INT_NULL_CONST}, ptr {ref}")
@@ -5028,7 +4978,8 @@ class CodeGen:
                         elif type_ == BLOB or type_ == REGEX or type_ == ASCII or isinstance(
                                 type_, (types_mod.ImageType, types_mod.AudioType,
                                        types_mod.HttpType, types_mod.SocketType,
-                                       types_mod.UrlType, types_mod.EnumType)):
+                                       types_mod.UrlType, types_mod.EnumType,
+                                       types_mod.TableType)):
                             # claude.md #256: ascii joins this branch on
                             # exactly blob's terms -- always scheduled
                             # for release, no escaping-ness or
@@ -5146,7 +5097,17 @@ class CodeGen:
             if type_ == BLOB or type_ == REGEX or isinstance(
                     type_, (types_mod.ImageType, types_mod.AudioType,
                             types_mod.HttpType, types_mod.SocketType,
-                            types_mod.UrlType, types_mod.EnumType)):
+                            types_mod.UrlType, types_mod.EnumType,
+                            types_mod.TableType)):
+                # claude.md #265: a table row takes this branch too, on
+                # exactly blob's terms. `People p = rows[0]` aliases a
+                # row the array still owns, so it needs its own +1 --
+                # without one, `free p` would drop the array's reference
+                # and the array's own cascade would then release a row
+                # already freed. That is not hypothetical: it is what
+                # the table_rows isolation program reported the moment
+                # rows became refcounted and this branch had not been
+                # widened yet.
                 # claude.md #109: `blob save = 'save.dat'` reads the file
                 # and hands back a fresh handle with a refcount of 1;
                 # `blob other = save` aliases the same handle and needs
@@ -8657,37 +8618,17 @@ class CodeGen:
         A scalar element needs no minting (its loaded value survives
         the container by copy), so the container is simply released.
 
-        A TABLE-ROW element cannot be minted the same way -- a row has
-        no refcount header of its own (the array owns its rows
-        outright, #85), so there is nothing to retain, and releasing
-        the array HERE would free the row out from under the
-        expression. claude.md #260: what it can do instead is PARK the
-        array on the enclosing member chain, so the decision moves out
-        to where the value that actually escapes is known --
-        _release_member_chain's whole job (#108/#117). `rows()[0].name`
-        then copies the name FIRST and releases the array after, which
-        is exactly the treatment `make().inner.n` already gets; the row
-        dies with the array, and the escaping column does not.
-
-        Only when there IS an enclosing chain, decided by the same AST
-        node IDENTITY test _begin_member_chain uses: `_chain_receiver
-        is expr` means the frame above set this very node as the
-        receiver it is about to emit, so the entry parked here is the
-        one that frame will drain. A `rows()[0]` in any other position
-        -- bound straight to a `People` local, passed as an argument,
-        returned -- has no such frame, so nothing is parked and the
-        documented leak stands there unchanged (todo.md). Parking
-        regardless would be worse than the leak: the entry would sit on
-        a list nobody drains, or be released by a frame that never
-        owned it.
+        A TABLE ROW is no longer the exception it was for #119, #224 and
+        #260. claude.md #265 gave rows the ordinary refcount header, so
+        `rows()[0]` retains the row, the array is released, and the
+        array's own cascade decrements the row straight back to the one
+        reference this expression owns -- the identical two-instruction
+        answer every other refcounted element type gets, with nothing
+        row-shaped left here at all.
 
         Returns the (possibly replaced) element value."""
         if not (_is_refcounted(obj_type)
                 and self._is_owning_refcounted_source(expr.obj)):
-            return out
-        if isinstance(elem_type, types_mod.TableType):
-            if self._chain_receiver is expr:
-                self._chain_pending.append((expr.obj, obj_val, obj_type))
             return out
         if _is_refcounted(elem_type):
             lines.append(f"  call void @festina_retain(ptr {out})")
@@ -9681,6 +9622,13 @@ class CodeGen:
             return self._release_fn_for_array(type_)
         if isinstance(type_, types_mod.MapType):
             return self._release_fn_for_map(type_)
+        if isinstance(type_, types_mod.TableType):
+            # claude.md #265: the same per-table wrapper an arr[Table]'s
+            # own cascade already used -- it is a release now rather
+            # than an unconditional free, so it is safe to reach from
+            # every ordinary ownership site too, not just from a
+            # container tearing its elements down.
+            return self._emit_table_row_release_fn(type_)
         if type_ == BLOB:
             # claude.md #109: a blob carries the ordinary refcount
             # header, so the only thing generic @festina_release cannot
@@ -9967,24 +9915,23 @@ class CodeGen:
         # per-element cascade wrapper below already dispatches each
         # element through _release_fn_for, which handles all of them;
         # _is_refcounted is the exact "has a reference to drop" test,
-        # plus TableType (its rows are owned, cascaded specially below)
-        # and TEXT (copied, not refcounted, but still needs freeing).
-        if not (_is_refcounted(elem_type)
-                or isinstance(elem_type, types_mod.TableType)
-                or elem_type == TEXT):
+        # plus TEXT (copied, not refcounted, but still needs freeing).
+        # claude.md #265: TableType used to need naming here separately;
+        # it is inside _is_refcounted now.
+        if not (_is_refcounted(elem_type) or elem_type == TEXT):
             return "@festina_release_array"
         key = types_mod.type_name(type_)
         if key in self._array_release_fns:
             return self._array_release_fns[key]
         fn_name = f"@__festina_release_array_{self._unique()}"
         self._array_release_fns[key] = fn_name
-        # claude.md #85: an arr[Table] owns its rows outright (they have
-        # no refcount header of their own to share), so its cascade
-        # frees each one directly instead of releasing a reference.
-        if isinstance(elem_type, types_mod.TableType):
-            elem_release_fn = self._emit_table_row_release_fn(elem_type)
-        else:
-            elem_release_fn = self._release_fn_for(elem_type)
+        # claude.md #265: an arr[Table]'s cascade RELEASES each row now
+        # rather than freeing it outright -- rows carry the ordinary
+        # refcount header, so a row something else still holds survives
+        # its array. _release_fn_for dispatches TableType to the same
+        # per-table wrapper this used to name directly, so there is no
+        # longer a case to split here at all.
+        elem_release_fn = self._release_fn_for(elem_type)
         elem_llvm_ty = _llvm_type(elem_type)
         cyclic = self._is_cyclic_type(type_)
         body = [f"define void {fn_name}(ptr %payload) {{", "entry:"]
@@ -10058,6 +10005,27 @@ class CodeGen:
         self._table_row_release_fns[key] = fn_name
         cols = self.tables[table_type.name]
         body = [f"define void {fn_name}(ptr %row) {{", "entry:"]
+        # claude.md #265: a row is REFERENCE COUNTED now -- this is a
+        # release, not an unconditional free. Null-guarded first (a
+        # TableType local reads null until assigned, and `free` nulls its
+        # slot), then the standard festina_release_check: it decrements
+        # and answers non-zero only on the last reference, exactly as
+        # every other refcounted type's wrapper does. Everything below
+        # therefore runs at most once per row, which is what makes the
+        # column frees safe now that more than one binding can hold one.
+        null_label = self.label("relrow.null")
+        check_label = self.label("relrow.check")
+        free_label = self.label("relrow.free")
+        is_null = self.tmp()
+        body.append(f"  {is_null} = icmp eq ptr %row, null")
+        body.append(f"  br i1 {is_null}, label %{null_label}, label %{check_label}")
+        body.append(f"{check_label}:")
+        should_free = self.tmp()
+        body.append(f"  {should_free} = call i8 @festina_release_check(ptr %row)")
+        cond = self.tmp()
+        body.append(f"  {cond} = icmp ne i8 {should_free}, 0")
+        body.append(f"  br i1 {cond}, label %{free_label}, label %{null_label}")
+        body.append(f"{free_label}:")
         # claude.md #109: blob joins these -- a blob column is a real
         # handle now, so freeing it with plain @free would leak its path
         # and byte buffer and skip its refcount entirely.
@@ -10074,7 +10042,14 @@ class CodeGen:
             # not free() -- an img owns a Cairo surface and an aud owns
             # its decoded PCM, neither of which a plain free() releases.
             body.append(f"  call void {media_free.get(col_type, '@free')}(ptr {val})")
-        body.append("  call void @free(ptr %row)")
+        # claude.md #265: the allocation starts one i64 BEFORE the
+        # payload every field offset is measured from -- free the base,
+        # never the payload.
+        base = self.tmp()
+        body.append(f"  {base} = getelementptr i8, ptr %row, i64 -8")
+        body.append(f"  call void @free(ptr {base})")
+        body.append(f"  br label %{null_label}")
+        body.append(f"{null_label}:")
         body.append("  ret void")
         body.append("}")
         body.append("")
@@ -14286,7 +14261,16 @@ class CodeGen:
             fp = self.tmp()
             body.append(f"  {fp} = getelementptr {struct_ty}, ptr {payload}, i32 0, i32 {idx}")
             body.append(f"  store {f_llvm} {v}, ptr {fp}")
-        body.append("  call void @free(ptr %row)")
+        # claude.md #265: the row buffer starts one i64 before the
+        # payload pointer now (the refcount header every row carries).
+        # This path is the row's ONLY other freer -- a struct-query row
+        # is converted here exactly once, immediately after collection,
+        # and never enters the refcounted world at all (nothing can
+        # alias it before this runs), so it is freed outright rather
+        # than released.
+        row_base = self.tmp()
+        body.append(f"  {row_base} = getelementptr i8, ptr %row, i64 -8")
+        body.append(f"  call void @free(ptr {row_base})")
         body.append(f"  ret ptr {payload}")
         body.append("}")
         body.append("")

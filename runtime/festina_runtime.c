@@ -3634,9 +3634,21 @@ void festina_sqlite_collect_rows(sqlite3_stmt *stmt, int32_t col_count,
          * existing field offset is untouched. +1 more, only when
          * want_rowid, for the rowid slot right after THAT -- so a
          * struct-query row (want_rowid always false) allocates exactly
-         * what it always has. */
-        int64_t *row = malloc(((size_t)col_count + 1 + (want_rowid ? 1 : 0)) * sizeof(int64_t));
-        if (!row) festina_fail("out of memory in festina_sqlite_collect_rows");
+         * what it always has.
+         *
+         * claude.md #265: and one i64 IN FRONT, the standard refcount
+         * header every other refcounted value carries. `row` stays the
+         * PAYLOAD pointer, so every column write below, every field GEP
+         * codegen emits, and festina_row_undefined's own presence-mask
+         * read are all untouched -- exactly the property that made this
+         * possible at all (see #256's ascii header for the same
+         * reasoning). The count starts at 1: the result array owns the
+         * row, and anything else that wants to outlive the array takes
+         * its own reference. */
+        int64_t *raw = malloc((1 + (size_t)col_count + 1 + (want_rowid ? 1 : 0)) * sizeof(int64_t));
+        if (!raw) festina_fail("out of memory in festina_sqlite_collect_rows");
+        raw[0] = 1;
+        int64_t *row = raw + 1;
         uint64_t present = 0;
 
         for (int32_t c = 0; c < col_count; c++) {

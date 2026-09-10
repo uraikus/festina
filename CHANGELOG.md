@@ -100,30 +100,22 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
-- **Returning a table row no longer crashes.** A function that
-  returned a row read out of its own local query-result array released
-  that array on the way out, freeing the row it was handing back — a
-  use-after-free the caller then read. Such a function now keeps the
-  array alive instead, which leaks it (the same bounded row-array leak
-  [todo.md](todo.md) already describes) rather than corrupting memory.
-  Returning a row from an array the caller passed in, or from a global,
-  was always safe and is unchanged.
+- **A query row is reference counted, so every way of using one is now
+  safe.** A row used to be a bare borrow into the array that owned it,
+  so a row outliving its array was either a leak or a crash depending
+  on the shape: returning one read out of a function's own local array
+  was a use-after-free, and reading a column off a call-result array
+  (`rows()[0].name`) leaked the whole array. Rows now carry the same
+  refcount header every other managed type has, so binding, aliasing,
+  passing, returning, storing in an `arr`/`map`, and `free` all behave
+  exactly as they do for a struct. Rows still alias — `p.name = 'x'` is
+  visible through every binding of that row, unchanged.
 
 - **`.length` off a `blob`/`text`/`ascii` field no longer leaks the
   object it came from.** `make().someBlob.length`, and every shape like
   it — a struct field or a query-row column — kept the whole struct or
   row alive. Only the `arr[T]` case ever released it. Answers are
   unchanged everywhere; only what gets reclaimed afterwards changed.
-
-- **Reading a column off a query row taken straight from a call
-  result no longer leaks the array.** `rows()[0].name` — where
-  `rows()` returns a query result never bound to a name — kept the
-  whole array alive, because a row has no refcount header to retain
-  past its container. The column that escapes is now copied (or
-  retained) first and the array released after, so nothing is left
-  behind. Binding the ROW itself off such a call (`People p =
-  rows()[0]`, or passing/returning one) still keeps its array alive —
-  see [todo.md](todo.md) for what those shapes need.
 
 - **A `throw` out of a `.sort()` comparator no longer leaks the sort's
   scratch buffer.** The comparator is ordinary Festina code, so it can

@@ -8093,15 +8093,13 @@ class TestComputedIndexAndArgumentOwnership:
         assert result.returncode == 0
         assert result.stdout.strip() == str(sum(range(50)) + 10 + 50)
 
-    def test_a_table_row_element_stays_borrowed(self, compile_and_run, tmp_path):
-        # The one computed-index shape that does NOT mint: rows have no
-        # refcount header (the array owns them outright), so there is
-        # nothing to retain. claude.md #260: the array is no longer
-        # simply left alive for it either -- it is parked on the
-        # enclosing member chain and released once the column that
-        # escapes has been copied. The row stays borrowed either way,
-        # which is what this pins; leak-freedom is
-        # tests/stress/row_chain_churn.f's job.
+    def test_a_table_row_element_is_minted_like_any_other(self, compile_and_run, tmp_path):
+        # claude.md #265: a row carries the ordinary refcount header, so
+        # a computed-index row off an owning array is minted exactly
+        # like every other refcounted element -- retained, then the
+        # array released, netting the one reference this expression
+        # owns. Leak-freedom is tests/stress/row_ownership_churn.f's
+        # job; this pins that the value read back is real.
         db = tmp_path / "t.sqlite"
         source = f"""
         DatabaseURL = '{db}'
@@ -8150,14 +8148,14 @@ class TestComputedIndexAndArgumentOwnership:
 
     def test_returning_a_row_borrowed_from_a_local_array_does_not_crash(
             self, compile_and_run, tmp_path):
-        # claude.md #264: BOTH of these used to be a use-after-free that
-        # crashed (exit 245, confirmed under ASan as a
-        # heap-use-after-free): the function released its local array on
-        # the way out, freeing the very row it was handing back. The
-        # array is now left alive instead -- a bounded leak, the same
-        # one todo.md already carries for every other borrowed-row
-        # shape, and unambiguously better than corruption. What this
-        # pins is that the caller reads real data.
+        # BOTH of these used to be a use-after-free that crashed (exit
+        # 245, confirmed under ASan): the function released its local
+        # array on the way out, freeing the very row it was handing
+        # back. claude.md #264 contained that by leaking the array
+        # instead; #265 fixed it outright -- the returned row is
+        # retained on the way out, so the array's release just drops one
+        # of its two references and the caller owns the other. Nothing
+        # leaks and nothing dangles.
         db = tmp_path / "t.sqlite"
         source = f"""
         DatabaseURL = '{db}'
@@ -8181,12 +8179,12 @@ class TestComputedIndexAndArgumentOwnership:
 
     def test_returning_a_row_borrowed_from_a_parameter_or_global_is_unaffected(
             self, compile_and_run, tmp_path):
-        # claude.md #264's opt-out is keyed on the FUNCTION's return
-        # type, not on which array a row came from, so these two -- an
-        # array the caller owns, and one that lives until exit -- were
-        # always safe and stay exactly as they were. They are here so a
-        # future tightening of that rule cannot quietly start rejecting
-        # or mismanaging them.
+        # These two -- a row off an array the caller owns, and one off
+        # an array that lives until exit -- were safe even before
+        # claude.md #265 made every row shape safe, precisely because
+        # nothing released the array early. They stay here as the
+        # control: a row's own reference must not make the ARRAY's
+        # lifetime any shorter than it was.
         db = tmp_path / "t.sqlite"
         source = f"""
         DatabaseURL = '{db}'
@@ -8205,11 +8203,10 @@ class TestComputedIndexAndArgumentOwnership:
 
     def test_a_row_bound_to_a_name_still_borrows_from_its_array(
             self, compile_and_run, tmp_path):
-        # claude.md #260 deliberately changed nothing here: with the
-        # array bound to a name, the row is a plain borrow into storage
-        # the local still owns, released at scope exit as it always was.
-        # Parking only happens when there IS an enclosing member chain
-        # to drain it.
+        # The ordinary shape, and the one that has always worked: the
+        # array is bound to a name and reclaimed at scope exit, and the
+        # row read out of it holds its own reference until then
+        # (claude.md #265).
         db = tmp_path / "t.sqlite"
         source = f"""
         DatabaseURL = '{db}'

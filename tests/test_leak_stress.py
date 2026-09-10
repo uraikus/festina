@@ -215,11 +215,11 @@ sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'row'])
 int total = 0
 for int i = 0, i < 200, i++ {
     arr[People] rows = sqlite('SELECT * FROM People')
-    People first = rows[0]   // borrowed
+    People first = rows[0]   // its own reference (claude.md #265)
     total = total + first.id
     if rows[0].undefined('name') { log('unreachable') }
-    free first               // drops the binding only
-    free rows
+    free first               // drops this binding's reference
+    free rows                // drops the array's, and the row with it
 }
 log(total)
 """,
@@ -671,6 +671,19 @@ class TestLeakStress:
             # ASan, not LeakSanitizer alone. Verified to FAIL without
             # the fix.
             "row_chain_churn.f",
+            # claude.md #265: a table row carries the ordinary refcount
+            # header now, so it is an ordinary refcounted value
+            # everywhere -- bound, aliased, passed, returned, stored in
+            # a container, freed by hand, and outliving the array it
+            # came from. Every shape here was broken before that: two
+            # CRASHED (a row returned from a function that owned its
+            # array), one leaked its array on every access, and the rest
+            # only worked because the array was leaked rather than
+            # reclaimed. A double-free test as much as a leak test --
+            # one release too many frees a row the array is still going
+            # to release. Verified to FAIL without the change, with a
+            # heap-use-after-free.
+            "row_ownership_churn.f",
             # claude.md #262: `.length` off a member chain whose
             # receiver is NOT an array -- a blob/text/ascii field of a
             # call-result struct. Those three cases dropped the chain's

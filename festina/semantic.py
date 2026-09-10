@@ -4624,7 +4624,7 @@ def analyze(program, filename="<string>"):
         if isinstance(declared_type, types_mod.TableType) and decl.init is None:
             raise CompileError(
                 f"'{decl.name}' ({declared_type.name}) requires an initializer -- "
-                f"a table row is a borrowed handle onto one row of a query result, "
+                f"a table row is one row of a query result, "
                 f"never independently constructed (assign an existing row, e.g. "
                 f"`{declared_type.name} {decl.name} = rows[0]`); to build a value "
                 f"by hand, declare a struct with the same fields instead (see "

@@ -5086,3 +5086,54 @@ Only a FUNCTION-LOCAL array is released early enough to strand the row it hands 
 **Verified.** All ten shapes give the right answer and exit 0. Under ASan, the two former crashes now report a bounded leak and nothing else; the parameter and global cases stay completely clean, which is the check that says the gate did not overreach. Two pytest tests, one per direction. No stress-suite entry: this program leaks BY DESIGN now, and `scripts/leak_stress.sh` requires clean.
 
 **Full suite:** `python3 -m pytest tests -q`: **2407 passed, 14 skipped, 0 failed** in 549.75s (9:09); `scripts/leak_stress.sh`: all 32 programs clean.
+
+265. A TABLE ROW IS AN ORDINARY REFCOUNTED VALUE -- #85's PREMISE WAS TRUE ONCE AND STOPPED BEING TRUE
+
+The whole borrowed-row family -- #85's original "the array owns its rows outright", #119's minting exception, #224's six-round copy plan, #260's chain-parking, #264's containment of a use-after-free -- rested on one sentence: a row has no refcount header. Asked to take #224, the first thing that had to be checked was whether that is still a constraint or just an old decision nobody had re-opened.
+
+**It was an old decision.** Two findings changed the plan before any code was written.
+
+**First: rows ALIAS today, so #224's copy-on-bind plan was a visible semantic break, not just a memory fix.**
+
+```
+People p = rows[0]
+p.name = 'CHANGED'
+log(rows[0].name)   // CHANGED -- a row local is a genuine alias
+People q = p
+q.name = 'AGAIN'
+log(p.name)         // AGAIN
+```
+
+Copying on bind would have silently turned that into value semantics. #224 never said so, because #224 was reasoning about lifetimes, not about what a row IS to a program using one.
+
+**Second: the surface #85 assumed was too large is three functions.**
+
+| | |
+|---|---|
+| producers | **one** -- `festina_sqlite_collect_rows` |
+| freers | **two**, both generated -- `_emit_table_row_release_fn`, `_emit_row_to_struct_fn` |
+| field access | every offset measured from the payload pointer -- a header in FRONT changes nothing |
+| `festina_row_undefined` | payload-relative too -- unchanged |
+| thread clone | none exists: a table value cannot cross a thread boundary at all (#195) |
+
+That is the same closed world #256 gave `ascii` a header in, and nothing like `text`'s four provenances (#83), which is the case #85 was really generalizing from. So a row gets the standard i64 refcount header at `payload - 8`: `festina_retain`/`festina_release_check` work on one unchanged, every field GEP is untouched, and the count starts at 1 with the result array owning it.
+
+**Everything else fell out rather than being built.** `_is_refcounted` gained `TableType`; `_release_fn_for` dispatches it to the per-table wrapper that already existed (now a release rather than an unconditional free); the VarDecl binding and tracking branches gained it on exactly blob's terms. Then:
+
+- **#260's chain-parking: deleted.** A row element is minted like any other refcounted element now -- retain, release the container, net one reference.
+- **#264's containment: deleted**, along with `_can_own_table_rows` and the `_current_func_returns_row` flag. A returned row is retained on the way out; the local array's release drops one of its two references and the caller owns the other.
+- **`_release_fn_for_array`'s TableType special case: deleted.** `_release_fn_for` answers with the same function, so there is no case left to split.
+
+Net: the change ADDS a header and REMOVES three special cases, two of them written earlier the same night.
+
+**Every one of the ten row-escaping shapes #264 enumerated is now clean under ASan** -- including the two that were use-after-frees and the one that leaked its array on every access. Not contained: clean.
+
+**One real bug on the way, found by a test written years earlier for exactly this.** With the header in but the VarDecl branches not yet widened, `People first = rows[0]` did not retain, so `free first` dropped the ARRAY's reference and the array's own cascade then released a row already freed. The `table_rows` per-type isolation program reported it as a heap-use-after-free on the first run. That program exists to pin one type alone so a regression names the type in the test id, and that is precisely what it did -- the failure said `[table_rows]` and nothing else was red.
+
+**Verified.** `tests/stress/row_ownership_churn.f`: 500 iterations of every shape -- returned from a function that owned the array, returned through a local, bound off a call-result array, outliving its array by an explicit `free`, borrowed from a caller-owned array, aliased and mutated through the alias, passed as an argument both borrowed and fresh, stored into an `arr` and a `map` that outlive the query, and columns read straight off call-result rows. ASan-clean, and confirmed to FAIL without the change with a heap-use-after-free. It is a double-free test as much as a leak test: one release too many frees a row the array is still going to release. Aliasing re-checked byte-for-byte against the old build.
+
+**What is still true.** `text` still has no header and never will (#83's four provenances are real and unchanged). The `struct_query` path is untouched: a struct-query row is converted once, immediately after collection, before anything can alias it, so it is freed outright rather than released.
+
+**todo.md loses the whole bullet.** The Memory model section's remaining open item is the cycle-collector deferred-root buffer.
+
+**Full suite:** `python3 -m pytest tests -q`: **2408 passed, 14 skipped, 0 failed** in 541.28s (9:01); `scripts/leak_stress.sh`: all 33 programs clean.
