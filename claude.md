@@ -5189,3 +5189,17 @@ Asked for an optimization pass alongside the bug hunt. Three candidates, each me
 **The divide-by-zero guard is emitted even for a literal non-zero divisor** -- `icmp eq i64 1000000007, 0` and three basic blocks around it, in every `/` and `%`. LLVM folds it before it reaches the back end, so the runtime cost is zero; folding it in codegen would shrink emitted IR and shave compile time only. Recorded, not done: it optimizes the compiler's output size rather than the compiled program.
 
 A measurement that says "leave it alone" is worth the same as one that says "change it", provided it was actually taken.
+
+269. WINDOWS CI HAD NO `git`, SO THE NEW `festina update` TESTS COULD NOT RUN
+
+The first CI round after `festina update` landed (claude.md #249) came back green on linux and macos and red on windows, with five failures -- every `TestUpdate` case that shells out to real `git`, and only those. The one case that never calls git, `test_refuses_a_non_git_installation`, passed.
+
+The failure was `FileNotFoundError: [WinError 2]` sixty frames deep inside `subprocess`, which says nothing about what was missing. What was missing was `git` itself: the windows job runs pytest inside MSYS2's UCRT64 environment, and `msys2/setup-msys2@v2`'s default `path-type: minimal` deliberately keeps the native Windows PATH out of that shell. The runner *does* have Git for Windows -- `actions/checkout` shells out to `C:\Program Files\Git\bin\git.exe` in the same job's log -- but that path is invisible from inside MSYS2, and MSYS2 ships no `git` of its own unless asked.
+
+**The fix is one word in the pacman list.** `git` joins clang/python/sqlite3/pkgconf/libsystre/mpg123/cairo/libjpeg-turbo, for the reason the job's own comment already gives for all of them: exactly one PATH to reason about, rather than a native Windows tool reached across the environment boundary.
+
+**Deliberately not a skip.** The conftest mechanism macOS Phase 0 built (`compile_file_or_skip`, `_require_c_compiler`, the Xvfb and wasm gates) turns *absent optional tooling* into a clean skip, and `FESTINA_STRICT_DEPS=1` forbids those on linux so coverage cannot quietly shrink. `git` is not that kind of dependency: these tests exist to drive real git subprocesses, and a checkout with no git is a broken environment, not a tier a platform lacks. Skipping them would have turned the job green while deleting exactly the coverage the job exists to provide. `_run_git` now fails fast with a one-line reason instead -- the same red, legible in one line rather than sixty.
+
+**One portability seam closed while here.** `_make_origin_and_clone` passed the clone's source and destination as absolute paths, which on that runner means native `C:\...` strings handed to an msys2-runtime `git` build with POSIX path semantics. Both are now names relative to the cwd the helper already sets; everything else in these tests reaches its repo through `-C` or `cwd`, which the runtime converts.
+
+**Verified by reproducing it first**: running `TestUpdate` with `git` removed from PATH reproduces the exact CI shape -- the same five failures, the same one pass -- and the full `tests/test_cli.py` passes with git present.

@@ -609,6 +609,17 @@ class TestMainDispatch:
 
 def _run_git(*args, cwd):
     import subprocess
+    # claude.md #269: without this, a missing `git` surfaces as a raw
+    # FileNotFoundError sixty frames deep inside subprocess internals --
+    # which is exactly how it surfaced on the Windows CI job, where
+    # setup-msys2's minimal path-type keeps the runner's own
+    # C:\Program Files\Git\bin out of the shell. Deliberately a failure
+    # and not a skip: these tests drive real git, and a checkout without
+    # git is a broken environment, not an optional tier the way a
+    # missing C compiler or Xvfb is (see tests/conftest.py).
+    if shutil.which("git") is None:
+        pytest.fail("git is not on PATH -- TestUpdate drives real `git` "
+                    "subprocesses and cannot run without it")
     result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
     assert result.returncode == 0, f"git {' '.join(args)} failed: {result.stderr}"
     return result.stdout
@@ -633,7 +644,13 @@ def _make_origin_and_clone(tmp_path):
     _run_git("commit", "-q", "-m", "initial", cwd=origin)
 
     clone = tmp_path / "clone"
-    _run_git("clone", "-q", str(origin), str(clone), cwd=tmp_path)
+    # Both names relative to tmp_path (which is already the cwd), rather
+    # than absolute: the Windows CI job runs pytest under MSYS2's UCRT64
+    # environment, whose `git` is an msys2-runtime build with POSIX path
+    # semantics, so handing it native `C:\...` strings to parse is a
+    # portability seam worth simply not having. Everything else here
+    # takes its path from -C/cwd, which the runtime converts.
+    _run_git("clone", "-q", "origin", "clone", cwd=tmp_path)
     _run_git("config", "user.email", "test@example.com", cwd=clone)
     _run_git("config", "user.name", "Test", cwd=clone)
     return origin, clone
