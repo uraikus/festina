@@ -78,7 +78,7 @@
         library), not as a marketing claim.
       </p>
       <p class="lede">
-        These same five programs are also benchmarked cross-compiled
+        These same programs are also benchmarked cross-compiled
         to <code>wasm32-wasi</code> (against C and Go, also compiled
         to wasm) — see <a href="wasm.html#benchmarks">wasm.md</a>.
       </p>
@@ -86,10 +86,10 @@
       <section class="doc-section" id="methodology">
         <h2>Methodology <a class="anchor" href="#methodology">#</a></h2>
         <p>
-          Five programs, each implemented equivalently in Festina,
+          Six programs, each implemented equivalently in Festina,
           Rust, Go, and Bun (source in
           <a href="https://github.com/uraikus/festina/tree/main/benchmarks">benchmarks/</a>),
-          plus a sixth comparing Festina's canvas against a browser's
+          plus one comparing Festina's canvas against a browser's
           and MonoGame's — see <a href="#canvas">Canvas</a> at the
           end:
         </p>
@@ -99,7 +99,8 @@
             <tr><td>fib</td><td>Recursive function-call overhead and raw compute throughput — naive recursive <code>fib(32)</code> (no memoization), ~7 million calls. Deliberately not reducible to a closed form by an optimizer (unlike a linear sum), so this actually measures generated-code quality, not the compiler's algebra.</td></tr>
             <tr><td>loop_sum</td><td>Tight-loop / branch-free arithmetic throughput — a 100,000,000-iteration polynomial-hash accumulation (<code>total = (total * 1000003 + i) % 1000000007</code>), each iteration depending on the last so it can't be folded into a closed-form constant either — a plain running-sum version of this loop optimizes away entirely, running in ~2ms regardless of iteration count.</td></tr>
             <tr><td>array_sum</td><td>Allocation-heavy throughput — 2,000,000 iterations, each building a fresh 8-element <code>arr[int]</code> literal (never escaping, so Festina reclaims it at that iteration's own scope-exit — see <a href="todo.html#memory-model">todo.md</a>) and summing its elements into a running total. Directly exercises automatic memory management: every iteration is a genuine allocate-fill-read cycle, not just arithmetic. Each element's value depends on the <em>previous</em> iteration's own running total, the same closed-form-resistance trick <code>loop_sum</code> already uses. The hot loop lives inside a <code>void func run(...)</code>, not bare top-level code — escape analysis only ever analyzes a function/handler's own body, never the top-level statement sequence.</td></tr>
-            <tr><td>string_concat</td><td>String-heavy throughput — 15,000 iterations of repeated concatenation (<code>`${s}x`</code>/<code>s = s + "x"</code>), <code>s</code> growing by one character each time. Written as the textbook O(n²) naive-concatenation pattern; Festina now compiles that exact shape as an in-place append onto <code>s</code>'s own buffer (amortized O(1) each), so its row now measures that path rather than a quadratic copy.</td></tr>
+            <tr><td>string_concat</td><td>String-heavy throughput — 15,000 iterations of repeated concatenation (<code>`${s}x`</code>/<code>s = s + "x"</code>), <code>s</code> growing by one character each time. Written as the textbook O(n²) naive-concatenation pattern; Festina compiles that exact shape as an in-place append onto <code>s</code>'s own buffer (amortized O(1) each), so its row measures that path rather than a quadratic copy.</td></tr>
+            <tr><td id="char_scan">char_scan</td><td>Character-by-character scan throughput — walk a ~1.7 MB buffer counting identifier runs, indexing one character at a time. The Festina version uses <code>ascii</code> rather than <code>text</code>, since a byte-indexed scan is exactly the workload <code>ascii</code> exists for (see <a href="api.html#ascii">api.md</a>); Go and Rust deliberately index raw <code>[]byte</code>/<code>as_bytes()</code> rather than ranging a string or using <code>char_indices</code>, both of which would measure UTF-8 decoding instead of scanning.</td></tr>
           </table>
         </div>
         <p class="muted">
@@ -150,16 +151,16 @@
 
       <section class="doc-section" id="results">
         <h2>Results <a class="anchor" href="#results">#</a></h2>
-        <p class="muted">Last run: 2026-09-03 on this machine — absolute numbers vary by hardware, relative ordering is the point.</p>
+        <p class="muted">Last run: 2026-09-10 on this machine — absolute numbers vary by hardware, relative ordering is the point.</p>
 
         <div class="table-wrap">
           <table>
             <thead><tr><th>hello</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
             <tbody>
-              <tr class="row-festina"><td>Festina</td><td class="num">1.6 ms</td><td class="num">80.0 ms</td><td class="num">1.49 MB</td></tr>
-              <tr><td>Rust</td><td class="num">1.9 ms</td><td class="num">97.8 ms</td><td class="num">3.77 MB</td></tr>
-              <tr><td>Go</td><td class="num">1.3 ms</td><td class="num">189.2 ms</td><td class="num">2.11 MB</td></tr>
-              <tr><td>Bun</td><td class="num">12.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+              <tr class="row-festina"><td>Festina</td><td class="num">1.5 ms</td><td class="num">93.7 ms</td><td class="num">1.49 MB</td></tr>
+              <tr><td>Rust</td><td class="num">1.7 ms</td><td class="num">110.2 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">1.7 ms</td><td class="num">224.0 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">12.6 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
             </tbody>
           </table>
         </div>
@@ -167,10 +168,10 @@
           <table>
             <thead><tr><th>fib(32)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
             <tbody>
-              <tr class="row-festina"><td>Festina</td><td class="num">8.0 ms</td><td class="num">84.5 ms</td><td class="num">1.49 MB</td></tr>
-              <tr><td>Rust</td><td class="num">8.5 ms</td><td class="num">107.8 ms</td><td class="num">3.77 MB</td></tr>
-              <tr><td>Go</td><td class="num">14.7 ms</td><td class="num">190.3 ms</td><td class="num">2.11 MB</td></tr>
-              <tr><td>Bun</td><td class="num">31.5 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+              <tr class="row-festina"><td>Festina</td><td class="num">9.1 ms</td><td class="num">99.7 ms</td><td class="num">1.49 MB</td></tr>
+              <tr><td>Rust</td><td class="num">9.9 ms</td><td class="num">118.7 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">14.5 ms</td><td class="num">215.4 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">35.7 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
             </tbody>
           </table>
         </div>
@@ -178,10 +179,10 @@
           <table>
             <thead><tr><th>loop_sum (100M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
             <tbody>
-              <tr class="row-festina"><td>Festina</td><td class="num">524.2 ms</td><td class="num">86.0 ms</td><td class="num">1.49 MB</td></tr>
-              <tr><td>Rust</td><td class="num">530.9 ms</td><td class="num">101.9 ms</td><td class="num">3.77 MB</td></tr>
-              <tr><td>Go</td><td class="num">464.6 ms</td><td class="num">189.1 ms</td><td class="num">2.11 MB</td></tr>
-              <tr><td>Bun</td><td class="num">9109.4 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+              <tr class="row-festina"><td>Festina</td><td class="num">526.6 ms</td><td class="num">105.5 ms</td><td class="num">1.49 MB</td></tr>
+              <tr><td>Rust</td><td class="num">501.3 ms</td><td class="num">125.5 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">460.8 ms</td><td class="num">214.9 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">9213.8 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
             </tbody>
           </table>
         </div>
@@ -189,10 +190,10 @@
           <table>
             <thead><tr><th>array_sum (2M)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
             <tbody>
-              <tr class="row-festina"><td>Festina</td><td class="num">93.7 ms</td><td class="num">108.7 ms</td><td class="num">1.49 MB</td></tr>
-              <tr><td>Rust</td><td class="num">90.9 ms</td><td class="num">203.2 ms</td><td class="num">3.77 MB</td></tr>
-              <tr><td>Go</td><td class="num">89.6 ms</td><td class="num">182.7 ms</td><td class="num">2.11 MB</td></tr>
-              <tr><td>Bun</td><td class="num">2456.0 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+              <tr class="row-festina"><td>Festina</td><td class="num">86.4 ms</td><td class="num">122.4 ms</td><td class="num">1.49 MB</td></tr>
+              <tr><td>Rust</td><td class="num">86.6 ms</td><td class="num">159.6 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">88.0 ms</td><td class="num">214.0 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">2674.1 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
             </tbody>
           </table>
         </div>
@@ -200,10 +201,21 @@
           <table>
             <thead><tr><th>string_concat (15K)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
             <tbody>
-              <tr class="row-festina"><td>Festina</td><td class="num">1.9 ms</td><td class="num">84.5 ms</td><td class="num">1.49 MB</td></tr>
-              <tr><td>Rust</td><td class="num">1.7 ms</td><td class="num">123.8 ms</td><td class="num">3.77 MB</td></tr>
-              <tr><td>Go</td><td class="num">38.9 ms</td><td class="num">181.5 ms</td><td class="num">2.11 MB</td></tr>
+              <tr class="row-festina"><td>Festina</td><td class="num">1.7 ms</td><td class="num">109.8 ms</td><td class="num">1.50 MB</td></tr>
+              <tr><td>Rust</td><td class="num">1.7 ms</td><td class="num">144.0 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">32.3 ms</td><td class="num">198.4 ms</td><td class="num">2.11 MB</td></tr>
               <tr><td>Bun</td><td class="num">14.2 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>char_scan (1.7MB)</th><th class="num">Run time</th><th class="num">Build time</th><th class="num">Binary size</th></tr></thead>
+            <tbody>
+              <tr class="row-festina"><td>Festina</td><td class="num">13.6 ms</td><td class="num">166.9 ms</td><td class="num">1.50 MB</td></tr>
+              <tr><td>Rust</td><td class="num">16.3 ms</td><td class="num">184.8 ms</td><td class="num">3.77 MB</td></tr>
+              <tr><td>Go</td><td class="num">14.8 ms</td><td class="num">182.0 ms</td><td class="num">2.11 MB</td></tr>
+              <tr><td>Bun</td><td class="num">40.6 ms</td><td class="num">n/a</td><td class="num">n/a</td></tr>
             </tbody>
           </table>
         </div>
@@ -215,10 +227,11 @@
           <li><strong><code>hello</code></strong> is dominated by process startup, not language performance — a graphics/audio-free Festina binary (see <a href="security.html#slim-binaries">security.md</a>) dynamically links only libc/libm (plus libz, a transitive dependency of the statically-linked sqlite3), the same ballpark as Go's or Rust's own small dynamic dependency lists here; a graphics- or audio-using Festina program would show up slower purely from the extra shared libraries the dynamic linker has to resolve at startup (<code>libcairo</code>/<code>libX11</code>/<code>libasound</code> and their own transitive dependencies).</li>
           <li><strong><code>fib</code></strong> and <strong><code>loop_sum</code></strong> are closer to an apples-to-apples compiled-code comparison — Rust and Go both compile through mature, years-optimized backends (LLVM and Go's own <code>gc</code>, respectively); Festina also compiles through LLVM (see <a href="api.html#compilation-pipeline">api.md</a>) but is a much younger frontend with far less codegen-level tuning, so a gap here reflects the compiler's maturity, not a ceiling in the language design. Bun's JIT has to warm up during the run itself, which a single-shot benchmark like this doesn't isolate from the actual computation — a longer-running workload would tell a different story for Bun specifically.</li>
           <li><strong><code>array_sum</code></strong> lands close to Rust/Go rather than behind them: the per-iteration <code>arr[int]</code> literal provably never escapes its own iteration, so Festina stack-allocates its header the same way a non-escaping struct local does, leaving only the growable data buffer's own <code>malloc</code> (a truly general growable buffer isn't safe to give a fixed-size <code>alloca</code>). The remaining, small gap is ordinary codegen-maturity noise, not an allocation-strategy gap.</li>
-          <li><strong><code>string_concat</code></strong> is where Festina's <code>text</code> ownership model shows up directly. A text binding's buffer is exclusively its own, so <code>s = `${s}x`</code> is an assignment that is about to free the very buffer it is copying from — and Festina's compiler now treats it as what it is: an append onto <code>s</code>'s own buffer, grown in place with a length the compiler tracks, amortized O(1) per step instead of a fresh copy of the whole string. That is the same idea Rust's <code>String</code> <code>+</code> uses (reusing the left operand's spare capacity, like <code>Vec</code>), which is why the two now land together; before this change Festina did the full O(n²) copy and sat about 2.4x behind Rust. Go's <code>+</code> on immutable strings has no spare capacity to grow into, which is why it does the quadratic copy; Bun's V8 backend uses rope/cons-string representations internally, deferring the copy until the string is actually read, which is why it avoids the blowup despite naive-looking source. None of this is a bug in any of the four — it's exactly the kind of language/runtime difference this benchmark exists to surface.</li>
+          <li><strong><code>string_concat</code></strong> is where Festina's <code>text</code> ownership model shows up directly. A text binding's buffer is exclusively its own, so <code>s = `${s}x`</code> is an assignment that is about to free the very buffer it is copying from — and the compiler treats it as what it is: an append onto <code>s</code>'s own buffer, grown in place with a length the compiler tracks, amortized O(1) per step instead of a fresh copy of the whole string. That is the same idea Rust's <code>String</code> <code>+</code> uses (reusing the left operand's spare capacity, like <code>Vec</code>), which is why the two land together. Go's <code>+</code> on immutable strings has no spare capacity to grow into, which is why it does the quadratic copy; Bun's V8 backend uses rope/cons-string representations internally, deferring the copy until the string is actually read, which is why it avoids the blowup despite naive-looking source. None of this is a bug in any of the four — it's exactly the kind of language/runtime difference this benchmark exists to surface.</li>
+          <li><strong><code>char_scan</code></strong> is the workload <code>ascii</code> exists for: walk a ~1.7MB buffer character by character, counting identifier runs. On a <code>text</code> this is quadratic — UTF-8 is variable-width, so <code>s[i]</code> walks from byte zero on every index — which is why the Festina version uses <code>ascii</code>, where one byte per character puts the length in the value's own header and makes <code>.length</code>/<code>s[i]</code>/<code>charCodeAt(i)</code> O(1). <code>charCodeAt(i)</code> is emitted inline — a null check, a header load, a bounds check and a byte load, right where the expression is used — so the scan loop makes no call per character, which is what puts it level with Rust and Go rather than behind them. The Go and Rust implementations deliberately index <code>[]byte</code>/<code>as_bytes()</code> rather than ranging a string or using <code>char_indices</code>, both of which decode UTF-8 and would measure decoding instead of scanning.</li>
           <li><strong>The canvas comparison</strong> (below) is the one benchmark here that isn't against another <em>language</em>. It's against the thing a 2D game would otherwise most likely be written on: an HTML <code>&lt;canvas&gt;</code>. Circles dominate frame cost, because Cairo tessellates every arc afresh — Festina caches one alpha mask per radius and stamps it thereafter (the same trick a glyph cache uses), which is most of why the frame stays fast. Festina also wins startup by more than an order of magnitude and wins on variance, which for a frame budget is not a footnote.</li>
           <li><strong>MonoGame</strong> joins the canvas comparison as a third side, and its number is the one on this page most likely to be quoted out of context. It is a GPU framework running here with no GPU, on Mesa's software rasterizer; on real hardware it would batch these 40,000 sprites into a couple of draw calls and beat everything else on this page by orders of magnitude. The row is worth having because headless rendering with no GPU is a real situation — CI, a build server, a container — and it is worth reading only with that sentence attached.</li>
-          <li>These five are intentionally small, fast benchmarks so they can be re-run on every change worth checking, not a comprehensive suite (no concurrency, no realistic mixed workload). I/O has its own section below — see <a href="#http-benchmark">HTTP</a>.</li>
+          <li>These six are intentionally small, fast benchmarks so they can be re-run on every change worth checking, not a comprehensive suite (no concurrency, no realistic mixed workload). I/O has its own section below — see <a href="#http-benchmark">HTTP</a>.</li>
         </ul>
       </section>
 
@@ -282,9 +295,8 @@
           and scan-converts a general polygon every single time.
           Rasterizing each radius once into an alpha mask and stamping
           it thereafter — what a glyph cache does — took circles to
-          20 ms and the frame from 90 ms to 31 ms (see
-          <a href="https://github.com/uraikus/festina/blob/main/claude.md">claude.md #104</a>),
-          leaving 11 ms of rectangles and 20 ms of circles.
+          20 ms and the frame from 90 ms to 31 ms, leaving 11 ms of
+          rectangles and 20 ms of circles.
         </p>
         <p class="muted">
           The second change noticed that neither of those needs a
@@ -350,7 +362,7 @@
         </p>
         <p>
           <strong>Equivalent logic, not equivalent idiom, the same
-          rule the five programs above already follow.</strong>
+          rule the six programs above already follow.</strong>
           Festina's HTTP server (<code>festina_runtime_http.c</code>)
           is deliberately single-threaded (one connection serviced at
           a time). Rust's and Go's servers here are hand-rolled
