@@ -100,6 +100,16 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **Reading a column off a query row taken straight from a call
+  result no longer leaks the array.** `rows()[0].name` — where
+  `rows()` returns a query result never bound to a name — kept the
+  whole array alive, because a row has no refcount header to retain
+  past its container. The column that escapes is now copied (or
+  retained) first and the array released after, so nothing is left
+  behind. Binding the ROW itself off such a call (`People p =
+  rows()[0]`, or passing/returning one) still keeps its array alive —
+  see [todo.md](todo.md) for what those shapes need.
+
 - **A `throw` out of a `.sort()` comparator no longer leaks the sort's
   scratch buffer.** The comparator is ordinary Festina code, so it can
   throw, and the throw jumps straight past the runtime's own sorting

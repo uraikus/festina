@@ -4966,3 +4966,38 @@ Everything below the first two rows is dispatched from an EVENT-LOOP frame, and 
 **todo.md's Memory model section loses this bullet entirely.** What is left open there is now the `rows()[0]` array leak and the cycle-collector deferred-root buffer.
 
 **Full suite:** `python3 -m pytest tests -q`: **2400 passed, 14 skipped, 0 failed** in 539.22s (8:59); `scripts/leak_stress.sh`: all 30 programs clean. The first run of the suite failed one test -- `test_graceful_shutdown.py::test_an_in_flight_connection_still_completes_before_exit`, a SIGTERM race with a 0.2s sleep in it and nothing to do with sorting -- and it reproduced once in isolation, which is why it was checked properly rather than waved off: the same test passes on a stash of these changes, passes six times in a row with them, and passes in the clean full run above. A flake, confirmed as one rather than assumed to be.
+
+260. `rows()[0]`'S ARRAY LEAK IS CLOSED -- AND THE FIX IS SMALLER THAN #224 SCOPED IT AS
+
+The project's own longest-standing documented leak, deliberate since #85, re-documented by #119, and scoped by #224 as a `TableType`-ownership project "comparable in size to claude.md #11-16" -- six rounds of copy-on-alias plumbing for a second header-less type. It turned out not to need any of that.
+
+**#224's plan was right about the blocker and wrong about the only way past it.** A row has no refcount header (the array owns it outright), so `_mint_and_release_computed` cannot do for `rows()[0]` what it does for every other element type: retain, then release the container. #224 concluded the answer was to COPY the whole row -- which then needs scope-exit ownership for `TableType` locals to free the copy, which is the six-round project. And #224 explicitly checked and rejected copy-at-the-extraction-site alone, correctly: without that scope-exit half it turns an array leak into a per-access row leak, which is worse.
+
+**The third option neither of those considered: don't mint the row at all -- park the ARRAY on the enclosing member chain.** `_release_member_chain` (#108/#117) already exists to answer exactly this question one link further out, where the type of the value that actually escapes is finally known. `rows()[0].name` copies the name FIRST (`festina_text_own`) and releases the array after; `rows()[0].someBlob` retains the blob first and nets +1 the same way; `rows()[0].id` needs neither, because an i64 owes the row nothing. The row itself is never minted, never copied, and stays exactly as borrowed as it has always been. Four lines in `_mint_and_release_computed`, no runtime change, no new per-table function, and no `TableType` ownership model.
+
+**Parked only when there is a chain to drain it,** decided by the same AST node IDENTITY test `_begin_member_chain` already uses: `self._chain_receiver is expr` means the frame above set this very node as the receiver it is about to emit, so whatever is parked is what that frame will drain. Parking unconditionally would be worse than the leak -- the entry would either sit on a list nobody drains, or be released by a frame that never owned it, which is a use-after-free rather than a leak. So `People p = rows()[0]` (bound straight to a row local), a row passed as an argument, or a row returned all still leak their array exactly as documented, and #224's scoping stays the accurate description of what a full fix for THOSE shapes would take.
+
+**Measured, before and after:**
+
+| | before | after |
+|---|---|---|
+| 200x `text got = rows()[0].name` | 24,800 bytes, 800 allocations | **clean** |
+| 200x `People p = boundArray[0]` (control) | clean | clean |
+
+**Verified.** `tests/stress/row_chain_churn.f` -- 500 iterations of every position the shape appears in (a plain binding, a scalar column, a discarded result, an interpolation, a comparison, a call argument) plus the already-fine name-bound control, ASan-clean and confirmed to FAIL without the fix. Three pytest tests, including one that reads several columns off several such arrays and prints them all afterwards, so a use-after-free would show up as wrong OUTPUT and not only as a sanitizer report.
+
+**A separate, pre-existing bug found on the way, NOT fixed here, and worth the care it did not get.** `X().someBlob.length` leaks: the `.length` branch drains its parked chain only for an ARRAY receiver, and drops it for blob/text/ascii ones. Measured on the UNMODIFIED compiler at 201 allocations over 200 iterations, so it has nothing to do with this entry. It is not a one-line fix, because the drop is currently masking an over-release: `_is_owning_refcounted_source(X().someBlob)` answers True (a chain whose base is a Call) while the inner `_emit_member_load` link never actually minted anything, so `_release_owned_receiver` releases a blob it does not own -- and gets away with it only because the leaked struct's cascade never runs to release it a second time. Draining the parked entry without also fixing that predicate mismatch converts a leak into a DOUBLE FREE. Recorded in todo.md with that trap spelled out, rather than patched at the end of a session.
+
+**Two canaries retired by this, both replaced deliberately.** `test_the_harness_can_actually_fail` was leaning on this exact leak -- the third canary in a row the compiler has fixed out from under it (the chained call result by #108/#117, the reference cycle by #120, this one now). Three is enough of a pattern to stop drawing canaries from the "known bug, not yet fixed" pile: the new one is a `text?` never freed, a leak by CONTRACT (#202/#257) that no future round can quietly fix, so if it ever stops leaking the loud failure is correct rather than a fourth retirement.
+
+**Full suite:** `python3 -m pytest tests -q`: **2403 passed, 14 skipped, 0 failed**; `scripts/leak_stress.sh`: all 31 programs clean.
+
+261. A FLAKY TEST, MEASURED RATHER THAN RERUN UNTIL GREEN
+
+`test_graceful_shutdown.py::test_an_in_flight_connection_still_completes_before_exit` failed twice in four full-suite runs while #259/#260 were being verified, and passed six times in a row in isolation. The tempting read is "flake, rerun it". The actual cause is a real race in the test, and it took one measurement to find.
+
+The test connected to the server, signalled SIGTERM, then sent the request. But a completed `connect()` only means the KERNEL finished the TCP handshake and queued the connection in the listen backlog -- not that the server process has `accept()`ed it. Signal first and the shutdown path closes the listener with that connection still unaccepted, so the client gets an RST instead of a response. Under load the server is less likely to be scheduled in time, which is exactly why it only failed inside a full suite run.
+
+**Quantified rather than argued.** The same scenario, 20 runs each, under deliberate CPU load (one spinning process per core): the old shape failed 2 of 20, the new one 0 of 20.
+
+**The fix makes the test stricter, not looser.** It now sends a PARTIAL request before the signal and completes it after, so the connection is genuinely mid-request when shutdown is triggered -- which is the state the grace period actually exists for, and a stronger property than "a socket sitting in a backlog gets served". It also removes the race by construction: the server has readable data waiting, so its poll() wakes and accepts immediately, and the sleep that follows gives that accept room before the signal lands. Recorded because "rerun until green" would have left a real 10%-under-load race in the suite and taught nothing.

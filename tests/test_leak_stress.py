@@ -340,29 +340,31 @@ class TestLeakStress:
         file.ll` silently produces an UNinstrumented object, so a harness
         built the obvious way passes everything and proves nothing.
 
-        The canary leaks on purpose and the harness must say so. It is
-        the row-array residual claude.md #119 documents as deliberate: a
-        table-row element off a call-result array (`rows()[0]`) cannot
-        retain its row past the array (rows have no header of their
-        own), so the array is knowingly leaked -- see todo.md. Two
+        The canary leaks on purpose and the harness must say so. THREE
         previous canaries were retired because the compiler fixed them
-        (the chained call result by claude.md #108/#117, the reference
-        cycle by claude.md #120), which is exactly the failure mode a
-        canary is supposed to have: it stops leaking, this test fails
-        loudly, and nobody discovers months later that the harness had
-        been vacuous.
+        -- the chained call result by claude.md #108/#117, the reference
+        cycle by #120, and the row-array residual (`rows()[0].name`,
+        deliberate since #85/#119) by #260 -- which is exactly the
+        failure mode a canary is supposed to have: it stops leaking,
+        this test fails loudly, and nobody discovers months later that
+        the harness had been vacuous.
+
+        Three retirements is enough of a pattern to stop picking
+        canaries from the "known bug, not yet fixed" pile. This one is a
+        `text?` built in a loop and never freed: a leak by CONTRACT
+        rather than by omission (claude.md #202/#257 -- `?` means the
+        compiler manages nothing, and `free` is the only release), so a
+        future round cannot quietly fix it out from under this test. If
+        THIS ever stops leaking, `?` itself is broken and the loud
+        failure is the correct outcome rather than a retirement.
         """
         canary = tmp_path / "canary.f"
         canary.write_text(
-            "table People { id:int name:text }\n"
-            "sqlite('DELETE FROM People')\n"
-            "sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'row'])\n"
-            "arr[People] func rows() {\n"
-            "    arr[People] r = sqlite('SELECT * FROM People')\n"
-            "    return r\n"
-            "}\n"
             "int i = 0\n"
-            "while i < 200 { text got = rows()[0].name i = i + 1 }\n"
+            "while i < 200 {\n"
+            "    text? held = `leaked ${i}`\n"
+            "    i = i + 1\n"
+            "}\n"
             "log('done')\n"
         )
         result = _run_harness(str(canary))
@@ -655,6 +657,20 @@ class TestLeakStress:
             # rather than merely leak. Verified to FAIL without the fix
             # (4,000 stranded scratch buffers).
             "callback_throw_churn.f",
+            # claude.md #260: a table-row column read off a CALL-RESULT
+            # array (`rows()[0].name`) -- the project's own
+            # longest-standing documented leak (#85/#119/#224), closed
+            # by parking the array on the enclosing member chain. Every
+            # position that shape appears in: a plain binding, a scalar
+            # column, a discarded result, an interpolation, a
+            # comparison, a call argument, plus the already-fine
+            # name-bound control. A text column must be COPIED and a
+            # blob column RETAINED before the array (and the row inside
+            # it) dies, so getting this wrong is a use-after-free or a
+            # double free, not a leak -- which is why it runs under
+            # ASan, not LeakSanitizer alone. Verified to FAIL without
+            # the fix.
+            "row_chain_churn.f",
             # claude.md #245: pool.postMessage(x) with no index --
             # main plus 3 feeder threads all auto-selecting against the
             # SAME handles array and round-robin counter at once, 12,000

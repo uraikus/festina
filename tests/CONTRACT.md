@@ -2816,8 +2816,9 @@ writes, map sets, delete, festina_map_delete's C-side entry removal)
 — a stale edge would let markGray double-remove a count and free a
 value still held. The struct_self leak program closes into a real
 cycle and runs leak-free every test run; the harness canary, formerly
-a cycle, is now the #119 row-array residual — the one deliberate leak
-left. Verified under ASan: self/pair/array-routed/map-routed cycles
+a cycle, is now (since #260 closed the #119 row-array residual too) a
+`text?` never freed — a leak by contract rather than by omission, so no
+future round can quietly fix it out from under the canary. Verified under ASan: self/pair/array-routed/map-routed cycles
 reclaimed, held cycles intact; ~34ms for 20k dropped 21-node cycles.
 `tests/test_codegen.py::TestCycleCollection` (6 tests).
 
@@ -2834,8 +2835,11 @@ element TYPE (a struct element retains; a table row cannot — the array
 owns its rows), the emission records what it minted (_minted_values)
 and the predicates read that back instead of walking syntax — the
 predicate/emission agreement #117 demanded, made structural. The row
-case stays borrowed and its array-leak residual is renamed in todo.md
-to its true size; the row's columns verified intact under ASan.
+case stays borrowed; claude.md #260 later closed its array-leak
+residual for the shape with an enclosing member chain to drain it
+(`rows()[0].name`), by parking the array on that chain instead of
+minting the row — leaving only the shapes where the ROW itself escapes.
+The row's columns verified intact under ASan.
 `tests/test_codegen.py::TestComputedIndexAndArgumentOwnership` (5 tests).
 
 **claude.md #118**: refcount headers for img/aud/regex; regex() memoized.
@@ -3225,7 +3229,7 @@ call site's owning argument temporaries are registered on the
 runtime's cleanup stack, and `festina_throw` releases everything above
 the catching frame. Leak-freedom is measured by
 `tests/stress/throw_unwind_churn.f` under ASan (`scripts/leak_stress.sh`,
-30 programs now) and Valgrind -- every kind of local through three
+31 programs now) and Valgrind -- every kind of local through three
 frames, a rethrow, a JSON failure two frames down, 400 balanced
 non-throwing calls; behaviour and IR shape by `tests/test_try_catch.py::
 TestThrowUnwindsIntermediateFrames` (8 tests, including that a program
@@ -3249,6 +3253,22 @@ still readable and re-sorts correctly, and a nested sort still gives
 the right answer. Timers and event handlers are not affected: they fire
 from the event loop, where no `try` is live, so a throw there ends the
 program as an uncaught one always did.
+
+**claude.md #260** (`rows()[0].name` no longer leaks its array): a
+table-row element cannot be minted the way every other element type is
+-- a row has no refcount header -- so the array is PARKED on the
+enclosing member chain instead, and `_release_member_chain` releases it
+once the escaping column has been copied (text) or retained (blob).
+Only when there is such a chain, decided by the same AST-node identity
+test `_begin_member_chain` uses; a row bound straight to a local, passed
+or returned still keeps its array alive (todo.md). Measured by
+`tests/stress/row_chain_churn.f` under ASan: clean with the fix, failing
+without it, over 500 iterations of every position the shape appears in
+plus the name-bound control. Behaviour by
+`tests/test_codegen.py::TestComputedIndexAndArgumentOwnership` -- three
+tests, one of which reads several columns off several such arrays and
+prints them all afterwards, so a use-after-free shows up as wrong output
+and not only as a sanitizer report.
 
 **claude.md #237** (a compiled `.wasm` in a browser): the project's own
 WASI Preview 1 host (`runtime/wasm/festina_wasi_browser.js`) is verified

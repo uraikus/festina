@@ -8526,21 +8526,39 @@ class CodeGen:
         ownership predicate downstream agrees the +1 exists.
 
         A scalar element needs no minting (its loaded value survives
-        the container by copy), so the container is simply released. A
-        TABLE-ROW element is the one shape that still cannot be fixed
-        this way: a row has no refcount header of its own -- the array
-        owns its rows outright (#85) -- so there is nothing to retain,
-        and releasing the array would free the row out from under the
-        expression. That case deliberately keeps #117's documented
-        leak (todo.md), and stays UNRECORDED here so the predicates
-        keep treating the row as borrowed -- a text column read off it
-        is still copied at its binding, exactly as before.
+        the container by copy), so the container is simply released.
+
+        A TABLE-ROW element cannot be minted the same way -- a row has
+        no refcount header of its own (the array owns its rows
+        outright, #85), so there is nothing to retain, and releasing
+        the array HERE would free the row out from under the
+        expression. claude.md #260: what it can do instead is PARK the
+        array on the enclosing member chain, so the decision moves out
+        to where the value that actually escapes is known --
+        _release_member_chain's whole job (#108/#117). `rows()[0].name`
+        then copies the name FIRST and releases the array after, which
+        is exactly the treatment `make().inner.n` already gets; the row
+        dies with the array, and the escaping column does not.
+
+        Only when there IS an enclosing chain, decided by the same AST
+        node IDENTITY test _begin_member_chain uses: `_chain_receiver
+        is expr` means the frame above set this very node as the
+        receiver it is about to emit, so the entry parked here is the
+        one that frame will drain. A `rows()[0]` in any other position
+        -- bound straight to a `People` local, passed as an argument,
+        returned -- has no such frame, so nothing is parked and the
+        documented leak stands there unchanged (todo.md). Parking
+        regardless would be worse than the leak: the entry would sit on
+        a list nobody drains, or be released by a frame that never
+        owned it.
 
         Returns the (possibly replaced) element value."""
         if not (_is_refcounted(obj_type)
                 and self._is_owning_refcounted_source(expr.obj)):
             return out
         if isinstance(elem_type, types_mod.TableType):
+            if self._chain_receiver is expr:
+                self._chain_pending.append((expr.obj, obj_val, obj_type))
             return out
         if _is_refcounted(elem_type):
             lines.append(f"  call void @festina_retain(ptr {out})")

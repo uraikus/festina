@@ -8094,10 +8094,14 @@ class TestComputedIndexAndArgumentOwnership:
         assert result.stdout.strip() == str(sum(range(50)) + 10 + 50)
 
     def test_a_table_row_element_stays_borrowed(self, compile_and_run, tmp_path):
-        # The one computed-index shape that deliberately does NOT mint:
-        # rows have no refcount header (the array owns them outright),
-        # so the container is left alive -- leaked, per todo.md -- and
-        # a column read off the row is still copied at its binding.
+        # The one computed-index shape that does NOT mint: rows have no
+        # refcount header (the array owns them outright), so there is
+        # nothing to retain. claude.md #260: the array is no longer
+        # simply left alive for it either -- it is parked on the
+        # enclosing member chain and released once the column that
+        # escapes has been copied. The row stays borrowed either way,
+        # which is what this pins; leak-freedom is
+        # tests/stress/row_chain_churn.f's job.
         db = tmp_path / "t.sqlite"
         source = f"""
         DatabaseURL = '{db}'
@@ -8113,6 +8117,57 @@ class TestComputedIndexAndArgumentOwnership:
         result = compile_and_run(source)
         assert result.returncode == 0
         assert result.stdout.strip() == "row"
+
+    def test_a_column_read_off_a_call_result_row_outlives_the_array(
+            self, compile_and_run, tmp_path):
+        # claude.md #260: the array (and so the row inside it) is
+        # released as soon as the chain has the column, so the copy that
+        # escapes must be genuinely independent -- not a pointer into
+        # the freed row. Reading several columns off several such
+        # arrays, then printing them all afterwards, is what would
+        # surface a use-after-free as wrong output rather than a
+        # sanitizer report.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'ada'])
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [2, 'grace'])
+        arr[People] func rows() {{
+            arr[People] r = sqlite('SELECT * FROM People ORDER BY id')
+            return r
+        }}
+        text first = rows()[0].name
+        text second = rows()[1].name
+        int n = rows()[1].id
+        log(`${{first}} ${{second}} ${{n}}`)
+        log(rows()[0].name == 'ada')
+        log(`${{rows()[1].name}}!`)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ada grace 2\ntrue\ngrace!\n"
+
+    def test_a_row_bound_to_a_name_still_borrows_from_its_array(
+            self, compile_and_run, tmp_path):
+        # claude.md #260 deliberately changed nothing here: with the
+        # array bound to a name, the row is a plain borrow into storage
+        # the local still owns, released at scope exit as it always was.
+        # Parking only happens when there IS an enclosing member chain
+        # to drain it.
+        db = tmp_path / "t.sqlite"
+        source = f"""
+        DatabaseURL = '{db}'
+        table People {{ id:int  name:text }}
+        sqlite('INSERT INTO People (id, name) VALUES (?, ?)', [1, 'ada'])
+        arr[People] rows = sqlite('SELECT * FROM People')
+        People p = rows[0]
+        log(p.name)
+        log(rows.length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout == "ada\n1\n"
 
 
 class TestCycleCollection:

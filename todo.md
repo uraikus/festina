@@ -85,19 +85,42 @@ open:
   amortized CPU for higher peak memory (collection is delayed). Earns
   its own dedicated round: a fresh plan, and ASan/LeakSanitizer-under-
   stress verification of the deferred-free "zombie" path specifically.
-- **A table-row element off a call-result array leaks the array**
-  (`rows()[0]` where the elements are query rows). Rows have no
-  refcount header — the array owns them outright — so the element
-  cannot be retained past its container. Bind the array to a name first
-  and it reclaims normally. claude.md #224 scoped the real fix: a
-  per-table row-copy function is straightforward (mirrors the existing
-  per-table row-release function, using the already-existing
-  `festina_text_own`/`festina_retain` primitives column-by-column), but
-  it only closes the leak once paired with genuine scope-exit ownership
-  tracking for `TableType` locals generally — the same "always owned
-  once bound, always released at scope exit" symmetry `text` itself
-  needed six dedicated, individually-verified rounds to get right
-  (claude.md #11-16). A real fix is that size, not a quick patch.
+- **A table row bound off a call-result array leaks the array**
+  (`People p = rows()[0]`, a row passed as an argument, or one
+  returned). Reading a COLUMN off such a row — `rows()[0].name`, the
+  shape this was originally reported as — is fixed (claude.md #260):
+  the array is parked on the enclosing member chain and released once
+  the column that escapes has been copied. What is left is the shapes
+  with no such chain to drain it, where the row itself is what escapes.
+  Rows have no refcount header — the array owns them outright — so the
+  row cannot be retained past its container, and binding it to a name
+  first still reclaims normally. claude.md #224 scoped what those
+  shapes need and it is unchanged: a per-table row-copy function
+  (straightforward — it mirrors the existing per-table row-release
+  function, using the already-existing `festina_text_own`/
+  `festina_retain` primitives column-by-column), paired with genuine
+  scope-exit ownership tracking for `TableType` locals generally, the
+  same "always owned once bound, always released at scope exit"
+  symmetry `text` itself needed six dedicated, individually-verified
+  rounds to get right (claude.md #11-16).
+- **`X().someBlob.length` leaks the object the blob came from**, and
+  the obvious one-line fix would make it a double free. The `.length`
+  branch drains its parked member chain only for an *array* receiver
+  and drops it for `blob`/`text`/`ascii` ones (measured: 201
+  allocations over 200 iterations). The drop is currently masking an
+  over-release in the other direction:
+  `_is_owning_refcounted_source(X().someBlob)` answers True — a chain
+  whose base is a `Call` — while the inner `_emit_member_load` link
+  never actually minted anything, so `_release_owned_receiver` releases
+  a blob it does not own, and gets away with it only because the leaked
+  object's cascade never runs to release it a second time. Draining the
+  parked entry without also fixing that predicate mismatch converts the
+  leak into a use-after-free. The real fix is to route those branches
+  through `_release_member_chain` (whose own filter excludes
+  never-minted intermediate links by construction) — but `text` and
+  `ascii` receivers are not in that filter's refcounted family at all,
+  so each needs its own treatment. Found while closing #260; a
+  predicate-alignment round of its own, not a patch.
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.
