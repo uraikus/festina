@@ -166,10 +166,17 @@ They compile three Festina binaries and run them across the corpus, and
 nothing in any of them is platform-specific: they compare two
 implementations against each other, which is compiler-development
 tooling rather than platform coverage. On Linux all three cost about 15
-seconds together; on Windows, where process spawning is slowest, the
-lexer and parser alone cost roughly four minutes of a 45-minute budget
-that had four to spare. Skipping them there is what buys the room for
-the semantic harness to run at all.
+seconds together, which is why that is where they run.
+
+Gating them measured, against the head before it: windows 40:38 →
+**39:13**, macos 10:22 → **7:55**, linux 10:19 → **10:39** (the new
+semantic harness). macOS shows what the gate is worth where the clock is
+not noisy. Windows was predicted to save about four minutes and saved
+1:25; run-to-run variance on that runner is larger than the effect being
+measured, so the four-minute figure it was predicted from is not
+trustworthy either. The durable result is that Windows has 5:47 of
+headroom in its 45-minute cap rather than 4:22, which is the room the
+semantic harness needed.
 
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
