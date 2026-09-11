@@ -5524,3 +5524,34 @@ The visible symptom was small -- main's own `on message` type never being record
 This is the same shape as #279's finding about `?`: a property was assumed of the language rather than probed, and the probe took four lines. It is also a real papercut for anyone writing a linked structure in Festina, and it is documented behaviour rather than a bug -- worth an api.md note, not a change.
 
 **What the remaining 14 have in common: they all need the expression walk.** Five hoist an arrow function into a `__festina_arrow_N` binding, which is only discoverable by descending into expressions; five need a thread's or main's `reply` type, which comes from `worker.reply(x)` CALL SITES; four are sources the Python side rejects for an assignability violation this side does not check. There is no longer any declaration-shaped work left -- the next increment is expression analysis, which is also what the last four need to produce `SEMERR` at the right place.
+
+283. `clear` -- `free` WITH THE BYTES WIPED FIRST
+
+Asked for directly: "add clear, which is like free but it zeroizes the freed data first", with the example
+
+```
+person? brad = {'name': 'Brad'}
+clear brad // free and zeroize the heap
+```
+
+The first change written under #278's order -- specification.md, then tests watched failing, then code -- and the order earned itself immediately: writing the clause is what surfaced the design question below, at a point where it cost a paragraph rather than a rewrite.
+
+**The question the clause had to answer: what does zeroizing mean for a value someone else still holds?** `free` is a refcount DECREMENT, not a forced free (claude.md #111) -- an aliased value survives. So `clear` has two possible readings. Wipe unconditionally, and a buffer another binding can still read is destroyed under it: a use-after-free by construction, manufactured deliberately by the language. Or wipe only when the release actually returns the storage, and a program with a live alias gets no wipe at all. The second is the only one compatible with the rest of the language, and the cost is that the guarantee is conditional on sole ownership -- which is stated in the clause rather than left to be discovered.
+
+**Implemented: `text`.** A `text` binding owns its buffer outright (copy-on-alias, claude.md #83), so there is never another binding to invalidate and the wipe is unconditional and exact. `festina_clear_text` zeroes and frees; `_emit_free` routes to it when `zeroing` is set.
+
+**Not implemented: the cascade.** On every other type `clear` is accepted and behaves as `free`. Carrying "this release is a clear" down through a struct's fields and a container's elements means touching every generated release function and the runtime frees they reach, and the design question -- a thread-local flag consulted at each free, or a parallel clearing release function per type -- is written down in todo.md rather than guessed at. The specification clause says exactly this; a spec that promised the cascade would be describing something that does not exist.
+
+**The user's own example does not compile today, for an unrelated reason.** `person? brad = {'name': 'Brad'}` is a map literal assigned to a struct, which is `cannot assign value of type map[text] to Person` -- structs are built by field assignment. Worth recording because it was found by writing the test, not by reading the grammar.
+
+**`free` and `clear` are ONE AST node with a `zeroing` flag, not two.** Every rule about what may be freed applies unchanged to clearing -- the clause says so in as many words -- and two nodes would be two copies of those rules to keep in step. The semantic checks are shared; only the word in each message changes, so a program is told what it wrote.
+
+**The write must not be optimizable away.** A store to memory that is about to be freed is as dead as storage gets, and deleting it is exactly the optimization every hand-written wipe-the-password loop in C has historically lost to. `festina_zeroize` writes through a `volatile unsigned char *`, which is an observable side effect the standard does not permit to be elided. The length comes from the allocator (`festina_usable_size`, which already existed with its three platform spellings) rather than from `strlen`, so a buffer that once held a longer secret does not keep the tail.
+
+**Two harness findings.**
+
+The IR test first asserted `"@festina_clear_text" in cleared` and `not in freed` -- and failed, because every module declares the runtime's entry points unconditionally, so the bare name is present either way. The assertion is now on `call void @festina_clear_text`. **The control half is what caught it**: without the `free` case asserting the absence, the test would have passed while checking nothing.
+
+Adding a keyword desynchronised the bootstrap lexer, and `tests/test_bootstrap_parser.py` went red on 19 files -- which is the differential test doing its job, not a regression. `bootstrap/lexer.f`'s KW_SRC and `parser.f`'s statement dispatch both needed `clear`, and the FreeStmt node needed the `zeroing` field so the dumps match. A language change now costs a bootstrap change, and that is the point of having the bootstrap.
+
+**Verified.** `tests/test_clear.py`, 15 tests. `tests/stress/clear_churn.f` under ASan/LeakSanitizer: clean, and with the `free` removed from `festina_clear_text` it leaks **198,890 bytes in 4,000 allocations**, so the program tests what it claims. Full suite 2663 passed, 14 skipped. All three bootstrap harnesses re-verified after the keyword change: lexer 92/92, parser 92/92, semantic 78/92.

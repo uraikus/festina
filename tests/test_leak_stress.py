@@ -719,6 +719,7 @@ class TestLeakStress:
             # call-result receiver (must be), over a non-ASCII file so
             # slice() is really copying multi-byte sequences.
             "bytes_trim_churn.f",
+            "clear_churn.f",
             # claude.md #245: pool.postMessage(x) with no index --
             # main plus 3 feeder threads all auto-selecting against the
             # SAME handles array and round-robin counter at once, 12,000

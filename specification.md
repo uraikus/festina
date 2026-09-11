@@ -484,11 +484,11 @@ function, type or thread: [#51]
 
 ```
 amor    arr     ascii   aud     blob    bool    break   catch
-const   continue delete else    enum    fail    false   float
-for     free    func    http    if      img     import  int
-let     log     map     match   null    on      return  socket
-sqlite  struct  table   text    thread  throw   true    try
-typeof  var     void    while
+clear   const   continue delete else    enum    fail    false
+float   for     free    func    http    if      img     import
+int     let     log     map     match   null    on      return
+socket  sqlite  struct  table   text    thread  throw   true
+try     typeof  var     void    while
 ```
 
 `var` and `let` are reserved so that using them is a clear compile
@@ -1217,7 +1217,7 @@ forms (§10.9).
   *Block* | *VariableDeclaration* | *ConstantDeclaration*
 | *ExpressionStatement* | *IfStatement* | *WhileStatement*
 | *ForStatement* | *MatchStatement* | *TryStatement* | *ThrowStatement*
-| *ReturnStatement* | `break` | `continue` | *FreeStatement*
+| *ReturnStatement* | `break` | `continue` | *FreeStatement* | *ClearStatement*
 | *DeleteStatement* | *ImportDeclaration* | *DatabaseURLStatement*
 | *Declaration*
 
@@ -1351,9 +1351,10 @@ dispatches it, and so ends the program. Unwinding releases every
 managed local and temporary between the throw and the catch (§13.7).
 Not available on `wasm32-wasi` (§21.5). [#157, #236, #259]
 
-### 10.11 `free` and `delete`
+### 10.11 `free`, `clear` and `delete`
 
 *FreeStatement* ::= `free` *Identifier*
+*ClearStatement* ::= `clear` *Identifier*
 *DeleteStatement* ::= `delete` *MemberExpression* | `delete` *IndexExpression*
 
 `free x` releases whatever the variable holds and sets it to `null`.
@@ -1363,6 +1364,34 @@ buffer is freed. For scalars it is `x = null`. Freeing twice is a
 no-op. Constants and ordinary parameters may not be freed; a `T?`
 parameter may. After `free`, reading a field through the variable is
 undefined (§14.4). [#111]
+
+`clear x` is `free x` that overwrites the bytes with zero before they
+are released, for a value whose contents should not outlive it — a key,
+a password, a token. It is accepted wherever `free` is, rejected
+wherever `free` is, and leaves the binding `null` exactly as `free`
+does. Clearing twice is a no-op.
+
+**Zeroing covers a `text` value.** `text` is exclusively owned — every
+binding holds a private copy (§13.2) — so there is never another
+binding to invalidate and the wipe is unconditional.
+
+For every other type `clear` is accepted and behaves exactly as `free`,
+releasing without zeroing. A reference-counted value is not necessarily
+freed by a release at all, and overwriting a buffer another binding can
+still read would be a use-after-free by construction, so a wipe can only
+happen at whichever release reaches zero. Carrying the "this release is
+a clear" intent down through a release cascade — into a struct's fields
+and a container's elements — is open work (todo.md); until then a
+program that needs a secret wiped must hold it in a `text`.
+
+Zeroing is not elidable: an implementation must not optimize the write
+away on the grounds that the storage is dead, which is the whole reason
+the statement exists rather than being spelled `x = '' ; free x`.
+
+`clear` makes no claim about copies the program made earlier, about
+values the allocator has already recycled, or about memory the
+operating system has paged out or written to a swap file or core dump.
+It zeroes one buffer at one moment. [#283]
 
 `delete m[key]` (or `delete m.key`) removes a map entry entirely; a
 missing key is a no-op. `delete s.field` releases a struct field and
@@ -2490,7 +2519,8 @@ Statement          ::= Block | VariableDeclaration | ConstantDeclaration
                      | ExpressionStatement | IfStatement | WhileStatement
                      | ForStatement | MatchStatement | TryStatement
                      | ThrowStatement | ReturnStatement | 'break' | 'continue'
-                     | FreeStatement | DeleteStatement | ImportDeclaration
+                     | FreeStatement | ClearStatement | DeleteStatement
+                     | ImportDeclaration
                      | DatabaseURLStatement | Declaration
 Declaration        ::= FunctionDeclaration | StructDeclaration | TableDeclaration
                      | EnumDeclaration | EventHandler | ThreadDeclaration
@@ -2509,6 +2539,7 @@ TryStatement       ::= 'try' Block 'catch' '(' Identifier ':' 'text' ')' Block
 ThrowStatement     ::= 'throw' Expression
 ReturnStatement    ::= 'return' [ Expression ]
 FreeStatement      ::= 'free' Identifier
+ClearStatement     ::= 'clear' Identifier
 DeleteStatement    ::= 'delete' ( MemberExpression | IndexExpression )
 ImportDeclaration  ::= 'import' Path
 DatabaseURLStatement ::= 'DatabaseURL' '=' Expression
@@ -2560,9 +2591,9 @@ Name               ::= Identifier | any reserved word
 ## Annex B — Reserved Words and Global Names
 
 **Reserved words** (§7.4): `amor arr ascii aud blob bool break catch
-const continue delete else enum fail false float for free func http if
-img import int let log map match null on return socket sqlite struct
-table text thread throw true try typeof var void while`.
+clear const continue delete else enum fail false float for free func
+http if img import int let log map match null on return socket sqlite
+struct table text thread throw true try typeof var void while`.
 
 **Contextual words**: `default`, `use`, `DatabaseURL`.
 

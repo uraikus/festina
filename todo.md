@@ -49,6 +49,25 @@ stubs. Nothing open here.
   deliberate part: a blob is a *file*, carrying its own path, so a slice
   of one has no path to carry.
 
+## `clear` beyond `text`
+
+`clear x` (specification.md §10.11) zeroes the bytes before releasing
+them. It covers `text` today, which is exclusively owned and so always
+safe to wipe. Extending it to a struct's fields and a container's
+elements needs the "this release is a clear" intent carried down
+through the release cascade — every generated release function and the
+runtime frees they reach.
+
+The design question to settle first: a reference-counted value is not
+necessarily freed by a release, so the wipe can only happen at
+whichever release reaches zero. Either the intent travels with the
+value (a thread-local flag set around the release, consulted at each
+free) or each type grows a parallel clearing release function. The flag
+is far less code and gets the cascade for free; the parallel functions
+are explicit and carry no ambient state across a call. Nothing in the
+repository needs either yet — the motivating case, a secret in a
+`text`, is already covered.
+
 ## Memory model
 
 Automatic reclamation is escape analysis plus reference counting.

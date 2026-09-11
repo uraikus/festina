@@ -5709,3 +5709,40 @@ void festina_cycle_dispose_map(void *payload) {
     free(entries);
     free((char *)payload - sizeof(int64_t));
 }
+
+/* ---------------------------------------------------------------------
+ * decisions.md #283: `clear x` -- `free x` that overwrites the bytes
+ * with zero before releasing them, for a value whose contents should
+ * not outlive it (specification.md 10.11).
+ *
+ * The write must not be optimizable away. A compiler is entitled to
+ * delete a store to memory it can prove is dead, and the storage here
+ * is about to be freed, which is as dead as storage gets -- that is
+ * precisely the optimization every "wipe the password" routine in C
+ * has historically lost to. The volatile pointer below is the portable
+ * defence: a write through a volatile lvalue is an observable side
+ * effect the standard does not allow to be elided.
+ *
+ * The size comes from the allocator rather than from strlen, so the
+ * whole block goes, not just the bytes up to the NUL -- a buffer that
+ * once held a longer secret and was later shortened still has the tail
+ * sitting in it. festina_usable_size answers 0 on a platform with no
+ * such query, and zeroing nothing is the honest answer there rather
+ * than guessing a length. */
+void festina_zeroize(void *p) {
+    if (!p) return;
+    size_t n = festina_usable_size(p);
+    if (n == 0) return;
+    volatile unsigned char *q = (volatile unsigned char *)p;
+    while (n--) *q++ = 0;
+}
+
+/* `clear` on a `text`. text is exclusively owned -- copy-on-alias,
+ * claude.md #83 -- so there is never another binding to invalidate and
+ * the wipe is unconditional. A null is a no-op, which is what makes
+ * clearing twice safe, exactly as freeing twice is. */
+void festina_clear_text(char *s) {
+    if (!s) return;
+    festina_zeroize(s);
+    free(s);
+}

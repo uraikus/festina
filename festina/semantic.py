@@ -5346,16 +5346,20 @@ def analyze(program, filename="<string>"):
             # type with nothing to release (int, a borrowed query row)
             # freeing degenerates to nulling the binding, which is still
             # a coherent thing to ask for.
+            # decisions.md #283: `clear` shares this node and every one
+            # of these rules; only the word in the message changes, so a
+            # program is told what it wrote.
+            word = "clear" if getattr(stmt, "zeroing", False) else "free"
             sym = scope.lookup(stmt.name)
             if sym is None or sym.kind not in ("variable", "constant", "parameter"):
                 raise CompileError(
-                    f"free: unknown variable '{stmt.name}'",
+                    f"{word}: unknown variable '{stmt.name}'",
                     file=filename, line=stmt.line, column=stmt.column,
                     category="unknown variable",
                 )
             if sym.kind == "constant":
                 raise CompileError(
-                    f"cannot free the constant '{stmt.name}'",
+                    f"cannot {word} the constant '{stmt.name}'",
                     file=filename, line=stmt.line, column=stmt.column,
                     category="invalid statement",
                 )
@@ -5373,8 +5377,8 @@ def analyze(program, filename="<string>"):
                 # A parameter is a BORROWED reference (claude.md #84) --
                 # the caller's value, which the caller will release.
                 raise CompileError(
-                    f"cannot free the parameter '{stmt.name}' -- a parameter "
-                    f"borrows its caller's value; free it in the caller",
+                    f"cannot {word} the parameter '{stmt.name}' -- a parameter "
+                    f"borrows its caller's value; {word} it in the caller",
                     file=filename, line=stmt.line, column=stmt.column,
                     category="invalid statement",
                 )

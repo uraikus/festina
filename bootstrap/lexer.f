@@ -65,7 +65,7 @@ bool func isWs(c:int) {
 map[int] KEYWORDS = {}
 map[int] EXPR_ENDING = {}
 
-text KW_SRC = 'int float bool text blob arr struct table img aud null true false void func const import if else on fail log sqlite for while map amor break continue http socket try catch enum typeof thread match ascii return var let throw free delete'
+text KW_SRC = 'int float bool text blob arr struct table img aud null true false void func const import if else on fail log sqlite for while map amor break continue http socket try catch enum typeof thread match ascii return var let throw free clear delete'
 text EE_SRC = 'IDENT NUMBER STRING TSTRING_END RPAREN RBRACK true false null log fail sqlite'
 
 // ---------------------------------------------------------------------

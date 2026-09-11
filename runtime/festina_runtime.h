@@ -1732,6 +1732,13 @@ const void *festina_blob_bytes(void *payload, int64_t *out_len);
 int64_t festina_blob_length(void *payload);
 int64_t festina_blob_byte_at(void *payload, int64_t index);
 char *festina_blob_slice(void *payload, int64_t start, int64_t end);
+
+/* decisions.md #283: `clear x` -- release with the bytes overwritten
+ * first. festina_zeroize wipes a whole allocator block through a
+ * volatile pointer so the write cannot be optimized away as a store to
+ * dead memory; festina_clear_text wipes and frees an owned text. */
+void festina_zeroize(void *p);
+void festina_clear_text(char *s);
 int8_t festina_blob_write(void *payload, const char *content);
 int8_t festina_blob_append(void *payload, const char *content);
 int8_t festina_blob_exists(void *payload);

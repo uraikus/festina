@@ -296,11 +296,19 @@ class ThrowStmt(Node):
 
 class FreeStmt(Node):
     """claude.md #111: `free name` -- release whatever the binding holds
-    and null the binding."""
-    def __init__(self, name, line=0, column=0):
+    and null the binding.
+
+    decisions.md #283: `clear name` is the same statement with
+    `zeroing=True`. One node rather than two is deliberate -- every
+    rule about what may be freed applies unchanged to clearing
+    (specification.md 10.11 says so in as many words), and two nodes
+    would be two copies of those rules to keep in step.
+    """
+    def __init__(self, name, line=0, column=0, zeroing=False):
         self.name = name
         self.line = line
         self.column = column
+        self.zeroing = zeroing
 
 
 class DeleteStmt(Node):

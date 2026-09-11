@@ -2250,6 +2250,7 @@ class CodeGen:
             # escaping struct/arr[T]/map[T] locals -- see
             # _emit_free_active_locals.
             "declare void @free(ptr)",
+            "declare void @festina_clear_text(ptr)",
             # claude.md #77: reference counting for struct values escape
             # analysis proves DO escape (global structs, and escaping
             # local structs that are never themselves returned) -- see
@@ -4733,10 +4734,20 @@ class CodeGen:
         if llvm_ty == "ptr":
             old = self.tmp()
             lines.append(f"  {old} = load ptr, ptr {ref}")
+            zeroing = getattr(stmt, "zeroing", False)
             if _is_refcounted(ttype):
+                # decisions.md #283: a refcounted value is released, not
+                # necessarily freed. Zeroing a buffer another binding
+                # can still read would be a use-after-free by
+                # construction, so the wipe belongs at whichever release
+                # actually reaches zero -- see the note in _emit_free.
                 lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
             elif ttype == TEXT:
-                lines.append(f"  call void @free(ptr {old})")
+                if zeroing:
+                    self.uses_clear = True
+                    lines.append(f"  call void @festina_clear_text(ptr {old})")
+                else:
+                    lines.append(f"  call void @free(ptr {old})")
             # Any other ptr-backed value: nothing released, only the
             # binding dropped. claude.md #265: a table row is no longer
             # in that group -- it is refcounted, so `free row` is an

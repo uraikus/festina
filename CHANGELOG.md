@@ -48,6 +48,15 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Added
 
+- **`clear x`** — `free x` that overwrites the bytes with zero before
+  releasing them, for a value whose contents should not outlive it
+  (specification.md §10.11). The write goes through a volatile pointer
+  so it cannot be optimized away as a store to dead memory. Zeroing
+  covers `text`, which is exclusively owned and so always safe to wipe;
+  on other types `clear` is accepted and behaves as `free`, with the
+  cascade through struct fields and container elements left as open
+  work in todo.md (decisions.md #283).
+
 - **`bootstrap/semdump.py`** — the canonical dump the Festina port of
   semantic analysis will be checked against. Because `analyze()` is a
   checker rather than an annotator, diffing its return value would say
