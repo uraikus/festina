@@ -36,10 +36,10 @@ python bootstrap/astdiff.py                         # parser, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 89-file repository corpus:
+Over the 92-file repository corpus:
 
-- **lexer: 89 match, 0 differ.**
-- **parser: 89 match, 0 differ, 0 unported.**
+- **lexer: 92 match, 0 differ.**
+- **parser: 92 match, 0 differ, 0 unported.**
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
 `parser.f`, the largest source in the corpus at ~1,200 lines, takes
@@ -90,7 +90,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 89-file repository corpus is a strong oracle for ordinary code and
+The 92-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -146,8 +146,8 @@ expression kind, because a case list has to be complete to be correct
 and goes quietly out of date the moment the grammar grows.
 
 `semdiff.py` is not in the pytest suite yet. It compiles a third
-Festina binary and runs it over 91 files, and the Windows job has about
-five minutes of headroom (see the CI note above) — so adding it belongs
+Festina binary and runs it over 92 files, and the Windows job has about
+four minutes of headroom (see the CI note above) — so adding it belongs
 with the change that makes the bootstrap suites Linux-only, not before.
 
 ## Then: codegen
@@ -170,7 +170,7 @@ globals, constants, functions, parameters, loop and catch variables,
 and locals nested arbitrarily deep. The wrapper lives in the harness,
 so the compiler carries no test-only hook.
 
-Over the corpus that is 3,175 records across 78 analyzed files; the
+Over the corpus that is 4,732 records across 81 analyzed files; the
 11 rejected ones are all `cases/*.f`, which exist to be lexed rather
 than to be valid programs. A rejection dumps `SEMERR|line|col` alone —
 position, never message text.
