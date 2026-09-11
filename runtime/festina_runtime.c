@@ -4682,7 +4682,7 @@ int8_t festina_release_check(void *payload) {
 void festina_release(void *payload) {
     if (!payload) return;
     if (festina_release_check(payload)) {
-        free((char *)payload - sizeof(int64_t));
+        festina_free_z((char *)payload - sizeof(int64_t));
     }
 }
 
@@ -5492,8 +5492,8 @@ void festina_release_array(void *payload) {
      * say) are not individually released here -- see todo.md on why
      * that's still a separate, open gap this section doesn't close. */
     void *data = *(void **)((char *)payload + sizeof(int64_t));
-    free(data);
-    free((char *)payload - sizeof(int64_t));
+    festina_free_z(data);
+    festina_free_z((char *)payload - sizeof(int64_t));
 }
 
 void festina_release_map(void *payload) {
@@ -5508,7 +5508,7 @@ void festina_release_map(void *payload) {
     void *entries = *(void **)((char *)payload + sizeof(int64_t));
     int64_t capacity = *(int64_t *)((char *)payload + 2 * sizeof(int64_t));
     festina_map_free_entries(entries, capacity);
-    free((char *)payload - sizeof(int64_t));
+    festina_free_z((char *)payload - sizeof(int64_t));
 }
 
 /* claude.md #167: found while chasing an unrelated keep-alive leak,
@@ -5535,7 +5535,7 @@ void festina_release_map(void *payload) {
  * festina_release_map itself uses. */
 static void festina_free_map_text_value(int64_t raw, const char *key) {
     (void)key;
-    free((void *)(intptr_t)raw);
+    festina_free_z((void *)(intptr_t)raw);
 }
 
 void festina_release_text_map(void *payload) {
@@ -5544,7 +5544,7 @@ void festina_release_text_map(void *payload) {
     int64_t capacity = *(int64_t *)((char *)payload + 2 * sizeof(int64_t));
     festina_map_for_each(entries, capacity, festina_free_map_text_value);
     festina_map_free_entries(entries, capacity);
-    free((char *)payload - sizeof(int64_t));
+    festina_free_z((char *)payload - sizeof(int64_t));
 }
 
 /* ---- cycle collection -- claude.md #120 ----
@@ -5691,8 +5691,8 @@ void festina_cycle_visit_map(void *payload, void (*fn)(void *)) {
  * refcount check the trial has already superseded. */
 void festina_cycle_dispose_array(void *payload) {
     void *data = *(void **)((char *)payload + sizeof(int64_t));
-    free(data);
-    free((char *)payload - sizeof(int64_t));
+    festina_free_z(data);
+    festina_free_z((char *)payload - sizeof(int64_t));
 }
 
 void festina_cycle_dispose_map(void *payload) {
@@ -5735,6 +5735,39 @@ void festina_zeroize(void *p) {
     if (n == 0) return;
     volatile unsigned char *q = (volatile unsigned char *)p;
     while (n--) *q++ = 0;
+}
+
+/* decisions.md #284: the clearing intent, carried down a release
+ * cascade the caller does not walk itself.
+ *
+ * A generated per-struct release function frees each field and then the
+ * header, and a container's release frees its elements; none of those
+ * sites takes an argument from the `clear` statement. Passing one would
+ * mean a second, clearing variant of every generated release function
+ * and every runtime release -- the same cascade twice, kept in step by
+ * hand. A flag consulted at each free gets the whole cascade instead.
+ *
+ * It is `__thread` for the same reason the catch-frame stack is
+ * (claude.md #163): one thread clearing must not make another thread's
+ * ordinary frees start zeroing. It is a DEPTH rather than a boolean so
+ * that a nested release -- a cleared struct holding a cleared field --
+ * cannot switch clearing off early on the way back out. */
+static __thread int g_festina_clearing = 0;
+
+void festina_begin_clearing(void) { g_festina_clearing++; }
+
+void festina_end_clearing(void) {
+    if (g_festina_clearing > 0) g_festina_clearing--;
+}
+
+/* The free every release path uses in place of free(). Zeroes first
+ * when a `clear` is in flight, and is exactly free() otherwise -- so
+ * the ordinary path pays one predictable branch on a thread-local
+ * already in cache, and nothing else. */
+void festina_free_z(void *p) {
+    if (!p) return;
+    if (g_festina_clearing > 0) festina_zeroize(p);
+    free(p);
 }
 
 /* `clear` on a `text`. text is exclusively owned -- copy-on-alias,

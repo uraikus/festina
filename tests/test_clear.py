@@ -180,3 +180,163 @@ log(q.name)
 log(q.token)
 """)
         assert result.stdout.split() == ["Brad", "sk-secret"]
+
+
+class TestTheCascade:
+    """decisions.md #284: zeroing follows the release cascade, so a
+    struct's fields and a container's elements go too.
+
+    Checked at the IR layer for the same reason the `text` case is: a
+    released buffer has no defined reading. What IS checkable is that
+    the cascade's free sites reach the zeroing allocator entry point
+    rather than plain `free`, and that the clearing intent is scoped to
+    the one statement rather than left switched on.
+    """
+
+    def _ir(self, parser, semantic, codegen, src):
+        program = parser.parse(src, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        return codegen.generate_ir(program, analyzed, filename="main.f")
+
+    def test_clearing_a_struct_brackets_the_release(self, parser, semantic, codegen):
+        """The intent has to reach a cascade the caller does not walk
+        itself -- a generated per-struct release function frees each
+        field and then the header -- so it travels as runtime state set
+        around the release, not as an argument."""
+        ir = self._ir(parser, semantic, codegen, """
+struct Person { name:text  token:text }
+Person? brad
+brad.name = 'Brad'
+brad.token = 'sk'
+clear brad
+""")
+        assert "call void @festina_begin_clearing()" in ir
+        assert "call void @festina_end_clearing()" in ir
+
+    def test_freeing_a_struct_does_not(self, parser, semantic, codegen):
+        """The control. Without it the assertions above would pass on a
+        compiler that switched clearing on unconditionally."""
+        ir = self._ir(parser, semantic, codegen, """
+struct Person { name:text  token:text }
+Person? brad
+brad.name = 'Brad'
+brad.token = 'sk'
+free brad
+""")
+        assert "call void @festina_begin_clearing()" not in ir
+
+    def test_clearing_an_array_brackets_the_release(self, parser, semantic, codegen):
+        ir = self._ir(parser, semantic, codegen, """
+arr[text] keys = ['alpha', 'beta']
+clear keys
+""")
+        assert "call void @festina_begin_clearing()" in ir
+
+    def test_a_structs_text_field_is_freed_through_the_zeroing_path(
+            self, parser, semantic, codegen):
+        """The site that matters most, and the one first missed.
+
+        A struct holding a secret holds it in a text FIELD. Wiping only
+        the struct's own storage would leave the secret itself sitting
+        in the heap, and `clear` would be a lie for its most obvious
+        use. This was routed through plain @free until an unrelated
+        codegen test's free-counting assertion pointed at it."""
+        ir = self._ir(parser, semantic, codegen, """
+struct Creds { user:text  token:text }
+Creds? c
+c.user = 'brad'
+c.token = 'sk'
+clear c
+""")
+        wrapper = ir.split("define void @__festina_release_struct_Creds", 1)[1]
+        wrapper = wrapper.split("\n}", 1)[0]
+        # Two text fields plus the struct header, none through plain
+        # @free -- an unzeroed free here is a secret left in the heap.
+        assert wrapper.count("call void @festina_free_z(") == 3
+        assert "call void @free(" not in wrapper
+
+    def test_a_generated_struct_release_frees_through_the_zeroing_path(
+            self, parser, semantic, codegen):
+        """The cascade's own free sites must consult the flag, or
+        bracketing the call would set state nothing reads."""
+        ir = self._ir(parser, semantic, codegen, """
+struct Inner { a:text }
+struct Outer { inner:Inner  b:text }
+Outer? o
+clear o
+""")
+        assert "define void @__festina_release_struct_Outer" in ir
+        cascade = ir.split("define void @__festina_release_struct_Outer", 1)[1]
+        cascade = cascade.split("\n}", 1)[0]
+        assert "@festina_free_z" in cascade, (
+            "the generated cascade still frees through plain @free, so "
+            "the clearing flag would never be consulted")
+
+
+class TestTheWipeActuallyHappens:
+    """The one claim nothing else in this file proves.
+
+    Every other test here checks that `clear` reaches the zeroing path.
+    None of them checks that the path writes zeros -- and it is exactly
+    the kind of code a C compiler is entitled to delete, since the
+    storage is about to be freed. So this compiles the runtime at -O2
+    and inspects the bytes directly, which is the only place the answer
+    is observable.
+    """
+
+    PROBE = r"""
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+void festina_zeroize(void *p);
+void festina_begin_clearing(void);
+void festina_end_clearing(void);
+
+int main(void) {
+    char *p = malloc(64);
+    memset(p, 'S', 64);
+    festina_zeroize(p);
+    int nonzero = 0;
+    for (int i = 0; i < 64; i++) if (p[i]) nonzero++;
+
+    char *a = malloc(64); memset(a, 'A', 64);
+    char *b = malloc(64); memset(b, 'B', 64);
+    festina_begin_clearing();
+    festina_zeroize(a);
+    festina_end_clearing();
+    int az = 0, bz = 0;
+    for (int i = 0; i < 64; i++) { if (!a[i]) az++; if (!b[i]) bz++; }
+    printf("%d %d %d\n", nonzero, az, bz);
+    free(p); free(a); free(b);
+    return 0;
+}
+"""
+
+    def test_zeroize_writes_zeros_at_O2(self, tmp_path):
+        import subprocess
+        import os
+        from tests.conftest import _require_c_compiler
+        cc = _require_c_compiler()
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        src = tmp_path / "zprobe.c"
+        src.write_text(self.PROBE)
+        exe = tmp_path / "zprobe"
+        build = subprocess.run(
+            [cc, "-O2", "-I", os.path.join(root, "runtime"), str(src),
+             os.path.join(root, "runtime", "festina_runtime.c"),
+             "-o", str(exe), "-lsqlite3", "-lm", "-lpthread", "-ldl"],
+            capture_output=True, text=True, encoding="utf-8")
+        if build.returncode != 0:
+            pytest.skip(f"cannot link the runtime here: {build.stderr[-300:]}")
+        out = subprocess.run([str(exe)], capture_output=True, text=True,
+                             encoding="utf-8", timeout=60)
+        nonzero, cleared, untouched = (int(x) for x in out.stdout.split())
+        # -O2 is the point: a store to memory about to be freed is what
+        # a compiler is entitled to delete, and the volatile pointer in
+        # festina_zeroize is the defence. If this ever reports nonzero
+        # bytes, that defence has stopped working.
+        assert nonzero == 0, f"{nonzero} of 64 bytes survived zeroize at -O2"
+        assert cleared == 64
+        # The control: an untouched buffer must NOT come back zeroed, or
+        # the test is measuring the allocator rather than the wipe.
+        assert untouched == 0

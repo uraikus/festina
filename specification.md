@@ -1371,18 +1371,20 @@ a password, a token. It is accepted wherever `free` is, rejected
 wherever `free` is, and leaves the binding `null` exactly as `free`
 does. Clearing twice is a no-op.
 
-**Zeroing covers a `text` value.** `text` is exclusively owned — every
-binding holds a private copy (§13.2) — so there is never another
-binding to invalidate and the wipe is unconditional.
+Zeroing happens **only where the storage is actually released**. For a
+reference-counted type that means only when this was the last
+reference: a value another binding still holds is neither freed nor
+zeroed, because overwriting a buffer another binding can still read
+would be a use-after-free by construction. `clear` on such a value
+decrements and wipes nothing. A program that must guarantee the wipe
+has to hold the only reference, which a `T?` binding does by definition
+(§13.4) and a `text` binding does always (§13.2).
 
-For every other type `clear` is accepted and behaves exactly as `free`,
-releasing without zeroing. A reference-counted value is not necessarily
-freed by a release at all, and overwriting a buffer another binding can
-still read would be a use-after-free by construction, so a wipe can only
-happen at whichever release reaches zero. Carrying the "this release is
-a clear" intent down through a release cascade — into a struct's fields
-and a container's elements — is open work (todo.md); until then a
-program that needs a secret wiped must hold it in a `text`.
+The zeroing follows the release cascade. Clearing a struct wipes the
+struct's own storage and the storage of every field released with it;
+clearing an `arr[T]` or `map[T]` covers the elements released with it;
+and a nested value that survives on another reference is left intact,
+along with the reference that saved it.
 
 Zeroing is not elidable: an implementation must not optimize the write
 away on the grounds that the storage is dead, which is the whole reason

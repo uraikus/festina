@@ -52,10 +52,11 @@ round-by-round design and implementation record predating 0.1 lives in
   releasing them, for a value whose contents should not outlive it
   (specification.md §10.11). The write goes through a volatile pointer
   so it cannot be optimized away as a store to dead memory. Zeroing
-  covers `text`, which is exclusively owned and so always safe to wipe;
-  on other types `clear` is accepted and behaves as `free`, with the
-  cascade through struct fields and container elements left as open
-  work in todo.md (decisions.md #283).
+  follows the release cascade: clearing a struct wipes its own storage
+  and every field released with it, and clearing an `arr[T]`/`map[T]`
+  covers the elements released with it. It happens only where storage
+  is actually released, so a value another binding still holds is
+  neither freed nor zeroed (decisions.md #283, #284).
 
 - **`bootstrap/semdump.py`** — the canonical dump the Festina port of
   semantic analysis will be checked against. Because `analyze()` is a

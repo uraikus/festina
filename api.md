@@ -3334,13 +3334,23 @@ which is the optimization that has historically defeated hand-written
 wipe-the-password loops, and the reason this is a statement rather than
 `x = '' ; free x`.
 
-**Zeroing covers `text`.** A `text` binding owns its buffer outright,
-so wiping it can never invalidate another binding. On every other type
-`clear` is accepted and behaves exactly like `free`: a reference-counted
-value may still be held elsewhere, and overwriting a buffer another
-binding can read would be a use-after-free. Extending the wipe through
-struct fields and container elements is open work — see
-[todo.md](todo.md).
+**The wipe follows the release cascade.** Clearing a struct wipes its
+own storage and every field released with it; clearing an `arr[T]` or
+`map[T]` covers the elements released with it.
+
+**It happens only where storage is actually released.** A
+reference-counted value another binding still holds is neither freed
+nor zeroed — overwriting a buffer someone can still read would be a
+use-after-free. So `clear` on a shared value decrements and wipes
+nothing, and a program that needs the guarantee must hold the only
+reference. A `text` binding always does; a `T?` binding does by
+definition.
+
+```festina
+arr[text] a = ['alpha', 'beta']
+arr[text] b = a
+clear a              // b still reads 'alpha' -- nothing was freed
+```
 
 `clear` wipes one buffer at one moment. It says nothing about copies
 made earlier, about memory the allocator has already handed out again,

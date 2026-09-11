@@ -4062,7 +4062,11 @@ class TestAutomaticMemoryReclamation:
         wrapper_body = ir[wrapper_start:wrapper_end]
         assert "call i8 @festina_release_check(" in wrapper_body
         assert "call void @festina_release(" in wrapper_body
-        assert "call void @free(" in wrapper_body
+        # decisions.md #284: a release cascade frees through
+        # @festina_free_z, which is exactly @free unless a `clear` is in
+        # flight. The claim is unchanged -- the wrapper frees Outer's
+        # own storage -- only the spelling of the call.
+        assert "call void @festina_free_z(" in wrapper_body
         # And every release site for an Outer value (here, g's own
         # reassignment and o's own scope-exit) must call the wrapper,
         # not the plain generic release, directly.
@@ -12528,8 +12532,12 @@ class TestStructTextFieldReclamation:
         ir = self._ir(parser, semantic, codegen, source)
         assert "define void @__festina_release_struct_Person" in ir
         wrapper = ir.split("define void @__festina_release_struct_Person")[1].split("\n}")[0]
-        # the text field, then the struct's own header
-        assert wrapper.count("call void @free(") == 2
+        # The text field, then the struct's own header -- both through
+        # @festina_free_z (decisions.md #284), which is exactly @free
+        # unless a `clear` is in flight. Still exactly two releases of
+        # exactly two owned buffers, which is what this asserts.
+        assert wrapper.count("call void @festina_free_z(") == 2
+        assert wrapper.count("call void @free(") == 0
 
     def test_stack_allocated_struct_frees_its_text_field(self, parser, semantic, codegen):
         source = """
