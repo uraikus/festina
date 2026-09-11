@@ -38,18 +38,16 @@ stubs. Nothing open here.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately: each new
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
-- **A raw byte-buffer type** — a generalized, writable `blob`, or a
-  new `bytes` type, with `[i] =` assignment and
-  `text.toBytes()`/`bytes.toText()` conversions at the boundary. Open
-  but unmotivated: the case usually made for it is skipping a shell-out
-  to clang on textual LLVM IR, and that is already true without it —
-  `llvm_backend.py` parses the generated IR in-process via libLLVM's C
-  API whenever it is available, with `clang`/`cc` only a fallback, and
-  in-place string append makes building that IR text cheap as a plain
-  `text`. A mutable, indexable byte buffer could still earn its place
-  on its own merits (binary protocol and data construction), but a full
-  new primitive type costs surface area from the lexer through to the
-  runtime, and nothing currently needs one.
+- **A raw byte-buffer type** — the *read* half of this shipped as
+  `blob.byteAt(i)`/`blob.slice(a, b)` (claude.md #272), on the type that
+  already is a file's bytes, rather than as a new primitive. What is
+  still open is the **write** half: `[i] =` assignment into a mutable,
+  indexable buffer, for binary protocol and data construction. Still
+  unmotivated — nothing in the repository needs it, and the case that
+  motivated the read half (a lexer carrying non-ASCII bytes through) is
+  answered. `blob.slice` answering `text` rather than a blob is the
+  deliberate part: a blob is a *file*, carrying its own path, so a slice
+  of one has no path to carry.
 
 ## Memory model
 

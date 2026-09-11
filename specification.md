@@ -530,8 +530,9 @@ must be representable as an `int`.
 
 Single- and double-quoted strings are equivalent and have type `text`.
 A string may not contain an unescaped line terminator. Escapes are
-`\n`, `\t`, `\r`, `\\`, `\'`, `\"`, `` \` `` and `\0`; a backslash
-before any other character yields that character. A string literal
+`\n`, `\t`, `\r`, `\\`, `\'`, `\"` and `` \` ``; a backslash before
+any other character yields that character. The `\0` escape is a compile
+error: `text` cannot hold a NUL. [#272] A string literal
 assigned to an `ascii` binding is converted at compile time (§8.5).
 [#206, #266]
 
@@ -707,8 +708,9 @@ reference counted: `ascii b = a` shares one buffer. [#256]
 
 A `blob` is the bytes of a file together with the path they came from.
 Declaring `blob f = path` loads the file synchronously; an unreadable
-path yields an empty blob whose `.exists()` is `false`. A blob is
-reference counted; assignment shares the handle. A blob read from a
+path yields an empty blob whose `.exists()` is `false`. Its bytes are
+readable through `.length`, `.byteAt(i)` and `.slice(start, end)`
+(§16.3). A blob is reference counted; assignment shares the handle. A blob read from a
 database column has no path (§15.3). Methods: §16.3. [#36, #109]
 
 ### 8.7 Arrays: `arr[T]` and `amor arr[T]`
@@ -1260,15 +1262,16 @@ expression is evaluated for effect (§12.5). [#164, #165]
 
 ### 10.4 `if`
 
-*IfStatement* ::= `if` *Condition* *Block* [ `else` ( *IfStatement* | *Block* ) ]
-*Condition* ::= *Expression* | `(` *Expression* `)`
+*IfStatement* ::= `if` *Expression* *Block* [ `else` ( *IfStatement* | *Block* ) ]
 
 The condition must be `bool`; there is no truthiness (§2.5).
-Parentheses are optional. `else if` chains are permitted. [#17, #19]
+Parentheses around the condition are ordinary grouping and are
+optional; `if (a || b) && c { }` groups as written. `else if` chains
+are permitted. [#17, #19, #274]
 
 ### 10.5 `while`
 
-*WhileStatement* ::= `while` *Condition* *Block*
+*WhileStatement* ::= `while` *Expression* *Block*
 
 The condition must be `bool` and is evaluated before each iteration.
 [#61]
@@ -1677,7 +1680,8 @@ it, in the form
 file:line:column: error: message
 ```
 
-naming the file the offending statement came from (§6.2). Lexical
+naming the file the offending statement came from (§6.2). The column
+counts characters (code points), not bytes. [#272] Lexical
 errors (an unexpected character, an unterminated string, `${` outside a
 template) are reported in the same form. Compile errors include at
 least: [#48, #266]
@@ -1895,6 +1899,7 @@ A user declaration may not reuse any of these names (§6.7).
 | `s[i]` | `text` | one code point or `null` |
 | `.toInt()` | `int` | leading whitespace, optional sign, digits, trailing garbage ignored; `null` if no digits |
 | `.toAscii()` | `ascii` | `null` if not representable |
+| `.trim()` | `text` | leading and trailing ASCII whitespace removed; byte-oriented, so UTF-8 is safe |
 | `.charCodeAt(i)` | `int` | code point at `i`, or `null` |
 | `.split(sep)` | `arr[text]` | `sep` is `text` or `regex`; empty pieces kept; an empty separator splits per code point |
 | `.match(re)` | `text` | first match or `null`; `g` ignored |
@@ -1932,6 +1937,8 @@ A user declaration may not reuse any of these names (§6.7).
 | Method | Result | Notes |
 |---|---|---|
 | `.length` | `int` | exact byte count, O(1) |
+| `.byteAt(i)` | `int` | the byte at `i` as `0`–`255`, or `null` out of range |
+| `.slice(start, end)` | `text` | the bytes in `[start, end)`, clamped; a `text` rather than a blob, since a slice has no path |
 | `.toText()` | `text` | the bytes up to the first NUL |
 | `.exists()` | `bool` | `false` for a pathless blob |
 | `.write(t:text)`, `.append(t:text)` | `bool` | update the bytes and the file; `false` on failure or without a path |
@@ -2493,9 +2500,8 @@ VariableDeclaration::= DeclaredType Identifier [ '=' Expression ]
 ConstantDeclaration::= 'const' Type Identifier '=' Expression
 ExpressionStatement::= Assignment | CallExpression | PostfixExpression
                      | 'http' MapLiteral | ('blob' | 'img' | 'aud') Expression
-IfStatement        ::= 'if' Condition Block [ 'else' ( IfStatement | Block ) ]
-Condition          ::= Expression | '(' Expression ')'
-WhileStatement     ::= 'while' Condition Block
+IfStatement        ::= 'if' Expression Block [ 'else' ( IfStatement | Block ) ]
+WhileStatement     ::= 'while' Expression Block
 ForStatement       ::= 'for' VariableDeclaration ',' Expression ',' Expression Block
 MatchStatement     ::= 'match' Subject '{' { StringLiteral Block } [ 'default' Block ] '}'
 Subject            ::= Identifier { '.' Name }
@@ -2597,6 +2603,7 @@ cited.
 | scalar-only JSON parsing; no `\u` escapes | nested parsing and `\u` decoding (§16.4) | #173, #206 |
 | Windows graphics/HTTP opt-in variables; macOS `try` rejection | first-class (§21.4) | #169, #235 |
 | rows owned by their array and un-returnable | reference-counted rows (§8.10) | #265 |
+| the `\0` string escape | a compile error; `text` cannot hold a NUL (§7.5.2) | #272 |
 
 ## Annex D — Non-goals
 

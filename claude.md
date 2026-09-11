@@ -130,14 +130,14 @@ Use this table to go straight to the right place. "Spec" is
 | Imports, entry file, startup order, hoisting, namespaces | §6 | Imports; CLI | #4–#8, #58, #140, #178 | `festina/imports.py`, `compiler.py` | `test_imports.py`, `test_entry_point_and_example.py` |
 | Types, `null`, zero values, assignability | §8.1, §8.2, §8.19, §8.20 | Types | #10–#16, #25, #50, #97 | `festina/types.py`, `semantic.py` | `test_types.py` |
 | Numbers, promotion, division by zero, `Math` | §8.3, §16.2 | Types | #55–#57, #93, #102, #143, #188 | `festina/codegen.py` | `test_numeric_conversion.py` |
-| `text`, `ascii`, string methods | §8.4, §8.5, §16.3 | Strings; `ascii` | #83, #116, #150, #243, #249, #251, #256, #258 | `runtime/festina_runtime.c` | `test_codegen.py` |
+| `text`, `ascii`, string methods | §8.4, §8.5, §16.3 | Strings; `ascii` | #83, #116, #150, #243, #249, #251, #256, #258, #272 | `runtime/festina_runtime.c` | `test_codegen.py` |
 | Arrays, `amor`, maps | §8.7, §8.8 | Arrays; Maps | #26, #62–#65, #72, #96, #130, #156, #174, #175, #184, #186 | `codegen.py`, runtime | `test_maps.py`, `test_loops.py` |
 | Structs, enums, `typeof`, `match` | §8.9, §8.11, §9.6, §10.9 | Structs; Enums | #27, #106, #176, #252, #267 | `semantic.py`, `codegen.py` | `test_enums.py` |
 | Functions, first-class values, arrows | §8.12, §11.1 | Variables, constants, functions | #23, #24, #140–#142, #187 | `semantic.py` | `test_codegen.py` |
-| Control flow, `try`/`catch`/`throw` | §10 | Control flow; `try` / `catch` / `throw` | #17–#20, #60, #61, #73, #157, #193, #236, #259 | `codegen.py` | `test_control_flow.py`, `test_try_catch.py` |
+| Control flow, `try`/`catch`/`throw` | §10 | Control flow; `try` / `catch` / `throw` | #17–#20, #60, #61, #73, #157, #193, #236, #259, #274 | `codegen.py` | `test_control_flow.py`, `test_try_catch.py` |
 | Memory: escape analysis, refcounts, cycles, `T?`, `free`/`delete` | §13, §8.18, §10.11 | Structs (reclamation paragraphs); Freeing and deleting | #43, #74–#88, #108, #111, #117–#120, #191–#194, #202–#205, #223, #236, #254, #257, #260–#265 | `festina/escape_analysis.py`, `codegen.py`, `runtime/festina_runtime.c` | `test_escape_analysis.py`, `test_manually_managed.py`, `test_leak_stress.py`, `tests/stress/` |
 | SQLite: tables, schema sync, queries, rows | §15, §8.10 | Built-in SQLite | #28–#34, #46, #70, #94, #101, #111–#113, #199, #219, #265 | `festina/sqlite_schema.py`, runtime | `test_sqlite_schema.py`, `test_database_url.py` |
-| Files, directories, environment, `argv`, `exec`, time | §16 | Files; Directories; Running other programs; Environment variables; Command-line arguments; Time | #71, #93, #109, #110, #132, #150, #221 | runtime | `test_environment.py`, `test_cli.py` |
+| Files, directories, environment, `argv`, `exec`, time | §16 | Files; Directories; Running other programs; Environment variables; Command-line arguments; Time | #71, #93, #109, #110, #132, #150, #221, #272 | runtime | `test_environment.py`, `test_cli.py` |
 | Regular expressions | §8.15 | Regex | #67, #68, #85, #86, #107, #118, #122 | runtime | `test_regex.py` |
 | JSON rendering and parsing, logging | §8.21, §16.4, §16.5 | Logging and rendering; `.toStruct()` / `.toArr()`; `troubleshoot()` | #114, #115, #158, #159, #173, #190, #192, #206, #223, #233 | runtime, `codegen.py` | `test_json_parse.py`, `test_troubleshoot.py` |
 | Graphics: canvas, window, drawing, style, images | §17 | Graphics | #37, #39, #89–#95, #104, #133–#136, #139, #179, #180, #183, #185, #188, #189, #234, #240, #241 | `runtime/festina_runtime_graphics.c`, `festina_runtime_window*.{c,m,h}`, `festina/colors.py` | `test_graphics.py`, `test_events_and_graphics.py` |
@@ -146,10 +146,11 @@ Use this table to go straight to the right place. "Spec" is
 | Timers, background loads, program lifetime, shutdown | §12 | Timers; Files (`.callback()`); `log()` / `fail()` / `close()`; Graceful shutdown | #69, #131, #161, #163, #165, #172, #177 | `runtime/festina_runtime_async.c` | `test_timers.py`, `test_async_io.py`, `test_graceful_shutdown.py` |
 | HTTP, WebSocket, client, TLS | §19 | HTTP and WebSocket servers | #151–#155, #160, #162–#168, #247, #248 | `runtime/festina_runtime_http.c`, `festina_runtime_https.c` | `test_http.py`, `test_secure_port.py` |
 | Threads, pools, messaging, hand-off | §20 | Threads | #195–#218, #220, #222, #230–#232, #245, #246 | `runtime/festina_runtime_thread.c`, `semantic.py` | `test_threads.py`, `scripts/thread_tsan_stress.sh` |
-| Compile errors, runtime failure, undefined behavior | §14 | Error format | #48, #158, #266 | `festina/errors.py` | `test_semantic_errors.py` |
+| Compile errors, runtime failure, undefined behavior | §14 | Error format | #48, #158, #266, #272 | `festina/errors.py` | `test_semantic_errors.py` |
 | Compiler pipeline, CLI, linking, install | §21.1–§21.3, §21.6 | CLI; Compilation pipeline | #3, #47, #59, #144, #145, #147, #250, #253 | `festina/cli.py`, `llvm_backend.py`, `bin/festina`, `install.sh`, `packaging/` | `test_cli.py`, `test_llvm_backend.py`, `test_packaging.py` |
 | Platforms: Linux, macOS, Windows | §21.4 | [setup.md](setup.md), [macos.md](macos.md), [windows.md](windows.md) | #121–#129, #169, #170, #235, #238 | window and audio backends, `cli.py` (`_check_feature_supported`) | `test_platform.py`, `.github/workflows/ci.yml` |
 | `wasm32-wasi` target and browser host | §21.5 | [wasm.md](wasm.md) | #148, #237, #242, #244, #263 | `runtime/wasm/` | `test_wasm.py`, `test_wasm_browser.py` |
+| Bootstrapping: the lexer and parser written in Festina, differential tests | — | — | #271–#276 | `bootstrap/lexer.f`, `bootstrap/parser.f`, `bootstrap/difftest.py`, `bootstrap/astdiff.py`, `bootstrap/cases/` | `test_bootstrap_lexer.py`, `test_bootstrap_parser.py` |
 | Removed and superseded features | Annex C | — | the entry cited in each row | — | `test_non_goals.py` |
 | Security posture | — | [security.md](security.md) | #192–#194 | — | — |
 | Benchmarks and measurements | — | [benchmark.md](benchmark.md) | #103, #105, #153, #171, #239, #244, #254, #268 | `benchmarks/` | — |
@@ -176,6 +177,7 @@ Use this table to go straight to the right place. "Spec" is
 | `festina/` | The compiler (Python): `lexer.py`, `parser.py`, `ast.py`, `imports.py`, `semantic.py`, `escape_analysis.py`, `types.py`, `sqlite_schema.py`, `codegen.py` (LLVM IR), `llvm_backend.py`, `cli.py`, `compiler.py`, `errors.py`, `colors.py` |
 | `runtime/` | The native C runtime: `festina_runtime.c/.h` plus `_graphics`, `_audio`, `_http`, `_https`, `_thread`, `_async`, the window backends, and `wasm/` (the WASI host) |
 | `tests/` | The pytest suite, `stress/` and `valgrind_stress/` programs, `fixtures/`, and `CONTRACT.md` |
+| `bootstrap/` | Festina's own lexer and parser written in Festina, with differential tests against the Python originals |
 | `examples/`, `benchmarks/` | Runnable programs (every example is compiled by the test suite); benchmark suites |
 | `bin/festina`, `install.sh`, `packaging/`, `scripts/` | The CLI entry point, installer, packaged-binary build, and stress scripts |
 | `docs/`, `editors/` | The documentation site and editor support |

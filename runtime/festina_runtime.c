@@ -1815,6 +1815,34 @@ int64_t festina_text_to_int(const char *s) {
     return (int64_t)v;
 }
 
+/* claude.md #272: text.trim() -- leading and trailing whitespace
+ * removed, as a fresh owned copy (never a pointer into `s`, which may
+ * be a .rodata literal -- claude.md #83's four provenances mean a text
+ * this runtime hands back must always be independently freeable).
+ *
+ * Byte-oriented, deliberately: the whitespace set is ASCII space, tab,
+ * newline, carriage return, vertical tab and form feed -- exactly what
+ * C's isspace() answers in the "C" locale, and the same set Python's
+ * str.strip() removes for ASCII input. No Unicode whitespace (U+00A0,
+ * U+2000..) is stripped. That is safe to do byte-wise on UTF-8 without
+ * decoding: every byte of a multi-byte sequence has its high bit set,
+ * so none of them can be mistaken for one of these seven ASCII bytes. */
+char *festina_text_trim(const char *s) {
+    if (!s) s = "";
+    const unsigned char *p = (const unsigned char *)s;
+    size_t len = strlen(s);
+    size_t start = 0;
+    while (start < len && isspace(p[start])) start++;
+    size_t end = len;
+    while (end > start && isspace(p[end - 1])) end--;
+    size_t out_len = end - start;
+    char *out = malloc(out_len + 1);
+    if (!out) festina_fail("out of memory in text.trim()");
+    memcpy(out, s + start, out_len);
+    out[out_len] = '\0';
+    return out;
+}
+
 /* text[i] -> a single UTF-8 code point, the same unit split('') already
  * uses (see festina_text_split's own empty-separator branch just
  * above) -- walked independently here rather than factored out, since
@@ -2805,6 +2833,59 @@ int64_t festina_blob_length(void *payload) {
     if (!payload) return 0;
     FestinaBlob *b = (FestinaBlob *)payload;
     return b->length;
+}
+
+/* claude.md #272: blob.byteAt(i) -- an O(1) indexed read of one raw
+ * byte, 0..255, and null (int's own sentinel, the same answer
+ * text.charCodeAt and ascii's own indexing already give) for a negative
+ * or past-the-end index. Bounds-checked, unlike arr[T] indexing: this
+ * reads a buffer whose length the program did not choose, so "test,
+ * don't fail" is the right rule -- the same reasoning blob.length's own
+ * "unreadable path is 0" answer follows.
+ *
+ * The cast through unsigned char is what makes this a BYTE read rather
+ * than a char read: plain char is signed on x86, so byte 0xE9 would
+ * otherwise come back as -23 instead of 233.
+ *
+ * This is the read half of the byte-buffer type todo.md carries. It
+ * exists because bootstrap/lexer.f (claude.md #271) could not read its
+ * own repository: text.toAscii() validates and answers null for
+ * non-ASCII, and a lexer for a UTF-8 language must carry those bytes
+ * through string literals without interpreting them. */
+int64_t festina_blob_byte_at(void *payload, int64_t index) {
+    if (!payload) return festina_null_int();
+    FestinaBlob *b = (FestinaBlob *)payload;
+    if (index < 0 || index >= b->length) return festina_null_int();
+    return (int64_t)(unsigned char)b->bytes[index];
+}
+
+/* claude.md #272: blob.slice(start, end) -- the half-open byte range
+ * [start, end) as a fresh owned `text`. Clamped rather than failing
+ * (splice()'s own rule, api.md's "Indexing is not bounds-checked"
+ * section names it as the contrast to arr[T]), so an inverted or
+ * out-of-range range answers '' instead of reading past the buffer.
+ *
+ * Answers `text` and not another blob deliberately: a blob is a FILE --
+ * it carries the path it was loaded from and .save() writes back to it
+ * -- so a slice of one has no meaningful path of its own. Handing back
+ * text keeps the file/bytes distinction intact. */
+char *festina_blob_slice(void *payload, int64_t start, int64_t end) {
+    int64_t len = 0;
+    const char *bytes = "";
+    if (payload) {
+        FestinaBlob *b = (FestinaBlob *)payload;
+        bytes = b->bytes;
+        len = b->length;
+    }
+    if (start < 0) start = 0;
+    if (end > len) end = len;
+    if (end < start) end = start;
+    size_t out_len = (size_t)(end - start);
+    char *out = malloc(out_len + 1);
+    if (!out) festina_fail("out of memory in blob.slice()");
+    memcpy(out, bytes + start, out_len);
+    out[out_len] = '\0';
+    return out;
 }
 
 /* Replaces the in-memory bytes as well as the file, so .toText()

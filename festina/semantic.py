@@ -337,6 +337,13 @@ _BLOB_METHODS = {
     "append": ((_TEXT,), _BOOL),
     "exists": ((), _BOOL),
     "delete": ((), _BOOL),
+    # claude.md #272: the read half of a byte buffer. byteAt(i) is an
+    # O(1) raw byte (0..255, null out of range); slice(a, b) is the
+    # half-open byte range as text -- text and not another blob, since a
+    # blob is a FILE that carries its own path and a slice of one has no
+    # path to carry.
+    "byteAt": ((_INT,), _INT),
+    "slice": ((_INT, _INT), _TEXT),
 }
 
 # claude.md #37, #39: signatures for the builtins with real implementations
@@ -3467,6 +3474,19 @@ def analyze(program, filename="<string>"):
                     infer(callee.obj, scope) == _TEXT
                     or _is_ascii_type(infer(callee.obj, scope))):
                 return _INT
+            # claude.md #272: text.trim() -> text -- leading and
+            # trailing ASCII whitespace removed. An `ascii` receiver is
+            # deliberately NOT accepted here: it would have to answer an
+            # `ascii`, and that is a second runtime function for a case
+            # nothing has asked for yet (bootstrap/lexer.f, the reason
+            # this exists, trims a text).
+            if callee.prop == "trim" and infer(callee.obj, scope) == _TEXT:
+                if expr.args:
+                    raise CompileError(
+                        f"trim() takes no arguments, got {len(expr.args)}",
+                        file=filename, line=expr.line, column=expr.column,
+                        category="wrong argument count")
+                return _TEXT
             # claude.md #249: text.charCodeAt(i:int) -> int -- the
             # Unicode CODE POINT at code-point index i (the same unit
             # text[i] already uses), null for i<0 or past the last
