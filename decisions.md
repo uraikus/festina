@@ -5620,15 +5620,29 @@ This is the third time a control has been the thing that found the gap (#276's e
 
 Asked for: put `semdiff.py` into CI alongside making the bootstrap suites Linux-only. Both halves are one change, because the first is what makes room for the second.
 
-**The problem.** `bootstrap/semantic.f` reached 93/93 (#286) with nothing in CI protecting it -- `semdiff.py` ran only by hand, so a regression would have gone unnoticed until someone thought to look. Adding it meant a third Festina binary compiled and run across the corpus, and the Windows job had measured **40:38 of its 45-minute timeout** on the last merged head (#284). There was no room.
+**The stated problem.** `bootstrap/semantic.f` reached 93/93 (#286) with nothing in CI protecting it -- `semdiff.py` ran only by hand, so a regression would have gone unnoticed until someone thought to look. Adding it meant a third Festina binary compiled and run across the corpus, and the Windows job had measured **40:38 of its 45-minute timeout** on the last merged head (#284). There was no room.
 
-**The trade, and why it is not a loss.** On Linux all three harnesses together cost **14.6 seconds**. Nothing in any of them is platform-specific: they compare two implementations of the lexer, parser and analyzer against each other, which is compiler-development tooling, not platform coverage. Every platform-specific claim the project makes is tested elsewhere, by tests that stay everywhere. So the gate makes them Linux-only, Linux gains the semantic harness for fifteen seconds, and the thing that was unprotected becomes protected.
+That framing did not survive being measured, and the correction is the more useful half of this entry.
 
-**What it actually cost, measured against the last merged head.** windows 40:38 -> **39:13** (-1:25); macos 10:22 -> **7:55** (-2:27); linux 10:19 -> **10:39** (+0:20, the new semantic harness). macOS is the clean read of what the gate does -- two harnesses dropped, two and a half minutes back, no coverage lost.
+**The reason that stands on its own.** On Linux all three harnesses together cost **14.6 seconds**. Nothing in any of them is platform-specific: they compare two implementations of the lexer, parser and analyzer against each other, which is compiler-development tooling, not platform coverage. Every platform-specific claim the project makes is tested elsewhere, by tests that stay everywhere. Running them on three platforms buys nothing that running them on one does not. This argument has no clock in it and is untouched by everything below.
 
-**The Windows prediction was wrong, and that matters more than the number.** The estimate going in was "roughly 36", taken from #105 having moved that job 35:23 -> 39:35 when it *added* the two harnesses: 4:12. Removing them gave back 1:25 of that 4:12. The missing 2:47 is not explained by anything in the change, and the honest reading is that Windows job times vary by minutes run to run -- which means #105's 4:12 was never a clean measurement of the harnesses either. A single pair of runs cannot separate a real cost from runner variance, and this one did not. What is true regardless: Windows now has **5:47 of headroom** in its 45-minute cap rather than 4:22.
+**Four runs of the Windows job, three of them meant to be comparable:**
 
-Both platforms end up better off, which is why this was the recorded fix for the budget rather than raising `timeout-minutes` a second time (claude.md #238 already raised it once, and a budget raised twice is a budget nobody is managing).
+| head | what changed | windows | macos | linux |
+|---|---|---|---|---|
+| #105 before | -- | 35:23 | | |
+| #105 after | added lexer + parser harnesses | 39:35 | | |
+| #284 | last merged head | 40:38 | 10:22 | 10:19 |
+| 6d32746 | the gate + semdiff | **39:13** | 7:55 | 10:39 |
+| d1ed981 | **two .md files, nothing else** | **22:15** | 9:44 | 8:39 |
+
+The last row is the one that matters. `d1ed981` changed two documentation files and not one line of code or test configuration, so it ran **exactly** the tests `6d32746` ran, under exactly the same gate. Windows took **22:15 instead of 39:13** -- a swing of nearly seventeen minutes with no behavioral difference whatsoever. macOS moved +1:49 the other way and Linux -2:00, on the same nothing.
+
+**So the budget crisis was substantially an artifact of one noisy sample.** The 40:38 that made "there was no room" feel like a fact is a single draw from a distribution that also contains 22:15. The prediction built on it -- Windows would return to "roughly 36" -- was wrong in the small (it landed at 39:13) and then wrong in a much more interesting way (the very next run, with identical behavior, landed at 22:15). The 4:12 that #105 appeared to measure for adding the harnesses is inside the noise floor and never measured anything.
+
+**The rule worth keeping: a hosted-runner wall-clock is a sample, not a measurement.** Every timing claim this project has made about CI budget rests on single runs, and the variance here is larger than every effect any of those claims asserted. A cost claim needs repeats or it is noise wearing a number's clothes. The project applies this standard to benchmarks already (#254's insistence on reporting both numbers honestly); CI durations were quietly exempted from it, and should not have been.
+
+**What is actually true after all this.** The gate is right for the coverage reason, which never depended on timing. The semantic harness is in CI, which was the goal. Windows finishes inside its 45-minute cap, as it did before. What cannot be claimed is that the gate bought a specific number of minutes on Windows -- the measurement to support that does not exist, and the run that looked like it did was noise. Raising `timeout-minutes` a second time was still the wrong fix (claude.md #238 raised it once, and a budget raised twice is a budget nobody is managing), but it was the wrong fix to a problem smaller than it appeared.
 
 **Where the decision lives.** One helper, `_require_bootstrap_platform` in `tests/conftest.py`, carrying the whole reasoning; the three suites call it from the fixture that builds their binary. Deliberately NOT a module-level skip: each of those modules also holds cheap, pure-Python tests -- the corpus-not-empty guard, the `division_vs_regex.f` shape check, and every one of `test_bootstrap_semantic.py`'s oracle canaries -- and those keep running on all three platforms, because they cost about a second and are worth having everywhere.
 

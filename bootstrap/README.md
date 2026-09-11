@@ -168,15 +168,14 @@ implementations against each other, which is compiler-development
 tooling rather than platform coverage. On Linux all three cost about 15
 seconds together, which is why that is where they run.
 
-Gating them measured, against the head before it: windows 40:38 →
-**39:13**, macos 10:22 → **7:55**, linux 10:19 → **10:39** (the new
-semantic harness). macOS shows what the gate is worth where the clock is
-not noisy. Windows was predicted to save about four minutes and saved
-1:25; run-to-run variance on that runner is larger than the effect being
-measured, so the four-minute figure it was predicted from is not
-trustworthy either. The durable result is that Windows has 5:47 of
-headroom in its 45-minute cap rather than 4:22, which is the room the
-semantic harness needed.
+The gate was justified partly on CI budget at the time, and that part of
+the argument did not survive measurement — see decisions.md #287. The
+short version: the Windows job ran the identical test set in **39:13**
+on one commit and **22:15** on the next, where that next commit changed
+two documentation files and nothing else. Hosted-runner wall-clock is a
+sample, not a measurement, and the variance is larger than any harness
+cost anyone has claimed to observe. The coverage argument above is the
+one that holds.
 
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
