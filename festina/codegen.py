@@ -2250,6 +2250,10 @@ class CodeGen:
             # escaping struct/arr[T]/map[T] locals -- see
             # _emit_free_active_locals.
             "declare void @free(ptr)",
+            "declare void @festina_clear_text(ptr)",
+            "declare void @festina_begin_clearing()",
+            "declare void @festina_end_clearing()",
+            "declare void @festina_free_z(ptr)",
             # claude.md #77: reference counting for struct values escape
             # analysis proves DO escape (global structs, and escaping
             # local structs that are never themselves returned) -- see
@@ -4733,10 +4737,29 @@ class CodeGen:
         if llvm_ty == "ptr":
             old = self.tmp()
             lines.append(f"  {old} = load ptr, ptr {ref}")
+            zeroing = getattr(stmt, "zeroing", False)
             if _is_refcounted(ttype):
+                # decisions.md #284: a refcounted value is released, not
+                # necessarily freed, and the release runs a cascade this
+                # call site does not walk -- a generated per-struct
+                # function frees each field, a container frees its
+                # elements. The clearing intent therefore travels as
+                # thread-local state set around the whole cascade, and
+                # every free inside it consults the flag. A value still
+                # referenced elsewhere is neither freed nor zeroed,
+                # because the flag is only ever read at a free that
+                # actually happens.
+                if zeroing:
+                    lines.append("  call void @festina_begin_clearing()")
                 lines.append(f"  call void {self._release_fn_for(ttype)}(ptr {old})")
+                if zeroing:
+                    lines.append("  call void @festina_end_clearing()")
             elif ttype == TEXT:
-                lines.append(f"  call void @free(ptr {old})")
+                if zeroing:
+                    self.uses_clear = True
+                    lines.append(f"  call void @festina_clear_text(ptr {old})")
+                else:
+                    lines.append(f"  call void @free(ptr {old})")
             # Any other ptr-backed value: nothing released, only the
             # binding dropped. claude.md #265: a table row is no longer
             # in that group -- it is refcounted, so `free row` is an
@@ -9828,7 +9851,7 @@ class CodeGen:
         header_offset = -16 if tagged else -8
         header = self.tmp()
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 {header_offset}")
-        body.append(f"  call void @free(ptr {header})")
+        body.append(f"  call void @festina_free_z(ptr {header})")
         body.append(f"  br label %{done_label}")
         if cyclic:
             self._emit_cycle_trial(body, type_, alive_label, done_label)
@@ -9863,15 +9886,24 @@ class CodeGen:
                 lines.append(f"  call void {field_release_fn}(ptr {fval})")
             elif ftype == TEXT:
                 # claude.md #83: a text-typed field is copy-managed, not
-                # refcounted -- freed with a plain @free (NULL-safe),
-                # never through _release_fn_for's own struct/arr[T]/
-                # map[T] dispatch, since there's no refcount header to
-                # decrement here at all.
+                # refcounted -- never routed through _release_fn_for's
+                # struct/arr[T]/map[T] dispatch, since there is no
+                # refcount header to decrement here at all.
+                #
+                # decisions.md #284: it still goes through
+                # @festina_free_z rather than plain @free, and this is
+                # the site that matters most for `clear`. A struct
+                # holding a secret holds it in a text FIELD -- freeing
+                # that field unzeroed while wiping only the struct's own
+                # storage would leave the secret in the heap and the
+                # statement would be a lie for its most obvious use.
+                # @festina_free_z is exactly @free when no clear is in
+                # flight, so the ordinary path is unchanged.
                 fptr = self.tmp()
                 lines.append(f"  {fptr} = getelementptr {struct_ty}, ptr {obj_ptr}, i32 0, i32 {i}")
                 fval = self.tmp()
                 lines.append(f"  {fval} = load ptr, ptr {fptr}")
-                lines.append(f"  call void @free(ptr {fval})")
+                lines.append(f"  call void @festina_free_z(ptr {fval})")
 
     def _emit_release_nested_fields_only(self, ref, struct_type, lines):
         """claude.md #78: the stack-allocated counterpart to
@@ -9971,10 +10003,10 @@ class CodeGen:
         data_ptr = self.tmp()
         body.append(f"  {data_ptr} = load ptr, ptr {data_field_ptr}")
         self._emit_release_array_elements(data_ptr, len_val, elem_release_fn, elem_llvm_ty, body)
-        body.append(f"  call void @free(ptr {data_ptr})")
+        body.append(f"  call void @festina_free_z(ptr {data_ptr})")
         header = self.tmp()
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
-        body.append(f"  call void @free(ptr {header})")
+        body.append(f"  call void @festina_free_z(ptr {header})")
         body.append(f"  br label %{done_label}")
         if cyclic:
             self._emit_cycle_trial(body, type_, alive_label, done_label)
@@ -10170,7 +10202,7 @@ class CodeGen:
         body.append(f"  call void @festina_map_free_entries(ptr {entries_ptr}, i64 {cap_val})")
         header = self.tmp()
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
-        body.append(f"  call void @free(ptr {header})")
+        body.append(f"  call void @festina_free_z(ptr {header})")
         body.append(f"  br label %{done_label}")
         if cyclic:
             self._emit_cycle_trial(body, type_, alive_label, done_label)
@@ -10304,7 +10336,7 @@ class CodeGen:
                 body.append(f"{cont_label}:")
             header = self.tmp()
             body.append(f"  {header} = getelementptr i8, ptr %payload, i64 -8")
-            body.append(f"  call void @free(ptr {header})")
+            body.append(f"  call void @festina_free_z(ptr {header})")
             body.append(f"  br label %{done_label}")
             body.append(f"{done_label}:")
             body.append("  ret void")
@@ -10585,8 +10617,13 @@ class CodeGen:
                     fval = load_field(body, i)
                     body.append(f"  call void {self._release_fn_for(ftype)}(ptr {fval})")
                 elif ftype == TEXT:
+                    # decisions.md #284: the cycle collector's dispose
+                    # path frees the same text fields the ordinary
+                    # cascade does, so it wipes them under the same
+                    # rule -- a secret in a cyclic struct is still a
+                    # secret.
                     fval = load_field(body, i)
-                    body.append(f"  call void @free(ptr {fval})")
+                    body.append(f"  call void @festina_free_z(ptr {fval})")
             # claude.md #176: same tagged-struct offset correction as
             # _release_fn_for_struct's own free path -- a tagged
             # struct's true allocation base sits 16 bytes back, not 8.

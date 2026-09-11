@@ -54,7 +54,8 @@ SPEC_KEYWORDS = frozenset({
 # parser needs distinct token types to dispatch on. Both remain valid
 # MEMBER names (parser.eat_name accepts keyword tokens), which is what
 # keeps blob's `f.delete()` parsing.
-_EXTRA_KEYWORDS = frozenset({"return", "var", "let", "throw", "free", "delete"})
+_EXTRA_KEYWORDS = frozenset({"return", "var", "let", "throw", "free", "clear",
+                             "delete"})
 
 # Exposed reserved-word set used by the parser/semantic layer. A superset
 # of the spec's list is fine -- tests only check the spec words are

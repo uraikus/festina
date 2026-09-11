@@ -3099,7 +3099,7 @@ says** (all of it applies here too):
   under `--target=wasm32-wasi`, for the identical reason `openPort()`
   isn't there either.
 
-## Freeing and deleting
+## Freeing, clearing and deleting
 
 Memory is automatic — but `free` and `delete` exist for the moments you
 know better than the compiler does.
@@ -3313,6 +3313,48 @@ type is struct/arr/map auto-vivifies on the next reach-through, per the
 zero-value rule, so it re-appears empty rather than staying null.)
 
 To remove a whole *variable*, that's `free` — `delete x` says so.
+
+### `clear` — free, with the bytes wiped first
+
+`clear x` does everything `free x` does — releases the value, nulls the
+binding, no-ops on a second clear — and overwrites the bytes with zero
+before they are released. It is for a value whose contents should not
+outlive it: a key, a password, a session token.
+
+```festina
+text token = 'sk-live-0123456789abcdef'
+sendRequest(token)
+clear token          // the buffer is zeroed, then freed
+log(`${token == null}`)   // true
+```
+
+The write goes through a volatile pointer in the runtime, so a C
+compiler cannot delete it as a store to memory that is about to die —
+which is the optimization that has historically defeated hand-written
+wipe-the-password loops, and the reason this is a statement rather than
+`x = '' ; free x`.
+
+**The wipe follows the release cascade.** Clearing a struct wipes its
+own storage and every field released with it; clearing an `arr[T]` or
+`map[T]` covers the elements released with it.
+
+**It happens only where storage is actually released.** A
+reference-counted value another binding still holds is neither freed
+nor zeroed — overwriting a buffer someone can still read would be a
+use-after-free. So `clear` on a shared value decrements and wipes
+nothing, and a program that needs the guarantee must hold the only
+reference. A `text` binding always does; a `T?` binding does by
+definition.
+
+```festina
+arr[text] a = ['alpha', 'beta']
+arr[text] b = a
+clear a              // b still reads 'alpha' -- nothing was freed
+```
+
+`clear` wipes one buffer at one moment. It says nothing about copies
+made earlier, about memory the allocator has already handed out again,
+or about pages the operating system has written to swap or a core dump.
 
 ## Saving bytes to a path
 

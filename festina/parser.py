@@ -262,6 +262,14 @@ class Parser:
             free_tok = self.eat()
             name_tok = self.eat("IDENT")
             return ast.FreeStmt(name_tok.value, free_tok.line, free_tok.column)
+        if t.type == "clear":
+            # decisions.md #283: `clear name` is `free name` that zeroes
+            # the bytes first, and takes the same bare-name target for
+            # the same reason -- there has to be a binding to null.
+            clear_tok = self.eat()
+            name_tok = self.eat("IDENT")
+            return ast.FreeStmt(name_tok.value, clear_tok.line,
+                                clear_tok.column, zeroing=True)
         if t.type == "delete":
             # claude.md #111: `delete m.key` / `delete m['key']` /
             # `delete s.field`. Parsed as a full postfix expression and

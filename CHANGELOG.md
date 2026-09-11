@@ -30,6 +30,63 @@ round-by-round design and implementation record predating 0.1 lives in
   itself is now a short set of working instructions for agents that
   points at the specification instead of containing it (decisions.md
   #277).
+- **A language change is now written specification first, then tests,
+  then code.** Anything that adds to or changes the language surface
+  starts as a normative clause in specification.md, beside the clauses
+  it interacts with; the tests are written against that clause and
+  watched failing for the right reason; the implementation comes last.
+  A bug fix, where the specification already says what should happen
+  and the code disagrees, instead confirms the clause, adds the failing
+  test and fixes — but an addition dressed as a fix follows the full
+  order. Recorded in claude.md §2 (decisions.md #278).
+- **Documentation describes the present, and only the present** — not
+  what the project used to be, and not what it is going to be. Exactly
+  three documents are exempt because recording time is their purpose:
+  CHANGELOG.md and decisions.md for the past, todo.md for the future,
+  plus Annex C of specification.md for removed features. Recorded in
+  claude.md §2 (decisions.md #278).
+
+### Added
+
+- **`clear x`** — `free x` that overwrites the bytes with zero before
+  releasing them, for a value whose contents should not outlive it
+  (specification.md §10.11). The write goes through a volatile pointer
+  so it cannot be optimized away as a store to dead memory. Zeroing
+  follows the release cascade: clearing a struct wipes its own storage
+  and every field released with it, and clearing an `arr[T]`/`map[T]`
+  covers the elements released with it. It happens only where storage
+  is actually released, so a value another binding still holds is
+  neither freed nor zeroed (decisions.md #283, #284).
+
+- **`bootstrap/semdump.py`** — the canonical dump the Festina port of
+  semantic analysis will be checked against. Because `analyze()` is a
+  checker rather than an annotator, diffing its return value would say
+  nothing about the inside of a function body; the dump instead wraps
+  `Scope.define` and records the resolved type of every name the
+  program binds anywhere, including locals nested arbitrarily deep.
+  3,175 records over 78 analyzed corpus files.
+  `tests/test_bootstrap_semantic.py` pins its discriminating power
+  (decisions.md #280).
+
+- **`bootstrap/semantic.f`** — `festina/semantic.py` ported to Festina,
+  the third step of bootstrapping the compiler in its own language.
+  77 of 91 corpus files produce the same dump as the Python analyzer,
+  0 unported. It resolves declarations, merges imports in dependency
+  order, and walks thread bodies in their own isolated scope. The 14
+  remaining differences all need expression analysis, which it does not
+  do yet: arrow-function hoisting, a thread's `reply` type, and the
+  assignability check that makes four invalid sources reject.
+  `bootstrap/semdiff.py` runs the comparison (decisions.md #281, #282).
+
+### Unchanged
+
+- **`T?` keeps the meaning it has** — a self-managed binding, never
+  retained on alias and never released by anyone but the program. The
+  uniform "pointer to a cell" model, and a `view`/`alias` borrowing
+  syntax considered alongside it, are both decided against; no
+  specification clause and no code changed. The bootstrap ports turn
+  out to use no `T?`, `free` or `delete` at all, so nothing was waiting
+  on this (decisions.md #279).
 
 ## [0.44] - 2026-09-02
 

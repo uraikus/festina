@@ -1371,13 +1371,17 @@ Node func parseStatement() {
     if k == 'break' { return parseSimpleKeywordStmt('break', 'BreakStmt') }
     if k == 'continue' { return parseSimpleKeywordStmt('continue', 'ContinueStmt') }
 
-    if k == 'free' {
+    // decisions.md #283: `clear` is `free` with zeroing=true -- ONE
+    // node on the Python side too, so the dump carries the flag and
+    // both spellings have to set it.
+    if k == 'free' || k == 'clear' {
         Tok freeTok = advance()
         Tok nameTok = eat('IDENT')
         Node n = mk('FreeStmt')
         addStr(n, 'name', nameTok.val)
         addInt(n, 'line', freeTok.line)
         addInt(n, 'column', freeTok.col)
+        addBool(n, 'zeroing', k == 'clear')
         return n
     }
     if k == 'delete' {

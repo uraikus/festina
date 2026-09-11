@@ -1732,6 +1732,22 @@ const void *festina_blob_bytes(void *payload, int64_t *out_len);
 int64_t festina_blob_length(void *payload);
 int64_t festina_blob_byte_at(void *payload, int64_t index);
 char *festina_blob_slice(void *payload, int64_t start, int64_t end);
+
+/* decisions.md #283: `clear x` -- release with the bytes overwritten
+ * first. festina_zeroize wipes a whole allocator block through a
+ * volatile pointer so the write cannot be optimized away as a store to
+ * dead memory; festina_clear_text wipes and frees an owned text. */
+void festina_zeroize(void *p);
+void festina_clear_text(char *s);
+
+/* decisions.md #284: the clearing intent travels as thread-local state
+ * set around a release, because a release cascade's free sites take no
+ * argument from the statement that started it. festina_free_z is the
+ * free every release path uses; it zeroes first only while a `clear`
+ * is in flight. */
+void festina_begin_clearing(void);
+void festina_end_clearing(void);
+void festina_free_z(void *p);
 int8_t festina_blob_write(void *payload, const char *content);
 int8_t festina_blob_append(void *payload, const char *content);
 int8_t festina_blob_exists(void *payload);

@@ -63,6 +63,29 @@ the specification's own conformance rules (specification.md §2).
 - Never add a project dependency (a Python package, a C library, a
   build tool) without explicit permission.
 
+**The order of work for a language change** (decisions.md #278)
+
+Anything that adds to or changes the language surface — a type, a
+method, an operator, a statement form, a literal, a diagnostic — is
+written in this order, and the order is not negotiable:
+
+1. **specification.md first.** Write the normative clause before any
+   other file. Deciding the rule in prose, where it has to sit beside
+   the clauses it interacts with, is what catches a design that does
+   not fit; discovering that halfway through codegen is expensive.
+   Add the Annex C row if something is being removed or superseded.
+2. **Tests second.** Write them against the clause, and watch them
+   fail for the right reason before implementing. A test written after
+   the implementation tests what the code does; one written after the
+   specification tests what the language promises.
+3. **The implementation last**, until those tests pass.
+
+This does not apply to a bug fix, where the specification already says
+what should happen and the code disagrees — there, the clause is the
+thing being restored, so confirm it says what you think, add the
+failing test, then fix. It does apply the moment a "fix" turns out to
+need a rule that is not written down yet.
+
 **While changing**
 
 - Keep compiled programs fast: prefer compile-time work, native
@@ -90,7 +113,9 @@ the specification's own conformance rules (specification.md §2).
 **Documenting every change** (all of these, every time)
 
 1. specification.md — the normative rule; add an Annex C row for
-   anything removed.
+   anything removed. For a language change this was already written
+   first, before the tests and the code; check it still says what the
+   implementation ended up doing, and correct whichever one is wrong.
 2. api.md — the reference and worked examples, kept consistent with the
    specification and the code.
 3. decisions.md — append the next numbered entry, in the existing
@@ -105,18 +130,35 @@ Cite decision entries as `decisions.md #N` in new comments, tests and
 documents; the older `claude.md #N` spelling remains valid and means
 the same entry.
 
-**Version history belongs only in CHANGELOG.md and decisions.md.**
-specification.md, api.md, benchmark.md, todo.md, setup.md, macos.md,
-windows.md, wasm.md, security.md and the documentation site all
-describe the software as it is now — no "as of version X", no "this
-used to work differently", no `claude.md #N`/`decisions.md #N`
-citation used to explain what changed instead of what is true. Annex C
-of specification.md is the one sanctioned exception: a table of
-removed/superseded features naming the entry that removed each, kept
-exactly because a reader needs to know something is gone. When a
-change makes an existing sentence read as history rather than as a
-present-tense rule, rewrite the sentence; do not leave the old and new
-framing side by side.
+**Documentation describes the present, and only the present.** Every
+document states what the project *is* right now — not what it used to
+be, and not what it is going to be. No "as of version X", no "this
+used to work differently", no "this will be added later", no
+`claude.md #N`/`decisions.md #N` citation used to explain what changed
+instead of what is true. This covers specification.md, api.md,
+benchmark.md, setup.md, macos.md, windows.md, wasm.md, security.md,
+README.md, every `README.md` under a subdirectory, tests/CONTRACT.md
+and the documentation site.
+
+Exactly three documents are exempt, because recording time is their
+whole purpose:
+
+| | |
+|---|---|
+| CHANGELOG.md | the past, by version |
+| decisions.md | the past, by decision — what was asked, decided, and why |
+| todo.md | the future — open work and deliberate non-work |
+
+One sanctioned exception outside those three: Annex C of
+specification.md, a table of removed and superseded features naming
+the entry that removed each, kept because a reader needs to know
+something is gone.
+
+When a change makes an existing sentence read as history or as a
+promise, rewrite the sentence; do not leave the old and new framing
+side by side, and do not annotate the stale one. A number that has
+moved (a file count, a test count, a measurement) is the same problem
+in miniature: correct it rather than letting it date the document.
 
 **Delivering**
 

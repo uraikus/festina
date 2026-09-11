@@ -1,7 +1,11 @@
 # bootstrap/
 
-Festina's own compiler, being rewritten in Festina — the lexer and the
-parser, both complete.
+Festina's own compiler, written in Festina — the lexer and parser
+complete, and semantic analysis under way.
+
+Nothing in the shipped compiler depends on this directory. It exists to
+be a demanding real program in the language, and to be checked against
+the Python implementation it mirrors.
 
 ## What's here
 
@@ -14,6 +18,10 @@ parser, both complete.
 | `difftest.py` | diffs both lexers over every `.f` file in the repo |
 | `astdump.py` | the Python side's canonical AST dump |
 | `astdiff.py` | diffs both parsers over the same corpus |
+| `semantic.f` | `festina/semantic.py`, ported (imports `parser.f`) |
+| `semdumpf.f` | entry point: dumps semantic analysis in the canonical form |
+| `semdump.py` | the Python side's canonical semantic-analysis dump |
+| `semdiff.py` | diffs both analyzers over the same corpus |
 | `cases/*.f` | targeted sources covering what the corpus doesn't reach |
 
 `tests/test_bootstrap_lexer.py` and `tests/test_bootstrap_parser.py` run
@@ -28,27 +36,36 @@ python bootstrap/astdiff.py                         # parser, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Current state:
+Over the 89-file repository corpus:
 
-- **lexer: 89 files match, 0 differ.**
+- **lexer: 89 match, 0 differ.**
 - **parser: 89 match, 0 differ, 0 unported.**
 
-## How the parser stayed honest while it grew
+The lexer lexes itself; the parser parses itself. Lexing and parsing
+`parser.f`, the largest source in the corpus at ~1,200 lines, takes
+about 60 ms.
 
-A construct with no implementation produces an `(UNPORTED ...)` node, and
-`astdiff.py` counts a file containing one as *unported* — never as a
-match, never as a difference. That is what let coverage be reported as a
-real 64/89 mid-port rather than guessed at, and what kept a
-silently-mis-parsing construct showing up as a difference rather than as
-progress. It is kept now the port is complete: the next construct the
-grammar grows will announce itself rather than mis-parse. The only thing
-still unimplemented is the `http {...}` anonymous send, which no corpus
-file uses.
+## Why a port, not a rewrite
 
-Its AST is one generic node — a kind plus a list of named fields — rather
-than the ~45 structs mirroring `festina/ast.py` would need. That is what
-lets the dump be generic on both sides; a per-node dumper would be a
-second parser to keep in sync.
+The only claim worth making about a reimplementation is that it agrees
+with the original. `lexer.f` and `parser.f` are therefore deliberate
+translations of `festina/lexer.py` and `festina/parser.py` — same token
+kinds, same keyword sets, same precedence — checked by diffing a
+canonical dump from each side over the whole corpus.
+
+The lexer has one structural difference from its original: where the
+Python lexer uses a single master regex with named groups and
+`lastgroup`, this is a hand-written byte scanner, because Festina's
+`regex` is POSIX ERE with no named groups. The alternation order of
+`TOKEN_SPEC` is load-bearing — Python's `re` alternation is
+leftmost-**first**, not longest-match, so the scanner tries the same
+kinds in the same order. Getting that wrong is how `x++` becomes
+`+` `+`.
+
+The parser's AST is one generic node — a kind plus a list of named
+fields — rather than the ~45 structs mirroring `festina/ast.py` would
+need. That is what lets the dump be generic on both sides; a per-node
+dumper would be a second parser to keep in sync.
 
 Both sides print one token per line in the same canonical form:
 
@@ -58,85 +75,110 @@ line:col|REGEX|pattern|flags
 line:col|LEXERR|char           # a rejected source reports only this
 ```
 
-## Why a port, not a rewrite
+## The UNPORTED marker
 
-The only claim worth making about a reimplementation is that it agrees
-with the original. `lexer.f` is therefore a deliberate translation of
-`festina/lexer.py` — same token kinds, same keyword sets, same
-precedence — with one structural difference: where the Python lexer uses
-a single master regex with named groups and `lastgroup`, this is a
-hand-written character scanner, because Festina's own `regex` is POSIX
-ERE with no named groups, and scanning is what `ascii` exists for.
+A construct with no implementation produces an `(UNPORTED ...)` node,
+and `astdiff.py` counts a file containing one as *unported* — never as
+a match, never as a difference. Coverage therefore only moves when
+something is really implemented, and a construct that silently
+mis-parses shows up as a difference rather than as progress.
 
-The alternation order of `TOKEN_SPEC` is load-bearing. Python's `re`
-alternation is leftmost-**first**, not longest-match, so the scanner
-tries the same kinds in the same order. Getting that wrong is how `x++`
-becomes `+` `+`.
+Nothing in the corpus reaches it today. It is kept so the next
+construct the grammar grows announces itself rather than mis-parsing;
+the one construct still without an implementation is the `http {...}`
+anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 69-file repo corpus is a strong oracle for ordinary code and a weak
-one for edge cases — it contains no ambiguous `/` at all, and block
-comments appear in exactly one file. `cases/` exists to close that, and
+The 89-file repository corpus is a strong oracle for ordinary code and
+a weak one for edge cases — it contains no ambiguous `/` at all, and
+block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
 regex-vs-division denylist from `lexer.f` must make the test fail, and
 `tests/test_bootstrap_lexer.py::TestTheDifferentialTestCanFail` pins
 that discipline.
 
-That check has already earned its place. The first `division_vs_regex.f`
-put one `/` per line, which passes whether or not the denylist works at
-all — a failed regex attempt falls back to division on its own. Two `/`
-on one line is what actually tests it.
+That check earns its place. A `division_vs_regex.f` with one `/` per
+line passes whether or not the denylist works at all, because a failed
+regex attempt falls back to division on its own. Two `/` on one line is
+what actually tests it.
 
-## What this told us about the language
+Both harnesses carry verified negative controls:
 
-Four limits, recorded in full in claude.md #271. Three are now fixed
-(claude.md #272), which is what this exercise was for:
+| break this | and this many files differ |
+|---|---|
+| longest-match on `++` | 17 |
+| the regex-vs-division denylist | `OP\|/` where `REGEX\| 2 \|` belongs |
+| character columns (use bytes) | exactly the 2 non-ASCII files |
+| additive/multiplicative precedence | 25 |
+| postfix `++` | 24 |
 
-- **`ascii` could not read 3 of the 69 corpus files.** `text.toAscii()`
-  validates and answers `null` for non-ASCII, but a lexer for a UTF-8
-  language must carry those bytes through string literals untouched.
-  **Fixed:** `blob.byteAt(i)`/`blob.slice(a, b)` give the read half of a
-  byte buffer on the type that already holds a file's bytes, and
-  `lexer.f` now scans the source blob by byte offset. All 69 files lex.
-- **`text` could not hold a NUL**, so it could not represent a value its
-  own lexer produced (`'a\0b'.length` answered 1). **Fixed:** the `\0`
-  escape is a compile error now.
-- **`text` had no `.trim()`.** **Fixed:** it does.
-- **`int / int` promotes to float**, so there is no integer midpoint to
-  binary-search with. *Not* fixed — that is claude.md #61's rule working
-  as designed; `lexer.f` walks a forward-only line cursor instead.
+`difftest.KNOWN_DIVERGENCES` is the place to record a divergence that
+genuinely cannot be fixed, so the decision lives next to the test
+rather than in a commit message. It is empty.
 
-And one the differential test found that neither lexer showed alone:
+## Semantic analysis: 77 match, 14 differ, 0 unported
 
-- **A column is a *character* offset, not a byte offset.** Python's
-  lexer indexes `str`, so it counts code points for free. Scanning bytes
-  gives a different answer on any line with non-ASCII before the token —
-  and that column is what every compile error's caret points at. Only
-  running both lexers against real non-ASCII source made it visible.
+`semantic.f` resolves declarations, merges imports, and walks scopes
+including thread bodies. Every remaining difference needs something it
+deliberately does not do yet — analyse expressions:
 
-## Recording a divergence
+| | |
+|---|---|
+| 5 files | an arrow function is hoisted into a named `__festina_arrow_N` binding, which needs the expression walk that finds it |
+| 4 files | the Python side rejects them; without assignability checking this side accepts |
+| 5 files | a thread's `reply` type, and main's, come from `worker.reply(x)` call sites |
 
-`difftest.KNOWN_DIVERGENCES` is empty, and kept rather than deleted. It
-held exactly one entry — the `\0` case above — which was fixed in the
-language instead of tolerated here. If a future divergence genuinely
-cannot be fixed, that table is where it goes, so the decision lives next
-to the test rather than in a commit message.
+Specification.md §10.2 is why this gets as far as it does with no
+inference at all: "A declaration states its type; there is no `var`,
+`let` or inference." Every `DECL` record's type therefore comes from a
+declared type expression. Checking that an initializer is *assignable*
+to its declaration is the separate job those 4 files need.
 
-## What the port has found in the compiler itself
+`semdiff.py` is not in the pytest suite yet. It compiles a third
+Festina binary and runs it over 91 files, and the Windows job has about
+five minutes of headroom (see the CI note above) — so adding it belongs
+with the change that makes the bootstrap suites Linux-only, not before.
 
-Beyond the four language limits above, writing a parser in Festina found
-a real bug in the shipped one (claude.md #274): **`while (a || b) && c`
-did not parse.** `parse_if`/`parse_while` implemented optional condition
-parens by eating a leading `(` and its match, which truncates any
-condition that merely *begins* with a parenthesised group. 2,500 tests
-and 89 corpus files had never written that shape; a parser needed it
-immediately. Fixed by deleting the special case — `parse_primary`
-already handles `( expr )` as ordinary grouping.
+## Then: codegen
 
-## Next
+About 14,500 lines of Python — more than everything ported so far
+combined.
 
-Semantic analysis, then codegen — together about 20k lines, more than
-everything before them combined. Both should wait for the `?` cell
-model, which is a documented breaking change to `?` semantics and would
-otherwise land under a half-ported compiler.
+Neither depends on any language change. The ports use no `T?`, no
+`free` and no `delete`: automatic reclamation handles the whole front
+end unassisted.
+
+`semdump.py` defines the oracle semantic analysis is ported against.
+`analyze()` is a checker rather than an annotator — it raises, or
+returns a symbol table, and writes nothing back onto the AST — so
+diffing its return value alone would say nothing about the inside of a
+function body. Instead the dump wraps `Scope.define`, the single
+chokepoint every binding in the program passes through, and records
+**the resolved type of every name the program binds, anywhere**:
+globals, constants, functions, parameters, loop and catch variables,
+and locals nested arbitrarily deep. The wrapper lives in the harness,
+so the compiler carries no test-only hook.
+
+Over the corpus that is 3,175 records across 78 analyzed files; the
+11 rejected ones are all `cases/*.f`, which exist to be lexed rather
+than to be valid programs. A rejection dumps `SEMERR|line|col` alone —
+position, never message text.
+
+`tests/test_bootstrap_semantic.py` pins the oracle's own discriminating
+power, including that a type renderer collapsing every type into one
+string fails three of its tests.
+
+Codegen has the strongest oracle in the project and needs no design
+work: its output is LLVM IR text, comparable byte for byte.
+
+The obstacles are structural rather than semantic:
+
+- **Festina structs have no methods.** 227 class methods and 77 AST and
+  type classes become free functions over explicit state, the shape
+  `parser.f` already uses.
+- **`isinstance` dispatch**, 480 sites, becomes the generic node's kind
+  string.
+- **`map[T]` keys are `text`.** Three side tables keyed by node identity
+  become a field on the node itself.
+- **One return value per function**, so 259 tuple returns become structs.

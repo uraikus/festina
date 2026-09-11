@@ -5395,3 +5395,181 @@ This file was renamed from claude.md to decisions.md with `git mv`, its content 
 Not done, deliberately: no rewrite of the existing `claude.md #N` citations (a mechanical one-line sed across ~180 files, worth doing as its own change once this one has landed so the diff stays reviewable), and no docs/specification.html for the documentation site (the site links to the GitHub file, as it did for claude.md).
 
 Verified by re-reading the assembled document's internal anchors (every table-of-contents link resolves), by checking each grammar claim against parser.py (the `for` clause separators, `else if`, unary `+`/`-`/`!`/`typeof`, the postfix and call precedence, `catch (name:text)`, the `http {...}` and `blob 'path'.callback(fn)` statement forms) and each name against lexer.py's SPEC_KEYWORDS/_EXTRA_KEYWORDS and semantic.py's BUILTIN_FUNCTIONS, _BUILTIN_SIGNATURES, _EVENT_SIGNATURES and _THREAD_EVENT_SIGNATURES, and by running the front-end test modules after the rename.
+
+278. A LANGUAGE CHANGE IS WRITTEN SPECIFICATION FIRST, THEN TESTS, THEN CODE
+
+Asked for directly, immediately after #277 landed: "for future additions to the language, first add it to specifications, then to tests, then make the change to the language."
+
+This is a working instruction rather than a language rule, so it lives in claude.md §2 -- but it is recorded here because it changes how every later entry in this file comes to exist, and because the reason it was asked for is worth keeping.
+
+**What prompted it.** #277 consolidated the language into specification.md, which only works if the document stays the definition rather than becoming a transcript. Everything before it was written the other way round: the code was written, the behavior was observed, and the rule was recorded afterwards as the entry that introduced it. That is exactly why #277 was needed -- the current rule for anything lived scattered across the entry that introduced it and every later entry that touched it, and api.md was the only consolidated statement of the language. Writing the clause last is what produced that state; writing it first is what stops it recurring.
+
+**The order.** specification.md, then tests, then the implementation.
+
+The reason the clause comes first is not bookkeeping. A normative clause has to sit beside the clauses it interacts with -- assignability, zero values, ownership, the precedence ladder, the compile-error list -- and writing it there is what surfaces a design that does not fit, at the point where changing it costs a paragraph. #105 is the counter-example from the session just before this: `blob.slice()` returning `text` rather than another `blob` is right, and the reason (a blob carries the path it was loaded from, and a slice has no path to carry) is a fact about §8.6 that reads as obvious in the specification and was arrived at while writing C.
+
+The reason the tests come second is that a test written after the implementation tests what the code does, which is a tautology; a test written against the clause tests what the language promises, which can fail. They must be watched failing for the right reason before the implementation exists, the same discipline the harness canaries in `tests/test_bootstrap_lexer.py` and `test_leak_stress.py::test_the_harness_can_actually_fail` already enforce for the differential and leak suites.
+
+**The exception, stated so it is not used as a loophole.** A bug fix, where the specification already says what should happen and the code disagrees, starts by confirming the clause really says what you think, then adds the failing test, then fixes. #274 (`while (a || b) && c` did not parse) is that shape: §10.5 already allowed it. But the moment a "fix" turns out to need a rule that is not written down, it is an addition, and the order above applies.
+
+**Also settled here.** The three language changes from #105 -- `text.trim()`, `blob.byteAt()`/`blob.slice()`, and the rejected `\0` escape -- were checked against specification.md on the assumption they had missed it, having been merged while #277 was being written. They had not: #277 folded them in (§7.5.2 and Annex C for the escape, §8.6 and §16.3 for the blob accessors and `trim()`, §14.1 for the character-column rule, §10.4/§10.5 for #274). Nothing was added. Recorded because the assumption was stated before it was checked.
+
+279. `?` STAYS AS IT IS; THE CELL MODEL IS DECIDED AGAINST, AND IT NEVER BLOCKED THE PORT
+
+Two questions, one answer. Asked first: keep `?` meaning a self-managed variable, and add `view`/`alias` for explicit borrowing --
+
+```
+blob? file = '/to/my/file.txt'
+blob? fileView = view file     // read only
+blob? fileAlias = alias file   // read and write
+```
+
+Asked second, after that was set aside: "if we keep ? as it is, what is the problem we are facing in the bootstrap?"
+
+**The answer to the second question is: none. `?` was never the obstacle.** bootstrap/README.md said semantic analysis and codegen "should wait for the `?` cell model", and the staged plan put the cell model before them. That was written by assuming the port depended on `?` rather than checking whether it did. It does not: `bootstrap/lexer.f`, `parser.f`, `lexdump.f` and `astdumpf.f` contain **zero `?` declarations and zero `free`/`delete` statements** across 2,223 lines. Automatic reclamation carried the entire front end. Nor is there memory-model pressure at this scale -- the compiled parser lexes and parses its own ~1,200-line source in about 60 ms. A dependency that was never measured was stated as a blocker and then planned around, which is the same failure as #276's re-introduced encoding trap in a different register: the repository knew the answer and nobody asked it.
+
+**`alias` already exists, and is spelled by juxtaposition.** Probed rather than inferred:
+
+```
+blob? a = 'probe_data.txt'
+blob? b = a            // compiles today
+b.write('CHANGED')     // a sees: CHANGED   <- already a read/write alias
+a = 'probe_other.txt'  // b still sees CHANGED; rebinding does not propagate
+```
+
+So the proposed `alias` keyword names the existing default. The only version of it that would add anything is one where rebinding *is* shared -- which is the cell model, made opt-in per declaration. That variant is genuinely better than the cell model as planned, because it is additive rather than a breaking change, and it is recorded here in case a program ever wants it.
+
+**`view` is the substantive half, and it is under-specified in the place that decides whether it can work.** Read-only has to be a property of the *type*, not of the binding, or it evaporates at the first call: if the parameter is spelled `blob?`, the callee calls `.write()` and the guarantee is gone. Enforcing it needs a new type constructor, assignability rules in one direction only, and a spelling in every signature that accepts either. Festina has no immutability-through-a-reference concept at all today (`const` is about the binding, and `const T?` is already a compile error), so this would be the language's first, and it would require classifying the mutating method of every type -- exhaustively, or the guarantee is false, which is worse than no guarantee.
+
+The one real capability it would buy: §20.4 deep-copies every message except a `T?`, which crosses uncounted and mutably. So sharing a large read-only buffer with a thread has no safe spelling -- the choice is "clone it" or "share it mutably and hope". A `view` is the principled third answer. Set aside anyway, at the user's own call ("I don't really see the benefit of what I suggested so no need to add to the todo"), so it is recorded here rather than in todo.md.
+
+**Two limits it would not have lifted.** `int? b = alias a; b++` requires `a` to be addressable, so scalars need the cell representation either way; and `free file` while a view is live is a silent use-after-free with no lifetimes to catch it -- the same hazard the cell model carries, made likelier by a feature whose purpose is easy borrowing. §8.18's existing ban on `?` inside another type, on a struct field and on a return type cuts both ways here: a view could never outlive its frame, which contains the hazard and simultaneously prevents building any structure out of views.
+
+**Also corrected here, because the claim was made before it was checked.** Two counts given while answering were produced by bad greps and are wrong. "232 closures" counted class methods at four-space indentation; the real figure is 5 genuinely nested functions and 3 lambdas across both files, so closures are nearly a non-issue. "20 non-text map keys" counted list-of-tuple literals; the real figure is 3, all `id(node)` side tables (`_regex_lit_cache`, `_regex_memo_slots`, `_minted_values`), each better expressed as a field on the generic node than as a side table, so `map[T]`'s text-only keys are not an obstacle either.
+
+**On map keys, asked in the same breath:** #175 made `map[T]` a genuine hash table -- FNV-1a, open addressing, linear probing, O(1) where a linear scan had been O(n). That change was about lookup cost, not about what may be a key; keys have been `text` since #72 and were not revisited. Arbitrary keys are not a small follow-on: `map[T]` names the *value* type, so there is no syntactic slot for a key type, and §14.1 makes equality between structs a compile error, so a struct cannot be a key until structural equality exists. Scalar keys alone would be bounded work. Nothing needs either today.
+
+**Decided.** `?` keeps the meaning §8.18 and §13.4 give it. The cell model is not implemented. No specification clause changes, and no code changes. bootstrap/README.md's "Next" section is rewritten to state the real obstacles -- the oracle problem, and 20,000 lines of methods-on-classes to turn into free functions -- rather than a blocker that was never there.
+
+280. THE ORACLE SEMANTIC ANALYSIS WILL BE PORTED AGAINST
+
+Asked for: start on semantic analysis, the next piece of the compiler after #275's parser. #279 established that no language change blocks it. What does block it is that nobody had said what "the port is correct" would mean.
+
+**Semantic analysis has no output to diff, which is why it needed designing at all.** The lexer had a token stream and the parser an AST; both are total, canonical and line-comparable, and the dump falls out of the data structure. `analyze()` is a *checker*: it raises a `CompileError`, or returns an `AnalyzedProgram` holding the global symbol table, structs, tables, enums, threads and main's message/reply types. It writes nothing back onto the AST -- codegen re-derives every expression type itself. So the obvious oracle, "diff the analyzed program", is far weaker than it looks: **it says nothing whatsoever about the inside of a function body.** Two analyzers could agree on every global and disagree about the type of every local and it would not notice.
+
+**What makes it strong instead: `Scope.define` is a single chokepoint.** Every binding in the program passes through `Scope.define(name, symbol, err_node, filename)` -- globals, constants, functions, parameters, loop variables, catch variables, and locals nested arbitrarily deep inside function and handler bodies. Wrapping it records the resolved type of all of them with the position they were declared at. The dump is therefore not the analyzed program; it is **the resolved type of every name the program binds, anywhere**, which is what a type checker is for. `bootstrap/semdump.py` holds the wrapper, so `festina/semantic.py` carries no test-only hook.
+
+The form, sorted so that neither side's dict iteration or pass order can manufacture a difference:
+
+```
+DECL|line:col|name|kind|type
+STRUCT|name|field:type|...      TABLE|name|column:type|...
+ENUM|name|member:type|...       THREAD|name|in=type|reply=type
+MAIN|msg=type|reply=type
+SEMERR|line|col                 # a rejection, alone; position, never message text
+```
+
+Types render through `types_mod.type_name`, the compiler's own renderer -- the same one codegen keys its generated release-function caches on, so it already has to distinguish every type the language can tell apart. Reusing it means the oracle cannot disagree with the compiler about what "the same type" means.
+
+**Over the corpus: 3,175 records across 78 analyzed files, 0 crashes.** The 11 rejected files are all `bootstrap/cases/*.f`, which exist to exercise *lexing* -- stray characters, unterminated strings, ambiguous slashes -- and are correctly not valid programs.
+
+**A harness bug found before it could become a requirement on the port.** The first version parsed each file alone. Seven corpus files came back rejected: five on names their imports define (`parser.f`, `lexdump.f`, `astdumpf.f`, `multifile.f`) and two on `DatabaseURL` (`config.f`, `thread_db_churn.f`). None is a fact about the language -- an `import` merges every file's statements into ONE program before `analyze()` sees them (§6.2), and `DatabaseURL` is resolved in the same pass. The dump now goes through `imports.build_program`, the same front end `cli.py` runs. Left unfixed, every one of those seven would have obliged the Festina port to reproduce an error that does not exist, and the record count would have been 1,726 instead of 3,175.
+
+**The canary was wrong, and only testing the harness itself showed it.** Two negative controls were written first and both fired: dropping the manually-managed marker from every resolved type changed 5 files, and reporting every binding as kind=variable changed 78. Both looked like proof that the oracle compares types. Then the renderer itself was gutted -- `_type` returning the constant `"T"`, so every type in every record renders identically -- and **all 15 tests still passed.** The `?` canary only *appeared* to cover this: a port that drops the marker also rejects different programs, so the test fires on the `SEMERR` lines and never reaches the type column. Nothing was asserting that two different types produce two different records, which is the single thing the whole oracle rests on.
+
+Three tests now assert it directly -- four distinct types must render four ways, a manually-managed type must not render as its base (§8.18), and the corpus dump must carry more than 20 distinct type strings -- and all three were confirmed to fail under the gutted renderer and pass under the real one. The general lesson is the one #276 taught in a different register: a negative control that fires proves the harness noticed *something*, not that it noticed the thing you meant. Perturb the specific mechanism you are claiming, not a proxy for it.
+
+**Verified.** `tests/test_bootstrap_semantic.py`, 18 tests, under a second (the Windows job has ~5 minutes of headroom, so cost was checked rather than assumed). No change to any shipped compiler file: this round adds an oracle and its tests, nothing else.
+
+281. SEMANTIC ANALYSIS IN FESTINA: 62/91, AND WHY IT GETS THAT FAR WITH NO TYPE INFERENCE
+
+Asked for directly: "go ahead and write the semantic.f port." #280 had defined the oracle; this is the first implementation measured against it.
+
+**62 match, 11 differ, 18 unported, of 91 files.** `bootstrap/semantic.f` is about 500 lines against `festina/semantic.py`'s 5,692.
+
+**The reason 500 lines reaches 62 files is one clause.** specification.md 10.2: "A declaration states its type; there is no `var`, `let` or inference." Every `DECL` record's type therefore comes from a *declared* type expression, never from an initializer -- so reproducing the dump needs type resolution and scope walking, and no expression inference whatsoever. That was worth checking before writing anything: the alternative reading, that a port of the dump needs a port of the type checker, would have made this a 5,000-line job instead of a 500-line one.
+
+**What the 11 differences are, in three groups rather than eleven problems.** Seven files use `import`, which this side does not follow, so a name defined in another file does not resolve (`origin|variable|-` where the Python side has `Point`). Three are `cases/*.f` that the Python side *rejects* -- they are type-invalid, and without assignability checking this side accepts them and emits records where the oracle emits `SEMERR`. One hoists an arrow function into a `__festina_arrow_0` binding. The 18 unported are all `ThreadDecl`.
+
+Grouping first is the habit #275 paid for: 34 of that round's 35 parser differences turned out to be one bug, and looking at any single failure closely before looking at what they had in common was the slow path.
+
+**Two bugs found, both of the same kind: field names guessed rather than read.** `TryStmt` carries `try_body`/`catch_var`/`catch_body` and `IfStmt` carries `then`/`orelse` -- not the `*_block`/`catch_name` spellings this file first assumed. The symptom was not an error but *silence*: a block that is never walked binds nothing, and a statement that binds nothing looks exactly like a statement with no bindings. Ten files' worth of missing catch variables and catch-body locals came from those two names. Reading all seven statement kinds' fields out of `parser.f` at once, rather than fixing the one that had surfaced, is what turned 50 match into 60 in a single edit.
+
+**The absent type has two spellings, and they are not interchangeable.** `semdump.py`'s `_type` answers `-` for a missing type, while `types.type_name(None)` answers `unknown`; the first is what a record shows, the second is what appears nested inside another type. Collapsing them rendered `environment` wrongly on every single file, and the enum members wrongly on two. `dumpType` and `typeName` are therefore separate functions here, which reads like duplication and is not.
+
+**`amor` cannot be a struct field name.** It is a reserved word, so `Ty.amor` is a parse error; the field is `amortized`. Worth recording only because it is the third time a port has been caught by the language's own keyword list (`fail` in #271, `thread` in #275).
+
+**Not in the pytest suite yet, deliberately.** `semdiff.py` compiles a third Festina binary and runs it across 91 files. The Windows job used 39:35 of its 45-minute budget on the merged head (#280), so adding this belongs with the change that makes the bootstrap suites Linux-only -- which is the fix already recorded for when that budget runs out -- rather than being pushed in ahead of it and tipping the job over. Running `python bootstrap/semdiff.py` reproduces the numbers above.
+
+**Verified.** The numbers here come from running the differ, not from inspection. Full suite unchanged at 2641 passed, 14 skipped; no shipped compiler file is touched by this round.
+
+282. IMPORTS, THREADS, AND A STRUCT FIELD THAT CANNOT BE COMPARED TO null
+
+Continuing #281: "keep going with the imports and ThreadDecl." **62 match -> 77 match, 14 differ, 0 unported, of 91 files.**
+
+**`ThreadDecl` (18 files).** A thread's body is isolated (specification.md 20.3): its handlers parent on a scope holding only function names, never on the global one. Parenting the body on the enclosing scope instead would make every thread-local that shares a name with a global look like a redeclaration, so the body gets a fresh root scope. The thread's own NAME is bound in the ENCLOSING scope with its own specific type -- `thread 'pool'`, not the generic `thread` a parameter gets -- and the `THREAD|name|in=T|reply=R` record's inbound type comes from the second parameter of the `on message` handler inside the body, which is the only place it is declared.
+
+**Imports (7 files).** §6.2 merges an imported file's statements into ONE program in dependency order before analysis; it is not a module system. So the port does the merge: `expandImports` walks the statement list, and each `ImportDecl` is replaced in place by the recursively-expanded contents of the file it names, imported-first. `parseProgram` drives the parser's own `TOKS`/`POS` globals and analysis runs after the entry file is already parsed, so each nested parse saves and restores them -- without that the outer parse is left pointing into the imported file's token stream. A `map[bool]` of resolved paths makes a diamond import parse once.
+
+**The bug worth recording: a struct-typed field cannot be compared to `null`, because reading it creates one.** `Scope.parent` is a `Scope`, and `s.parent == null` is ALWAYS false -- specification.md 10.11's re-vivification means the read itself manufactures a Scope. Confirmed directly with a four-line probe rather than inferred:
+
+```
+struct Box { inner:Box  n:int }
+Box b
+if b.inner == null { log('inner is null') } else { log('inner VIVIFIED') }   // VIVIFIED
+```
+
+The visible symptom was small -- main's own `on message` type never being recorded, because the "am I at the top level?" test could not be true. The invisible one was worse: a parent-chain walk written as `while cur != null { cur = cur.parent }` does not terminate, and `known()` was written exactly that way. Scopes now carry an `int depth`, which is the one thing about a scope that can be compared without reaching through a reference, and the chain walk is bounded by it.
+
+This is the same shape as #279's finding about `?`: a property was assumed of the language rather than probed, and the probe took four lines. It is also a real papercut for anyone writing a linked structure in Festina, and it is documented behaviour rather than a bug -- worth an api.md note, not a change.
+
+**What the remaining 14 have in common: they all need the expression walk.** Five hoist an arrow function into a `__festina_arrow_N` binding, which is only discoverable by descending into expressions; five need a thread's or main's `reply` type, which comes from `worker.reply(x)` CALL SITES; four are sources the Python side rejects for an assignability violation this side does not check. There is no longer any declaration-shaped work left -- the next increment is expression analysis, which is also what the last four need to produce `SEMERR` at the right place.
+
+283. `clear` -- `free` WITH THE BYTES WIPED FIRST
+
+Asked for directly: "add clear, which is like free but it zeroizes the freed data first", with the example
+
+```
+person? brad = {'name': 'Brad'}
+clear brad // free and zeroize the heap
+```
+
+The first change written under #278's order -- specification.md, then tests watched failing, then code -- and the order earned itself immediately: writing the clause is what surfaced the design question below, at a point where it cost a paragraph rather than a rewrite.
+
+**The question the clause had to answer: what does zeroizing mean for a value someone else still holds?** `free` is a refcount DECREMENT, not a forced free (claude.md #111) -- an aliased value survives. So `clear` has two possible readings. Wipe unconditionally, and a buffer another binding can still read is destroyed under it: a use-after-free by construction, manufactured deliberately by the language. Or wipe only when the release actually returns the storage, and a program with a live alias gets no wipe at all. The second is the only one compatible with the rest of the language, and the cost is that the guarantee is conditional on sole ownership -- which is stated in the clause rather than left to be discovered.
+
+**Implemented: `text`.** A `text` binding owns its buffer outright (copy-on-alias, claude.md #83), so there is never another binding to invalidate and the wipe is unconditional and exact. `festina_clear_text` zeroes and frees; `_emit_free` routes to it when `zeroing` is set.
+
+**Not implemented: the cascade.** On every other type `clear` is accepted and behaves as `free`. Carrying "this release is a clear" down through a struct's fields and a container's elements means touching every generated release function and the runtime frees they reach, and the design question -- a thread-local flag consulted at each free, or a parallel clearing release function per type -- is written down in todo.md rather than guessed at. The specification clause says exactly this; a spec that promised the cascade would be describing something that does not exist.
+
+**The user's own example does not compile today, for an unrelated reason.** `person? brad = {'name': 'Brad'}` is a map literal assigned to a struct, which is `cannot assign value of type map[text] to Person` -- structs are built by field assignment. Worth recording because it was found by writing the test, not by reading the grammar.
+
+**`free` and `clear` are ONE AST node with a `zeroing` flag, not two.** Every rule about what may be freed applies unchanged to clearing -- the clause says so in as many words -- and two nodes would be two copies of those rules to keep in step. The semantic checks are shared; only the word in each message changes, so a program is told what it wrote.
+
+**The write must not be optimizable away.** A store to memory that is about to be freed is as dead as storage gets, and deleting it is exactly the optimization every hand-written wipe-the-password loop in C has historically lost to. `festina_zeroize` writes through a `volatile unsigned char *`, which is an observable side effect the standard does not permit to be elided. The length comes from the allocator (`festina_usable_size`, which already existed with its three platform spellings) rather than from `strlen`, so a buffer that once held a longer secret does not keep the tail.
+
+**Two harness findings.**
+
+The IR test first asserted `"@festina_clear_text" in cleared` and `not in freed` -- and failed, because every module declares the runtime's entry points unconditionally, so the bare name is present either way. The assertion is now on `call void @festina_clear_text`. **The control half is what caught it**: without the `free` case asserting the absence, the test would have passed while checking nothing.
+
+Adding a keyword desynchronised the bootstrap lexer, and `tests/test_bootstrap_parser.py` went red on 19 files -- which is the differential test doing its job, not a regression. `bootstrap/lexer.f`'s KW_SRC and `parser.f`'s statement dispatch both needed `clear`, and the FreeStmt node needed the `zeroing` field so the dumps match. A language change now costs a bootstrap change, and that is the point of having the bootstrap.
+
+**Verified.** `tests/test_clear.py`, 15 tests. `tests/stress/clear_churn.f` under ASan/LeakSanitizer: clean, and with the `free` removed from `festina_clear_text` it leaks **198,890 bytes in 4,000 allocations**, so the program tests what it claims. Full suite 2663 passed, 14 skipped. All three bootstrap harnesses re-verified after the keyword change: lexer 92/92, parser 92/92, semantic 78/92.
+
+284. THE `clear` CASCADE: THE INTENT TRAVELS AS THREAD-LOCAL STATE
+
+Asked for: finish `clear` (#283), which covered `text` only. The design question #283 left in todo.md was which mechanism carries the clearing intent into a release cascade; this settles it.
+
+**The problem.** `clear x` is one statement, but the release it triggers runs a cascade the call site does not walk: a generated per-struct function frees each field and then the header, a container frees its elements, and the cycle collector's dispose path frees the same fields again by another route. None of those sites takes an argument from the statement. Passing one would mean a clearing variant of every generated release function and every runtime release -- the same cascade twice, kept in step by hand, forever.
+
+**The mechanism: a `__thread` depth counter, and one free.** `festina_begin_clearing()`/`festina_end_clearing()` bracket the release; `festina_free_z()` replaces `free()` at every release-path free site and zeroes first only while the count is above zero. `__thread` for the reason the catch-frame stack is (claude.md #163): one thread clearing must not make another thread's ordinary frees start zeroing. A DEPTH rather than a boolean so a nested release -- a cleared struct holding a cleared field -- cannot switch clearing off early on the way back out.
+
+This also gets the specification's hardest rule for free. A value another binding still holds is neither freed nor zeroed, because the flag is only ever READ at a free that actually happens; a release that merely decrements never reaches one. Nothing had to implement that rule -- it falls out of hooking the free rather than the release.
+
+**The site first missed, and how it surfaced.** A struct holding a secret holds it in a text FIELD, and a text field was still freed through plain `@free` -- so the struct's own storage was wiped and the secret itself was left sitting in the heap. `clear` would have been a lie for its most obvious use. Nothing in `tests/test_clear.py` caught this; what caught it was an UNRELATED pre-existing assertion, `test_struct_with_only_a_text_field_gets_a_release_wrapper` counting `call void @free(` in the generated wrapper and finding 1 where it expected 2. A test that had nothing to do with this change knew the shape of the cascade better than the change did. The field free now goes through `festina_free_z`, as does the cycle collector's dispose path, and a test pins it directly.
+
+**The wipe is now verified, not just routed.** Every other test asserts that `clear` REACHES the zeroing path; none proved the path writes zeros, which matters because it is exactly the code a compiler may delete -- the storage is about to be freed. `test_zeroize_writes_zeros_at_O2` compiles the runtime at -O2 and reads the bytes: 0 of 64 survive, 64 zeroed with clearing on, and the control buffer 0 zeroed with it off. That last assertion is what stops the test measuring the allocator instead of the wipe.
+
+**Two existing assertions changed, neither weakened.** Both counted frees in a generated cascade; both still assert that every owned buffer is released exactly once, with one call now spelled `@festina_free_z`. Updating a test to a new spelling is legitimate; loosening it to `>= 1` would not have been, and the count is still exact.
+
+**Verified.** 2669 passed, 14 skipped. `tests/stress/clear_churn.f` extended to the cascade -- a cleared struct, a cleared `map[text]`, and an aliased array that must SURVIVE a clear -- clean under ASan/LeakSanitizer, as are all 41 stress programs. Bootstrap unaffected: lexer 92/92, parser 92/92, semantic 78/92. specification.md 10.11 now states the cascade rule; todo.md's open item is removed, since it is done.
