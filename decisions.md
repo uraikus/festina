@@ -5450,3 +5450,33 @@ The one real capability it would buy: §20.4 deep-copies every message except a 
 **On map keys, asked in the same breath:** #175 made `map[T]` a genuine hash table -- FNV-1a, open addressing, linear probing, O(1) where a linear scan had been O(n). That change was about lookup cost, not about what may be a key; keys have been `text` since #72 and were not revisited. Arbitrary keys are not a small follow-on: `map[T]` names the *value* type, so there is no syntactic slot for a key type, and §14.1 makes equality between structs a compile error, so a struct cannot be a key until structural equality exists. Scalar keys alone would be bounded work. Nothing needs either today.
 
 **Decided.** `?` keeps the meaning §8.18 and §13.4 give it. The cell model is not implemented. No specification clause changes, and no code changes. bootstrap/README.md's "Next" section is rewritten to state the real obstacles -- the oracle problem, and 20,000 lines of methods-on-classes to turn into free functions -- rather than a blocker that was never there.
+
+280. THE ORACLE SEMANTIC ANALYSIS WILL BE PORTED AGAINST
+
+Asked for: start on semantic analysis, the next piece of the compiler after #275's parser. #279 established that no language change blocks it. What does block it is that nobody had said what "the port is correct" would mean.
+
+**Semantic analysis has no output to diff, which is why it needed designing at all.** The lexer had a token stream and the parser an AST; both are total, canonical and line-comparable, and the dump falls out of the data structure. `analyze()` is a *checker*: it raises a `CompileError`, or returns an `AnalyzedProgram` holding the global symbol table, structs, tables, enums, threads and main's message/reply types. It writes nothing back onto the AST -- codegen re-derives every expression type itself. So the obvious oracle, "diff the analyzed program", is far weaker than it looks: **it says nothing whatsoever about the inside of a function body.** Two analyzers could agree on every global and disagree about the type of every local and it would not notice.
+
+**What makes it strong instead: `Scope.define` is a single chokepoint.** Every binding in the program passes through `Scope.define(name, symbol, err_node, filename)` -- globals, constants, functions, parameters, loop variables, catch variables, and locals nested arbitrarily deep inside function and handler bodies. Wrapping it records the resolved type of all of them with the position they were declared at. The dump is therefore not the analyzed program; it is **the resolved type of every name the program binds, anywhere**, which is what a type checker is for. `bootstrap/semdump.py` holds the wrapper, so `festina/semantic.py` carries no test-only hook.
+
+The form, sorted so that neither side's dict iteration or pass order can manufacture a difference:
+
+```
+DECL|line:col|name|kind|type
+STRUCT|name|field:type|...      TABLE|name|column:type|...
+ENUM|name|member:type|...       THREAD|name|in=type|reply=type
+MAIN|msg=type|reply=type
+SEMERR|line|col                 # a rejection, alone; position, never message text
+```
+
+Types render through `types_mod.type_name`, the compiler's own renderer -- the same one codegen keys its generated release-function caches on, so it already has to distinguish every type the language can tell apart. Reusing it means the oracle cannot disagree with the compiler about what "the same type" means.
+
+**Over the corpus: 3,175 records across 78 analyzed files, 0 crashes.** The 11 rejected files are all `bootstrap/cases/*.f`, which exist to exercise *lexing* -- stray characters, unterminated strings, ambiguous slashes -- and are correctly not valid programs.
+
+**A harness bug found before it could become a requirement on the port.** The first version parsed each file alone. Seven corpus files came back rejected: five on names their imports define (`parser.f`, `lexdump.f`, `astdumpf.f`, `multifile.f`) and two on `DatabaseURL` (`config.f`, `thread_db_churn.f`). None is a fact about the language -- an `import` merges every file's statements into ONE program before `analyze()` sees them (§6.2), and `DatabaseURL` is resolved in the same pass. The dump now goes through `imports.build_program`, the same front end `cli.py` runs. Left unfixed, every one of those seven would have obliged the Festina port to reproduce an error that does not exist, and the record count would have been 1,726 instead of 3,175.
+
+**The canary was wrong, and only testing the harness itself showed it.** Two negative controls were written first and both fired: dropping the manually-managed marker from every resolved type changed 5 files, and reporting every binding as kind=variable changed 78. Both looked like proof that the oracle compares types. Then the renderer itself was gutted -- `_type` returning the constant `"T"`, so every type in every record renders identically -- and **all 15 tests still passed.** The `?` canary only *appeared* to cover this: a port that drops the marker also rejects different programs, so the test fires on the `SEMERR` lines and never reaches the type column. Nothing was asserting that two different types produce two different records, which is the single thing the whole oracle rests on.
+
+Three tests now assert it directly -- four distinct types must render four ways, a manually-managed type must not render as its base (§8.18), and the corpus dump must carry more than 20 distinct type strings -- and all three were confirmed to fail under the gutted renderer and pass under the real one. The general lesson is the one #276 taught in a different register: a negative control that fires proves the harness noticed *something*, not that it noticed the thing you meant. Perturb the specific mechanism you are claiming, not a proxy for it.
+
+**Verified.** `tests/test_bootstrap_semantic.py`, 18 tests, under a second (the Windows job has ~5 minutes of headroom, so cost was checked rather than assumed). No change to any shipped compiler file: this round adds an oracle and its tests, nothing else.

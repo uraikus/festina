@@ -18,6 +18,7 @@ the Python implementation it mirrors.
 | `difftest.py` | diffs both lexers over every `.f` file in the repo |
 | `astdump.py` | the Python side's canonical AST dump |
 | `astdiff.py` | diffs both parsers over the same corpus |
+| `semdump.py` | the Python side's canonical semantic-analysis dump |
 | `cases/*.f` | targeted sources covering what the corpus doesn't reach |
 
 `tests/test_bootstrap_lexer.py` and `tests/test_bootstrap_parser.py` run
@@ -123,12 +124,25 @@ Neither depends on any language change. The ports use no `T?`, no
 `free` and no `delete`: automatic reclamation handles the whole front
 end unassisted.
 
-What makes semantic analysis harder than either port so far is the
-oracle. A lexer has a token stream and a parser has an AST dump — both
-total, canonical and line-comparable. Semantic analysis produces an AST
-*annotated* with resolved types plus a set of accepted and rejected
-programs, and a port that cannot be diffed cannot be verified. Defining
-that dump is the first task, not the last.
+`semdump.py` defines the oracle semantic analysis is ported against.
+`analyze()` is a checker rather than an annotator — it raises, or
+returns a symbol table, and writes nothing back onto the AST — so
+diffing its return value alone would say nothing about the inside of a
+function body. Instead the dump wraps `Scope.define`, the single
+chokepoint every binding in the program passes through, and records
+**the resolved type of every name the program binds, anywhere**:
+globals, constants, functions, parameters, loop and catch variables,
+and locals nested arbitrarily deep. The wrapper lives in the harness,
+so the compiler carries no test-only hook.
+
+Over the corpus that is 3,175 records across 78 analyzed files; the
+11 rejected ones are all `cases/*.f`, which exist to be lexed rather
+than to be valid programs. A rejection dumps `SEMERR|line|col` alone —
+position, never message text.
+
+`tests/test_bootstrap_semantic.py` pins the oracle's own discriminating
+power, including that a type renderer collapsing every type into one
+string fails three of its tests.
 
 Codegen has the strongest oracle in the project and needs no design
 work: its output is LLVM IR text, comparable byte for byte.

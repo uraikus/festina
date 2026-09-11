@@ -46,6 +46,18 @@ round-by-round design and implementation record predating 0.1 lives in
   plus Annex C of specification.md for removed features. Recorded in
   claude.md §2 (decisions.md #278).
 
+### Added
+
+- **`bootstrap/semdump.py`** — the canonical dump the Festina port of
+  semantic analysis will be checked against. Because `analyze()` is a
+  checker rather than an annotator, diffing its return value would say
+  nothing about the inside of a function body; the dump instead wraps
+  `Scope.define` and records the resolved type of every name the
+  program binds anywhere, including locals nested arbitrarily deep.
+  3,175 records over 78 analyzed corpus files.
+  `tests/test_bootstrap_semantic.py` pins its discriminating power
+  (decisions.md #280).
+
 ### Unchanged
 
 - **`T?` keeps the meaning it has** — a self-managed binding, never
