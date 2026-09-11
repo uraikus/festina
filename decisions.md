@@ -5413,3 +5413,40 @@ The reason the tests come second is that a test written after the implementation
 **The exception, stated so it is not used as a loophole.** A bug fix, where the specification already says what should happen and the code disagrees, starts by confirming the clause really says what you think, then adds the failing test, then fixes. #274 (`while (a || b) && c` did not parse) is that shape: §10.5 already allowed it. But the moment a "fix" turns out to need a rule that is not written down, it is an addition, and the order above applies.
 
 **Also settled here.** The three language changes from #105 -- `text.trim()`, `blob.byteAt()`/`blob.slice()`, and the rejected `\0` escape -- were checked against specification.md on the assumption they had missed it, having been merged while #277 was being written. They had not: #277 folded them in (§7.5.2 and Annex C for the escape, §8.6 and §16.3 for the blob accessors and `trim()`, §14.1 for the character-column rule, §10.4/§10.5 for #274). Nothing was added. Recorded because the assumption was stated before it was checked.
+
+279. `?` STAYS AS IT IS; THE CELL MODEL IS DECIDED AGAINST, AND IT NEVER BLOCKED THE PORT
+
+Two questions, one answer. Asked first: keep `?` meaning a self-managed variable, and add `view`/`alias` for explicit borrowing --
+
+```
+blob? file = '/to/my/file.txt'
+blob? fileView = view file     // read only
+blob? fileAlias = alias file   // read and write
+```
+
+Asked second, after that was set aside: "if we keep ? as it is, what is the problem we are facing in the bootstrap?"
+
+**The answer to the second question is: none. `?` was never the obstacle.** bootstrap/README.md said semantic analysis and codegen "should wait for the `?` cell model", and the staged plan put the cell model before them. That was written by assuming the port depended on `?` rather than checking whether it did. It does not: `bootstrap/lexer.f`, `parser.f`, `lexdump.f` and `astdumpf.f` contain **zero `?` declarations and zero `free`/`delete` statements** across 2,223 lines. Automatic reclamation carried the entire front end. Nor is there memory-model pressure at this scale -- the compiled parser lexes and parses its own ~1,200-line source in about 60 ms. A dependency that was never measured was stated as a blocker and then planned around, which is the same failure as #276's re-introduced encoding trap in a different register: the repository knew the answer and nobody asked it.
+
+**`alias` already exists, and is spelled by juxtaposition.** Probed rather than inferred:
+
+```
+blob? a = 'probe_data.txt'
+blob? b = a            // compiles today
+b.write('CHANGED')     // a sees: CHANGED   <- already a read/write alias
+a = 'probe_other.txt'  // b still sees CHANGED; rebinding does not propagate
+```
+
+So the proposed `alias` keyword names the existing default. The only version of it that would add anything is one where rebinding *is* shared -- which is the cell model, made opt-in per declaration. That variant is genuinely better than the cell model as planned, because it is additive rather than a breaking change, and it is recorded here in case a program ever wants it.
+
+**`view` is the substantive half, and it is under-specified in the place that decides whether it can work.** Read-only has to be a property of the *type*, not of the binding, or it evaporates at the first call: if the parameter is spelled `blob?`, the callee calls `.write()` and the guarantee is gone. Enforcing it needs a new type constructor, assignability rules in one direction only, and a spelling in every signature that accepts either. Festina has no immutability-through-a-reference concept at all today (`const` is about the binding, and `const T?` is already a compile error), so this would be the language's first, and it would require classifying the mutating method of every type -- exhaustively, or the guarantee is false, which is worse than no guarantee.
+
+The one real capability it would buy: §20.4 deep-copies every message except a `T?`, which crosses uncounted and mutably. So sharing a large read-only buffer with a thread has no safe spelling -- the choice is "clone it" or "share it mutably and hope". A `view` is the principled third answer. Set aside anyway, at the user's own call ("I don't really see the benefit of what I suggested so no need to add to the todo"), so it is recorded here rather than in todo.md.
+
+**Two limits it would not have lifted.** `int? b = alias a; b++` requires `a` to be addressable, so scalars need the cell representation either way; and `free file` while a view is live is a silent use-after-free with no lifetimes to catch it -- the same hazard the cell model carries, made likelier by a feature whose purpose is easy borrowing. §8.18's existing ban on `?` inside another type, on a struct field and on a return type cuts both ways here: a view could never outlive its frame, which contains the hazard and simultaneously prevents building any structure out of views.
+
+**Also corrected here, because the claim was made before it was checked.** Two counts given while answering were produced by bad greps and are wrong. "232 closures" counted class methods at four-space indentation; the real figure is 5 genuinely nested functions and 3 lambdas across both files, so closures are nearly a non-issue. "20 non-text map keys" counted list-of-tuple literals; the real figure is 3, all `id(node)` side tables (`_regex_lit_cache`, `_regex_memo_slots`, `_minted_values`), each better expressed as a field on the generic node than as a side table, so `map[T]`'s text-only keys are not an obstacle either.
+
+**On map keys, asked in the same breath:** #175 made `map[T]` a genuine hash table -- FNV-1a, open addressing, linear probing, O(1) where a linear scan had been O(n). That change was about lookup cost, not about what may be a key; keys have been `text` since #72 and were not revisited. Arbitrary keys are not a small follow-on: `map[T]` names the *value* type, so there is no syntactic slot for a key type, and §14.1 makes equality between structs a compile error, so a struct cannot be a key until structural equality exists. Scalar keys alone would be bounded work. Nothing needs either today.
+
+**Decided.** `?` keeps the meaning §8.18 and §13.4 give it. The cell model is not implemented. No specification clause changes, and no code changes. bootstrap/README.md's "Next" section is rewritten to state the real obstacles -- the oracle problem, and 20,000 lines of methods-on-classes to turn into free functions -- rather than a blocker that was never there.

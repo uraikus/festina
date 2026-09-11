@@ -130,18 +130,35 @@ Cite decision entries as `decisions.md #N` in new comments, tests and
 documents; the older `claude.md #N` spelling remains valid and means
 the same entry.
 
-**Version history belongs only in CHANGELOG.md and decisions.md.**
-specification.md, api.md, benchmark.md, todo.md, setup.md, macos.md,
-windows.md, wasm.md, security.md and the documentation site all
-describe the software as it is now — no "as of version X", no "this
-used to work differently", no `claude.md #N`/`decisions.md #N`
-citation used to explain what changed instead of what is true. Annex C
-of specification.md is the one sanctioned exception: a table of
-removed/superseded features naming the entry that removed each, kept
-exactly because a reader needs to know something is gone. When a
-change makes an existing sentence read as history rather than as a
-present-tense rule, rewrite the sentence; do not leave the old and new
-framing side by side.
+**Documentation describes the present, and only the present.** Every
+document states what the project *is* right now — not what it used to
+be, and not what it is going to be. No "as of version X", no "this
+used to work differently", no "this will be added later", no
+`claude.md #N`/`decisions.md #N` citation used to explain what changed
+instead of what is true. This covers specification.md, api.md,
+benchmark.md, setup.md, macos.md, windows.md, wasm.md, security.md,
+README.md, every `README.md` under a subdirectory, tests/CONTRACT.md
+and the documentation site.
+
+Exactly three documents are exempt, because recording time is their
+whole purpose:
+
+| | |
+|---|---|
+| CHANGELOG.md | the past, by version |
+| decisions.md | the past, by decision — what was asked, decided, and why |
+| todo.md | the future — open work and deliberate non-work |
+
+One sanctioned exception outside those three: Annex C of
+specification.md, a table of removed and superseded features naming
+the entry that removed each, kept because a reader needs to know
+something is gone.
+
+When a change makes an existing sentence read as history or as a
+promise, rewrite the sentence; do not leave the old and new framing
+side by side, and do not annotate the stale one. A number that has
+moved (a file count, a test count, a measurement) is the same problem
+in miniature: correct it rather than letting it date the document.
 
 **Delivering**
 

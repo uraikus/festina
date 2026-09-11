@@ -39,6 +39,22 @@ round-by-round design and implementation record predating 0.1 lives in
   and the code disagrees, instead confirms the clause, adds the failing
   test and fixes — but an addition dressed as a fix follows the full
   order. Recorded in claude.md §2 (decisions.md #278).
+- **Documentation describes the present, and only the present** — not
+  what the project used to be, and not what it is going to be. Exactly
+  three documents are exempt because recording time is their purpose:
+  CHANGELOG.md and decisions.md for the past, todo.md for the future,
+  plus Annex C of specification.md for removed features. Recorded in
+  claude.md §2 (decisions.md #278).
+
+### Unchanged
+
+- **`T?` keeps the meaning it has** — a self-managed binding, never
+  retained on alias and never released by anyone but the program. The
+  uniform "pointer to a cell" model, and a `view`/`alias` borrowing
+  syntax considered alongside it, are both decided against; no
+  specification clause and no code changed. The bootstrap ports turn
+  out to use no `T?`, `free` or `delete` at all, so nothing was waiting
+  on this (decisions.md #279).
 
 ## [0.44] - 2026-09-02
 
