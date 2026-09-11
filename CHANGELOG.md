@@ -70,13 +70,27 @@ round-by-round design and implementation record predating 0.1 lives in
 
 - **`bootstrap/semantic.f`** — `festina/semantic.py` ported to Festina,
   the third step of bootstrapping the compiler in its own language.
-  77 of 91 corpus files produce the same dump as the Python analyzer,
-  0 unported. It resolves declarations, merges imports in dependency
-  order, and walks thread bodies in their own isolated scope. The 14
-  remaining differences all need expression analysis, which it does not
-  do yet: arrow-function hoisting, a thread's `reply` type, and the
-  assignability check that makes four invalid sources reject.
-  `bootstrap/semdiff.py` runs the comparison (decisions.md #281, #282).
+  **all 93 corpus files produce the same dump as the Python analyzer,
+  0 differ, 0 unported** — so all three stages of the front end now
+  agree with their originals. It resolves declarations, merges imports
+  in dependency order, walks thread bodies in their own isolated scope,
+  descends into expressions, infers types, and rejects the programs the
+  original rejects. The type checker is conservative by construction:
+  anything it does not understand infers no type and is checked
+  against nothing, so it can miss an error but never invent one.
+  `bootstrap/semdiff.py` runs the comparison (decisions.md #281, #282,
+  #285, #286).
+
+- **All three bootstrap differential harnesses now run in CI**, the
+  semantic one for the first time — on Linux only. They compare two
+  implementations of the lexer, parser and analyzer against each other,
+  which is compiler-development tooling rather than platform coverage,
+  and nothing in them is platform-specific. Windows stops paying the
+  roughly four minutes the lexer and parser harnesses cost it, which is
+  what makes room for the semantic harness to run at all (on Linux all
+  three together cost about 15 seconds). `FESTINA_BOOTSTRAP_EVERYWHERE=1`
+  runs them anywhere. The cheap pure-Python tests in the same modules
+  keep running on every platform (decisions.md #287).
 
 ### Unchanged
 

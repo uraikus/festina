@@ -151,6 +151,23 @@ map[bool] THREAD_NAMES = {}
 
 text MAIN_MSG = '-'
 text BASE_DIR = ''
+// An arrow function's synthesized name is registered in the GLOBAL
+// scope wherever the arrow was written (register_func_signature), so
+// analyzeArrow needs a handle on it that is not the scope it is walking.
+Scope GLOBAL_SCOPE
+// Whether the walk is currently inside a thread body. A thread's own
+// scope is a fresh ROOT (specification.md 20.3 isolation), so its depth
+// is 0 too -- which made every thread's `on message` look like main's
+// and reported a main message type on four files that have none.
+// Depth answers "how nested am I", never "whose program am I in".
+bool IN_THREAD = false
+// A receiver's reply type is INFERRED from the argument of its first
+// `worker.reply(x)` call (claude.md #217) -- there is nowhere it can be
+// declared. Two of them, because main is a receiver too and is not a
+// `thread` declaration with a _ThreadInfo to hang one on.
+text THREAD_REPLY = '-'
+text MAIN_REPLY = '-'
+
 map[bool] IMPORTED = {}
 
 // specification.md 6.2: an import merges the imported file's statements
@@ -169,7 +186,15 @@ arr[Node] func parseImported(path:text) {
     if IMPORTED[full] != null { return none }
     IMPORTED[full] = true
     blob b = full
-    if !b.exists() { return none }
+    if !b.exists() {
+        // specification.md 6.2: an unreadable import is a compile error
+        // ("cannot find imported file"), reported before analysis
+        // begins. Returning an empty statement list instead analysed a
+        // program missing everything the import declares, and then
+        // agreed with nothing.
+        semFail(0, 0)
+        return none
+    }
     arr[Tok] savedToks = TOKS
     int savedPos = POS
     bool savedFailed = FAILED
@@ -325,7 +350,27 @@ bool func rawBool(n:Node, name:text) {
 map[bool] PRIMS = {}
 text PRIM_SRC = 'int float bool text blob ascii color font void regex url'
 
+// A struct field's declared type, for `p.name`-shaped inference.
+map[Node] STRUCT_DECLS = {}
+
+Ty func structFieldType(structName:text, field:text) {
+    Node d = STRUCT_DECLS[structName]
+    if d == null { return null }
+    arr[Node] fs = listOf(d, 'fields')
+    int i = 0
+    while i < fs.length {
+        if rawText(fs[i], 'name') == field {
+            return applyManaged(resolveTypeField(fs[i], 'type_expr'),
+                                rawBool(fs[i], 'manually_managed'))
+        }
+        i++
+    }
+    return null
+}
+
 void func initSemantic() {
+    initInference()
+    initAssignability()
     int i = 0
     arr[text] names = PRIM_SRC.split(' ')
     while i < names.length {
@@ -429,6 +474,7 @@ struct Scope {
     parent:Scope
     depth:int
     names:map[bool]
+    types:map[Ty]     // the same keys as `names`, carrying each one's type
 }
 
 Scope func newScope(parent:Scope) {
@@ -436,7 +482,24 @@ Scope func newScope(parent:Scope) {
     s.parent = parent
     s.depth = 0
     s.names = {}
+    s.types = {}
     return s
+}
+
+// A name's type, searched outward. `names` answers presence and `types`
+// answers the type, because a symbol whose type is genuinely null
+// (`environment`) must still count as declared -- one map cannot say
+// both.
+Ty func lookupType(s:Scope, name:text) {
+    Scope cur = s
+    int guard = cur.depth
+    while guard >= 0 {
+        if cur.names[name] != null { return cur.types[name] }
+        if guard == 0 { return null }
+        cur = cur.parent
+        guard--
+    }
+    return null
 }
 
 Scope func childScope(parent:Scope) {
@@ -463,6 +526,7 @@ void func define(s:Scope, name:text, t:Ty, kind:text, line:int, col:int) {
         return
     }
     s.names[name] = true
+    if t != null { s.types[name] = t }
     OUT.push(`DECL|${line.toText()}:${col.toText()}|${name}|${kind}|${dumpType(t)}`)
 }
 
@@ -487,9 +551,51 @@ text func declKind(n:Node) {
     return 'variable'
 }
 
+// specification.md 10.2/8.20: an initializer must be assignable to the
+// declared type. Only PRIMITIVE-to-primitive pairs are judged here --
+// containers, structs, enums and rows all infer null today and are
+// left alone -- because the cost of a wrong answer is asymmetric. A
+// missed error leaves the port differing on a file the original
+// rejects, which is visible progress not yet made; a false error turns
+// a matching file into a differing one, losing progress already made.
+//
+// Rule 5's text coercion is what makes `blob f = 'x.txt'` legal, and
+// `regex` is deliberately NOT in that set -- which is exactly why
+// `regex r = 'x'.replace(/y/g, 'z')` is the error it is.
+map[bool] TEXT_COERCIBLE = {}
+
+void func initAssignability() {
+    arr[text] cs = 'blob img aud color font ascii'.split(' ')
+    int i = 0
+    while i < cs.length {
+        TEXT_COERCIBLE[cs[i]] = true
+        i++
+    }
+}
+
+bool func assignable(declared:Ty, actual:Ty) {
+    if declared == null || actual == null { return true }
+    if declared.kind != 'prim' || actual.kind != 'prim' { return true }
+    if declared.name == actual.name { return true }
+    // int widens to float; float never narrows to int (8.3, claude.md #61).
+    if declared.name == 'float' && actual.name == 'int' { return true }
+    if actual.name == 'text' && TEXT_COERCIBLE[declared.name] != null { return true }
+    return false
+}
+
 void func analyzeVarDecl(s:Scope, n:Node) {
+    // The initializer is walked BEFORE the binding is defined, which is
+    // the order festina/semantic.py infers in. It matters only for the
+    // arrow counter -- the dump itself is sorted -- but an arrow in an
+    // initializer must take its number before the variable it
+    // initializes exists, not after.
+    walkExpr(s, childOf(n, 'init'))
     Ty t = resolveTypeField(n, 'type_expr')
     t = applyManaged(t, rawBool(n, 'manually_managed'))
+    Node init = childOf(n, 'init')
+    if init != null && !assignable(t, inferExpr(s, init)) {
+        semFail(rawInt(n, 'line'), rawInt(n, 'column'))
+    }
     define(s, rawText(n, 'name'), t, declKind(n),
            rawInt(n, 'line'), rawInt(n, 'column'))
 }
@@ -528,7 +634,17 @@ void func analyzeFuncDecl(s:Scope, n:Node) {
     // body locals go in a fresh child scope.
     int line = rawInt(n, 'line')
     int col = rawInt(n, 'column')
-    define(s, rawText(n, 'name'), returnTypeOf(n), 'function', line, col)
+    // A THREAD-PRIVATE function's name is not recorded, and that is a
+    // faithful copy of an asymmetry in the original rather than a
+    // simplification. festina/semantic.py hoists a thread's own
+    // functions with `thread_functions_scope.vars[name] = Symbol(...)`
+    // -- a direct write that bypasses Scope.define, because the pass
+    // does its own duplicate check first. The oracle wraps define, so
+    // the name never reaches it. Its PARAMETERS still do, since the
+    // body is analysed normally.
+    if !IN_THREAD {
+        define(s, rawText(n, 'name'), returnTypeOf(n), 'function', line, col)
+    }
     Scope inner = childScope(s)
     defineParams(inner, listOf(n, 'params'), line, col)
     analyzeBlock(inner, childOf(n, 'body'))
@@ -567,6 +683,233 @@ text func enumMembers(n:Node) {
 }
 
 // ---------------------------------------------------------------------
+// Type inference.
+//
+// CONSERVATIVE BY CONSTRUCTION. `inferExpr` answers null for anything it
+// does not understand, and every caller treats null as "no opinion" and
+// checks nothing. That is not laziness -- it is the only safe shape for
+// a partial type checker inside a differential test. An incomplete
+// inference that GUESSES would reject valid programs, and each false
+// rejection turns a matching file into a differing one; answering null
+// can only ever leave a real error unreported, which shows up as the
+// port still differing on a file the original rejects. One failure mode
+// costs progress already made, the other costs progress not yet made.
+
+Ty func inferExprList(s:Scope, es:arr[Node]) {
+    // The element type of a literal list: the first element that has a
+    // type at all. A mixed list is the original's error to report, not
+    // this one's.
+    int i = 0
+    while i < es.length {
+        Ty t = inferExpr(s, es[i])
+        if t != null { return t }
+        i++
+    }
+    return null
+}
+
+bool func isNumeric(t:Ty) {
+    return t != null && t.kind == 'prim' && (t.name == 'int' || t.name == 'float')
+}
+
+// specification.md 8.3 / claude.md #61: int and float mix freely in any
+// binary operator, the int side coerced to float -- and `/` ALWAYS
+// answers float, even for two ints. That last rule is what makes
+// `int b = a / 2 / 5` a compile error rather than integer division.
+Ty func inferArith(op:text, l:Ty, r:Ty) {
+    if op == '/' {
+        if isNumeric(l) && isNumeric(r) { return tyPrim('float') }
+        return null
+    }
+    if !isNumeric(l) || !isNumeric(r) { return null }
+    if l.name == 'float' || r.name == 'float' { return tyPrim('float') }
+    return tyPrim('int')
+}
+
+map[bool] COMPARISONS = {}
+map[bool] TEXT_METHODS_TEXT = {}
+map[bool] TEXT_METHODS_INT = {}
+
+void func initInference() {
+    arr[text] cmps = '== != < > <= >='.split(' ')
+    int i = 0
+    while i < cmps.length {
+        COMPARISONS[cmps[i]] = true
+        i++
+    }
+    // The text methods whose RESULT type is what a check here turns on.
+    // Deliberately not the whole surface (16.3): a method missing from
+    // these tables infers null, which checks nothing, and that is the
+    // conservative direction.
+    arr[text] tt = 'match replace trim toText toAscii'.split(' ')
+    i = 0
+    while i < tt.length {
+        TEXT_METHODS_TEXT[tt[i]] = true
+        i++
+    }
+    arr[text] ti = 'length charCodeAt toInt'.split(' ')
+    i = 0
+    while i < ti.length {
+        TEXT_METHODS_INT[ti[i]] = true
+        i++
+    }
+}
+
+// The property name of a Member node, however the parser stored it.
+text func memberName(e:Node) {
+    return rawText(e, 'prop')
+}
+
+Ty func inferMember(s:Scope, e:Node) {
+    Ty recv = inferExpr(s, childOf(e, 'obj'))
+    text prop = memberName(e)
+    if recv == null || prop == '' { return null }
+    if recv.kind == 'prim' && recv.name == 'text' {
+        if TEXT_METHODS_TEXT[prop] != null { return tyPrim('text') }
+        if TEXT_METHODS_INT[prop] != null { return tyPrim('int') }
+        if prop == 'split' { return tyArr(tyPrim('text'), false) }
+        return null
+    }
+    if recv.kind == 'arr' && prop == 'length' { return tyPrim('int') }
+    if recv.kind == 'struct' { return structFieldType(recv.name, prop) }
+    return null
+}
+
+Ty func inferExpr(s:Scope, e:Node) {
+    if e == null { return null }
+    text k = e.kind
+    if k == 'NumberLit' {
+        // The parser keeps the literal's own spelling, and `1` and `1.0`
+        // are different types -- a fractional part is the whole
+        // difference (7.5.1).
+        text v = rawText(e, 'value')
+        if v == '' { v = fieldOf(e, 'value').raw }
+        int i = 0
+        while i < v.length {
+            if v.charCodeAt(i) == 46 { return tyPrim('float') }
+            i++
+        }
+        return tyPrim('int')
+    }
+    if k == 'StringLit' || k == 'TemplateLit' { return tyPrim('text') }
+    if k == 'BoolLit' { return tyPrim('bool') }
+    if k == 'RegexLit' { return tyPrim('regex') }
+    if k == 'NullLit' { return null }
+    if k == 'Identifier' { return lookupType(s, rawText(e, 'name')) }
+    if k == 'LogicalOp' { return tyPrim('bool') }
+    if k == 'BinOp' {
+        text op = rawText(e, 'op')
+        if COMPARISONS[op] != null { return tyPrim('bool') }
+        Ty l = inferExpr(s, childOf(e, 'left'))
+        Ty r = inferExpr(s, childOf(e, 'right'))
+        if op == '+' && l != null && l.kind == 'prim' && l.name == 'text' {
+            return tyPrim('text')
+        }
+        return inferArith(op, l, r)
+    }
+    if k == 'UnaryOp' {
+        text op = rawText(e, 'op')
+        if op == '!' { return tyPrim('bool') }
+        if op == 'typeof' { return tyPrim('text') }
+        return inferExpr(s, childOf(e, 'operand'))
+    }
+    if k == 'Member' { return inferMember(s, e) }
+    if k == 'Call' {
+        // A call's type is its callee's RESULT. For a method that is
+        // what inferMember already answers; for a bare function name it
+        // is the return type the symbol carries.
+        return inferExpr(s, childOf(e, 'callee'))
+    }
+    if k == 'Ternary' {
+        Ty a = inferExpr(s, childOf(e, 'cons'))
+        if a != null { return a }
+        return inferExpr(s, childOf(e, 'alt'))
+    }
+    return null
+}
+
+// ---------------------------------------------------------------------
+// Expressions.
+//
+// Most expressions bind nothing, so for a long time this file walked
+// only statements. An arrow function is the exception: `void (x:int) =>
+// log(x)` is an EXPRESSION that compiles to an ordinary top-level
+// function (claude.md #142), and analysing it defines a synthesized
+// name plus a parameter for each of its own. Those bindings are
+// unreachable without descending into expressions.
+//
+// The descent is generic -- every `node` and `list` field of every node,
+// in the order the parser added them -- rather than a case per
+// expression kind. A case list would have to be complete to be correct,
+// and would go quietly out of date the moment the grammar grew; walking
+// every child cannot miss one.
+
+int ARROW_N = 0
+
+void func walkExprList(s:Scope, es:arr[Node]) {
+    int i = 0
+    while i < es.length {
+        walkExpr(s, es[i])
+        i++
+    }
+}
+
+void func walkExpr(s:Scope, e:Node) {
+    if e == null { return }
+    if e.kind == 'ArrowFuncExpr' {
+        analyzeArrow(s, e)
+        return
+    }
+    noteReply(s, e)
+    int i = 0
+    while i < e.fields.length {
+        Field f = e.fields[i]
+        if f.tag == 'node' { walkExpr(s, f.node) }
+        else if f.tag == 'list' { walkExprList(s, f.list) }
+        i++
+    }
+}
+
+// `worker.reply(x)` fixes its receiver's reply type, first call wins.
+// Recorded during the ordinary expression walk rather than by a
+// separate search, so a reply nested inside any expression is seen
+// wherever it appears.
+void func noteReply(s:Scope, e:Node) {
+    if e.kind != 'Call' { return }
+    Node callee = childOf(e, 'callee')
+    if callee == null || callee.kind != 'Member' { return }
+    if memberName(callee) != 'reply' { return }
+    arr[Node] args = listOf(e, 'args')
+    if args.length == 0 { return }
+    text t = dumpType(inferExpr(s, args[0]))
+    if IN_THREAD {
+        if THREAD_REPLY == '-' { THREAD_REPLY = t }
+    } else {
+        if MAIN_REPLY == '-' { MAIN_REPLY = t }
+    }
+}
+
+// festina/semantic.py builds a FuncDecl for the arrow, registers its
+// signature, then analyses the body -- so the name is taken from the
+// counter BEFORE the body is walked, and a nested arrow gets the higher
+// number. Pre-order here, for that reason and no other.
+//
+// The synthesized name lands in the GLOBAL scope with kind `function`
+// and the arrow's RETURN type (register_func_signature), not in the
+// scope the arrow was written in and not as a func[...] type -- an
+// ordinary function symbol, because that is exactly what it becomes.
+void func analyzeArrow(s:Scope, e:Node) {
+    int line = rawInt(e, 'line')
+    int col = rawInt(e, 'column')
+    text name = '__festina_arrow_' + ARROW_N.toText()
+    ARROW_N++
+    define(GLOBAL_SCOPE, name, returnTypeOf(e), 'function', line, col)
+    Scope inner = childScope(s)
+    defineParams(inner, listOf(e, 'params'), line, col)
+    walkExpr(inner, childOf(e, 'body'))
+}
+
+// ---------------------------------------------------------------------
 // Statement walking.
 //
 // Only statements that BIND a name, or that contain a block which
@@ -574,6 +917,20 @@ text func enumMembers(n:Node) {
 // than being skipped: a statement that binds nothing and a statement
 // this file does not know about look identical from the outside, and
 // conflating them is how a port reports coverage it does not have.
+
+// specification.md 10.4/10.5: a condition must be `bool` -- there is no
+// truthiness (Annex D). Reported at the STATEMENT's position, not the
+// expression's, which is where the original reports it.
+//
+// Only a condition whose type is actually known is checked. An
+// unrecognised shape infers null and is left alone, so this can miss a
+// real error but can never invent one.
+void func checkCondition(s:Scope, stmt:Node, test:Node) {
+    Ty t = inferExpr(s, test)
+    if t == null { return }
+    if t.kind == 'prim' && t.name == 'bool' { return }
+    semFail(rawInt(stmt, 'line'), rawInt(stmt, 'column'))
+}
 
 void func analyzeBlock(s:Scope, b:Node) {
     if b == null { return }
@@ -595,6 +952,8 @@ void func analyzeStmt(s:Scope, n:Node) {
     if k == 'VarDecl' { analyzeVarDecl(s, n)  return }
     if k == 'Block' { analyzeBlock(s, n)  return }
     if k == 'IfStmt' {
+        checkCondition(s, n, childOf(n, 'test'))
+        walkExpr(s, childOf(n, 'test'))
         analyzeBlock(s, childOf(n, 'then'))
         // `else if` chains hang the next IfStmt off `orelse` directly
         // rather than wrapping it in a Block, so this dispatches as a
@@ -602,13 +961,20 @@ void func analyzeStmt(s:Scope, n:Node) {
         analyzeStmt(s, childOf(n, 'orelse'))
         return
     }
-    if k == 'WhileStmt' { analyzeBlock(s, childOf(n, 'body'))  return }
+    if k == 'WhileStmt' {
+        checkCondition(s, n, childOf(n, 'test'))
+        walkExpr(s, childOf(n, 'test'))
+        analyzeBlock(s, childOf(n, 'body'))
+        return
+    }
     if k == 'ForStmt' {
         // The loop variable belongs to a scope wrapping the body, not
         // to the body's own scope: `for int i = 0, ...` must not
         // collide with an `int i` declared inside.
         Scope loop = childScope(s)
         analyzeStmt(loop, childOf(n, 'init'))
+        walkExpr(loop, childOf(n, 'test'))
+        walkExpr(loop, childOf(n, 'update'))
         analyzeBlock(loop, childOf(n, 'body'))
         return
     }
@@ -623,14 +989,18 @@ void func analyzeStmt(s:Scope, n:Node) {
         analyzeBlock(c, childOf(n, 'catch_body'))
         return
     }
-    if k == 'ExprStmt' || k == 'Return' || k == 'ThrowStmt' { return }
+    if k == 'ExprStmt' || k == 'Return' || k == 'ThrowStmt' {
+        walkExpr(s, childOf(n, 'expr'))
+        walkExpr(s, childOf(n, 'value'))
+        return
+    }
     if k == 'FreeStmt' || k == 'DeleteStmt' { return }
     if k == 'ImportDecl' { return }
     if k == 'FuncDecl' { analyzeFuncDecl(s, n)  return }
     if k == 'StructDecl' { analyzeRecordDecl('STRUCT', n)  return }
     if k == 'TableDecl' { analyzeRecordDecl('TABLE', n)  return }
     if k == 'EventHandler' {
-        if rawText(n, 'name') == 'message' && s.depth == 0 {
+        if rawText(n, 'name') == 'message' && s.depth == 0 && !IN_THREAD {
             arr[Node] mps = listOf(n, 'params')
             if mps.length > 1 {
                 Ty mt = resolveTypeField(mps[1], 'type_expr')
@@ -661,10 +1031,18 @@ void func analyzeStmt(s:Scope, n:Node) {
         define(s, rawText(n, 'name'), tyNamed('thread', rawText(n, 'name')),
                'thread', rawInt(n, 'line'), rawInt(n, 'column'))
         Node tbody = childOf(n, 'body')
-        OUT.push('THREAD|' + rawText(n, 'name') + '|in=' + inboundTypeOf(tbody)
-                 + '|reply=-')
         Scope ts = newScope(null)
+        bool wasInThread = IN_THREAD
+        text wasReply = THREAD_REPLY
+        IN_THREAD = true
+        THREAD_REPLY = '-'
         analyzeStmts(ts, listOf(tbody, 'body'))
+        // Emitted after the walk: the reply type is only known once the
+        // body's own `worker.reply(x)` has been seen.
+        OUT.push('THREAD|' + rawText(n, 'name') + '|in=' + inboundTypeOf(tbody)
+                 + '|reply=' + THREAD_REPLY)
+        IN_THREAD = wasInThread
+        THREAD_REPLY = wasReply
         return
     }
     if k == 'MatchStmt' {
@@ -694,7 +1072,10 @@ void func registerNames(stmts:arr[Node]) {
     while i < stmts.length {
         Node n = stmts[i]
         if n != null {
-            if n.kind == 'StructDecl' { STRUCT_NAMES[rawText(n, 'name')] = true }
+            if n.kind == 'StructDecl' {
+                STRUCT_NAMES[rawText(n, 'name')] = true
+                STRUCT_DECLS[rawText(n, 'name')] = n
+            }
             if n.kind == 'TableDecl' { TABLE_NAMES[rawText(n, 'name')] = true }
             if n.kind == 'EnumDecl' { ENUM_NAMES[rawText(n, 'name')] = true }
             if n.kind == 'ThreadDecl' { THREAD_NAMES[rawText(n, 'name')] = true }
@@ -709,10 +1090,16 @@ arr[text] func analyzeProgram(stmts:arr[Node]) {
     SEM_FAILED = false
     HIT_UNSUPPORTED = false
     MAIN_MSG = '-'
+    MAIN_REPLY = '-'
+    THREAD_REPLY = '-'
+    IN_THREAD = false
     IMPORTED = {}
+    STRUCT_DECLS = {}
     arr[Node] merged = expandImports(stmts)
     registerNames(merged)
+    ARROW_N = 0
     Scope g = newScope(null)
+    GLOBAL_SCOPE = g
     defineBuiltins(g)
     analyzeStmts(g, merged)
     if SEM_FAILED {
@@ -720,7 +1107,7 @@ arr[text] func analyzeProgram(stmts:arr[Node]) {
         only.push(`SEMERR|${SEM_LINE.toText()}|${SEM_COL.toText()}`)
         return only
     }
-    OUT.push('MAIN|msg=' + MAIN_MSG + '|reply=-')
+    OUT.push('MAIN|msg=' + MAIN_MSG + '|reply=' + MAIN_REPLY)
     return OUT
 }
 

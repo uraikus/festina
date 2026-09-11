@@ -1,12 +1,13 @@
-"""The oracle semantic analysis will be ported against (decisions.md #280).
+"""Semantic analysis, ported to Festina, and the oracle it is checked
+against (decisions.md #280, #286).
 
 `bootstrap/semdump.py` defines what two implementations of semantic
-analysis must agree on. The Festina port does not exist yet; these tests
-pin the oracle itself, because an oracle that cannot fail would let a
-wrong port pass, and that is a more expensive mistake to make late than
-to prevent now.
+analysis must agree on, and `bootstrap/semantic.f` is the second
+implementation. `TestBootstrapSemanticMatchesPython` is the comparison;
+everything before it pins the ORACLE, because an oracle that cannot
+fail would let a wrong port pass.
 
-Three things are checked:
+Four things are checked:
 
 1. **It covers the corpus** -- most files analyze, and the ones that do
    not are only the deliberate lexer/parser edge cases.
@@ -17,6 +18,12 @@ Three things are checked:
    confirming the dump changes -- the same discipline
    `test_bootstrap_lexer.py::TestTheDifferentialTestCanFail` and
    `test_leak_stress.py::test_the_harness_can_actually_fail` apply.
+4. **The two implementations agree**, over every `.f` file in the
+   repository.
+
+Only the fourth needs a compiled Festina binary, so only it is
+Linux-only (decisions.md #287); the oracle's own tests are pure Python
+and run everywhere in about a second.
 """
 import os
 import sys
@@ -25,14 +32,15 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bootstrap import difftest, semdump   # noqa: E402
+from bootstrap import difftest, semdiff, semdump   # noqa: E402
 from festina import semantic as py_semantic  # noqa: E402
 
 
 @pytest.fixture(scope="module")
 def corpus_dumps():
     """Every corpus file dumped once -- the baseline every canary
-    perturbs. Module-scoped because analysis of 89 files is not free."""
+    perturbs. Module-scoped because analysing the whole corpus is not
+    free."""
     out = {}
     for path in difftest.corpus():
         out[path] = semdump.dump_file(path)
@@ -271,3 +279,52 @@ class TestTheDumpIsCanonical:
 
 def _rejected(dump):
     return len(dump) == 1 and dump[0].startswith("SEMERR|")
+
+
+class TestBootstrapSemanticMatchesPython:
+    """The differential test itself (decisions.md #286).
+
+    Everything above pins the ORACLE -- that the dump discriminates,
+    that it covers locals, that it can fail. This is what the oracle is
+    for: `bootstrap/semantic.f` must produce the same dump as
+    `festina/semantic.py` over every `.f` file in the repository.
+
+    Linux-only, like the lexer and parser harnesses and for the same
+    reason: it compiles a Festina binary and runs it across the whole
+    corpus, and nothing in it is platform-specific. See
+    `_require_bootstrap_platform`.
+    """
+
+    @pytest.fixture(scope="module")
+    def semantic_binary(self, tmp_path_factory):
+        from tests.conftest import _require_bootstrap_platform, _require_c_compiler
+        _require_bootstrap_platform()
+        _require_c_compiler()
+        out = tmp_path_factory.mktemp("bootstrap") / "fsem"
+        return semdiff.build_semantic(str(out))
+
+    @pytest.mark.parametrize("rel", [
+        os.path.relpath(p, difftest.REPO_ROOT) for p in difftest.corpus()
+    ])
+    def test_dump_matches_the_python_analyzer(self, semantic_binary, rel):
+        path = os.path.join(difftest.REPO_ROOT, rel)
+        status, detail = semdiff.compare(semantic_binary, path)
+        if status == "unported":
+            pytest.skip(f"not ported yet: {detail}")
+        assert status == "match", (
+            f"{rel}: record {detail[0]}\n"
+            f"  python:  {detail[1]}\n"
+            f"  festina: {detail[2]}")
+
+    def test_nothing_is_unported(self, semantic_binary):
+        """The UNPORTED skip above must not be quietly hiding files.
+
+        A skip is invisible in a green run, so the count is asserted
+        directly: the port is complete, and a construct that starts
+        reporting itself again is a finding, not a silent pass."""
+        unported = [
+            os.path.relpath(p, difftest.REPO_ROOT)
+            for p in difftest.corpus()
+            if semdiff.compare(semantic_binary, p)[0] == "unported"
+        ]
+        assert unported == [], f"unported files: {unported}"

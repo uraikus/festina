@@ -141,6 +141,37 @@ def _require_c_compiler():
     return cc
 
 
+# decisions.md #287: the bootstrap differential harnesses run on Linux
+# only, and this is the one place that decision is written down.
+#
+# They compile three Festina binaries and run them across the whole
+# corpus -- roughly 280 subprocess invocations -- and nothing in any of
+# them is platform-specific: they compare two implementations of the
+# lexer, parser and analyzer against each other, which is
+# compiler-development tooling rather than platform coverage. Every
+# platform-specific claim the project makes is tested elsewhere.
+#
+# What they cost is the Windows job's remaining budget. It measured
+# 40:38 of its 45-minute timeout on the last merged head (decisions.md
+# #284), and process spawning is slower there than anywhere else, so
+# these suites are most of the gap between "tight" and "over". Skipping
+# them there is what buys the room for the semantic harness to run at
+# all -- on Linux, where it is free.
+#
+# FESTINA_BOOTSTRAP_EVERYWHERE=1 runs them anyway, for confirming by
+# hand that the ports are not somehow platform-dependent.
+def _require_bootstrap_platform():
+    if os.environ.get("FESTINA_BOOTSTRAP_EVERYWHERE"):
+        return
+    if sys.platform != "linux":
+        pytest.skip(
+            "the bootstrap differential harnesses run on Linux only -- "
+            "they are compiler-development tooling, not platform "
+            "coverage, and they are what the Windows job has no budget "
+            "for (decisions.md #287). Set "
+            "FESTINA_BOOTSTRAP_EVERYWHERE=1 to run them here anyway.")
+
+
 @pytest.fixture
 def compile_and_run(tmp_path, codegen, cli_mod):
     """Compile a Festina source string to a native executable and run it.

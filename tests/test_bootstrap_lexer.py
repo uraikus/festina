@@ -18,7 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bootstrap import difftest  # noqa: E402
 
-from tests.conftest import _require_c_compiler  # noqa: E402
+from tests.conftest import (_require_bootstrap_platform,  # noqa: E402
+                            _require_c_compiler)
 
 
 @pytest.fixture(scope="module")
@@ -26,6 +27,7 @@ def lexer_binary(tmp_path_factory):
     """bootstrap/lexer.f, compiled. Skips (rather than fails) with no C
     compiler, the same tier rule tests/conftest.py's own compile_and_run
     fixture follows -- this needs to link a real native binary."""
+    _require_bootstrap_platform()
     _require_c_compiler()
     out = tmp_path_factory.mktemp("bootstrap") / "flex"
     return difftest.build_lexer(str(out))

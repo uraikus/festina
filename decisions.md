@@ -5573,3 +5573,81 @@ This also gets the specification's hardest rule for free. A value another bindin
 **Two existing assertions changed, neither weakened.** Both counted frees in a generated cascade; both still assert that every owned buffer is released exactly once, with one call now spelled `@festina_free_z`. Updating a test to a new spelling is legitimate; loosening it to `>= 1` would not have been, and the count is still exact.
 
 **Verified.** 2669 passed, 14 skipped. `tests/stress/clear_churn.f` extended to the cascade -- a cleared struct, a cleared `map[text]`, and an aliased array that must SURVIVE a clear -- clean under ASan/LeakSanitizer, as are all 41 stress programs. Bootstrap unaffected: lexer 92/92, parser 92/92, semantic 78/92. specification.md 10.11 now states the cascade rule; todo.md's open item is removed, since it is done.
+
+285. EXPRESSION DESCENT: ARROW FUNCTIONS, AND TWO ASYMMETRIES COPIED RATHER THAN TIDIED
+
+Asked for: start the expression analysis in `bootstrap/semantic.f`. **78 match -> 86 match, 6 differ, 0 unported, of 92 files.**
+
+**Most expressions bind nothing, which is why this file walked only statements for so long. The arrow function is the exception.** `void (x:int) => log(x)` is an EXPRESSION that compiles to an ordinary top-level function (claude.md #142), so analysing one defines a synthesized `__festina_arrow_N` plus a parameter for each of its own -- bindings unreachable without descending into expressions.
+
+The descent is **generic**: every `node` and `list` field of every node, in the order the parser added them, rather than a case per expression kind. A case list has to be complete to be correct and goes quietly out of date the moment the grammar grows; walking every child cannot miss one. The order matters for exactly one reason -- the arrow counter is monotonic in analysis order, so a wrong walk order renames every arrow after it. `festina/semantic.py` takes the name BEFORE analysing the body, so a nested arrow gets the higher number; this is pre-order for that reason and no other. A `VarDecl`'s initializer is likewise walked before its own binding is defined, matching the order the original infers in.
+
+**A bug this round introduced, and then found.** `s.depth == 0` was the test for "is this main's own `on message`" (#282 -- a struct-typed field cannot be compared to `null`, so depth replaced a parent-chain walk). But a thread body is analysed in a fresh ROOT scope, since §20.3 makes it isolated -- so its depth is 0 too, and every thread's `on message` was reported as main's. Four files claimed a main message type they do not have. Depth answers "how nested am I", never "whose program am I in"; an explicit `IN_THREAD` flag answers the second.
+
+**Two asymmetries in the original, copied rather than tidied.**
+
+A THREAD-PRIVATE function's name is not recorded at all, while its parameters are. `festina/semantic.py` hoists a thread's own functions with `thread_functions_scope.vars[name] = Symbol(...)` -- a direct dict write that bypasses `Scope.define`, because that pass does its own duplicate check first. The oracle wraps `define`, so the name never reaches it. Emitting the name would have been the "obviously right" thing and would have been four records wrong on one file.
+
+An arrow's synthesized name lands in the GLOBAL scope with the arrow's RETURN type and kind `function` -- not in the scope the arrow was written in, and not as a `func[...]` type. It becomes an ordinary function, so it is registered as one.
+
+Both are the same lesson as the port keeps teaching: the oracle is what the original DOES, not what it ought to do, and a port that improves on its subject is a port that differs from it.
+
+**What the remaining six need is one thing.** Four are sources the Python side rejects for an assignability violation this side does not check; two need a thread's `reply` type, which is inferred from the argument of its `worker.reply(x)` call (`msg + 1`, `layer.getPixelColor(32, 32) == null`). Both need expression TYPE INFERENCE and scopes that carry types rather than just names -- `Scope` holds a `map[bool]` of names today, and an identifier's type cannot be looked up in it. That is the next unit of work, and it is one unit, not two.
+
+**Verified.** 2669 passed, 14 skipped. Lexer 92/92, parser 92/92, semantic 86/92. No shipped compiler file changed.
+
+286. TYPE INFERENCE, AND A CANARY THAT DID NOT FIRE
+
+Continuing #285: "keep going with the type inference." **86 match -> 93 match, 0 differ, 0 unported, of 93 files.** All three stages of the front end now agree with their originals over the whole corpus.
+
+**The checker is conservative by construction, and that is a design decision rather than an unfinished one.** `inferExpr` answers null for anything it does not understand, and every caller treats null as "no opinion" and checks nothing. The two failure modes are not symmetric: a MISSED error leaves the port differing on a file the original rejects -- progress not yet made, and visible as a difference. A FALSE error turns a matching file into a differing one -- progress already made, lost, and visible only as a mysterious regression somewhere else. A partial checker inside a differential test must be able to be wrong in one direction only, and this one is.
+
+That shape is what let the checks land one at a time with the count measured after each: scopes carrying types (86, inert), a missing import rejected (87), conditions required to be `bool` (87, no regression), assignability on primitives (90), reply types (93). Nothing ever went backwards.
+
+**Four causes, not four problems.** The four files the original rejected turned out to fail for four genuinely different reasons: `int b = a / 2 / 5` is a float assigned to an int (claude.md #61's rule -- `/` always answers float); `if s.match(/world/)` is a `text` condition where §10.4 wants `bool`; `regex r = 'x'.replace(/y/g, 'z')` is a `text` assigned to a `regex`, which §10.2's rule-5 coercion deliberately does not cover; and `imports.f` names a file that does not exist, which is not a type error at all -- my side silently analysed a program missing everything the import declares.
+
+**Field names guessed instead of read, for the third time.** `Member` carries `obj`/`prop`, not `object`/`property`; `Ternary` carries `cons`/`alt`, not `then`/`orelse`. The symptom was the same silence as #285's: inference returned null, every check was skipped, and the count simply did not move. #282 recorded this exact lesson about `TryStmt` and `IfStmt` and it was not learned. Reading all of a node's fields out of `parser.f` costs one command; guessing costs a compile, a run, and a diff -- every time.
+
+**The finding worth the most: a canary that did not fire.** Two negative controls were run against the finished 92/92. Making `assignable` accept everything dropped it to 90 -- the check is real. Freezing the arrow counter so every arrow is named `__festina_arrow_0` changed **nothing at all**.
+
+The reason is that no file in the repository corpus has more than one arrow function. Every program produced exactly `__festina_arrow_0`, so a counter that never advanced was indistinguishable from a correct one, and #285's careful pre-order reasoning about nested arrows was never tested by anything. `bootstrap/cases/arrow_numbering.f` closes it: three arrows, one nested inside another's body, which makes the frozen-counter canary fire (93 match -> 92 match, 1 differ). Writing it also confirmed §11.1.4 from the error message -- the inner arrow cannot capture the outer's parameter, because there are no closures.
+
+This is the third time a control has been the thing that found the gap (#276's eight false divergences, #280's collapsed type renderer, #284's unzeroed struct field). The pattern is specific enough to name: **a green differential test proves the two implementations agree, never that the corpus can tell them apart.** Only breaking the implementation on purpose distinguishes those.
+
+**Verified.** 2671 passed, 14 skipped. Lexer 93/93, parser 93/93, semantic 93/93, each with a canary confirmed to fire. No shipped compiler file changed.
+
+287. THE BOOTSTRAP HARNESSES RUN ON LINUX ONLY, WHICH IS WHAT PAYS FOR THE THIRD ONE
+
+Asked for: put `semdiff.py` into CI alongside making the bootstrap suites Linux-only. Both halves are one change, because the first is what makes room for the second.
+
+**The stated problem.** `bootstrap/semantic.f` reached 93/93 (#286) with nothing in CI protecting it -- `semdiff.py` ran only by hand, so a regression would have gone unnoticed until someone thought to look. Adding it meant a third Festina binary compiled and run across the corpus, and the Windows job had measured **40:38 of its 45-minute timeout** on the last merged head (#284). There was no room.
+
+That framing did not survive being measured, and the correction is the more useful half of this entry.
+
+**The reason that stands on its own.** On Linux all three harnesses together cost **14.6 seconds**. Nothing in any of them is platform-specific: they compare two implementations of the lexer, parser and analyzer against each other, which is compiler-development tooling, not platform coverage. Every platform-specific claim the project makes is tested elsewhere, by tests that stay everywhere. Running them on three platforms buys nothing that running them on one does not. This argument has no clock in it and is untouched by everything below.
+
+**Four runs of the Windows job, three of them meant to be comparable:**
+
+| head | what changed | windows | macos | linux |
+|---|---|---|---|---|
+| #105 before | -- | 35:23 | | |
+| #105 after | added lexer + parser harnesses | 39:35 | | |
+| #284 | last merged head | 40:38 | 10:22 | 10:19 |
+| 6d32746 | the gate + semdiff | **39:13** | 7:55 | 10:39 |
+| d1ed981 | **two .md files, nothing else** | **22:15** | 9:44 | 8:39 |
+
+The last row is the one that matters. `d1ed981` changed two documentation files and not one line of code or test configuration, so it ran **exactly** the tests `6d32746` ran, under exactly the same gate. Windows took **22:15 instead of 39:13** -- a swing of nearly seventeen minutes with no behavioral difference whatsoever. macOS moved +1:49 the other way and Linux -2:00, on the same nothing.
+
+**So the budget crisis was substantially an artifact of one noisy sample.** The 40:38 that made "there was no room" feel like a fact is a single draw from a distribution that also contains 22:15. The prediction built on it -- Windows would return to "roughly 36" -- was wrong in the small (it landed at 39:13) and then wrong in a much more interesting way (the very next run, with identical behavior, landed at 22:15). The 4:12 that #105 appeared to measure for adding the harnesses is inside the noise floor and never measured anything.
+
+**The rule worth keeping: a hosted-runner wall-clock is a sample, not a measurement.** Every timing claim this project has made about CI budget rests on single runs, and the variance here is larger than every effect any of those claims asserted. A cost claim needs repeats or it is noise wearing a number's clothes. The project applies this standard to benchmarks already (#254's insistence on reporting both numbers honestly); CI durations were quietly exempted from it, and should not have been.
+
+**What is actually true after all this.** The gate is right for the coverage reason, which never depended on timing. The semantic harness is in CI, which was the goal. Windows finishes inside its 45-minute cap, as it did before. What cannot be claimed is that the gate bought a specific number of minutes on Windows -- the measurement to support that does not exist, and the run that looked like it did was noise. Raising `timeout-minutes` a second time was still the wrong fix (claude.md #238 raised it once, and a budget raised twice is a budget nobody is managing), but it was the wrong fix to a problem smaller than it appeared.
+
+**Where the decision lives.** One helper, `_require_bootstrap_platform` in `tests/conftest.py`, carrying the whole reasoning; the three suites call it from the fixture that builds their binary. Deliberately NOT a module-level skip: each of those modules also holds cheap, pure-Python tests -- the corpus-not-empty guard, the `division_vs_regex.f` shape check, and every one of `test_bootstrap_semantic.py`'s oracle canaries -- and those keep running on all three platforms, because they cost about a second and are worth having everywhere.
+
+`FESTINA_BOOTSTRAP_EVERYWHERE=1` runs the gated part anyway. A skip with no escape hatch is a claim nobody can check, and the claim here -- that the ports are not platform-dependent -- should stay checkable by hand. Both directions of the gate were verified rather than assumed.
+
+**The new coverage is the point.** `TestBootstrapSemanticMatchesPython` is the comparison itself, 93 parametrized files plus an assertion that the unported count is zero -- because an UNPORTED skip is invisible in a green run, and "the port is complete" has to be asserted rather than inferred from an absence of failures.
+
+**Verified.** 2765 passed, 14 skipped (up from 2671: the semantic differential adds 94). Lexer 93/93, parser 93/93, semantic 93/93. The gate was tested in both directions: a simulated non-Linux platform skips, and the env var un-skips.

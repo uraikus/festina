@@ -19,12 +19,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bootstrap import astdiff, difftest  # noqa: E402
 
-from tests.conftest import _require_c_compiler  # noqa: E402
+from tests.conftest import (_require_bootstrap_platform,  # noqa: E402
+                            _require_c_compiler)
 
 
 @pytest.fixture(scope="module")
 def parser_binary(tmp_path_factory):
     """bootstrap/astdumpf.f, compiled once for the whole module."""
+    _require_bootstrap_platform()
     _require_c_compiler()
     out = tmp_path_factory.mktemp("bootstrap") / "fparse"
     return astdiff.build_parser(str(out))
