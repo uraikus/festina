@@ -151,6 +151,17 @@ map[bool] THREAD_NAMES = {}
 
 text MAIN_MSG = '-'
 text BASE_DIR = ''
+// An arrow function's synthesized name is registered in the GLOBAL
+// scope wherever the arrow was written (register_func_signature), so
+// analyzeArrow needs a handle on it that is not the scope it is walking.
+Scope GLOBAL_SCOPE
+// Whether the walk is currently inside a thread body. A thread's own
+// scope is a fresh ROOT (specification.md 20.3 isolation), so its depth
+// is 0 too -- which made every thread's `on message` look like main's
+// and reported a main message type on four files that have none.
+// Depth answers "how nested am I", never "whose program am I in".
+bool IN_THREAD = false
+
 map[bool] IMPORTED = {}
 
 // specification.md 6.2: an import merges the imported file's statements
@@ -488,6 +499,12 @@ text func declKind(n:Node) {
 }
 
 void func analyzeVarDecl(s:Scope, n:Node) {
+    // The initializer is walked BEFORE the binding is defined, which is
+    // the order festina/semantic.py infers in. It matters only for the
+    // arrow counter -- the dump itself is sorted -- but an arrow in an
+    // initializer must take its number before the variable it
+    // initializes exists, not after.
+    walkExpr(s, childOf(n, 'init'))
     Ty t = resolveTypeField(n, 'type_expr')
     t = applyManaged(t, rawBool(n, 'manually_managed'))
     define(s, rawText(n, 'name'), t, declKind(n),
@@ -528,7 +545,17 @@ void func analyzeFuncDecl(s:Scope, n:Node) {
     // body locals go in a fresh child scope.
     int line = rawInt(n, 'line')
     int col = rawInt(n, 'column')
-    define(s, rawText(n, 'name'), returnTypeOf(n), 'function', line, col)
+    // A THREAD-PRIVATE function's name is not recorded, and that is a
+    // faithful copy of an asymmetry in the original rather than a
+    // simplification. festina/semantic.py hoists a thread's own
+    // functions with `thread_functions_scope.vars[name] = Symbol(...)`
+    // -- a direct write that bypasses Scope.define, because the pass
+    // does its own duplicate check first. The oracle wraps define, so
+    // the name never reaches it. Its PARAMETERS still do, since the
+    // body is analysed normally.
+    if !IN_THREAD {
+        define(s, rawText(n, 'name'), returnTypeOf(n), 'function', line, col)
+    }
     Scope inner = childScope(s)
     defineParams(inner, listOf(n, 'params'), line, col)
     analyzeBlock(inner, childOf(n, 'body'))
@@ -567,6 +594,67 @@ text func enumMembers(n:Node) {
 }
 
 // ---------------------------------------------------------------------
+// Expressions.
+//
+// Most expressions bind nothing, so for a long time this file walked
+// only statements. An arrow function is the exception: `void (x:int) =>
+// log(x)` is an EXPRESSION that compiles to an ordinary top-level
+// function (claude.md #142), and analysing it defines a synthesized
+// name plus a parameter for each of its own. Those bindings are
+// unreachable without descending into expressions.
+//
+// The descent is generic -- every `node` and `list` field of every node,
+// in the order the parser added them -- rather than a case per
+// expression kind. A case list would have to be complete to be correct,
+// and would go quietly out of date the moment the grammar grew; walking
+// every child cannot miss one.
+
+int ARROW_N = 0
+
+void func walkExprList(s:Scope, es:arr[Node]) {
+    int i = 0
+    while i < es.length {
+        walkExpr(s, es[i])
+        i++
+    }
+}
+
+void func walkExpr(s:Scope, e:Node) {
+    if e == null { return }
+    if e.kind == 'ArrowFuncExpr' {
+        analyzeArrow(s, e)
+        return
+    }
+    int i = 0
+    while i < e.fields.length {
+        Field f = e.fields[i]
+        if f.tag == 'node' { walkExpr(s, f.node) }
+        else if f.tag == 'list' { walkExprList(s, f.list) }
+        i++
+    }
+}
+
+// festina/semantic.py builds a FuncDecl for the arrow, registers its
+// signature, then analyses the body -- so the name is taken from the
+// counter BEFORE the body is walked, and a nested arrow gets the higher
+// number. Pre-order here, for that reason and no other.
+//
+// The synthesized name lands in the GLOBAL scope with kind `function`
+// and the arrow's RETURN type (register_func_signature), not in the
+// scope the arrow was written in and not as a func[...] type -- an
+// ordinary function symbol, because that is exactly what it becomes.
+void func analyzeArrow(s:Scope, e:Node) {
+    int line = rawInt(e, 'line')
+    int col = rawInt(e, 'column')
+    text name = '__festina_arrow_' + ARROW_N.toText()
+    ARROW_N++
+    define(GLOBAL_SCOPE, name, returnTypeOf(e), 'function', line, col)
+    Scope inner = childScope(s)
+    defineParams(inner, listOf(e, 'params'), line, col)
+    walkExpr(inner, childOf(e, 'body'))
+}
+
+// ---------------------------------------------------------------------
 // Statement walking.
 //
 // Only statements that BIND a name, or that contain a block which
@@ -595,6 +683,7 @@ void func analyzeStmt(s:Scope, n:Node) {
     if k == 'VarDecl' { analyzeVarDecl(s, n)  return }
     if k == 'Block' { analyzeBlock(s, n)  return }
     if k == 'IfStmt' {
+        walkExpr(s, childOf(n, 'test'))
         analyzeBlock(s, childOf(n, 'then'))
         // `else if` chains hang the next IfStmt off `orelse` directly
         // rather than wrapping it in a Block, so this dispatches as a
@@ -602,13 +691,19 @@ void func analyzeStmt(s:Scope, n:Node) {
         analyzeStmt(s, childOf(n, 'orelse'))
         return
     }
-    if k == 'WhileStmt' { analyzeBlock(s, childOf(n, 'body'))  return }
+    if k == 'WhileStmt' {
+        walkExpr(s, childOf(n, 'test'))
+        analyzeBlock(s, childOf(n, 'body'))
+        return
+    }
     if k == 'ForStmt' {
         // The loop variable belongs to a scope wrapping the body, not
         // to the body's own scope: `for int i = 0, ...` must not
         // collide with an `int i` declared inside.
         Scope loop = childScope(s)
         analyzeStmt(loop, childOf(n, 'init'))
+        walkExpr(loop, childOf(n, 'test'))
+        walkExpr(loop, childOf(n, 'update'))
         analyzeBlock(loop, childOf(n, 'body'))
         return
     }
@@ -623,14 +718,18 @@ void func analyzeStmt(s:Scope, n:Node) {
         analyzeBlock(c, childOf(n, 'catch_body'))
         return
     }
-    if k == 'ExprStmt' || k == 'Return' || k == 'ThrowStmt' { return }
+    if k == 'ExprStmt' || k == 'Return' || k == 'ThrowStmt' {
+        walkExpr(s, childOf(n, 'expr'))
+        walkExpr(s, childOf(n, 'value'))
+        return
+    }
     if k == 'FreeStmt' || k == 'DeleteStmt' { return }
     if k == 'ImportDecl' { return }
     if k == 'FuncDecl' { analyzeFuncDecl(s, n)  return }
     if k == 'StructDecl' { analyzeRecordDecl('STRUCT', n)  return }
     if k == 'TableDecl' { analyzeRecordDecl('TABLE', n)  return }
     if k == 'EventHandler' {
-        if rawText(n, 'name') == 'message' && s.depth == 0 {
+        if rawText(n, 'name') == 'message' && s.depth == 0 && !IN_THREAD {
             arr[Node] mps = listOf(n, 'params')
             if mps.length > 1 {
                 Ty mt = resolveTypeField(mps[1], 'type_expr')
@@ -664,7 +763,10 @@ void func analyzeStmt(s:Scope, n:Node) {
         OUT.push('THREAD|' + rawText(n, 'name') + '|in=' + inboundTypeOf(tbody)
                  + '|reply=-')
         Scope ts = newScope(null)
+        bool wasInThread = IN_THREAD
+        IN_THREAD = true
         analyzeStmts(ts, listOf(tbody, 'body'))
+        IN_THREAD = wasInThread
         return
     }
     if k == 'MatchStmt' {
@@ -709,10 +811,13 @@ arr[text] func analyzeProgram(stmts:arr[Node]) {
     SEM_FAILED = false
     HIT_UNSUPPORTED = false
     MAIN_MSG = '-'
+    IN_THREAD = false
     IMPORTED = {}
     arr[Node] merged = expandImports(stmts)
     registerNames(merged)
+    ARROW_N = 0
     Scope g = newScope(null)
+    GLOBAL_SCOPE = g
     defineBuiltins(g)
     analyzeStmts(g, merged)
     if SEM_FAILED {

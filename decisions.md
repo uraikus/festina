@@ -5573,3 +5573,25 @@ This also gets the specification's hardest rule for free. A value another bindin
 **Two existing assertions changed, neither weakened.** Both counted frees in a generated cascade; both still assert that every owned buffer is released exactly once, with one call now spelled `@festina_free_z`. Updating a test to a new spelling is legitimate; loosening it to `>= 1` would not have been, and the count is still exact.
 
 **Verified.** 2669 passed, 14 skipped. `tests/stress/clear_churn.f` extended to the cascade -- a cleared struct, a cleared `map[text]`, and an aliased array that must SURVIVE a clear -- clean under ASan/LeakSanitizer, as are all 41 stress programs. Bootstrap unaffected: lexer 92/92, parser 92/92, semantic 78/92. specification.md 10.11 now states the cascade rule; todo.md's open item is removed, since it is done.
+
+285. EXPRESSION DESCENT: ARROW FUNCTIONS, AND TWO ASYMMETRIES COPIED RATHER THAN TIDIED
+
+Asked for: start the expression analysis in `bootstrap/semantic.f`. **78 match -> 86 match, 6 differ, 0 unported, of 92 files.**
+
+**Most expressions bind nothing, which is why this file walked only statements for so long. The arrow function is the exception.** `void (x:int) => log(x)` is an EXPRESSION that compiles to an ordinary top-level function (claude.md #142), so analysing one defines a synthesized `__festina_arrow_N` plus a parameter for each of its own -- bindings unreachable without descending into expressions.
+
+The descent is **generic**: every `node` and `list` field of every node, in the order the parser added them, rather than a case per expression kind. A case list has to be complete to be correct and goes quietly out of date the moment the grammar grows; walking every child cannot miss one. The order matters for exactly one reason -- the arrow counter is monotonic in analysis order, so a wrong walk order renames every arrow after it. `festina/semantic.py` takes the name BEFORE analysing the body, so a nested arrow gets the higher number; this is pre-order for that reason and no other. A `VarDecl`'s initializer is likewise walked before its own binding is defined, matching the order the original infers in.
+
+**A bug this round introduced, and then found.** `s.depth == 0` was the test for "is this main's own `on message`" (#282 -- a struct-typed field cannot be compared to `null`, so depth replaced a parent-chain walk). But a thread body is analysed in a fresh ROOT scope, since §20.3 makes it isolated -- so its depth is 0 too, and every thread's `on message` was reported as main's. Four files claimed a main message type they do not have. Depth answers "how nested am I", never "whose program am I in"; an explicit `IN_THREAD` flag answers the second.
+
+**Two asymmetries in the original, copied rather than tidied.**
+
+A THREAD-PRIVATE function's name is not recorded at all, while its parameters are. `festina/semantic.py` hoists a thread's own functions with `thread_functions_scope.vars[name] = Symbol(...)` -- a direct dict write that bypasses `Scope.define`, because that pass does its own duplicate check first. The oracle wraps `define`, so the name never reaches it. Emitting the name would have been the "obviously right" thing and would have been four records wrong on one file.
+
+An arrow's synthesized name lands in the GLOBAL scope with the arrow's RETURN type and kind `function` -- not in the scope the arrow was written in, and not as a `func[...]` type. It becomes an ordinary function, so it is registered as one.
+
+Both are the same lesson as the port keeps teaching: the oracle is what the original DOES, not what it ought to do, and a port that improves on its subject is a port that differs from it.
+
+**What the remaining six need is one thing.** Four are sources the Python side rejects for an assignability violation this side does not check; two need a thread's `reply` type, which is inferred from the argument of its `worker.reply(x)` call (`msg + 1`, `layer.getPixelColor(32, 32) == null`). Both need expression TYPE INFERENCE and scopes that carry types rather than just names -- `Scope` holds a `map[bool]` of names today, and an identifier's type cannot be looked up in it. That is the next unit of work, and it is one unit, not two.
+
+**Verified.** 2669 passed, 14 skipped. Lexer 92/92, parser 92/92, semantic 86/92. No shipped compiler file changed.

@@ -117,23 +117,33 @@ Both harnesses carry verified negative controls:
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Semantic analysis: 77 match, 14 differ, 0 unported
+## Semantic analysis: 86 match, 6 differ, 0 unported
 
-`semantic.f` resolves declarations, merges imports, and walks scopes
-including thread bodies. Every remaining difference needs something it
-deliberately does not do yet — analyse expressions:
+`semantic.f` resolves declarations, merges imports, walks scopes
+including thread bodies, and descends into expressions far enough to
+find the bindings they create.
+
+The remaining six all need the same missing piece — expression *type
+inference*, and scopes that carry types rather than just names:
 
 | | |
 |---|---|
-| 5 files | an arrow function is hoisted into a named `__festina_arrow_N` binding, which needs the expression walk that finds it |
-| 4 files | the Python side rejects them; without assignability checking this side accepts |
-| 5 files | a thread's `reply` type, and main's, come from `worker.reply(x)` call sites |
+| 4 files | the Python side rejects them for an assignability violation this side does not check |
+| 2 files | a thread's `reply` type is inferred from its `worker.reply(x)` argument (`msg + 1`, `pixel == null`) |
 
 Specification.md §10.2 is why this gets as far as it does with no
 inference at all: "A declaration states its type; there is no `var`,
 `let` or inference." Every `DECL` record's type therefore comes from a
-declared type expression. Checking that an initializer is *assignable*
-to its declaration is the separate job those 4 files need.
+declared type expression.
+
+The one expression that *does* bind names is the arrow function: `void
+(x:int) => log(x)` compiles to an ordinary top-level function
+(claude.md #142), so analysing it defines a synthesized
+`__festina_arrow_N` in the global scope plus a parameter for each of
+its own. The descent that finds it is generic — every `node` and
+`list` field of every node, in parser order — rather than a case per
+expression kind, because a case list has to be complete to be correct
+and goes quietly out of date the moment the grammar grows.
 
 `semdiff.py` is not in the pytest suite yet. It compiles a third
 Festina binary and runs it over 91 files, and the Windows job has about
