@@ -5502,3 +5502,25 @@ Grouping first is the habit #275 paid for: 34 of that round's 35 parser differen
 **Not in the pytest suite yet, deliberately.** `semdiff.py` compiles a third Festina binary and runs it across 91 files. The Windows job used 39:35 of its 45-minute budget on the merged head (#280), so adding this belongs with the change that makes the bootstrap suites Linux-only -- which is the fix already recorded for when that budget runs out -- rather than being pushed in ahead of it and tipping the job over. Running `python bootstrap/semdiff.py` reproduces the numbers above.
 
 **Verified.** The numbers here come from running the differ, not from inspection. Full suite unchanged at 2641 passed, 14 skipped; no shipped compiler file is touched by this round.
+
+282. IMPORTS, THREADS, AND A STRUCT FIELD THAT CANNOT BE COMPARED TO null
+
+Continuing #281: "keep going with the imports and ThreadDecl." **62 match -> 77 match, 14 differ, 0 unported, of 91 files.**
+
+**`ThreadDecl` (18 files).** A thread's body is isolated (specification.md 20.3): its handlers parent on a scope holding only function names, never on the global one. Parenting the body on the enclosing scope instead would make every thread-local that shares a name with a global look like a redeclaration, so the body gets a fresh root scope. The thread's own NAME is bound in the ENCLOSING scope with its own specific type -- `thread 'pool'`, not the generic `thread` a parameter gets -- and the `THREAD|name|in=T|reply=R` record's inbound type comes from the second parameter of the `on message` handler inside the body, which is the only place it is declared.
+
+**Imports (7 files).** §6.2 merges an imported file's statements into ONE program in dependency order before analysis; it is not a module system. So the port does the merge: `expandImports` walks the statement list, and each `ImportDecl` is replaced in place by the recursively-expanded contents of the file it names, imported-first. `parseProgram` drives the parser's own `TOKS`/`POS` globals and analysis runs after the entry file is already parsed, so each nested parse saves and restores them -- without that the outer parse is left pointing into the imported file's token stream. A `map[bool]` of resolved paths makes a diamond import parse once.
+
+**The bug worth recording: a struct-typed field cannot be compared to `null`, because reading it creates one.** `Scope.parent` is a `Scope`, and `s.parent == null` is ALWAYS false -- specification.md 10.11's re-vivification means the read itself manufactures a Scope. Confirmed directly with a four-line probe rather than inferred:
+
+```
+struct Box { inner:Box  n:int }
+Box b
+if b.inner == null { log('inner is null') } else { log('inner VIVIFIED') }   // VIVIFIED
+```
+
+The visible symptom was small -- main's own `on message` type never being recorded, because the "am I at the top level?" test could not be true. The invisible one was worse: a parent-chain walk written as `while cur != null { cur = cur.parent }` does not terminate, and `known()` was written exactly that way. Scopes now carry an `int depth`, which is the one thing about a scope that can be compared without reaching through a reference, and the chain walk is bounded by it.
+
+This is the same shape as #279's finding about `?`: a property was assumed of the language rather than probed, and the probe took four lines. It is also a real papercut for anyone writing a linked structure in Festina, and it is documented behaviour rather than a bug -- worth an api.md note, not a change.
+
+**What the remaining 14 have in common: they all need the expression walk.** Five hoist an arrow function into a `__festina_arrow_N` binding, which is only discoverable by descending into expressions; five need a thread's or main's `reply` type, which comes from `worker.reply(x)` CALL SITES; four are sources the Python side rejects for an assignability violation this side does not check. There is no longer any declaration-shaped work left -- the next increment is expression analysis, which is also what the last four need to produce `SEMERR` at the right place.

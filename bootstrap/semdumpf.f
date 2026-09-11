@@ -31,6 +31,22 @@ if errAt >= 0 {
     close(0)
 }
 
+// Imports resolve against the entry file's own directory. `text` has
+// no .slice() -- only ascii and blob do (specification.md 16.3) -- so
+// the prefix is accumulated a character at a time.
+text entry = argv[1]
+int slash = 0 - 1
+int c = 0
+while c < entry.length {
+    if entry.charCodeAt(c) == 47 { slash = c }
+    c++
+}
+int d = 0
+while d <= slash {
+    BASE_DIR = BASE_DIR + entry.charCodeAt(d).toChar()
+    d++
+}
+
 TOKS = toks
 POS = 0
 arr[Node] body = parseProgram()

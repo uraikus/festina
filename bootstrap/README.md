@@ -1,7 +1,7 @@
 # bootstrap/
 
-Festina's own compiler, written in Festina — the lexer and the parser,
-both complete.
+Festina's own compiler, written in Festina — the lexer and parser
+complete, and semantic analysis under way.
 
 Nothing in the shipped compiler depends on this directory. It exists to
 be a demanding real program in the language, and to be checked against
@@ -117,24 +117,23 @@ Both harnesses carry verified negative controls:
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Semantic analysis: 62 match, 11 differ, 18 unported
+## Semantic analysis: 77 match, 14 differ, 0 unported
 
-`semantic.f` resolves declarations and walks scopes. It does not yet
-type-check expressions, which is what the three groups of difference
-are:
+`semantic.f` resolves declarations, merges imports, and walks scopes
+including thread bodies. Every remaining difference needs something it
+deliberately does not do yet — analyse expressions:
 
 | | |
 |---|---|
-| 7 files | `import` is not followed, so names from another file do not resolve |
-| 3 files | the Python side rejects them; without assignability checking this side accepts |
-| 1 file | an arrow function is hoisted into a named `__festina_arrow_N` binding |
-| 18 files | `ThreadDecl`, marked `UNPORTED` rather than skipped |
+| 5 files | an arrow function is hoisted into a named `__festina_arrow_N` binding, which needs the expression walk that finds it |
+| 4 files | the Python side rejects them; without assignability checking this side accepts |
+| 5 files | a thread's `reply` type, and main's, come from `worker.reply(x)` call sites |
 
 Specification.md §10.2 is why this gets as far as it does with no
 inference at all: "A declaration states its type; there is no `var`,
 `let` or inference." Every `DECL` record's type therefore comes from a
 declared type expression. Checking that an initializer is *assignable*
-to its declaration is the separate job those 3 files need.
+to its declaration is the separate job those 4 files need.
 
 `semdiff.py` is not in the pytest suite yet. It compiles a third
 Festina binary and runs it over 91 files, and the Windows job has about

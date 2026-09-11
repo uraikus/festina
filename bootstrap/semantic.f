@@ -149,6 +149,87 @@ map[bool] TABLE_NAMES = {}
 map[bool] ENUM_NAMES = {}
 map[bool] THREAD_NAMES = {}
 
+text MAIN_MSG = '-'
+text BASE_DIR = ''
+map[bool] IMPORTED = {}
+
+// specification.md 6.2: an import merges the imported file's statements
+// into ONE program, in dependency order, before analysis begins -- it
+// is not a module system. Reproducing the dump therefore means doing
+// the merge, not skipping it: without this, seven corpus files resolve
+// nothing that another file declares.
+//
+// parseProgram drives the parser's own TOKS/POS globals, and analysis
+// runs after the entry file is already parsed, so each nested parse
+// saves and restores them. Missing that would leave the outer parse
+// pointing into the imported file's token stream.
+arr[Node] func parseImported(path:text) {
+    arr[Node] none = []
+    text full = BASE_DIR + path
+    if IMPORTED[full] != null { return none }
+    IMPORTED[full] = true
+    blob b = full
+    if !b.exists() { return none }
+    arr[Tok] savedToks = TOKS
+    int savedPos = POS
+    bool savedFailed = FAILED
+    arr[Tok] tk = tokenize(b, 0, b.length)
+    TOKS = tk
+    POS = 0
+    FAILED = false
+    arr[Node] body = parseProgram()
+    TOKS = savedToks
+    POS = savedPos
+    FAILED = savedFailed
+    return body
+}
+
+// An imported file's statements come BEFORE the importing file's, and
+// its own imports before those again -- the dependency order
+// imports.build_program produces.
+arr[Node] func expandImports(stmts:arr[Node]) {
+    arr[Node] out = []
+    int i = 0
+    while i < stmts.length {
+        Node st = stmts[i]
+        if st != null && st.kind == 'ImportDecl' {
+            arr[Node] inner = expandImports(parseImported(rawText(st, 'path')))
+            int j = 0
+            while j < inner.length {
+                out.push(inner[j])
+                j++
+            }
+        } else {
+            out.push(st)
+        }
+        i++
+    }
+    return out
+}
+
+// A thread's inbound message type is the second parameter of the
+// `on message(worker:thread, msg:T)` handler inside its own body --
+// there is nowhere else for it to be declared. The reply type comes
+// from a `worker.reply(x)` call, which needs expression analysis this
+// file does not do yet, so it stays `-`.
+text func inboundTypeOf(body:Node) {
+    arr[Node] stmts = listOf(body, 'body')
+    int i = 0
+    while i < stmts.length {
+        Node st = stmts[i]
+        if st != null && st.kind == 'EventHandler' && rawText(st, 'name') == 'message' {
+            arr[Node] ps = listOf(st, 'params')
+            if ps.length > 1 {
+                Ty t = resolveTypeField(ps[1], 'type_expr')
+                t = applyManaged(t, rawBool(ps[1], 'manually_managed'))
+                return dumpType(t)
+            }
+        }
+        i++
+    }
+    return '-'
+}
+
 void func semFail(line:int, col:int) {
     if SEM_FAILED { return }
     SEM_FAILED = true
@@ -337,23 +418,41 @@ Ty func applyManaged(t:Ty, managed:bool) {
 // makes the dump cover locals inside bodies rather than only globals --
 // exactly the chokepoint bootstrap/semdump.py wraps on the Python side.
 
+// `depth` is not bookkeeping for its own sake. A struct-typed field
+// AUTO-VIVIFIES when read (specification.md 10.11), so `s.parent ==
+// null` is never true -- reading the field manufactures a Scope. That
+// silently broke the top-level test for main's own `on message`, and a
+// parent-chain walk written as `while cur != null` would not terminate
+// at all. An int depth is the one thing about a scope that can be
+// compared without reaching through a reference.
 struct Scope {
     parent:Scope
+    depth:int
     names:map[bool]
 }
 
 Scope func newScope(parent:Scope) {
     Scope s
     s.parent = parent
+    s.depth = 0
     s.names = {}
+    return s
+}
+
+Scope func childScope(parent:Scope) {
+    Scope s = newScope(parent)
+    s.depth = parent.depth + 1
     return s
 }
 
 bool func known(s:Scope, name:text) {
     Scope cur = s
-    while cur != null {
+    int guard = cur.depth
+    while guard >= 0 {
         if cur.names[name] != null { return true }
+        if guard == 0 { return false }
         cur = cur.parent
+        guard--
     }
     return false
 }
@@ -430,7 +529,7 @@ void func analyzeFuncDecl(s:Scope, n:Node) {
     int line = rawInt(n, 'line')
     int col = rawInt(n, 'column')
     define(s, rawText(n, 'name'), returnTypeOf(n), 'function', line, col)
-    Scope inner = newScope(s)
+    Scope inner = childScope(s)
     defineParams(inner, listOf(n, 'params'), line, col)
     analyzeBlock(inner, childOf(n, 'body'))
 }
@@ -478,7 +577,7 @@ text func enumMembers(n:Node) {
 
 void func analyzeBlock(s:Scope, b:Node) {
     if b == null { return }
-    analyzeStmts(newScope(s), listOf(b, 'body'))
+    analyzeStmts(childScope(s), listOf(b, 'body'))
 }
 
 void func analyzeStmts(s:Scope, stmts:arr[Node]) {
@@ -508,14 +607,14 @@ void func analyzeStmt(s:Scope, n:Node) {
         // The loop variable belongs to a scope wrapping the body, not
         // to the body's own scope: `for int i = 0, ...` must not
         // collide with an `int i` declared inside.
-        Scope loop = newScope(s)
+        Scope loop = childScope(s)
         analyzeStmt(loop, childOf(n, 'init'))
         analyzeBlock(loop, childOf(n, 'body'))
         return
     }
     if k == 'TryStmt' {
         analyzeBlock(s, childOf(n, 'try_body'))
-        Scope c = newScope(s)
+        Scope c = childScope(s)
         text cn = rawText(n, 'catch_var')
         if cn != '' {
             define(c, cn, tyPrim('text'), 'variable',
@@ -531,16 +630,43 @@ void func analyzeStmt(s:Scope, n:Node) {
     if k == 'StructDecl' { analyzeRecordDecl('STRUCT', n)  return }
     if k == 'TableDecl' { analyzeRecordDecl('TABLE', n)  return }
     if k == 'EventHandler' {
+        if rawText(n, 'name') == 'message' && s.depth == 0 {
+            arr[Node] mps = listOf(n, 'params')
+            if mps.length > 1 {
+                Ty mt = resolveTypeField(mps[1], 'type_expr')
+                mt = applyManaged(mt, rawBool(mps[1], 'manually_managed'))
+                MAIN_MSG = dumpType(mt)
+            }
+        }
         // A handler's parameters are its own bindings, in a scope that
         // is NOT the global one -- the same shape a function body has.
         int hl = rawInt(n, 'line')
         int hc = rawInt(n, 'column')
-        Scope hs = newScope(s)
+        Scope hs = childScope(s)
         defineParams(hs, listOf(n, 'params'), hl, hc)
         analyzeBlock(hs, childOf(n, 'body'))
         return
     }
     if k == 'BreakStmt' || k == 'ContinueStmt' { return }
+    if k == 'ThreadDecl' {
+        // specification.md 20.3: a thread body is ISOLATED. Its
+        // handlers parent on a scope holding only function names, never
+        // on the global one, so a global variable is invisible inside
+        // and a local of the same name is not a redeclaration. Parenting
+        // on the enclosing scope here would silently make every such
+        // local collide.
+        // The thread's own NAME is bound in the enclosing scope, with
+        // its own specific thread type -- `thread 'pool'`, not the
+        // generic `thread` a parameter gets.
+        define(s, rawText(n, 'name'), tyNamed('thread', rawText(n, 'name')),
+               'thread', rawInt(n, 'line'), rawInt(n, 'column'))
+        Node tbody = childOf(n, 'body')
+        OUT.push('THREAD|' + rawText(n, 'name') + '|in=' + inboundTypeOf(tbody)
+                 + '|reply=-')
+        Scope ts = newScope(null)
+        analyzeStmts(ts, listOf(tbody, 'body'))
+        return
+    }
     if k == 'MatchStmt' {
         arr[Node] arms = listOf(n, 'arms')
         int a = 0
@@ -582,16 +708,19 @@ arr[text] func analyzeProgram(stmts:arr[Node]) {
     OUT = []
     SEM_FAILED = false
     HIT_UNSUPPORTED = false
-    registerNames(stmts)
+    MAIN_MSG = '-'
+    IMPORTED = {}
+    arr[Node] merged = expandImports(stmts)
+    registerNames(merged)
     Scope g = newScope(null)
     defineBuiltins(g)
-    analyzeStmts(g, stmts)
+    analyzeStmts(g, merged)
     if SEM_FAILED {
         arr[text] only = []
         only.push(`SEMERR|${SEM_LINE.toText()}|${SEM_COL.toText()}`)
         return only
     }
-    OUT.push('MAIN|msg=-|reply=-')
+    OUT.push('MAIN|msg=' + MAIN_MSG + '|reply=-')
     return OUT
 }
 

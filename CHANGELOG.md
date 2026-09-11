@@ -60,11 +60,13 @@ round-by-round design and implementation record predating 0.1 lives in
 
 - **`bootstrap/semantic.f`** — `festina/semantic.py` ported to Festina,
   the third step of bootstrapping the compiler in its own language.
-  62 of 91 corpus files produce the same dump as the Python analyzer;
-  11 differ (7 because `import` is not followed, 3 because expression
-  assignability is not checked yet, 1 arrow-function hoisting) and 18
-  are marked `UNPORTED` for `ThreadDecl`. `bootstrap/semdiff.py` runs
-  the comparison (decisions.md #281).
+  77 of 91 corpus files produce the same dump as the Python analyzer,
+  0 unported. It resolves declarations, merges imports in dependency
+  order, and walks thread bodies in their own isolated scope. The 14
+  remaining differences all need expression analysis, which it does not
+  do yet: arrow-function hoisting, a thread's `reply` type, and the
+  assignability check that makes four invalid sources reject.
+  `bootstrap/semdiff.py` runs the comparison (decisions.md #281, #282).
 
 ### Unchanged
 
