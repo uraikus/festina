@@ -5615,3 +5615,21 @@ The reason is that no file in the repository corpus has more than one arrow func
 This is the third time a control has been the thing that found the gap (#276's eight false divergences, #280's collapsed type renderer, #284's unzeroed struct field). The pattern is specific enough to name: **a green differential test proves the two implementations agree, never that the corpus can tell them apart.** Only breaking the implementation on purpose distinguishes those.
 
 **Verified.** 2671 passed, 14 skipped. Lexer 93/93, parser 93/93, semantic 93/93, each with a canary confirmed to fire. No shipped compiler file changed.
+
+287. THE BOOTSTRAP HARNESSES RUN ON LINUX ONLY, WHICH IS WHAT PAYS FOR THE THIRD ONE
+
+Asked for: put `semdiff.py` into CI alongside making the bootstrap suites Linux-only. Both halves are one change, because the first is what makes room for the second.
+
+**The problem.** `bootstrap/semantic.f` reached 93/93 (#286) with nothing in CI protecting it -- `semdiff.py` ran only by hand, so a regression would have gone unnoticed until someone thought to look. Adding it meant a third Festina binary compiled and run across the corpus, and the Windows job had measured **40:38 of its 45-minute timeout** on the last merged head (#284). There was no room.
+
+**The trade, and why it is not a loss.** The two existing harnesses cost Windows roughly four minutes -- #105 took that job from 35:23 to 39:35 by adding them -- and on Linux all three together cost **14.6 seconds**. Nothing in any of them is platform-specific: they compare two implementations of the lexer, parser and analyzer against each other, which is compiler-development tooling, not platform coverage. Every platform-specific claim the project makes is tested elsewhere, by tests that stay everywhere.
+
+So Windows stops paying four minutes and returns to roughly 36, Linux gains the semantic harness for fifteen seconds, and the thing that was unprotected becomes protected. Both platforms end up better off, which is why this was the recorded fix for the budget rather than raising `timeout-minutes` a second time (claude.md #238 already raised it once, and a budget raised twice is a budget nobody is managing).
+
+**Where the decision lives.** One helper, `_require_bootstrap_platform` in `tests/conftest.py`, carrying the whole reasoning; the three suites call it from the fixture that builds their binary. Deliberately NOT a module-level skip: each of those modules also holds cheap, pure-Python tests -- the corpus-not-empty guard, the `division_vs_regex.f` shape check, and every one of `test_bootstrap_semantic.py`'s oracle canaries -- and those keep running on all three platforms, because they cost about a second and are worth having everywhere.
+
+`FESTINA_BOOTSTRAP_EVERYWHERE=1` runs the gated part anyway. A skip with no escape hatch is a claim nobody can check, and the claim here -- that the ports are not platform-dependent -- should stay checkable by hand. Both directions of the gate were verified rather than assumed.
+
+**The new coverage is the point.** `TestBootstrapSemanticMatchesPython` is the comparison itself, 93 parametrized files plus an assertion that the unported count is zero -- because an UNPORTED skip is invisible in a green run, and "the port is complete" has to be asserted rather than inferred from an absence of failures.
+
+**Verified.** 2765 passed, 14 skipped (up from 2671: the semantic differential adds 94). Lexer 93/93, parser 93/93, semantic 93/93. The gate was tested in both directions: a simulated non-Linux platform skips, and the env var un-skips.

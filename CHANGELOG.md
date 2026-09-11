@@ -81,6 +81,17 @@ round-by-round design and implementation record predating 0.1 lives in
   `bootstrap/semdiff.py` runs the comparison (decisions.md #281, #282,
   #285, #286).
 
+- **All three bootstrap differential harnesses now run in CI**, the
+  semantic one for the first time — on Linux only. They compare two
+  implementations of the lexer, parser and analyzer against each other,
+  which is compiler-development tooling rather than platform coverage,
+  and nothing in them is platform-specific. Windows stops paying the
+  roughly four minutes the lexer and parser harnesses cost it, which is
+  what makes room for the semantic harness to run at all (on Linux all
+  three together cost about 15 seconds). `FESTINA_BOOTSTRAP_EVERYWHERE=1`
+  runs them anywhere. The cheap pure-Python tests in the same modules
+  keep running on every platform (decisions.md #287).
+
 ### Unchanged
 
 - **`T?` keeps the meaning it has** — a self-managed binding, never

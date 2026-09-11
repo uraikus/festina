@@ -1,7 +1,8 @@
 # bootstrap/
 
-Festina's own compiler, written in Festina — the lexer and parser
-complete, and semantic analysis under way.
+Festina's own compiler, written in Festina — the lexer, the parser and
+semantic analysis, all three complete and all three agreeing with their
+originals over the whole corpus.
 
 Nothing in the shipped compiler depends on this directory. It exists to
 be a demanding real program in the language, and to be checked against
@@ -24,15 +25,17 @@ the Python implementation it mirrors.
 | `semdiff.py` | diffs both analyzers over the same corpus |
 | `cases/*.f` | targeted sources covering what the corpus doesn't reach |
 
-`tests/test_bootstrap_lexer.py` and `tests/test_bootstrap_parser.py` run
-the same comparisons from pytest, so a divergence fails CI rather than
-waiting to be noticed.
+`tests/test_bootstrap_lexer.py`, `test_bootstrap_parser.py` and
+`test_bootstrap_semantic.py` run the same comparisons from pytest, so a
+divergence fails CI rather than waiting to be noticed — on Linux, for
+the reason below.
 
 ## Running it
 
 ```sh
 python bootstrap/difftest.py                        # lexer, whole corpus
 python bootstrap/astdiff.py                         # parser, whole corpus
+python bootstrap/semdiff.py                         # analyzer, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
@@ -104,7 +107,7 @@ line passes whether or not the denylist works at all, because a failed
 regex attempt falls back to division on its own. Two `/` on one line is
 what actually tests it.
 
-Both harnesses carry verified negative controls:
+All three harnesses carry verified negative controls:
 
 | break this | and this many files differ |
 |---|---|
@@ -157,10 +160,19 @@ its own. The descent that finds it is generic — every `node` and
 expression kind, because a case list has to be complete to be correct
 and goes quietly out of date the moment the grammar grows.
 
-`semdiff.py` is not in the pytest suite yet. It compiles a third
-Festina binary and runs it over 93 files, and the Windows job has about
-four minutes of headroom (see the CI note above) — so adding it belongs
-with the change that makes the bootstrap suites Linux-only, not before.
+All three harnesses run from pytest, so a divergence fails CI rather
+than waiting to be noticed — **on Linux only** (decisions.md #287).
+They compile three Festina binaries and run them across the corpus, and
+nothing in any of them is platform-specific: they compare two
+implementations against each other, which is compiler-development
+tooling rather than platform coverage. On Linux all three cost about 15
+seconds together; on Windows, where process spawning is slowest, the
+lexer and parser alone cost roughly four minutes of a 45-minute budget
+that had four to spare. Skipping them there is what buys the room for
+the semantic harness to run at all.
+
+`FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
+hand that the ports are not somehow platform-dependent.
 
 ## Then: codegen
 
