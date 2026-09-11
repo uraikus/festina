@@ -36,10 +36,11 @@ python bootstrap/astdiff.py                         # parser, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 92-file repository corpus:
+Over the 93-file repository corpus:
 
-- **lexer: 92 match, 0 differ.**
-- **parser: 92 match, 0 differ, 0 unported.**
+- **lexer: 93 match, 0 differ.**
+- **parser: 93 match, 0 differ, 0 unported.**
+- **semantic: 93 match, 0 differ, 0 unported.**
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
 `parser.f`, the largest source in the corpus at ~1,200 lines, takes
@@ -90,7 +91,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 92-file repository corpus is a strong oracle for ordinary code and
+The 93-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -112,24 +113,35 @@ Both harnesses carry verified negative controls:
 | character columns (use bytes) | exactly the 2 non-ASCII files |
 | additive/multiplicative precedence | 25 |
 | postfix `++` | 24 |
+| assignability checking (accept everything) | 2 |
+| the arrow-function counter (never advance it) | 1 |
+
+That last row is why `cases/arrow_numbering.f` exists. Freezing the
+counter changed nothing across the entire repository corpus, because no
+file in it has more than one arrow function — every program produced
+exactly `__festina_arrow_0`, and a counter that never advanced looked
+correct. A case with three arrows, one nested inside another, is what
+makes the numbering testable at all.
 
 `difftest.KNOWN_DIVERGENCES` is the place to record a divergence that
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Semantic analysis: 86 match, 6 differ, 0 unported
+## Semantic analysis: 93 match, 0 differ, 0 unported
 
-`semantic.f` resolves declarations, merges imports, walks scopes
-including thread bodies, and descends into expressions far enough to
-find the bindings they create.
+All three stages of the front end now agree with their originals over
+the whole corpus. `semantic.f` resolves declarations, merges imports,
+walks scopes including thread bodies, descends into expressions, infers
+types, and rejects the programs the original rejects.
 
-The remaining six all need the same missing piece — expression *type
-inference*, and scopes that carry types rather than just names:
-
-| | |
-|---|---|
-| 4 files | the Python side rejects them for an assignability violation this side does not check |
-| 2 files | a thread's `reply` type is inferred from its `worker.reply(x)` argument (`msg + 1`, `pixel == null`) |
+**The type checker is conservative by construction.** `inferExpr`
+answers "no type" for anything it does not understand, and every
+caller treats that as "no opinion" and checks nothing. That is the only
+safe shape for a partial checker inside a differential test: a missed
+error leaves the port differing on a file the original rejects, which
+is progress not yet made, while a false error turns a matching file
+into a differing one, which is progress lost. It can be wrong in one
+direction only.
 
 Specification.md §10.2 is why this gets as far as it does with no
 inference at all: "A declaration states its type; there is no `var`,
@@ -146,7 +158,7 @@ expression kind, because a case list has to be complete to be correct
 and goes quietly out of date the moment the grammar grows.
 
 `semdiff.py` is not in the pytest suite yet. It compiles a third
-Festina binary and runs it over 92 files, and the Windows job has about
+Festina binary and runs it over 93 files, and the Windows job has about
 four minutes of headroom (see the CI note above) — so adding it belongs
 with the change that makes the bootstrap suites Linux-only, not before.
 
@@ -170,7 +182,7 @@ globals, constants, functions, parameters, loop and catch variables,
 and locals nested arbitrarily deep. The wrapper lives in the harness,
 so the compiler carries no test-only hook.
 
-Over the corpus that is 4,732 records across 81 analyzed files; the
+Over the corpus that is 4,898 records across 82 analyzed files; the
 11 rejected ones are all `cases/*.f`, which exist to be lexed rather
 than to be valid programs. A rejection dumps `SEMERR|line|col` alone —
 position, never message text.

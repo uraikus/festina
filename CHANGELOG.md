@@ -70,15 +70,16 @@ round-by-round design and implementation record predating 0.1 lives in
 
 - **`bootstrap/semantic.f`** — `festina/semantic.py` ported to Festina,
   the third step of bootstrapping the compiler in its own language.
-  86 of 92 corpus files produce the same dump as the Python analyzer,
-  0 unported. It resolves declarations, merges imports in dependency
-  order, walks thread bodies in their own isolated scope, and descends
-  into expressions to find the bindings an arrow function creates. The
-  6 remaining differences all need expression type inference and scopes
-  that carry types: a thread's `reply` type, and the assignability
-  check that makes four invalid sources reject.
+  **all 93 corpus files produce the same dump as the Python analyzer,
+  0 differ, 0 unported** — so all three stages of the front end now
+  agree with their originals. It resolves declarations, merges imports
+  in dependency order, walks thread bodies in their own isolated scope,
+  descends into expressions, infers types, and rejects the programs the
+  original rejects. The type checker is conservative by construction:
+  anything it does not understand infers no type and is checked
+  against nothing, so it can miss an error but never invent one.
   `bootstrap/semdiff.py` runs the comparison (decisions.md #281, #282,
-  #285).
+  #285, #286).
 
 ### Unchanged
 
