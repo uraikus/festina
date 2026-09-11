@@ -130,6 +130,19 @@ Cite decision entries as `decisions.md #N` in new comments, tests and
 documents; the older `claude.md #N` spelling remains valid and means
 the same entry.
 
+**Version history belongs only in CHANGELOG.md and decisions.md.**
+specification.md, api.md, benchmark.md, todo.md, setup.md, macos.md,
+windows.md, wasm.md, security.md and the documentation site all
+describe the software as it is now — no "as of version X", no "this
+used to work differently", no `claude.md #N`/`decisions.md #N`
+citation used to explain what changed instead of what is true. Annex C
+of specification.md is the one sanctioned exception: a table of
+removed/superseded features naming the entry that removed each, kept
+exactly because a reader needs to know something is gone. When a
+change makes an existing sentence read as history rather than as a
+present-tense rule, rewrite the sentence; do not leave the old and new
+framing side by side.
+
 **Delivering**
 
 - Work on the designated branch, commit with clear messages, push, and
