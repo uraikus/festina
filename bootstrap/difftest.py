@@ -32,6 +32,27 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEXER_SOURCE = os.path.join(REPO_ROOT, "bootstrap", "lexdump.f")
 
 
+def run_text(argv, timeout, cwd=None):
+    """subprocess.run capturing text, decoded as UTF-8 -- ALWAYS explicitly,
+    never by locale default.
+
+    claude.md #276. `text=True` alone makes Python decode with the
+    locale's preferred encoding, which is cp1252 on Windows and UTF-8
+    almost everywhere else. Every binary here emits UTF-8, so without
+    this the Windows job silently compared mojibake against correct text
+    and reported a difference in the port that did not exist: the four
+    corpus files with non-ASCII content failed in both harnesses, eight
+    checks, none of them a real divergence.
+
+    This is the same trap tests/conftest.py's compile_and_run already
+    documents (claude.md #126), which is exactly why both harnesses now
+    funnel every subprocess through ONE helper rather than repeating the
+    keyword at four call sites and getting three of them right.
+    """
+    return subprocess.run(argv, capture_output=True, text=True,
+                          encoding="utf-8", timeout=timeout, cwd=cwd)
+
+
 def _esc(s):
     """The exact escaping bootstrap/lexer.f's own esc() applies."""
     out = []
@@ -126,7 +147,7 @@ def festina_dump(binary, path):
     non-ASCII byte is carried through rather than rejected -- the three
     files that used to be skipped here now lex like any other.
     """
-    result = subprocess.run([binary, path], capture_output=True, text=True, timeout=120)
+    result = run_text([binary, path], timeout=120)
     if result.returncode != 0:
         raise RuntimeError(f"{binary} {path} exited {result.returncode}: {result.stderr}")
     body = result.stdout
@@ -135,10 +156,9 @@ def festina_dump(binary, path):
 
 def build_lexer(out_path):
     """Compile bootstrap/lexer.f, returning the binary's path."""
-    result = subprocess.run(
+    result = run_text(
         [sys.executable, "-m", "festina.cli", "compile", LEXER_SOURCE, "-o", out_path],
-        cwd=REPO_ROOT, capture_output=True, text=True, timeout=600,
-    )
+        timeout=600, cwd=REPO_ROOT)
     if result.returncode != 0:
         raise RuntimeError(f"compiling {LEXER_SOURCE} failed:\n{result.stdout}\n{result.stderr}")
     return out_path

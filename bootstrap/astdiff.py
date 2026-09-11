@@ -4,11 +4,11 @@ claude.md #273, the same shape as bootstrap/difftest.py does for the
 lexer: both parsers emit one canonical AST dump (see astdump.py) and this
 diffs them over every .f file in the repository.
 
-The parser is a PARTIAL port, and this reports that honestly rather than
-counting it as agreement. A file whose Festina dump contains an
-`(UNPORTED ...)` node is classified "unported", not "match" and not
-"differ" -- so the coverage number moves only when a construct is
-actually implemented.
+All 89 corpus files match (claude.md #275). The UNPORTED machinery that
+carried the port while it was partial is kept: a file whose Festina dump
+contains an `(UNPORTED ...)` node is classified "unported", not "match"
+and not "differ", so a construct the grammar grows later announces
+itself rather than silently mis-parsing.
 
     python bootstrap/astdiff.py            # whole repo corpus
     python bootstrap/astdiff.py a.f b.f    # just these
@@ -22,7 +22,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bootstrap import astdump                 # noqa: E402
-from bootstrap.difftest import REPO_ROOT, corpus   # noqa: E402
+from bootstrap.difftest import REPO_ROOT, corpus, run_text   # noqa: E402
 from festina import parser as py_parser       # noqa: E402
 from festina.errors import CompileError       # noqa: E402
 
@@ -31,10 +31,9 @@ PARSER_SOURCE = os.path.join(REPO_ROOT, "bootstrap", "astdumpf.f")
 
 def build_parser(out_path):
     """Compile bootstrap/astdumpf.f, returning the binary's path."""
-    result = subprocess.run(
+    result = run_text(
         [sys.executable, "-m", "festina.cli", "compile", PARSER_SOURCE, "-o", out_path],
-        cwd=REPO_ROOT, capture_output=True, text=True, timeout=900,
-    )
+        timeout=900, cwd=REPO_ROOT)
     if result.returncode != 0:
         raise RuntimeError(
             f"compiling {PARSER_SOURCE} failed:\n{result.stdout}\n{result.stderr}")
@@ -53,7 +52,7 @@ def python_dump(source):
 
 
 def festina_dump(binary, path):
-    result = subprocess.run([binary, path], capture_output=True, text=True, timeout=180)
+    result = run_text([binary, path], timeout=180)
     if result.returncode != 0:
         raise RuntimeError(f"{binary} {path} exited {result.returncode}: {result.stderr}")
     body = result.stdout

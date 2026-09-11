@@ -83,6 +83,40 @@ class TestTheDifferentialTestCanFail:
         mutated[0] = mutated[0].replace("|int|int", "|int|WRONG")
         assert mutated != got
 
+    def test_subprocess_output_is_decoded_as_utf8_not_by_locale(self, lexer_binary):
+        """claude.md #276. `text=True` without an explicit `encoding`
+        decodes with the LOCALE's preferred codec -- cp1252 on Windows,
+        UTF-8 nearly everywhere else. Every binary these harnesses run
+        emits UTF-8, so an unguarded read silently compared mojibake
+        against correct text and reported eight differences that did not
+        exist: the four corpus files with non-ASCII content, in both
+        harnesses.
+
+        Forcing the locale default to cp1252 for any call that does NOT
+        name an encoding reproduces Windows exactly, on Linux. This test
+        fails if anyone drops the keyword again -- which is the point,
+        since Linux CI otherwise cannot see the bug at all."""
+        import subprocess
+        non_ascii = os.path.join(difftest.REPO_ROOT, "examples", "ascii_scan.f")
+        assert difftest.compare(lexer_binary, non_ascii)[0] == "match"
+
+        real_run = subprocess.run
+
+        def locale_cp1252(*args, **kwargs):
+            if kwargs.get("text") and "encoding" not in kwargs:
+                kwargs["encoding"] = "cp1252"
+            return real_run(*args, **kwargs)
+
+        subprocess.run = locale_cp1252
+        try:
+            status, _ = difftest.compare(lexer_binary, non_ascii)
+        finally:
+            subprocess.run = real_run
+        assert status == "match", (
+            "a non-UTF-8 locale changed the comparison's answer -- some "
+            "subprocess read is decoding by locale default again instead "
+            "of going through difftest.run_text")
+
     def test_the_ambiguous_slash_case_really_exercises_the_denylist(self):
         """The specific shape that caught the first version out: the
         division cases must put two '/' on a single line, or they prove

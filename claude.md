@@ -5339,3 +5339,24 @@ The second was subtler and worth the note: `ArrowFuncExpr` carries a `decl` fiel
 **The UNPORTED machinery is kept, not removed.** It has no work to do today (`http {...}` is the one construct still unimplemented, and no corpus file uses it), but it is what let coverage be reported as a real 64/89 mid-port instead of guessed at, and what kept a mis-parsing construct showing up as a difference rather than as progress. The next construct the grammar grows will announce itself rather than mis-parse. The pytest suite's coverage floor moved 60 -> 85 to match, which is what stops the "unported" skip from quietly hiding a regression.
 
 **Verified.** 2622 passed, 14 skipped. Three negative controls: swapping additive/multiplicative precedence differs on 34 files, dropping the `on request use` desugar on 1, dropping `thread`'s `pool_size` on 7.
+
+276. THE WINDOWS JOB COMPARED MOJIBAKE AND CALLED IT A DIFFERENCE
+
+PR #105's first Windows run failed with 8 checks red, all in the new bootstrap harnesses, all reporting a divergence between the Python and Festina implementations. Every one was false.
+
+```
+python:  22:11|STRING|  caf? na?ve  stra?e
+festina: 22:11|STRING|  café naïve  straße
+```
+
+The Festina side is correct there. **The PYTHON side is the mojibake** -- and the other direction appears too, in the same run (`caf\xc3\xa9` where `caf\xe9` is right), because whichever side was decoded with the wrong codec is whichever side the log happened to render. The cause is one keyword: `subprocess.run(..., text=True)` with no `encoding=`. That decodes with the LOCALE's preferred codec, which is cp1252 on Windows and UTF-8 nearly everywhere else, while every binary these harnesses run emits UTF-8.
+
+**Exactly 4 corpus files have non-ASCII content, times 2 harnesses, is 8.** The arithmetic is the confirmation: the failure set was not "some tests," it was precisely the files where the bug could possibly show.
+
+**This trap is already documented in this repository.** `tests/conftest.py`'s `compile_and_run` carries a five-line comment about it, ending "confirmed by real Windows CI (claude.md #126)". I wrote four new subprocess calls without it. Knowing a hazard is recorded somewhere is not the same as checking for it when writing the code that re-introduces it.
+
+**The fix is one shared helper, not four keywords.** `difftest.run_text()` is now the only place either harness spawns a process, and `astdiff.py` imports it. Repeating `encoding="utf-8"` at four call sites is how three of them end up right.
+
+**Reproduced on Linux before fixing, which is the part worth keeping.** Monkeypatching `subprocess.run` so that any call passing `text=True` WITHOUT an explicit encoding gets cp1252 is exactly what Windows does, and it reproduced the failure set precisely: the same 4 files in the lexer harness, the same 4 in the parser's. After the fix, 0 under the same forcing. That reproduction is now a permanent test (`test_subprocess_output_is_decoded_as_utf8_not_by_locale`), verified to fail when the keyword is dropped again -- which matters because **Linux CI cannot otherwise see this bug at all**, and the next person to add a subprocess call here would have had the same 35-minute Windows round trip to find out.
+
+**One unreproduced failure, reported rather than explained away.** The first full-suite run after the fix also failed `tests/stress/http_client_pool_kill_live_churn.f` (a thread-kill-during-live-HTTP program under ASan). It did not recur: 8/8 passes in isolation, 60/60 in its own file, and a clean full suite on re-run. It is pre-existing, untouched by this round's diff (two harness files that cannot reach an HTTP stress program), so it is not this change's -- but it is also not established as anything, so it is written down here rather than called a flake.
