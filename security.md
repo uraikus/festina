@@ -5,7 +5,7 @@ places a memory-safety or supply-chain issue would actually bite. This
 page describes the current security posture: the attack surface a
 compiled program has, the properties the implementation maintains, and
 how they are verified. The full round-by-round audit and design record
-lives in [claude.md](claude.md) and [tests/CONTRACT.md](tests/CONTRACT.md);
+lives in [decisions.md](decisions.md) and [tests/CONTRACT.md](tests/CONTRACT.md);
 this page is the state of the product.
 
 ## Reporting a vulnerability

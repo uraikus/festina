@@ -238,7 +238,7 @@ The compiler frontend, LLVM codegen backend, and native C runtime are
 real and tested: **2411 tests, 0 failures** (14 more skip cleanly when
 their optional tooling isn't installed — see
 [setup.md](setup.md#running-the-test-suite)). Every language construct
-in the [specification](claude.md) is implemented end to end, not just
+in the [specification](specification.md) is implemented end to end, not just
 parsed. That includes a leak stress suite —
 [`scripts/leak_stress.sh`](scripts/leak_stress.sh) runs mixed churn
 programs plus one isolation program per data type under
@@ -263,7 +263,8 @@ scripts/leak_stress.sh       # just the sanitizer stress runs
 | **Roadmap** | [todo.md](todo.md) |
 | **Changelog** | [CHANGELOG.md](CHANGELOG.md) |
 | **Full spec-compliance test suite** | [tests/CONTRACT.md](tests/CONTRACT.md) |
-| **Language specification** | [claude.md](claude.md) |
+| **Language specification** | [specification.md](specification.md) |
+| **Design decision log** | [decisions.md](decisions.md) |
 
 ## Design philosophy
 

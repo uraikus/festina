@@ -1,4 +1,25 @@
-FESTINA — AI AGENT IMPLEMENTATION SPECIFICATION
+FESTINA — DESIGN AND IMPLEMENTATION DECISION LOG
+
+This file is the project's numbered, chronological decision log. It was
+previously named claude.md, and a citation of the form `claude.md #N`
+anywhere in the repository (source comments, tests, CHANGELOG.md,
+tests/CONTRACT.md, api.md) refers to entry N below. The numbering is
+permanent: entries are never renumbered, reordered, or removed.
+
+Entries 1-73 are the original language specification as it was first
+written. They are kept verbatim as history but are no longer normative:
+several were changed by later numbered entries (for example, #55's
+"int and float never mix" was inverted by #143, #67/#68's replaceAll()
+was replaced by the /g flag in #107, and #42/#53's "no throw" by #157).
+The current, consolidated language specification is specification.md;
+the standard library as implemented is api.md; what is verified, and
+how, is tests/CONTRACT.md.
+
+Entries 74 onward record each feature, change, or fix in the order it
+was made, with its rationale, the alternatives considered, and how it
+was verified. A new entry is appended for every change to the language,
+compiler, or runtime.
+
 
 1. PROJECT
 
@@ -5224,3 +5245,17 @@ So a poll written as `if probe.returncode == 0 and "_NET_FRAME_EXTENTS" in probe
 **The lesson worth keeping**: a readiness poll whose success condition can be satisfied by the failure output is not a poll, and it fails silently in exactly the direction that hides it -- everything passes on a fast machine, forever, until a slow one. The condition has to be something only the success case can produce. Checking a probe's exit status is not enough when the tool reports "absent" as a successful answer to a well-formed question.
 
 **Verified**: the absent-form behaviour reproduced against a real X server (exit 0, name echoed, no "="), the old condition shown accepting it and the split then raising the exact CI IndexError; the readiness wait shown becoming true one probe later than the old one claimed; all six WM-dependent tests passing three runs in a row, and `tests/test_codegen.py` green in full (1067 passed).
+
+271. THE SPECIFICATION IS CONSOLIDATED INTO specification.md, AND THIS LOG IS RENAMED decisions.md
+
+Asked for directly: "create a specification.md file, which organizes the festina language specs, in a similar function to the ECMAScript standards. Then update claude.md to refer to this specification rather than containing the specs itself."
+
+What existed: claude.md was two documents in one file. Entries #1-#73 were the original numbered specification, written before any code; entries #74-#270 were this chronological decision log, in which every later language rule (int/float promotion in #143, `try`/`catch` in #157, `enum`/`typeof` in #176, threads in #195-#222, `T?` in #202-#205, `match` in #252, `ascii` in #256, and so on) lived only as the entry that introduced it, with the original section it changed (#55, #42/#53, #67/#68, #40, #95...) left standing as written. Finding the current rule for anything meant reading the original section, then every later entry that touched it. api.md was the only consolidated, topic-organized statement of the language, and it is a reference with examples rather than a specification.
+
+What was done. specification.md is a new, normative, topic-organized document in the shape of the ECMAScript standard: 1 Scope; 2 Conformance (with the "test, don't fail" convention and #54's ambiguity rules as clauses); 3 Normative References; 4 Overview; 5 Notation; 6 Source Text and Program Structure (imports, the entry function, DatabaseURL, startup, hoisting, namespaces); 7 Lexical Grammar; 8 Types (every type, null and zero values, assignability, text rendering); 9 Expressions (with a precedence table taken from the parser's own ladder); 10 Statements; 11 Declarations (functions, structs, tables, enums, the full event-handler table, threads); 12 Execution Model; 13 Memory Management; 14 Errors and Diagnostics (compile errors, `fail()`, exceptions, undefined and implementation-defined behavior); 15 The Built-in Database; 16 The Standard Library (an index of every builtin, global and method, deferring to api.md for detail); 17 Graphics; 18 Audio; 19 HTTP and WebSocket; 20 Threads; 21 Compilation, Targets and Tooling (pipeline, CLI, linking, the per-platform table, wasm32-wasi, environment variables); and annexes A (grammar summary), B (reserved words and global names), C (removed and superseded features, each with the entry that removed it), D (non-goals), and E (a table mapping original sections #1-#73 to the clauses that now carry them). Every clause cites the decision entries it consolidates as `[#N]`, so rationale is one hop away. The sources were entries #1-#73 read in full, api.md read in full, the lexer's keyword set and the parser's expression ladder and statement dispatch, semantic.py's builtin, signature, method and event tables, and a rule-by-rule extraction of entries #74-#270 (done in four parallel passes, each reporting the current rules an entry establishes and what it supersedes); where api.md and an older entry disagreed, the later entry and the code won.
+
+This file was renamed from claude.md to decisions.md with `git mv`, its content unchanged apart from the explanatory header now at the top. The rename rather than a split: about five thousand comments, test names and CHANGELOG/CONTRACT lines cite `claude.md #N` by entry number, so the numbering had to stay exactly as it is and the entries had to stay in one file; but a 1.2 MB file named claude.md is what an agent tool loads as project instructions on a case-insensitive filesystem, and nothing in it was instructions. The header records that `claude.md #N` means entry N here; new citations are written `decisions.md #N`. The rewritten claude.md is a short set of working instructions -- where each document lives and which are normative, the implementation rules that used to be #2/#54, the change checklist (spec, api.md, a numbered entry here, tests, CONTRACT.md, CHANGELOG.md), a repository map and conventions -- and contains no language rules of its own. README.md, api.md, security.md, todo.md, CHANGELOG.md, tests/CONTRACT.md, festina/__init__.py and the two docs pages that linked to claude.md now link to specification.md and/or decisions.md; every `claude.md #N` citation was left as it was.
+
+Not done, deliberately: no rewrite of the existing `claude.md #N` citations (a mechanical one-line sed across ~180 files, worth doing as its own change once this one has landed so the diff stays reviewable), and no docs/specification.html for the documentation site (the site links to the GitHub file, as it did for claude.md).
+
+Verified by re-reading the assembled document's internal anchors (every table-of-contents link resolves), by checking each grammar claim against parser.py (the `for` clause separators, `else if`, unary `+`/`-`/`!`/`typeof`, the postfix and call precedence, `catch (name:text)`, the `http {...}` and `blob 'path'.callback(fn)` statement forms) and each name against lexer.py's SPEC_KEYWORDS/_EXTRA_KEYWORDS and semantic.py's BUILTIN_FUNCTIONS, _BUILTIN_SIGNATURES, _EVENT_SIGNATURES and _THREAD_EVENT_SIGNATURES, and by running the front-end test modules after the rename.
