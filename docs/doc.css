@@ -365,3 +365,48 @@
     main { padding: 32px 20px 80px; }
     .topbar-links a.hide-narrow { display: none; }
   }
+
+  /* Specification page (ECMAScript-style numbered clauses) */
+  .clause-num {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    color: var(--alternate);
+    font-weight: 500;
+    margin-right: 2px;
+  }
+  h4 .anchor { opacity: 0; text-decoration: none; color: var(--ink-soft); font-size: 0.85em; margin-left: 6px; }
+  h4:hover .anchor { opacity: 1; }
+  a.clause-ref { white-space: nowrap; }
+  a.cite {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.85em;
+    text-decoration: none;
+    border-bottom: 1px dotted var(--line);
+  }
+  a.cite:hover { border-bottom-color: var(--primary); }
+  .grammar {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.85rem;
+    line-height: 1.7;
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--alternate);
+    padding: 10px 16px;
+    margin: 0 0 16px;
+    overflow-x: auto;
+  }
+  .grammar em { color: var(--primary); font-style: italic; }
+  .grammar code {
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: var(--ink);
+    font-weight: 600;
+  }
+  pre.code.grammar-block {
+    background: var(--bg-raised);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    box-shadow: none;
+  }
+  .callout.spec-note { border-left-color: var(--alternate); }
+  .callout.spec-note em { color: var(--ink); font-style: normal; font-weight: 600; }
