@@ -709,6 +709,16 @@ class TestLeakStress:
             # what catches that direction. Verified to FAIL without the
             # fix (66,000 allocations).
             "chain_length_churn.f",
+            # claude.md #272: text.trim(), blob.byteAt(i) and
+            # blob.slice(a, b). trim() and slice() both hand back a
+            # FRESH OWNED text -- a malloc'd copy, never a pointer into
+            # the receiver -- so both leak if the temporary is dropped
+            # and double-free if something mistakes the copy for a
+            # borrow into the blob's own buffer. The loop mixes a named
+            # receiver read repeatedly (must NOT be released) with a
+            # call-result receiver (must be), over a non-ASCII file so
+            # slice() is really copying multi-byte sequences.
+            "bytes_trim_churn.f",
             # claude.md #245: pool.postMessage(x) with no index --
             # main plus 3 feeder threads all auto-selecting against the
             # SAME handles array and round-robin counter at once, 12,000

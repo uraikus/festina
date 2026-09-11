@@ -5224,3 +5224,139 @@ So a poll written as `if probe.returncode == 0 and "_NET_FRAME_EXTENTS" in probe
 **The lesson worth keeping**: a readiness poll whose success condition can be satisfied by the failure output is not a poll, and it fails silently in exactly the direction that hides it -- everything passes on a fast machine, forever, until a slow one. The condition has to be something only the success case can produce. Checking a probe's exit status is not enough when the tool reports "absent" as a successful answer to a well-formed question.
 
 **Verified**: the absent-form behaviour reproduced against a real X server (exit 0, name echoed, no "="), the old condition shown accepting it and the split then raising the exact CI IndexError; the readiness wait shown becoming true one probe later than the old one claimed; all six WM-dependent tests passing three runs in a row, and `tests/test_codegen.py` green in full (1067 passed).
+
+271. THE LEXER, WRITTEN IN FESTINA -- AND WHAT IT FOUND
+
+Asked whether bootstrapping is worth doing now, the honest answer was "not as a replacement yet, but the lexer alone, as a differential test." This entry is that step: `bootstrap/lexer.f` reproduces `festina/lexer.py`'s token stream exactly, and `bootstrap/difftest.py` proves it over every `.f` file in the repository.
+
+**Result: 80 files match, 0 differ, 1 known divergence, 3 skipped.** The Festina lexer also lexes itself.
+
+**Why a port and not a rewrite.** The only claim worth making about a reimplementation is that it AGREES with the original, so this is a deliberate translation -- same token kinds, same keyword sets, same precedence -- with one structural difference forced by the language: `festina/lexer.py` uses one master regex with named groups and `lastgroup`, and Festina's `regex` is POSIX ERE with neither, so this is a hand-written character scanner. That is what `ascii` (#256) was added for.
+
+The subtlety worth writing down: `TOKEN_SPEC`'s alternation order is load-bearing because Python's `re` alternation is leftmost-FIRST, not longest-match. The scanner tries the same kinds in the same order. Getting it wrong is how `x++` lexes as `+` `+`.
+
+**Four findings about the LANGUAGE, which is the point of doing this from a real consumer rather than guessing:**
+
+**1. `ascii` cannot read 3 of the 69 corpus files.** `text.toAscii()` validates and answers `null` for anything non-ASCII -- correct for what it was specified to do, and fatal for a lexer. A lexer for a UTF-8 language does not need to *interpret* non-ASCII, but it must carry those bytes through string literals untouched. `ascii` as it stands is a validated ASCII string, not a byte view, so `examples/ascii_scan.f` (among others) is simply unreadable to a Festina lexer. This is the single biggest obstacle to going further, and it is an argument for the byte-buffer type todo.md already carries as "open but unmotivated" -- it now has a motivation.
+
+**2. `text` cannot hold a NUL, so it cannot represent a value its own lexer produces.** `festina/lexer.py` accepts `\0` in a string literal and yields the three-character `a\0b`; `'a\0b'.length` in any Festina program is `1`. This is the one recorded divergence, kept in `KNOWN_DIVERGENCES` and xfailed rather than deleted from the corpus, because the port cannot be fixed here -- only the language can. Worth noting separately that this means `'a\0b'` in ordinary Festina code silently truncates.
+
+**3. `text` has no `.trim()`.** Small, but the import-path rule needs Python's `.strip()` semantics exactly; `lexer.f` carries its own.
+
+**4. `int / int` promotes to float** (`7 / 2` is `3.5`, per #61's rule, working as designed). No integer midpoint means no ordinary binary search, so where the Python lexer bisects a line-starts index, `lexer.f` walks a forward-only cursor instead. Not a bug -- but a real ergonomic cost for exactly the integer-index code a compiler is made of.
+
+Notably absent from that list: the `ascii` method parity the plan filed as Part 3 (`split`, `replace`, `match`, `toInt`). The lexer needed `.length`, `[i]`, `charCodeAt`, `slice` and `toText` -- all shipped -- and nothing else. Part 3 is less urgent than it looked from the outside.
+
+**A bug in the port, caught by the test, worth recording because it is a shape that recurs.** The Python lexer's template handling calls `tokenize()` recursively on each `${...}` fragment and drops the sub-EOF. Errors propagate because the recursive call RAISES. The Festina port returns an array instead, whose last element is the EOF -- or, on failure, the LEXERR. Dropping "the last token" therefore threw away exactly the error, and a malformed interpolation lexed as if nothing were wrong. Returning a value where the original raises silently converts "propagate" into "discard" at every such site.
+
+**Two things about the oracle itself, because a differential test that cannot fail is worth nothing.**
+
+The corpus is strong for ordinary code and weak at the edges: it contains **no ambiguous `/` at all**, and block comments appear in exactly one file (the new lexer's own). `bootstrap/cases/` closes that, and its coverage is verified rather than assumed -- deleting the regex-vs-division denylist from `lexer.f` must make the test fail.
+
+That check immediately earned its place. The FIRST `division_vs_regex.f` put one `/` per line, and deleting the denylist still passed: a regex attempt that runs to end-of-line fails and falls back to division on its own, so such a line proves nothing. Two `/` on one line is what actually tests it. `TestTheDifferentialTestCanFail` pins both the general discipline and this specific shape -- the same reasoning as `test_leak_stress.py`'s own harness canary, arrived at the same way, by watching a test pass when it should not have.
+
+**Verified.** 2494 passed, 17 skipped, 1 xfailed, full suite. Two independent negative controls (break longest-match on `++`: 17 files differ, pinpointing `OP|++` vs `OP|+`; delete the regex denylist: `OP|/` vs `REGEX| 2 |`).
+
+**Where this leaves bootstrapping.** The parser is the natural next step and needs none of the four findings fixed. Semantic analysis and codegen should wait for the `?` cell model, which is a documented breaking change to shipped `?` semantics and would otherwise land underneath a half-ported compiler.
+
+272. THREE LANGUAGE FIXES THE LEXER PORT ASKED FOR, AND A FOURTH IT FOUND ON THE WAY
+
+claude.md #271 wrote Festina's lexer in Festina and recorded four limits it hit. Three of them were asked to be fixed. All three are, and the fix for the first turned out to be smaller and better placed than the "new `bytes` primitive" todo.md had been carrying.
+
+**1. `blob.byteAt(i)` and `blob.slice(a, b)` -- the read half of a byte buffer, on the type that already IS bytes.**
+
+The problem: `bootstrap/lexer.f` could not read 3 of this repository's own 69 `.f` files. `text.toAscii()` validates, so one non-ASCII byte anywhere -- in a comment, in a string literal -- made the whole file unreadable. A lexer for a UTF-8 language never has to *interpret* those bytes; it has to carry them through untouched.
+
+The obvious answer was a new `bytes` primitive, which todo.md had already priced ("a full new primitive type costs surface area from the lexer through to the runtime") and which the `ascii` work (#256, four phases) had just demonstrated the cost of. It is not needed. `blob` is already "a file's bytes": it holds `char *bytes` and an exact `int64_t length`, and `.length` has been an O(1) read of that field since #251. It wanted two accessors, not a parallel type.
+
+- `byteAt(i)` -> `int`, `0`..`255`, null out of range. The cast through `unsigned char` is what makes it a BYTE read: plain `char` is signed on x86, so `0xC3` would otherwise answer `-61` instead of `195`.
+- `slice(start, end)` -> **`text`**, not another blob. A blob is a FILE -- it carries the path it was loaded from and `.save()` writes back to it -- so a slice of one has no meaningful path. Answering text keeps the file/bytes distinction intact and sidesteps the question entirely.
+
+Bounds behavior follows blob's own existing rule rather than `arr[T]`'s: byteAt answers null, slice clamps. The buffer's length is not something the program chose, so "test, don't fail" is right here in a way it deliberately is not for an array index (api.md's own "Indexing is not bounds-checked" section).
+
+**2. The `\0` escape is rejected at compile time.** `text` is NUL-terminated, so `'a\0b'` lexed to a three-character value the language could never hold: `.length` answered 1, and everything past the NUL silently vanished. The alternatives were giving `text` a length -- exactly the change #83 ruled out, and for the same four-provenances reason -- or not producing the value. Accepting an escape whose result the language cannot represent is worse than rejecting it, so `\0` is now a compile error naming the truncation. `'a\\0b'` (escaped backslash, ordinary `0`) is untouched; nothing in the repository used the real escape.
+
+**3. `text.trim()`.** Leading and trailing whitespace, the seven bytes C's `isspace()` answers in the "C" locale -- the same set Python's `str.strip()` removes for ASCII input. Byte-oriented, which is safe on UTF-8 without decoding because every byte of a multi-byte sequence has its high bit set and so can never be mistaken for one of those seven. `'  café  '.trim()` is `'café'`; U+00A0 is not stripped. An `ascii` receiver is deliberately not accepted -- it would have to answer an `ascii`, a second runtime function for a case nothing has asked for.
+
+Finding 4 (`int / int` promotes to float) is left alone: it is #61's rule working as designed, and the port's forward-only line cursor is a fine answer to it.
+
+**THE FOURTH THING, which is the interesting one: a column is a CHARACTER offset, not a byte offset.**
+
+Reworking the lexer onto `blob` bytes made all 69 files readable, and immediately produced two diffs -- `50:79` against `50:80`, on the two files that had been unreadable. Python's lexer indexes `str`, whose unit is the code point, so `pos - line_start + 1` counts characters there for free. Counting bytes gives a different, wrong answer on any line with a non-ASCII character before the token.
+
+This is not cosmetic: that column is what every compile error a user reads points at, and a byte column silently misplaces the caret in exactly the files most likely to already be confusing. The fix counts UTF-8 lead bytes (`b < 0x80 || b >= 0xC0` -- continuation bytes are `10xxxxxx` and do not start a character). **The differential test found this; nothing else would have.** Neither lexer was "wrong" in isolation -- both produced plausible columns -- and only running them against each other over real non-ASCII source made the disagreement visible.
+
+**Result: 85 files match, 0 differ, 0 known divergences, 0 skipped.** The `KNOWN_DIVERGENCES` table #271 introduced is now empty -- its one entry (`'a\0b'`) was fixed in the language rather than tolerated in the harness -- and kept, rather than deleted, so a future divergence has an honest place to be recorded instead of a commit message.
+
+**Verified.** 23 new pytest tests; `tests/stress/bytes_trim_churn.f` under ASan/LeakSanitizer, mixing a named receiver read repeatedly (must NOT be released) with a call-result receiver (must be), over a non-ASCII file so `slice()` really copies multi-byte sequences. Negative control: deleting the receiver release from the new codegen branch leaks **340,000 bytes in 12,000 allocations**, so the program tests what it claims to. Three differential negative controls, including a new one for the column fix, which differs on exactly the two non-ASCII files.
+
+273. THE PARSER, WRITTEN IN FESTINA -- A PARTIAL PORT THAT SAYS SO
+
+The second step of bootstrapping, after the lexer (#271, #272). `bootstrap/parser.f` reproduces `festina/parser.py`'s AST, and `bootstrap/astdiff.py` proves it the same way the lexer's own harness does.
+
+**Result: 64 files match, 0 differ, 25 unported, of 89.**
+
+**The partial-ness is the design, not an apology.** A parser is a far bigger surface than a lexer, and a half-finished one that quietly mis-parses is worse than none. So a construct with no implementation produces an `(UNPORTED :what="...")` node, and the harness classifies a file containing one as *unported* -- never as a match, never as a difference. The coverage number can only move when a construct is genuinely implemented; a construct that mis-parsed instead shows up as a difference, not as progress. Still unported: event handlers (17 files), `thread` (6), `match` (1), arrow functions (1).
+
+**AST representation: one generic node, not forty-five structs.** `festina/ast.py` has ~45 classes. Mirroring that in Festina would mean 45 structs plus a 45-member enum, and -- worse -- a dumper per node on each side, which is a second parser to keep in sync. Instead a node here is a kind string plus a list of named fields, and the dump is generic on BOTH sides: Python walks `vars(node)`, Festina walks its own field list, and each sorts by field name so neither depends on the other's declaration order. Every field is dumped, `line`/`column` included -- the parser's whole downstream job is good error locations, and a structural-only comparison would let a port lose them silently.
+
+**A real bug in the shipped compiler, found by writing Festina in Festina (recorded separately as #274).** `while (a || b) && i < 3 { }` did not parse. `parse_if`/`parse_while` implemented optional condition parens by eating a leading `LPAREN` and its match, which truncates any condition that merely BEGINS with a parenthesised sub-expression: the condition ended at `)` and the parser then demanded `{` at `&&`. Nothing in 2,500 tests or 89 corpus files had written that shape. Writing a parser did, on the first try.
+
+**Two mistakes of my own worth recording, both caught by the harness rather than by reading.**
+
+The first: `unported()` returned a marker node without consuming anything, so `parseProgram`'s loop spun forever on a token it neither parsed nor advanced past. The symptom was not a parse error but the harness reporting `exit -9` -- the OOM killer. A "not implemented" path still has to make progress or terminate; returning a value is not the same as handling the input.
+
+The second, and the reason 34 of an initial 35 differences were one bug: `TemplateLit.parts`, `EnumDecl.members` and `FuncTypeExpr.param_types` are lists of plain STRINGS in Python. My `'#str'` marker nodes were unwrapped for single fields but not inside lists, so every template literal in the corpus dumped `[(#str :v="x")]` against Python's `["x"]`. One fix, 34 files. Worth noting how that read at first: 35 failures across unrelated files looked like a deep problem and was a three-line one -- the kind of ratio that argues for looking at what the failures have in common before looking at any one of them closely.
+
+**Two smaller language findings**, on top of #272's four: `text` has no `.slice()` (both `ascii` and now `blob` do), so extracting the payload from the lexer's `'int 42'` token value goes through `split(' ')`; and `fail` is a reserved builtin, so a parser cannot name its own error helper `fail()`.
+
+**Verified.** `tests/test_bootstrap_parser.py` runs the comparison per corpus file, plus a guard against the opposite failure -- if a change made everything report "unported", every comparison would skip and the suite would pass while testing nothing, so it asserts at least 60 files still parse identically. Two negative controls: swapping additive/multiplicative precedence differs on 25 files, deleting postfix `++` handling on 24.
+
+274. `while (a || b) && c` DID NOT PARSE
+
+Found by #273's parser port, which needed exactly that shape and could not compile itself.
+
+`parse_if` and `parse_while` supported optional condition parens (`if (x) { }` as well as `if x { }`) by checking for a leading `LPAREN`, eating it, parsing an expression, and eating the matching `RPAREN`. That is correct only when the parens wrap the WHOLE condition. When they wrap only its first operand, the condition is truncated at the closing paren and the parser demands the block at whatever follows -- `expected LBRACE, found OP('&&')`.
+
+**The fix is to delete the special case, not to extend it.** `parse_primary` already treats `( expr )` as an ordinary grouped expression, so `test = self.parse_expression()` handles both spellings and the truncation cannot recur: there is no longer any code that treats a leading paren as anything other than grouping. `if (x) { }` parses exactly as before.
+
+**Why nothing caught it.** The shape is only reachable when a condition both starts with a parenthesised group and continues with an operator. 2,500 tests and 89 corpus files never wrote it. This is the same lesson as #267's enum/JSON interaction, in a different place: the gap was not in any feature's own coverage but in a combination none of them owned. A new, demanding program written in the language is what found it -- which is the argument for bootstrapping, stated in the only way that counts.
+
+Verified: five regression tests pinning both spellings, the grouped-operand case, the bare case, and that `(a || b) && c` keeps its grouping rather than re-associating. Full suite 2527 passed.
+
+275. THE PARSER PORT FINISHED: 89/89
+
+#273 left `bootstrap/parser.f` at 64 of 89 corpus files, with event handlers, `thread`, `match` and arrow functions unported. All four are in. **89 match, 0 differ, 0 unported.**
+
+**Two bugs, and both were in tables I had transcribed rather than derived.**
+
+The first cost 15 of the 18 remaining failures: my `TYPE_KEYWORDS` list was wrong in both directions. It was missing `thread` -- and `on message(w:thread, msg:int)` is the shape every threading test opens with, so `parseType` rejected the parameter and the whole file failed. It also *contained* `void`, which the real set does not: `void` is a valid RETURN type but never an ordinary variable/field/element type, so `looksLikeDeclaration` would have treated it as starting a declaration. I had written the list from memory of what "a type" means rather than reading `festina/parser.py`'s own `TYPE_KEYWORDS = lexer_mod.PRIMITIVE_TYPE_KEYWORDS | {"img", "aud", "http", "socket", "thread"}`. Deriving it took one command.
+
+The second was subtler and worth the note: `ArrowFuncExpr` carries a `decl` field that is assigned `None` in `__init__`'s BODY rather than taken as a parameter, so the `inspect.signature` sweep I used to enumerate every node's fields never saw it. Three files differed by exactly `:decl=null`. **A constructor signature is not a field list** -- the generic dumper walks `vars(node)`, which is why the comparison caught it at all.
+
+**`on request use NAME` had to be reproduced, not skipped.** It desugars at parse time into an ordinary `EventHandler` whose body calls `NAME.giveRequest(req)`, and the whole point of #246's design is that nothing downstream can tell. That means the dumped AST of the sugared form must equal the dumped AST of the longhand -- so the port had to build the same six synthesized nodes with the same synthesized positions. Deleting that branch differs on exactly one file, which is the confirmation that the desugar is really being exercised.
+
+**The UNPORTED machinery is kept, not removed.** It has no work to do today (`http {...}` is the one construct still unimplemented, and no corpus file uses it), but it is what let coverage be reported as a real 64/89 mid-port instead of guessed at, and what kept a mis-parsing construct showing up as a difference rather than as progress. The next construct the grammar grows will announce itself rather than mis-parse. The pytest suite's coverage floor moved 60 -> 85 to match, which is what stops the "unported" skip from quietly hiding a regression.
+
+**Verified.** 2622 passed, 14 skipped. Three negative controls: swapping additive/multiplicative precedence differs on 34 files, dropping the `on request use` desugar on 1, dropping `thread`'s `pool_size` on 7.
+
+276. THE WINDOWS JOB COMPARED MOJIBAKE AND CALLED IT A DIFFERENCE
+
+PR #105's first Windows run failed with 8 checks red, all in the new bootstrap harnesses, all reporting a divergence between the Python and Festina implementations. Every one was false.
+
+```
+python:  22:11|STRING|  caf? na?ve  stra?e
+festina: 22:11|STRING|  café naïve  straße
+```
+
+The Festina side is correct there. **The PYTHON side is the mojibake** -- and the other direction appears too, in the same run (`caf\xc3\xa9` where `caf\xe9` is right), because whichever side was decoded with the wrong codec is whichever side the log happened to render. The cause is one keyword: `subprocess.run(..., text=True)` with no `encoding=`. That decodes with the LOCALE's preferred codec, which is cp1252 on Windows and UTF-8 nearly everywhere else, while every binary these harnesses run emits UTF-8.
+
+**Exactly 4 corpus files have non-ASCII content, times 2 harnesses, is 8.** The arithmetic is the confirmation: the failure set was not "some tests," it was precisely the files where the bug could possibly show.
+
+**This trap is already documented in this repository.** `tests/conftest.py`'s `compile_and_run` carries a five-line comment about it, ending "confirmed by real Windows CI (claude.md #126)". I wrote four new subprocess calls without it. Knowing a hazard is recorded somewhere is not the same as checking for it when writing the code that re-introduces it.
+
+**The fix is one shared helper, not four keywords.** `difftest.run_text()` is now the only place either harness spawns a process, and `astdiff.py` imports it. Repeating `encoding="utf-8"` at four call sites is how three of them end up right.
+
+**Reproduced on Linux before fixing, which is the part worth keeping.** Monkeypatching `subprocess.run` so that any call passing `text=True` WITHOUT an explicit encoding gets cp1252 is exactly what Windows does, and it reproduced the failure set precisely: the same 4 files in the lexer harness, the same 4 in the parser's. After the fix, 0 under the same forcing. That reproduction is now a permanent test (`test_subprocess_output_is_decoded_as_utf8_not_by_locale`), verified to fail when the keyword is dropped again -- which matters because **Linux CI cannot otherwise see this bug at all**, and the next person to add a subprocess call here would have had the same 35-minute Windows round trip to find out.
+
+**One unreproduced failure, reported rather than explained away.** The first full-suite run after the fix also failed `tests/stress/http_client_pool_kill_live_churn.f` (a thread-kill-during-live-HTTP program under ASan). It did not recur: 8/8 passes in isolation, 60/60 in its own file, and a clean full suite on re-run. It is pre-existing, untouched by this round's diff (two harness files that cannot reach an HTTP stress program), so it is not this change's -- but it is also not established as anything, so it is written down here rather than called a flake.

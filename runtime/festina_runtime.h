@@ -233,6 +233,7 @@ void *festina_ls(const char *path);
  * receiver, treating it as "" like every other text-consuming runtime
  * call here already does. */
 int64_t festina_text_to_int(const char *s);
+char *festina_text_trim(const char *s);
 char *festina_text_char_at(const char *s, int64_t index);
 
 /* claude.md #249: text.charCodeAt(i) -> int (the Unicode CODE POINT at
@@ -1729,6 +1730,8 @@ const void *festina_blob_bytes(void *payload, int64_t *out_len);
  * codegen site (see that site's own comment). NULL-safe like every
  * other blob accessor here. */
 int64_t festina_blob_length(void *payload);
+int64_t festina_blob_byte_at(void *payload, int64_t index);
+char *festina_blob_slice(void *payload, int64_t start, int64_t end);
 int8_t festina_blob_write(void *payload, const char *content);
 int8_t festina_blob_append(void *payload, const char *content);
 int8_t festina_blob_exists(void *payload);

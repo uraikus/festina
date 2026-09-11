@@ -791,12 +791,15 @@ class Parser:
 
     def parse_if(self):
         t = self.eat("if")
-        if self.at("LPAREN"):
-            self.eat("LPAREN")
-            test = self.parse_expression()
-            self.eat("RPAREN")
-        else:
-            test = self.parse_expression()
+        # claude.md #274: condition parens are optional, and that used to
+        # be implemented by eating a leading LPAREN and its matching
+        # RPAREN outright. That truncated any condition that merely
+        # BEGINS with a parenthesised sub-expression -- `if (a || b) && c`
+        # parsed as `if (a || b)` and then demanded the block at `&&`.
+        # No special case is needed: parse_primary already treats
+        # `( expr )` as an ordinary grouped expression, so `if (x) { }`
+        # still parses exactly as before and the truncation is gone.
+        test = self.parse_expression()
         then = self.parse_block()
         orelse = None
         if self.at("else"):
@@ -806,14 +809,11 @@ class Parser:
 
     def parse_while(self):
         # claude.md #61: `while condition { }` -- condition parens are
-        # optional, same convention as parse_if.
+        # optional, same convention as parse_if, and grouped the same
+        # way for the same reason (claude.md #274: see parse_if above --
+        # eating a leading LPAREN truncated `while (a || b) && c`).
         t = self.eat("while")
-        if self.at("LPAREN"):
-            self.eat("LPAREN")
-            test = self.parse_expression()
-            self.eat("RPAREN")
-        else:
-            test = self.parse_expression()
+        test = self.parse_expression()
         body = self.parse_block()
         return ast.WhileStmt(test, body, t.line, t.column)
 
