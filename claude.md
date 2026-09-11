@@ -5323,3 +5323,19 @@ Found by #273's parser port, which needed exactly that shape and could not compi
 **Why nothing caught it.** The shape is only reachable when a condition both starts with a parenthesised group and continues with an operator. 2,500 tests and 89 corpus files never wrote it. This is the same lesson as #267's enum/JSON interaction, in a different place: the gap was not in any feature's own coverage but in a combination none of them owned. A new, demanding program written in the language is what found it -- which is the argument for bootstrapping, stated in the only way that counts.
 
 Verified: five regression tests pinning both spellings, the grouped-operand case, the bare case, and that `(a || b) && c` keeps its grouping rather than re-associating. Full suite 2527 passed.
+
+275. THE PARSER PORT FINISHED: 89/89
+
+#273 left `bootstrap/parser.f` at 64 of 89 corpus files, with event handlers, `thread`, `match` and arrow functions unported. All four are in. **89 match, 0 differ, 0 unported.**
+
+**Two bugs, and both were in tables I had transcribed rather than derived.**
+
+The first cost 15 of the 18 remaining failures: my `TYPE_KEYWORDS` list was wrong in both directions. It was missing `thread` -- and `on message(w:thread, msg:int)` is the shape every threading test opens with, so `parseType` rejected the parameter and the whole file failed. It also *contained* `void`, which the real set does not: `void` is a valid RETURN type but never an ordinary variable/field/element type, so `looksLikeDeclaration` would have treated it as starting a declaration. I had written the list from memory of what "a type" means rather than reading `festina/parser.py`'s own `TYPE_KEYWORDS = lexer_mod.PRIMITIVE_TYPE_KEYWORDS | {"img", "aud", "http", "socket", "thread"}`. Deriving it took one command.
+
+The second was subtler and worth the note: `ArrowFuncExpr` carries a `decl` field that is assigned `None` in `__init__`'s BODY rather than taken as a parameter, so the `inspect.signature` sweep I used to enumerate every node's fields never saw it. Three files differed by exactly `:decl=null`. **A constructor signature is not a field list** -- the generic dumper walks `vars(node)`, which is why the comparison caught it at all.
+
+**`on request use NAME` had to be reproduced, not skipped.** It desugars at parse time into an ordinary `EventHandler` whose body calls `NAME.giveRequest(req)`, and the whole point of #246's design is that nothing downstream can tell. That means the dumped AST of the sugared form must equal the dumped AST of the longhand -- so the port had to build the same six synthesized nodes with the same synthesized positions. Deleting that branch differs on exactly one file, which is the confirmation that the desugar is really being exercised.
+
+**The UNPORTED machinery is kept, not removed.** It has no work to do today (`http {...}` is the one construct still unimplemented, and no corpus file uses it), but it is what let coverage be reported as a real 64/89 mid-port instead of guessed at, and what kept a mis-parsing construct showing up as a difference rather than as progress. The next construct the grammar grows will announce itself rather than mis-parse. The pytest suite's coverage floor moved 60 -> 85 to match, which is what stops the "unported" skip from quietly hiding a regression.
+
+**Verified.** 2622 passed, 14 skipped. Three negative controls: swapping additive/multiplicative precedence differs on 34 files, dropping the `on request use` desugar on 1, dropping `thread`'s `pool_size` on 7.

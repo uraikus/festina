@@ -1,7 +1,7 @@
 # bootstrap/
 
-Festina's own compiler, being rewritten in Festina — the lexer, and a
-partial parser.
+Festina's own compiler, being rewritten in Festina — the lexer and the
+parser, both complete.
 
 ## What's here
 
@@ -9,7 +9,7 @@ partial parser.
 |---|---|
 | `lexer.f` | `festina/lexer.py`, ported — the importable library |
 | `lexdump.f` | entry point: dumps a token stream in the canonical form |
-| `parser.f` | `festina/parser.py`, **partially** ported (imports `lexer.f`) |
+| `parser.f` | `festina/parser.py`, ported (imports `lexer.f`) |
 | `astdumpf.f` | entry point: dumps an AST in the canonical form |
 | `difftest.py` | diffs both lexers over every `.f` file in the repo |
 | `astdump.py` | the Python side's canonical AST dump |
@@ -30,17 +30,20 @@ python bootstrap/difftest.py examples/hello.f       # just these files
 
 Current state:
 
-- **lexer: 87 files match, 0 differ.**
-- **parser: 64 match, 0 differ, 25 unported** — event handlers (17
-  files), `thread` (6), `match` (1), arrow functions (1).
+- **lexer: 89 files match, 0 differ.**
+- **parser: 89 match, 0 differ, 0 unported.**
 
-## The parser is partial, and says so
+## How the parser stayed honest while it grew
 
-A construct with no implementation yet produces an `(UNPORTED ...)` node,
-and `astdiff.py` counts a file containing one as *unported* — never as a
-match, never as a difference. So the coverage number moves only when a
-construct is really implemented, and one that silently mis-parsed instead
-shows up as a difference rather than as progress.
+A construct with no implementation produces an `(UNPORTED ...)` node, and
+`astdiff.py` counts a file containing one as *unported* — never as a
+match, never as a difference. That is what let coverage be reported as a
+real 64/89 mid-port rather than guessed at, and what kept a
+silently-mis-parsing construct showing up as a difference rather than as
+progress. It is kept now the port is complete: the next construct the
+grammar grows will announce itself rather than mis-parse. The only thing
+still unimplemented is the `http {...}` anonymous send, which no corpus
+file uses.
 
 Its AST is one generic node — a kind plus a list of named fields — rather
 than the ~45 structs mirroring `festina/ast.py` would need. That is what
@@ -133,7 +136,7 @@ already handles `( expr )` as ordinary grouping.
 
 ## Next
 
-Finish the parser: event handlers first (17 files), then `thread`,
-`match` and arrow functions. Semantic analysis and codegen should wait
-for the `?` cell model, which is a documented breaking change to `?`
-semantics and would otherwise land under a half-ported compiler.
+Semantic analysis, then codegen — together about 20k lines, more than
+everything before them combined. Both should wait for the `?` cell
+model, which is a documented breaking change to `?` semantics and would
+otherwise land under a half-ported compiler.

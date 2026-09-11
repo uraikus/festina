@@ -6,17 +6,16 @@
 // redesign, validated the same way: bootstrap/astdiff.py dumps both
 // parsers' ASTs in one canonical form and diffs them over the corpus.
 //
-// WHAT IS AND IS NOT PORTED YET. This is a partial port, and it says so
-// out loud rather than quietly mis-parsing: a construct with no
-// implementation here produces an `(UNPORTED :what="...")` node, and
-// astdiff.py counts a file containing one as "unported" rather than as
-// a match or a difference. That keeps the coverage number honest while
-// the port grows. Ported so far: the whole expression grammar, types,
-// var/const declarations, functions, structs, tables, enums, blocks,
-// if/while/for/try/throw/return/break/continue, free/delete, import.
-// Not yet: arrow functions, `thread` declarations, event handlers,
-// `match`, and the two anonymous shorthands (`http {...}`,
-// `blob 'path'.callback(fn)`).
+// COVERAGE. All 89 .f files in the repository parse to a byte-identical
+// AST (claude.md #275). The one construct still unimplemented is the
+// `http {...}` anonymous send, which no corpus file uses.
+//
+// The UNPORTED machinery that carried this file while it was partial is
+// kept rather than deleted: a construct with no implementation produces
+// an `(UNPORTED :what="...")` node, and astdiff.py counts a file
+// containing one separately -- never as a match, never as a difference.
+// That is what the grammar wants the next time it grows, and it is what
+// let coverage be reported honestly at 64/89 rather than guessed at.
 //
 // AST REPRESENTATION. Python has ~45 node classes; rather than 45
 // Festina structs plus a 45-member enum, a node here is a kind string
@@ -151,10 +150,19 @@ void func sortFields(fs:arr[Field]) {
     }
 }
 
+text func dumpPairHalf(e:Node) {
+    if isStrType(e) { return e.fields[0].raw }
+    return dumpNode(e)
+}
+
 text func dumpNode(n:Node) {
     if n == null { return 'null' }
     if n.kind == '#pair' {
-        return '[' + dumpNode(n.fields[0].node) + ' ' + dumpNode(n.fields[1].node) + ']'
+        // Either half may be a '#str' marker rather than a real node:
+        // MapLit.entries holds two nodes, but MatchStmt.arms holds a
+        // plain tag STRING alongside its block.
+        return '[' + dumpPairHalf(n.fields[0].node) + ' '
+               + dumpPairHalf(n.fields[1].node) + ']'
     }
     sortFields(n.fields)
     if n.fields.length == 0 { return '(' + n.kind + ')' }
@@ -295,7 +303,14 @@ Node func unported(what:text) {
 // come out right.
 
 map[int] TYPE_KEYWORDS = {}
-text TK_SRC = 'int float bool text blob ascii img aud http socket void'
+// Exactly festina/parser.py's TYPE_KEYWORDS -- lexer PRIMITIVE_TYPE_
+// KEYWORDS plus img/aud/http/socket/thread. `void` is deliberately NOT
+// in it: it is a valid RETURN type but never an ordinary variable/field/
+// element type, so parseFuncDecl and parseArrowFunction special-case it
+// and looksLikeDeclaration must not treat it as starting a declaration.
+// `thread` IS in it -- `on message(w:thread, msg:int)` is the shape that
+// caught the first version of this list out, on 15 corpus files.
+text TK_SRC = 'int float bool text blob ascii img aud http socket thread'
 
 Node func mkStr(v:text) {
     Node n = mk('#str')
@@ -707,7 +722,7 @@ Node func parsePrimary() {
     // (`cbk.fn = int (x:int) => x + 1`), not just from statement start.
     // Checking only at statement start left this as a parse failure
     // rather than an honest "not ported yet".
-    if startsArrowFunctionHere() { return unported('arrow-function') }
+    if startsArrowFunctionHere() { return parseArrowFunction() }
     if t.kind == 'NUMBER' {
         advance()
         Node n = mk('NumberLit')
@@ -1153,6 +1168,187 @@ Node func parseExprStmt() {
     return n
 }
 
+// claude.md #273: `on NAME(params) { }` -- plus the one-line
+// `on request use NAME` shorthand, which desugars HERE, at parse time,
+// into an ordinary EventHandler whose body calls NAME.giveRequest(req).
+// Everything downstream stays unaware the sugar exists, which is
+// exactly why it has to be reproduced rather than skipped: the dumped
+// AST of the sugared form must equal the dumped AST of the longhand.
+Node func parseEventHandler() {
+    Tok t = eat('on')
+    Tok nameTok = eat('IDENT')
+
+    if nameTok.val == 'request' && at('IDENT') && peek().val == 'use' {
+        advance()
+        Tok targetTok = eat('IDENT')
+
+        Node param = mk('Param')
+        addStr(param, 'name', 'req')
+        addRaw(param, 'type_expr', '"http"')
+        addBool(param, 'manually_managed', true)
+
+        Node target = mk('Identifier')
+        addStr(target, 'name', targetTok.val)
+        addInt(target, 'line', targetTok.line)
+        addInt(target, 'column', targetTok.col)
+
+        Node callee = mk('Member')
+        addNode(callee, 'obj', target)
+        addStr(callee, 'prop', 'giveRequest')
+        addBool(callee, 'computed', false)
+        addInt(callee, 'line', targetTok.line)
+        addInt(callee, 'column', targetTok.col)
+
+        Node reqRef = mk('Identifier')
+        addStr(reqRef, 'name', 'req')
+        addInt(reqRef, 'line', targetTok.line)
+        addInt(reqRef, 'column', targetTok.col)
+        arr[Node] callArgs = []
+        callArgs.push(reqRef)
+
+        Node call = mk('Call')
+        addNode(call, 'callee', callee)
+        addList(call, 'args', callArgs)
+        addInt(call, 'line', targetTok.line)
+        addInt(call, 'column', targetTok.col)
+
+        Node give = mk('ExprStmt')
+        addNode(give, 'expr', call)
+        arr[Node] stmts = []
+        stmts.push(give)
+        Node block = mk('Block')
+        addList(block, 'body', stmts)
+
+        arr[Node] params = []
+        params.push(param)
+        Node n = mk('EventHandler')
+        addStr(n, 'name', 'request')
+        addList(n, 'params', params)
+        addNode(n, 'body', block)
+        addInt(n, 'line', t.line)
+        addInt(n, 'column', t.col)
+        return n
+    }
+
+    eat('LPAREN')
+    arr[Node] params = parseTypedParams()
+    eat('RPAREN')
+    Node body = parseBlock()
+    Node n = mk('EventHandler')
+    addStr(n, 'name', nameTok.val)
+    addList(n, 'params', params)
+    addNode(n, 'body', body)
+    addInt(n, 'line', t.line)
+    addInt(n, 'column', t.col)
+    return n
+}
+
+// `thread NAME { }`, `thread NAME[N] { }`, `thread NAME[] { }`. No
+// signature of its own -- the body is an ordinary block, and the nested
+// on load/on message/on exit handlers parse for free through
+// parseStatement, the same reuse parseFuncDecl's body already gets.
+Node func parseThreadDecl() {
+    Tok t = eat('thread')
+    Tok nameTok = eat('IDENT')
+    text poolSize = 'null'
+    if at('LBRACK') {
+        advance()
+        if at('RBRACK') {
+            // An explicitly empty bracket pair asks the compiler to size
+            // the pool itself; "auto" is the sentinel semantic.py
+            // resolves before any real analysis runs.
+            poolSize = '"auto"'
+        } else {
+            Tok sizeTok = eat('NUMBER')
+            arr[text] parts = sizeTok.val.split(' ')
+            if parts[0] != 'int' {
+                parseFail('a thread pool size must be a plain integer literal')
+                return mk('NullLit')
+            }
+            if parts[1].toInt() <= 0 {
+                parseFail('a thread pool size must be a positive integer')
+                return mk('NullLit')
+            }
+            poolSize = parts[1]
+        }
+        eat('RBRACK')
+    }
+    Node body = parseBlock()
+    Node n = mk('ThreadDecl')
+    addStr(n, 'name', nameTok.val)
+    addNode(n, 'body', body)
+    addInt(n, 'line', t.line)
+    addInt(n, 'column', t.col)
+    addRaw(n, 'pool_size', poolSize)
+    return n
+}
+
+// `match EXPR { 'Tag' { } ... default { } }`. Purely structural here --
+// no knowledge of which tags are valid and no exhaustiveness check;
+// semantic.py owns both, since they need the subject's resolved type.
+// `default` is recognized by VALUE, not reserved globally.
+Node func parseMatch() {
+    Tok t = eat('match')
+    Node subject = parseExpression()
+    eat('LBRACE')
+    arr[Node] arms = []
+    Node dflt
+    bool haveDefault = false
+    while at('RBRACE') == false && FAILED == false {
+        if at('IDENT') && peek().val == 'default' {
+            if haveDefault {
+                parseFail("match already has a 'default' case")
+                return mk('NullLit')
+            }
+            advance()
+            dflt = parseBlock()
+            haveDefault = true
+            continue
+        }
+        Tok tagTok = eat('STRING')
+        if FAILED { return mk('NullLit') }
+        Node body = parseBlock()
+        arms.push(mkPair(mkStr(tagTok.val), body))
+    }
+    eat('RBRACE')
+    Node n = mk('MatchStmt')
+    addNode(n, 'subject', subject)
+    addList(n, 'arms', arms)
+    if haveDefault { addNode(n, 'default', dflt) }
+    else { addNull(n, 'default') }
+    addInt(n, 'line', t.line)
+    addInt(n, 'column', t.col)
+    return n
+}
+
+// `<returnType> (params) => expr`, once startsArrowFunction has
+// confirmed the shape. `void` is special-cased rather than routed
+// through parseType -- it is a valid RETURN type but never a valid
+// variable/field/element type, the same asymmetry parseFuncDecl carries.
+Node func parseArrowFunction() {
+    Tok t = peek()
+    Node ret
+    if at('void') { advance() ret = mkStr('void') }
+    else { ret = parseType() }
+    eat('LPAREN')
+    arr[Node] params = parseTypedParams()
+    eat('RPAREN')
+    eatOp('=>')
+    Node body = parseAssign()
+    Node n = mk('ArrowFuncExpr')
+    addList(n, 'params', params)
+    addType(n, 'return_type', ret)
+    addNode(n, 'body', body)
+    // `decl` is assigned None in ArrowFuncExpr.__init__'s BODY rather
+    // than taken as a parameter (semantic.py fills it in later with a
+    // synthesized FuncDecl), so it does not show up in the constructor
+    // signature -- but it is a real field and the dump carries it.
+    addNull(n, 'decl')
+    addInt(n, 'line', t.line)
+    addInt(n, 'column', t.col)
+    return n
+}
+
 Node func parseStatement() {
     Tok t = peek()
     text k = t.kind
@@ -1198,11 +1394,12 @@ Node func parseStatement() {
         return n
     }
 
+    if k == 'thread' { return parseThreadDecl() }
+    if k == 'on' { return parseEventHandler() }
+    if k == 'match' { return parseMatch() }
+
     // Not ported yet -- each announces itself rather than being
     // mis-parsed. See this file's own header for the list.
-    if k == 'thread' { return unported('thread') }
-    if k == 'on' { return unported('on') }
-    if k == 'match' { return unported('match') }
     if k == 'http' && peekAt(1).kind == 'LBRACE' { return unported('http-anon') }
 
     if k == 'func' && peekAt(1).kind != 'LBRACK' {
@@ -1217,11 +1414,6 @@ Node func parseStatement() {
     }
     if k == 'LBRACE' { return parseBlock() }
     if looksLikeDeclaration() { return parseVarDecl() }
-
-    // An arrow function is only reachable from expression position, so
-    // it is detected there rather than here; until it is ported, a
-    // statement starting one would mis-parse, so it is caught up front.
-    if startsArrowFunctionHere() { return unported('arrow-function') }
 
     return parseExprStmt()
 }
