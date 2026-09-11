@@ -7,7 +7,29 @@ a patch-only release is ever needed); dates are in `YYYY-MM-DD`.
 This changelog starts from the point version tracking was introduced —
 it is not a reconstruction of the project's earlier history. The full
 round-by-round design and implementation record predating 0.1 lives in
-[claude.md](claude.md).
+[decisions.md](decisions.md) (the numbered decision log, cited as
+`claude.md #N` below and throughout the repository).
+
+## [Unreleased]
+
+### Changed
+
+- **The language specification now lives in
+  [specification.md](specification.md),** organized by topic in the
+  manner of the ECMAScript standard — scope and conformance, lexical
+  grammar, types, expressions, statements, declarations, execution and
+  memory models, errors, the built-in database, the standard library,
+  graphics, audio, HTTP, threads, compilation targets, and annexes for
+  the grammar, reserved words, removed features, non-goals and the
+  mapping from the original numbered sections. It consolidates the
+  original specification and every later decision-log change into one
+  current, normative document. The numbered decision log formerly
+  named `claude.md` is now [decisions.md](decisions.md), unchanged in
+  content and numbering; a citation of the form `claude.md #N` anywhere
+  in the repository still means entry N of that file. `claude.md`
+  itself is now a short set of working instructions for agents that
+  points at the specification instead of containing it (decisions.md
+  #277).
 
 ## [0.44] - 2026-09-02
 

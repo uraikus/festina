@@ -3,8 +3,11 @@
 The Festina language and standard library, as implemented today. For
 narrative introductions and rationale see the individual sections below;
 for exactly what's implemented vs. not (and known caveats), see
-[`tests/CONTRACT.md`](tests/CONTRACT.md); for the full target-language
-spec this compiler is built against, see [`claude.md`](claude.md).
+[`tests/CONTRACT.md`](tests/CONTRACT.md); for the normative language
+specification this compiler is built against, see
+[`specification.md`](specification.md); for the numbered decision log
+(cited as `claude.md #N` throughout the repository), see
+[`decisions.md`](decisions.md).
 
 ## CLI
 
@@ -3741,9 +3744,10 @@ plain string literal only, unlike the main program's own `DatabaseURL`
 (which may be any `text` expression):
 
 ```festina
+table LogEntry { message:text }
+
 thread logger {
     DatabaseURL = './logs.sqlite'
-    table LogEntry { message:text }
     on message(worker:thread, msg:text) {
         sqlite('INSERT INTO LogEntry (message) VALUES (?)', [msg])
     }

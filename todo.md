@@ -1,7 +1,8 @@
 # Roadmap
 
 Open work only, shortest useful form. The reasoning behind every closed
-item lives in [claude.md](claude.md) (the numbered decision log) and
+item lives in [decisions.md](decisions.md) (the numbered decision log,
+cited as `claude.md #N` throughout the repository) and
 [tests/CONTRACT.md](tests/CONTRACT.md) (what is verified, and how).
 
 ## Platforms

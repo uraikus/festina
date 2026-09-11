@@ -1,9 +1,14 @@
-# Test contract for the Festina language spec (`claude.md`)
+# Test contract for the Festina language spec (`specification.md`)
+
+A citation of the form `claude.md #N` anywhere in this file refers to
+entry N of [`decisions.md`](../decisions.md), the numbered decision log
+(formerly named `claude.md`). The consolidated, normative language
+specification is [`specification.md`](../specification.md).
 
 ## Status
 
 The `festina/` package at the repository root implements the front end
-of the spec in `claude.md` (lexing, parsing, type resolution, semantic
+of the spec in `specification.md` (lexing, parsing, type resolution, semantic
 analysis) **and** now a real LLVM codegen backend + native C runtime:
 `bin/festina compile program.f -o program` produces a standalone executable that
 needs neither Python nor `festina/` to run. Automatic SQLite table
