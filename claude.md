@@ -63,6 +63,29 @@ the specification's own conformance rules (specification.md §2).
 - Never add a project dependency (a Python package, a C library, a
   build tool) without explicit permission.
 
+**The order of work for a language change** (decisions.md #278)
+
+Anything that adds to or changes the language surface — a type, a
+method, an operator, a statement form, a literal, a diagnostic — is
+written in this order, and the order is not negotiable:
+
+1. **specification.md first.** Write the normative clause before any
+   other file. Deciding the rule in prose, where it has to sit beside
+   the clauses it interacts with, is what catches a design that does
+   not fit; discovering that halfway through codegen is expensive.
+   Add the Annex C row if something is being removed or superseded.
+2. **Tests second.** Write them against the clause, and watch them
+   fail for the right reason before implementing. A test written after
+   the implementation tests what the code does; one written after the
+   specification tests what the language promises.
+3. **The implementation last**, until those tests pass.
+
+This does not apply to a bug fix, where the specification already says
+what should happen and the code disagrees — there, the clause is the
+thing being restored, so confirm it says what you think, add the
+failing test, then fix. It does apply the moment a "fix" turns out to
+need a rule that is not written down yet.
+
 **While changing**
 
 - Keep compiled programs fast: prefer compile-time work, native
@@ -90,7 +113,9 @@ the specification's own conformance rules (specification.md §2).
 **Documenting every change** (all of these, every time)
 
 1. specification.md — the normative rule; add an Annex C row for
-   anything removed.
+   anything removed. For a language change this was already written
+   first, before the tests and the code; check it still says what the
+   implementation ended up doing, and correct whichever one is wrong.
 2. api.md — the reference and worked examples, kept consistent with the
    specification and the code.
 3. decisions.md — append the next numbered entry, in the existing

@@ -30,6 +30,15 @@ round-by-round design and implementation record predating 0.1 lives in
   itself is now a short set of working instructions for agents that
   points at the specification instead of containing it (decisions.md
   #277).
+- **A language change is now written specification first, then tests,
+  then code.** Anything that adds to or changes the language surface
+  starts as a normative clause in specification.md, beside the clauses
+  it interacts with; the tests are written against that clause and
+  watched failing for the right reason; the implementation comes last.
+  A bug fix, where the specification already says what should happen
+  and the code disagrees, instead confirms the clause, adds the failing
+  test and fixes — but an addition dressed as a fix follows the full
+  order. Recorded in claude.md §2 (decisions.md #278).
 
 ## [0.44] - 2026-09-02
 

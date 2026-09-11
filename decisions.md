@@ -5395,3 +5395,21 @@ This file was renamed from claude.md to decisions.md with `git mv`, its content 
 Not done, deliberately: no rewrite of the existing `claude.md #N` citations (a mechanical one-line sed across ~180 files, worth doing as its own change once this one has landed so the diff stays reviewable), and no docs/specification.html for the documentation site (the site links to the GitHub file, as it did for claude.md).
 
 Verified by re-reading the assembled document's internal anchors (every table-of-contents link resolves), by checking each grammar claim against parser.py (the `for` clause separators, `else if`, unary `+`/`-`/`!`/`typeof`, the postfix and call precedence, `catch (name:text)`, the `http {...}` and `blob 'path'.callback(fn)` statement forms) and each name against lexer.py's SPEC_KEYWORDS/_EXTRA_KEYWORDS and semantic.py's BUILTIN_FUNCTIONS, _BUILTIN_SIGNATURES, _EVENT_SIGNATURES and _THREAD_EVENT_SIGNATURES, and by running the front-end test modules after the rename.
+
+278. A LANGUAGE CHANGE IS WRITTEN SPECIFICATION FIRST, THEN TESTS, THEN CODE
+
+Asked for directly, immediately after #277 landed: "for future additions to the language, first add it to specifications, then to tests, then make the change to the language."
+
+This is a working instruction rather than a language rule, so it lives in claude.md §2 -- but it is recorded here because it changes how every later entry in this file comes to exist, and because the reason it was asked for is worth keeping.
+
+**What prompted it.** #277 consolidated the language into specification.md, which only works if the document stays the definition rather than becoming a transcript. Everything before it was written the other way round: the code was written, the behavior was observed, and the rule was recorded afterwards as the entry that introduced it. That is exactly why #277 was needed -- the current rule for anything lived scattered across the entry that introduced it and every later entry that touched it, and api.md was the only consolidated statement of the language. Writing the clause last is what produced that state; writing it first is what stops it recurring.
+
+**The order.** specification.md, then tests, then the implementation.
+
+The reason the clause comes first is not bookkeeping. A normative clause has to sit beside the clauses it interacts with -- assignability, zero values, ownership, the precedence ladder, the compile-error list -- and writing it there is what surfaces a design that does not fit, at the point where changing it costs a paragraph. #105 is the counter-example from the session just before this: `blob.slice()` returning `text` rather than another `blob` is right, and the reason (a blob carries the path it was loaded from, and a slice has no path to carry) is a fact about §8.6 that reads as obvious in the specification and was arrived at while writing C.
+
+The reason the tests come second is that a test written after the implementation tests what the code does, which is a tautology; a test written against the clause tests what the language promises, which can fail. They must be watched failing for the right reason before the implementation exists, the same discipline the harness canaries in `tests/test_bootstrap_lexer.py` and `test_leak_stress.py::test_the_harness_can_actually_fail` already enforce for the differential and leak suites.
+
+**The exception, stated so it is not used as a loophole.** A bug fix, where the specification already says what should happen and the code disagrees, starts by confirming the clause really says what you think, then adds the failing test, then fixes. #274 (`while (a || b) && c` did not parse) is that shape: §10.5 already allowed it. But the moment a "fix" turns out to need a rule that is not written down, it is an addition, and the order above applies.
+
+**Also settled here.** The three language changes from #105 -- `text.trim()`, `blob.byteAt()`/`blob.slice()`, and the rejected `\0` escape -- were checked against specification.md on the assumption they had missed it, having been merged while #277 was being written. They had not: #277 folded them in (§7.5.2 and Annex C for the escape, §8.6 and §16.3 for the blob accessors and `trim()`, §14.1 for the character-column rule, §10.4/§10.5 for #274). Nothing was added. Recorded because the assumption was stated before it was checked.
