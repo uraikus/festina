@@ -5480,3 +5480,25 @@ Types render through `types_mod.type_name`, the compiler's own renderer -- the s
 Three tests now assert it directly -- four distinct types must render four ways, a manually-managed type must not render as its base (§8.18), and the corpus dump must carry more than 20 distinct type strings -- and all three were confirmed to fail under the gutted renderer and pass under the real one. The general lesson is the one #276 taught in a different register: a negative control that fires proves the harness noticed *something*, not that it noticed the thing you meant. Perturb the specific mechanism you are claiming, not a proxy for it.
 
 **Verified.** `tests/test_bootstrap_semantic.py`, 18 tests, under a second (the Windows job has ~5 minutes of headroom, so cost was checked rather than assumed). No change to any shipped compiler file: this round adds an oracle and its tests, nothing else.
+
+281. SEMANTIC ANALYSIS IN FESTINA: 62/91, AND WHY IT GETS THAT FAR WITH NO TYPE INFERENCE
+
+Asked for directly: "go ahead and write the semantic.f port." #280 had defined the oracle; this is the first implementation measured against it.
+
+**62 match, 11 differ, 18 unported, of 91 files.** `bootstrap/semantic.f` is about 500 lines against `festina/semantic.py`'s 5,692.
+
+**The reason 500 lines reaches 62 files is one clause.** specification.md 10.2: "A declaration states its type; there is no `var`, `let` or inference." Every `DECL` record's type therefore comes from a *declared* type expression, never from an initializer -- so reproducing the dump needs type resolution and scope walking, and no expression inference whatsoever. That was worth checking before writing anything: the alternative reading, that a port of the dump needs a port of the type checker, would have made this a 5,000-line job instead of a 500-line one.
+
+**What the 11 differences are, in three groups rather than eleven problems.** Seven files use `import`, which this side does not follow, so a name defined in another file does not resolve (`origin|variable|-` where the Python side has `Point`). Three are `cases/*.f` that the Python side *rejects* -- they are type-invalid, and without assignability checking this side accepts them and emits records where the oracle emits `SEMERR`. One hoists an arrow function into a `__festina_arrow_0` binding. The 18 unported are all `ThreadDecl`.
+
+Grouping first is the habit #275 paid for: 34 of that round's 35 parser differences turned out to be one bug, and looking at any single failure closely before looking at what they had in common was the slow path.
+
+**Two bugs found, both of the same kind: field names guessed rather than read.** `TryStmt` carries `try_body`/`catch_var`/`catch_body` and `IfStmt` carries `then`/`orelse` -- not the `*_block`/`catch_name` spellings this file first assumed. The symptom was not an error but *silence*: a block that is never walked binds nothing, and a statement that binds nothing looks exactly like a statement with no bindings. Ten files' worth of missing catch variables and catch-body locals came from those two names. Reading all seven statement kinds' fields out of `parser.f` at once, rather than fixing the one that had surfaced, is what turned 50 match into 60 in a single edit.
+
+**The absent type has two spellings, and they are not interchangeable.** `semdump.py`'s `_type` answers `-` for a missing type, while `types.type_name(None)` answers `unknown`; the first is what a record shows, the second is what appears nested inside another type. Collapsing them rendered `environment` wrongly on every single file, and the enum members wrongly on two. `dumpType` and `typeName` are therefore separate functions here, which reads like duplication and is not.
+
+**`amor` cannot be a struct field name.** It is a reserved word, so `Ty.amor` is a parse error; the field is `amortized`. Worth recording only because it is the third time a port has been caught by the language's own keyword list (`fail` in #271, `thread` in #275).
+
+**Not in the pytest suite yet, deliberately.** `semdiff.py` compiles a third Festina binary and runs it across 91 files. The Windows job used 39:35 of its 45-minute budget on the merged head (#280), so adding this belongs with the change that makes the bootstrap suites Linux-only -- which is the fix already recorded for when that budget runs out -- rather than being pushed in ahead of it and tipping the job over. Running `python bootstrap/semdiff.py` reproduces the numbers above.
+
+**Verified.** The numbers here come from running the differ, not from inspection. Full suite unchanged at 2641 passed, 14 skipped; no shipped compiler file is touched by this round.

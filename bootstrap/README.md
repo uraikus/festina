@@ -18,7 +18,10 @@ the Python implementation it mirrors.
 | `difftest.py` | diffs both lexers over every `.f` file in the repo |
 | `astdump.py` | the Python side's canonical AST dump |
 | `astdiff.py` | diffs both parsers over the same corpus |
+| `semantic.f` | `festina/semantic.py`, ported (imports `parser.f`) |
+| `semdumpf.f` | entry point: dumps semantic analysis in the canonical form |
 | `semdump.py` | the Python side's canonical semantic-analysis dump |
+| `semdiff.py` | diffs both analyzers over the same corpus |
 | `cases/*.f` | targeted sources covering what the corpus doesn't reach |
 
 `tests/test_bootstrap_lexer.py` and `tests/test_bootstrap_parser.py` run
@@ -114,11 +117,34 @@ Both harnesses carry verified negative controls:
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Next: semantic analysis, then codegen
+## Semantic analysis: 62 match, 11 differ, 18 unported
 
-Together about 20,000 lines of Python — more than everything ported so
-far combined, and at the ratio the lexer and parser came out at,
-25,000–35,000 lines of Festina.
+`semantic.f` resolves declarations and walks scopes. It does not yet
+type-check expressions, which is what the three groups of difference
+are:
+
+| | |
+|---|---|
+| 7 files | `import` is not followed, so names from another file do not resolve |
+| 3 files | the Python side rejects them; without assignability checking this side accepts |
+| 1 file | an arrow function is hoisted into a named `__festina_arrow_N` binding |
+| 18 files | `ThreadDecl`, marked `UNPORTED` rather than skipped |
+
+Specification.md §10.2 is why this gets as far as it does with no
+inference at all: "A declaration states its type; there is no `var`,
+`let` or inference." Every `DECL` record's type therefore comes from a
+declared type expression. Checking that an initializer is *assignable*
+to its declaration is the separate job those 3 files need.
+
+`semdiff.py` is not in the pytest suite yet. It compiles a third
+Festina binary and runs it over 91 files, and the Windows job has about
+five minutes of headroom (see the CI note above) — so adding it belongs
+with the change that makes the bootstrap suites Linux-only, not before.
+
+## Then: codegen
+
+About 14,500 lines of Python — more than everything ported so far
+combined.
 
 Neither depends on any language change. The ports use no `T?`, no
 `free` and no `delete`: automatic reclamation handles the whole front
