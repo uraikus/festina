@@ -127,6 +127,22 @@ round-by-round design and implementation record predating 0.1 lives in
   `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anywhere. The cheap pure-Python tests in the same modules
   keep running on every platform (decisions.md #287).
 
+### Fixed
+
+- **A local that shadowed a function's name silently read back as that
+  function.** `codegen.py` consulted its flat, program-wide function
+  table before the scope chain when resolving a plain name, so any
+  local sharing a name with any function anywhere in the program stored
+  to its own slot and then read the function's global symbol instead. A
+  fifteen-line program passing a shadowing `map[int]` to a function
+  printed 0 for a one-entry map; the same shape inside a larger program
+  segfaulted in the runtime with a function pointer where a map header
+  belonged. Nothing reported it: semantic analysis resolves the name
+  correctly, so it type-checked, and a function symbol is a valid
+  pointer, so the IR was valid. The scope chain is now consulted first,
+  and passing a function by name where nothing shadows it is unaffected
+  (decisions.md #298).
+
 ### Unchanged
 
 - **`T?` keeps the meaning it has** — a self-managed binding, never

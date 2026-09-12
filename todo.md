@@ -108,33 +108,27 @@ open:
   too, and the fast path there refuses values like
   `0.30000000000000004`.
 
-- **A local that shadows a function name resolves to the FUNCTION
-  inside a template literal.** `bootstrap/parser.f` exports
-  `bool func at(kind:text)`; a `text at = ...` local in a file that
-  imports it passes semantic analysis, and then the codegen stage
-  fails the whole compile with
+- **A local that shadows a function name still reports badly inside a
+  template literal.** The silent-miscompilation half of this is fixed
+  (decisions.md #298): a shadowing local now reads as itself
+  everywhere, because `_emit_expr`'s Identifier branch consults the
+  scope chain before the program-wide function table. What remains is
+  diagnostics. Interpolating a `func` value fails the whole compile
+  with
 
       bootstrap/codegen.f:0:0: error: cannot interpolate a value of
       type func[text]:bool
 
   — no line, no column, and a type that appears nowhere in the
-  statement at fault. Worked around by renaming the local.
+  statement at fault, so the only way to find it is to bisect the file.
+  That message now only appears for a genuine attempt to interpolate a
+  function, which is a real mistake worth reporting; it just has to say
+  *where*. Two of this session's three shadowing hits presented as
+  exactly this.
 
-  **It happened twice in one session**, in two unrelated functions: a
-  local named `at` shadowing parser.f's `at` (decisions.md #295), then
-  a local named `known` shadowing semantic.f's
-  `bool func known(s:Scope, name:text)` (decisions.md #296). Not bad
-  luck — short helper names are exactly what those files export and
-  exactly what a code generator's locals want to be called.
-
-  Three consistent outcomes exist and the current behavior is none of
-  them: the local wins everywhere (what every other expression position
-  already does), or the shadowing declaration is rejected where it is
-  written, or interpolating a `func` value is itself legal. Accepting
-  the declaration and then misresolving it at an unrelated
-  interpolation is the worst of the three. The position on the error is
-  worth fixing regardless — `0:0` on a whole-file failure gives nothing
-  to search for.
+  Short helper names are what the bootstrap's own modules export
+  (`at`, `esc`, `known`) and exactly what a code generator's locals
+  want to be called, so this will keep coming up.
 
 ## Deliberate behavior (documented, not planned work)
 

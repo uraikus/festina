@@ -6209,7 +6209,35 @@ class CodeGen:
                 out = self.tmp()
                 lines.append(f"  {out} = call double @festina_device_pixel_ratio()")
                 return out, FLOAT
-            if expr.name in self.func_decls:
+            found = env.lookup(expr.name)
+            # claude.md #298: env.lookup FIRST, and self.func_decls only
+            # for a name the scope chain does not bind to something else
+            # -- the identical dispatch order _emit_call's own indirect
+            # branch already documents, and for the identical reason.
+            #
+            # It was the other way round here, and self.func_decls is a
+            # FLAT, program-wide dict, so ANY local sharing a name with
+            # ANY function anywhere in the program read back as that
+            # function's own symbol. The local's own store still went to
+            # its alloca, so a declaration wrote one place and every
+            # read took another. semantic.py resolves this correctly, so
+            # it type-checked; the result was valid IR; and nothing
+            # anywhere reported a problem. A 15-line program passing a
+            # shadowing `map[int] tag` to a function printed 0 instead
+            # of 1, and the identical shape inside a Festina-hosted
+            # compiler segfaulted in festina_map_keys with a FUNCTION
+            # POINTER where the map header should have been.
+            #
+            # `found[0] == f"@{name}"` is what separates a genuine
+            # function reference from a shadowing binding: a function's
+            # own env entry, registered by _register_func_signature, is
+            # exactly that global symbol. A global VARIABLE is also
+            # `@name`, but a global variable and a function cannot share
+            # a name -- semantic.py rejects the duplicate declaration --
+            # so the test is unambiguous, and a genuine first-class
+            # reference (`arr.sort(compare)`) still takes this branch.
+            if expr.name in self.func_decls and (
+                    found is None or found[0] == f"@{expr.name}"):
                 # claude.md #141: a bare reference to a function's own
                 # NAME, not immediately called -- the function's own
                 # global symbol (@name) IS its first-class VALUE, no
@@ -6227,7 +6255,6 @@ class CodeGen:
                 ret_type = (None if decl.return_type == "void"
                             else self._resolve(decl.return_type, decl))
                 return f"@{expr.name}", types_mod.FuncType(param_types, ret_type)
-            found = env.lookup(expr.name)
             if found is None:
                 raise CodegenError(f"unknown variable '{expr.name}'",
                                     file=self.filename, line=expr.line, column=expr.column)

@@ -19635,3 +19635,103 @@ class TestOutboundConnectionReuse:
         assert result.returncode == 0, result.stdout + result.stderr
         assert "200" in result.stdout
         assert "ok" in result.stdout
+
+
+class TestALocalShadowingAFunctionName:
+    """claude.md #298: a local that shares a name with any function
+    anywhere in the program used to READ BACK as that function's symbol.
+
+    `self.func_decls` is flat and program-wide, and `_emit_expr`'s
+    Identifier branch consulted it before the scope chain. The local's
+    own store still went to its alloca, so a declaration wrote one place
+    and every read took another -- and nothing reported it. semantic.py
+    resolves the name correctly, so the program type-checked; the IR was
+    valid; the compile succeeded. A `map[int]` local silently became a
+    function pointer, which prints a wrong answer at best and segfaults
+    inside the runtime at worst.
+
+    Found while porting the compiler to Festina, where `bootstrap/
+    lexer.f` exports `text func esc(s:text)` and a local named `esc` in
+    another file crashed in festina_map_keys with a function pointer
+    where the map header should have been. It took three separate hits
+    on name shadowing in one sitting to notice that this one was not
+    merely a diagnostics problem like the other two.
+    """
+
+    def test_a_shadowing_map_local_reads_as_itself(self, compile_and_run):
+        source = """
+        text func tag(s:text) { return '[' + s + ']' }
+
+        map[int] func mk() {
+            map[int] m = {}
+            m['x'] = 1
+            return m
+        }
+
+        int func sizeOf(m:map[int]) { return m.keys().length }
+
+        int k = 1
+        if k == 1 {
+            map[int] tag = mk()
+            log(sizeOf(tag))
+        }
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        # 1, the local's own entry count. Before the fix this printed 0:
+        # `sizeOf` was handed @tag, the function's symbol, and read a
+        # length out of executable code.
+        assert result.stdout.strip() == "1"
+
+    def test_the_ir_loads_the_local_rather_than_the_symbol(
+            self, parser, semantic, codegen):
+        """The behavioral test above can only fail loudly once the wrong
+        answer happens to differ from the right one. This pins the
+        mechanism: the argument must come from the local's own slot, and
+        the function's global symbol must not appear as an argument at
+        all."""
+        source = ("text func tag(s:text) { return s }\n"
+                  "int func sizeOf(m:map[int]) { return m.keys().length }\n"
+                  "int k = 1\n"
+                  "if k == 1 {\n"
+                  "    map[int] tag = {}\n"
+                  "    log(sizeOf(tag))\n"
+                  "}\n")
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        assert "@sizeOf(ptr @tag)" not in ir, (
+            "the shadowing local resolved to the function's own global "
+            "symbol again")
+        assert "%tag." in ir, "the local should still have its own slot"
+
+    def test_a_genuine_first_class_reference_still_resolves(
+            self, compile_and_run):
+        """The control. The branch this fix reorders is what makes
+        `compare` below a VALUE rather than a call, so narrowing it must
+        not break passing a function by name where nothing shadows it.
+        """
+        source = """
+        int func twice(v:int) { return v * 2 }
+        int func apply(f:func[int]:int, v:int) { return f(v) }
+        log(apply(twice, 21))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "42"
+
+    def test_a_shadowing_parameter_reads_as_itself(self, compile_and_run):
+        """A parameter is bound through a different path than a block
+        local, so it gets its own case rather than being assumed to
+        follow."""
+        source = """
+        int func size(v:int) { return v }
+        int func count(size:map[int]) { return size.keys().length }
+        map[int] m = {}
+        m['a'] = 1
+        m['b'] = 1
+        log(count(m))
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "2"

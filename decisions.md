@@ -5933,3 +5933,45 @@ That is the whole of what any single construct would unlock. **Nothing left in t
 **The general rule, now with three data points.** Every time this measurement has been wrong it has been wrong in the same direction: flattering, and specifically promising that one more construct would unlock a pile of files. Twice the mechanism was "stop at the first reason"; once it was "stop at the first reason, but only inside expressions". The question that catches it is the same one #290's file count needed: *what would this metric say about an implementation that gave up immediately?* A first-blocker histogram says "you are one step away" no matter how far away you are.
 
 **Verified.** 2861 passed, 90 skipped. Codegen 13 match, 0 differ, 76 unported, 11 rejected by both -- identical coverage to #296, which is the point: this slice changes only what the port can say about itself.
+
+
+298. A LOCAL THAT SHADOWED A FUNCTION NAME SILENTLY READ BACK AS THE FUNCTION
+
+A real bug in the shipped compiler, not in the port, found while writing the port's fifth module.
+
+**The shape, in fifteen lines:**
+
+    text func tag(s:text) { return '[' + s + ']' }
+    map[int] func mk() { map[int] m = {}  m['x'] = 1  return m }
+    int func sizeOf(m:map[int]) { return m.keys().length }
+
+    int k = 1
+    if k == 1 {
+        map[int] tag = mk()
+        log(sizeOf(tag))
+    }
+
+That printed **0**. The map has one entry.
+
+**What the IR said.** The local's own store went to its alloca and every read took the function's global symbol instead:
+
+      store ptr %t47, ptr %tag.5
+      %t48 = call i64 @sizeOf(ptr @tag)
+
+`sizeOf` was handed `@tag` -- a pointer to executable code -- and read a length out of it.
+
+**One line, in the wrong order.** `_emit_expr`'s Identifier branch checked `self.func_decls` *before* `env.lookup`. `self.func_decls` is a FLAT, program-wide dict keyed by name, so any local sharing a name with any function anywhere in the program resolved to that function. `env` is a proper scope chain and would have answered correctly; it was simply asked second.
+
+**Nothing reported it, and that is the part worth dwelling on.** semantic.py resolves the name correctly, so the program type-checked. The generated IR was valid -- a function symbol IS a `ptr`, so there was nothing for LLVM to object to. The compile succeeded. The only symptom was a wrong answer, and only for a program whose wrong answer happened to differ visibly from its right one. `_emit_call`'s own indirect branch already had the correct order, with a comment explaining exactly why ("so a local variable that shadows a real global function of the same name resolves to ITS OWN signature here too, never silently falling through") -- the read path had simply never been given the same treatment.
+
+**How it surfaced.** Porting `festina/escape_analysis.py` to Festina, a local named `esc` inside `bootstrap/escdumpf.f` shadowed `bootstrap/lexer.f`'s `text func esc(s:text)`. The program segfaulted in `festina_map_keys` on a function pointer. gdb named the frame in two seconds; the preceding half hour went on probes that all passed, because every one of them used a name nothing else in the program had taken.
+
+**It took three hits to see it.** #295 and #296 each recorded a shadowed name (`at` against parser.f's, `known` against semantic.f's) as a DIAGNOSTICS complaint: both failed loudly, at `0:0`, with a confusing message, and both were worked around by renaming the local. Two loud failures made the third look like more of the same. It was not: in a plain argument position the same resolution produces a valid-looking pointer and no error at all. **A bug that fails loudly twice and silently once is reported as a bug about messages.**
+
+**The fix keeps first-class functions working.** `env.lookup` runs first; `self.func_decls` is consulted only when the name is unbound or bound to exactly `@name`, which is the entry `_register_func_signature` itself creates. A global variable is also `@name`, but a global variable and a function cannot share a name (semantic.py rejects the duplicate), so the test is unambiguous and `apply(twice, 21)` still passes `twice` as a value.
+
+**Four tests, three of which fail without the fix.** The behavioral one (a shadowing `map[int]` local), an IR-level one asserting the argument comes from the local's slot and `@sizeOf(ptr @tag)` appears nowhere, a shadowing PARAMETER (bound through a different path, so not assumed to follow), and the control: a genuine first-class reference, which passes either way and is what proves the narrowed branch was not narrowed too far.
+
+**Verified.** 2865 passed, 90 skipped.
+
+**A process note, recorded because it cost real work.** This session's container was reclaimed mid-test-run, which discarded everything uncommitted -- this fix, `bootstrap/escape.f`, and its two harness files. The three pushed commits restored from the remote with `git fetch` and `git reset --hard`, and nothing pushed was lost. The lesson is not about the reclaim, which is ordinary: it is that "verify the full suite, then commit" leaves a wide window, and a small, independently-verified change is better committed on its own evidence than held back to ride along with a larger one.
