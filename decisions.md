@@ -5682,3 +5682,32 @@ That reasoning is the kind a sanitizer exists to check, so `tests/stress/struct_
 **The test-design mistake worth recording.** The acceptance tests first stopped at `semantic.analyze()`, and `Person p = {}` passed them while failing in codegen with "cannot infer the value type of an empty map literal". A semantic-only acceptance test is satisfied by an implementation that type-checks a struct literal and then cannot emit one. Compiling all the way to IR is the check that means what it says. The same shape as #287's canary: what a test stops short of is invisible in a green run.
 
 **Verified.** 2807 passed, 14 skipped (up from 2765: 38 new struct-literal tests plus the new stress program and its inventory entry). Lexer 94/94, parser 94/94, semantic 94/94 -- the corpus grew by the stress program, and the ports needed no change at all, the grammar being unchanged. `scripts/leak_stress.sh` clean across all 42 programs.
+
+
+289. THE CODEGEN PORT BEGINS: AN ORACLE THAT NEEDED NO DESIGN, AND TWO MEASUREMENTS THAT SAVED IT
+
+The fourth and last stage. `festina/codegen.py` is ~14,500 lines, more than everything ported so far combined, so this entry is the harness and the first slice, not the port.
+
+**The oracle needed no design, which is exactly what the README had been promising.** The other three stages each required a canonical form to be invented -- a token line, an AST dump, a binding record -- because their outputs are objects with no text form of their own. Codegen's output IS text: `irdump.py` is `generate_ir`, and the comparison is the LLVM IR line for line.
+
+It needed two corrections anyway, and both came from measuring rather than from reading the code.
+
+**1. `CodeGen._uid` is a CLASS attribute.** `_unique()` does `CodeGen._uid += 1`, so the counter climbs across every CodeGen instance in a process. Dumping one file twice in one process produces two different texts -- identical in structure, every generated name shifted by a constant (`@__festina_stmtcache_7` becomes `_17`, `%a.1 %b.2` become `%a.11 %b.12`). Nothing is wrong with the compiler: the CLI compiles one file per process, and a class-level counter is a sound way to keep names unique. But an in-process oracle would have handed the port a moving target, and the failure would have read as a port bug in every file after the first rather than as a harness bug. `irdump.dump_file` resets it, and the reset is checked against a genuinely fresh subprocess rather than assumed.
+
+**2. The IR embeds its own source path on line 2**, so a dump taken with an absolute path bakes this checkout's location into the expected output. `irdiff` makes every path repo-relative before either side sees it -- with absolute paths every file's IR contains `/home/user/festina`, with relative paths none does.
+
+**THE FINDING THAT MATTERS MOST: the obvious coverage number is wrong by three orders of magnitude.**
+
+The first real run reported **12 match**. The truth was one.
+
+Eleven of those twelve are `cases/*.f`, which exist to be lexed rather than to be valid programs. Both implementations answer a bare `SEMERR|line|col` for them, so they "agree" without either one generating anything -- and what they agree about is semantic analysis's claim (#286), already proven, not codegen's. On top of that, **382 of every module's lines are the identical runtime declaration block**: 94% of the smallest file in the corpus and 23% of all its IR, so a port able to do nothing but print a constant is already within a couple of dozen lines of matching `benchmarks/hello.f`.
+
+Measured honestly, the port reproduces **23 of 153,320 file-specific IR lines: 0.015%**.
+
+So `irdiff.py` now reports "rejected by both" separately from "match", and coverage is file-specific lines rather than files. This is the same lesson as #287's canary and #288's semantic-only acceptance tests, arriving a third time from a third direction: **a number that flatters is worse than no number, and the way to find out which kind you have is to ask what the metric would say about an implementation that does nothing.** For a file count, the answer here was "12 of 96".
+
+**A test that could not have failed, caught by its own control.** `TestTheOracleIsReproducible` was written against `benchmarks/hello.f` and passed. `benchmarks/hello.f` is `log('hello')` and calls `_unique()` exactly zero times, so all three reproducibility tests would have passed with the reset deleted. The control -- disable the reset, assert two dumps then diverge -- is what failed and exposed it. The tests now use `examples/hello.f`, which uses the counter ten times. Third time a control has been the thing that found the gap, and the first time one has caught a test rather than an implementation.
+
+**The first slice.** `bootstrap/codegen.f` emits the module header, the 382-line runtime declaration block, the argv globals, `@__festina_main`, the `main` wrapper, and `log(<string literal>)`. That is `benchmarks/hello.f`, matching all 406 lines. A non-ASCII string literal reports unported rather than guessing, since `text.length` is code points and the constant's length must be bytes -- conservative in the one safe direction, the same rule `semantic.f`'s `inferExpr` follows.
+
+**Verified.** 2835 passed, 98 skipped -- 14 as before, plus the 84 corpus files codegen has not reached, which are skips rather than silence because `test_coverage_does_not_go_backwards` asserts the floor separately. Lexer 96/96, parser 96/96, semantic 96/96; all three now handle `codegen.f` and `irdumpf.f`, their own new corpus members. Codegen: 1 match, 0 differ, 84 unported, 11 rejected by both. Canary confirmed: corrupting one preamble line turns the match into a difference naming the exact line.

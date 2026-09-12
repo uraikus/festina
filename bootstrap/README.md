@@ -1,8 +1,8 @@
 # bootstrap/
 
 Festina's own compiler, written in Festina — the lexer, the parser and
-semantic analysis, all three complete and all three agreeing with their
-originals over the whole corpus.
+semantic analysis all complete and all agreeing with their originals
+over the whole corpus, and codegen begun.
 
 Nothing in the shipped compiler depends on this directory. It exists to
 be a demanding real program in the language, and to be checked against
@@ -23,12 +23,16 @@ the Python implementation it mirrors.
 | `semdumpf.f` | entry point: dumps semantic analysis in the canonical form |
 | `semdump.py` | the Python side's canonical semantic-analysis dump |
 | `semdiff.py` | diffs both analyzers over the same corpus |
+| `codegen.f` | `festina/codegen.py`, in progress (imports `semantic.f`) |
+| `irdumpf.f` | entry point: dumps LLVM IR |
+| `irdump.py` | the Python side's IR, which needs no canonical form of its own |
+| `irdiff.py` | diffs both code generators over the same corpus |
 | `cases/*.f` | targeted sources covering what the corpus doesn't reach |
 
-`tests/test_bootstrap_lexer.py`, `test_bootstrap_parser.py` and
-`test_bootstrap_semantic.py` run the same comparisons from pytest, so a
-divergence fails CI rather than waiting to be noticed — on Linux, for
-the reason below.
+`tests/test_bootstrap_lexer.py`, `test_bootstrap_parser.py`,
+`test_bootstrap_semantic.py` and `test_bootstrap_codegen.py` run the
+same comparisons from pytest, so a divergence fails CI rather than
+waiting to be noticed — on Linux, for the reason below.
 
 ## Running it
 
@@ -36,14 +40,18 @@ the reason below.
 python bootstrap/difftest.py                        # lexer, whole corpus
 python bootstrap/astdiff.py                         # parser, whole corpus
 python bootstrap/semdiff.py                         # analyzer, whole corpus
+python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 94-file repository corpus:
+Over the 96-file repository corpus:
 
-- **lexer: 94 match, 0 differ.**
-- **parser: 94 match, 0 differ, 0 unported.**
-- **semantic: 94 match, 0 differ, 0 unported.**
+- **lexer: 96 match, 0 differ.**
+- **parser: 96 match, 0 differ, 0 unported.**
+- **semantic: 96 match, 0 differ, 0 unported.**
+- **codegen: 1 match, 0 differ, 84 unported, 11 rejected by both** —
+  23 of 153,320 file-specific IR lines. See below for why that is the
+  number reported rather than a file count.
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
 `parser.f`, the largest source in the corpus at ~1,200 lines, takes
@@ -94,7 +102,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 94-file repository corpus is a strong oracle for ordinary code and
+The 96-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -130,10 +138,10 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Semantic analysis: 94 match, 0 differ, 0 unported
+## Semantic analysis: 96 match, 0 differ, 0 unported
 
-All three stages of the front end now agree with their originals over
-the whole corpus. `semantic.f` resolves declarations, merges imports,
+All three stages of the front end agree with their originals over the
+whole corpus. `semantic.f` resolves declarations, merges imports,
 walks scopes including thread bodies, descends into expressions, infers
 types, and rejects the programs the original rejects.
 
@@ -180,37 +188,72 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Then: codegen
+## Codegen: 23 of 153,320 file-specific IR lines
 
-About 14,500 lines of Python — more than everything ported so far
-combined.
+About 14,500 lines of Python, more than everything ported so far
+combined, and begun rather than finished. It depends on no language
+change: the ports use no `T?`, no `free` and no `delete`, so automatic
+reclamation handles the whole compiler unassisted.
 
-Neither depends on any language change. The ports use no `T?`, no
-`free` and no `delete`: automatic reclamation handles the whole front
-end unassisted.
+**The oracle needed no design at all.** The other three stages required
+a canonical form to be invented for them, because their outputs are
+objects with no text form of their own. Codegen's output *is* text, so
+`irdump.py` is `generate_ir` and the comparison is the IR, line for
+line. It is the strongest oracle in the project and the only one with no
+judgement in it.
 
-`semdump.py` defines the oracle semantic analysis is ported against.
-`analyze()` is a checker rather than an annotator — it raises, or
-returns a symbol table, and writes nothing back onto the AST — so
-diffing its return value alone would say nothing about the inside of a
-function body. Instead the dump wraps `Scope.define`, the single
-chokepoint every binding in the program passes through, and records
-**the resolved type of every name the program binds, anywhere**:
-globals, constants, functions, parameters, loop and catch variables,
-and locals nested arbitrarily deep. The wrapper lives in the harness,
-so the compiler carries no test-only hook.
+It needed two corrections all the same, both found by measuring:
 
-Over the corpus that is 4,898 records across 82 analyzed files; the
-11 rejected ones are all `cases/*.f`, which exist to be lexed rather
-than to be valid programs. A rejection dumps `SEMERR|line|col` alone —
-position, never message text.
+**`CodeGen._uid` is a class attribute.** `_unique()` does
+`CodeGen._uid += 1`, so the counter keeps climbing across every CodeGen
+instance in a process, and generating IR for one file twice produces two
+different texts — identical in structure, every generated name shifted
+by a constant:
 
-`tests/test_bootstrap_semantic.py` pins the oracle's own discriminating
-power, including that a type renderer collapsing every type into one
-string fails three of its tests.
+```
+-@__festina_stmtcache_7       +@__festina_stmtcache_17
+-%a.1  %b.2  %dx.3            +%a.11 %b.12 %dx.13
+```
 
-Codegen has the strongest oracle in the project and needs no design
-work: its output is LLVM IR text, comparable byte for byte.
+Nothing is wrong with the compiler; the CLI compiles one file per
+process. But an in-process oracle would hand the port a moving target,
+and the failure would read as a port bug in every file after the first.
+`irdump.dump_file` resets it, and the reset is checked against a
+genuinely fresh subprocess rather than trusted.
+
+**The IR embeds its own source path**, on line 2, so a dump taken with
+an absolute path bakes the checkout's location into the expected output.
+`irdiff` makes every path repo-relative before either side sees it —
+with absolute paths every file's IR contains `/home/user/festina`, with
+relative paths none does.
+
+### Why the number here is lines and not files
+
+**382 of every module's lines are the identical runtime declaration
+block** — 94% of the smallest file in the corpus, 23% of all its IR. A
+port able to do nothing but print that block is already within a couple
+of dozen lines of matching `benchmarks/hello.f`.
+
+Worse, 11 corpus files are `cases/*.f`, which exist to be lexed rather
+than to be valid programs: both implementations answer a bare
+`SEMERR|line|col` for them and "agree" without either generating
+anything. The first real run reported **12 match** on a port that could
+emit exactly one module — 22 file-specific lines out of 153,320, or
+0.014%.
+
+So `irdiff.py` reports those eleven as *rejected by both*, separately
+from matches, and coverage is measured as file-specific IR lines
+reproduced. The eleven prove only that both sides reject the same
+programs, which is semantic analysis's claim and not codegen's. A number
+that flatters by three orders of magnitude is worse than no number.
+
+`tests/test_bootstrap_codegen.py` pins all of it, including a control
+that disables the `_uid` reset and confirms two dumps then diverge —
+which is what caught the reproducibility tests being pointed at
+`benchmarks/hello.f`, a program that calls `_unique()` exactly zero
+times and so could not have varied either way.
+
+### What is left
 
 The obstacles are structural rather than semantic:
 
@@ -222,3 +265,21 @@ The obstacles are structural rather than semantic:
 - **`map[T]` keys are `text`.** Three side tables keyed by node identity
   become a field on the node itself.
 - **One return value per function**, so 259 tuple returns become structs.
+
+What codegen needs from the analyzer is small and already mostly there:
+`structs`, `tables`, `enums`, `threads`, and the two message types.
+`codegen.f` imports `semantic.f` and reads them the way `CodeGen` reads
+them off `AnalyzedProgram`.
+
+The blockers, by how many corpus files each holds back:
+
+| | |
+|---|---|
+| `VarDecl` | 36 |
+| `StructDecl` | 22 |
+| `ImportDecl` | 8 |
+| `FuncDecl` | 6 |
+| `TableDecl` | 6 |
+| `ThreadDecl` | 3 |
+| a non-call expression statement | 2 |
+| `ForStmt` | 1 |
