@@ -5761,3 +5761,29 @@ The table was a histogram of **first** blockers, because `cgUnported` kept only 
 That is the third measurement in this port to correct a number that flattered: #289's file count (12 reported, 1 real), #290's inert canary, and now the blocker table. The common shape is that each one looked like information until someone asked what it would say about a case where the answer was already known.
 
 **Verified.** Lexer 97/97, parser 97/97, semantic 97/97. Codegen 3 match, 0 differ, 83 unported, 11 rejected by both -- 103 of 155,742 file-specific IR lines, unchanged, which is the point.
+
+
+292. THE SCALAR CORE: EXPRESSIONS, CONTROL FLOW AND FUNCTIONS
+
+The fourth codegen slice, taken as a batch because #291's measurement said a batch was the only thing that would move: the median unported file had four distinct blockers and no single construct was the sole blocker for more than two files. `FuncDecl`, `WhileStmt` and `log(Identifier)` together were the three largest, and `IfStmt`, `ForStmt`, `Return`, assignment and postfix came almost free once the machinery existed.
+
+**Result: 370 of 166,387 file-specific IR lines, up from 103.** Six files match rather than three. Coverage more than tripled, which is what a batch buys where a single construct bought nothing.
+
+**Four details that had to be exact, none of them guessable.**
+
+1. **The comparison result temp is allocated BEFORE the icmp temp.** `out = self.tmp()` sits above the branch that handles comparisons, so `a < b` emits `%t3 = icmp slt ...` then `%t2 = zext i1 %t3 to i8` -- the numbers inverted. Read off the output, then confirmed in the source.
+2. **Three separate module-wide counters.** `tmp_counter` and `label_counter` are instance state, `_uid` is a class attribute. Any of them made per-function yields structurally identical IR with every name shifted, which reads as a difference on every line rather than as one wrong decision.
+3. **Alloca hoisting** (claude.md #191) is a post-pass over the finished text, and had to be one here too: it is a property of the module, and doing it inline would mean knowing a local exists before reaching its declaration.
+4. **An `if` always emits all three blocks**, even with no `else`, and an arm ending in `return` gets no branch to `if.end` -- LLVM allows one terminator per block. Missing either renumbers every label after it.
+
+**The bug this produced, and how it was caught.** Adding terminator tracking made `fib.f` match and silently broke `p3.f`: a void function whose body does not return lost its `ret void`. `cgBlockInto` resets the flag on entry, but `cgFunc` iterated the body with a loop of its own, so the second function inherited `true` from the first function's `return`. Routing the body through the same helper fixed it. A flag that is correct for one function and wrong for the next is exactly what a whole-corpus differential test is for.
+
+**A COVERED-BY-NOTHING FINDING, the second of its kind.** Disabling the alloca hoister left **all five then-matching corpus files still matching**. `fib.f`'s only slot is a parameter, already at the top of its entry block, and no other matching file declared a local at all. The two canaries turned out to be complementary and neither sufficient: breaking the hoister is caught by a file with a loop-body local and not by `fib.f`; breaking terminator tracking is caught by `fib.f` and not by the loop file. `cases/control_flow.f` now does both, verified by making each break.
+
+That is three times a `cases/` file has found something the repository corpus could not -- #290's float range, #291's blocker table, this. The hit rate is high enough that writing the case file first is now the cheaper order.
+
+**A measurement regression, introduced and reverted inside this slice.** The early `if CG_UNPORTED { return }` guards added for output safety also stopped the walk, which collapsed #291's two-column blocker table back into one: every construct showed `blocks == only` because only the first reason was ever collected. Suppressing OUTPUT while continuing the WALK restores it. Worth recording because the symptom -- a table where every row claims to be the sole blocker -- looks like good news.
+
+**What is next is now unambiguous.** `declaration of a non-scalar type` blocks 48 files and is the last thing in the way for 6; `parameter of a non-scalar type` blocks 24 and is sole blocker for 4. Between them that is ten files, and they are `text`/`arr[T]`/`map[T]`/struct -- the point at which reference counting enters the port.
+
+**Verified.** 2846 passed, 95 skipped. Lexer 98/98, parser 98/98, semantic 98/98. Codegen 6 match, 0 differ, 81 unported, 11 rejected by both.

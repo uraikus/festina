@@ -32,7 +32,13 @@ bool CG_UNPORTED = false
 text CG_WHY = ''
 arr[text] CG_WHYS = []
 
+// Output stops once something is unported, but the WALK does not: the
+// module will not be printed either way, and continuing is what lets
+// irdiff report every distinct blocker rather than only the first
+// (decisions.md #291). Stopping the walk here is exactly the mistake
+// that turned that table's two columns back into one.
 void func cgEmit(line:text) {
+    if CG_UNPORTED { return }
     CG_IR.push(line)
 }
 
@@ -661,20 +667,463 @@ text func cgConstFor(ty:text, init:Node) {
     cgUnported(`initializer ${init.kind}`)
     return ''
 }
+// ---------------------------------------------------------------------
+// Name generators.
+//
+// Three separate counters, all module-wide, because that is what
+// festina/codegen.py has: `tmp_counter` and `label_counter` are
+// instance state and `_uid` is a CLASS attribute (decisions.md #289).
+// A port that made any of them per-function would produce structurally
+// identical IR with every generated name shifted, which reads as a
+// difference on every line rather than as one wrong decision.
+
+int CG_TMP = 0
+int CG_LABEL = 0
+int CG_UID = 0
+
+text func cgTmp() {
+    CG_TMP++
+    return `%t${CG_TMP}`
+}
+
+text func cgLabel(prefix:text) {
+    CG_LABEL++
+    return `${prefix}${CG_LABEL}`
+}
+
+int func cgUid() {
+    CG_UID++
+    return CG_UID
+}
+
+// ---------------------------------------------------------------------
+// Values.
+//
+// An emitted expression is an LLVM operand plus both of its types: the
+// LLVM one to spell instructions with, and the Festina one to decide
+// things LLVM cannot see -- which `log` overload to call, whether a
+// comparison is signed-integer or floating-point, whether a mix needs
+// an sitofp. `fty` is '' for anything not yet understood.
+
+struct Val {
+    v:text
+    lty:text
+    fty:text
+}
+
+Val func cgVal(v:text, lty:text, fty:text) {
+    Val r
+    r.v = v
+    r.lty = lty
+    r.fty = fty
+    return r
+}
+
+text func cgLtyOf(fty:text) {
+    if fty == 'int' { return 'i64' }
+    if fty == 'float' { return 'double' }
+    if fty == 'bool' { return 'i8' }
+    if fty == 'text' { return 'ptr' }
+    return ''
+}
+
+// ---------------------------------------------------------------------
+// Scopes.
+//
+// Globals live in @name; a parameter or local lives in an alloca slot
+// named %<name>.<uid>. Locals shadow globals, and a function's locals
+// are cleared on entry -- there is no nested block scoping here yet,
+// which is safe because semantic.py has already rejected any program
+// where that would matter.
+
+map[text] G_SLOT = {}
+map[text] G_FTY = {}
+map[text] L_SLOT = {}
+map[text] L_FTY = {}
+map[text] FN_RET = {}
+
+bool func cgIsLocal(name:text) {
+    return L_SLOT[name] != null
+}
+
+text func cgSlotOf(name:text) {
+    if L_SLOT[name] != null { return L_SLOT[name] }
+    if G_SLOT[name] != null { return G_SLOT[name] }
+    return ''
+}
+
+text func cgFtyOf(name:text) {
+    if L_FTY[name] != null { return L_FTY[name] }
+    if G_FTY[name] != null { return G_FTY[name] }
+    return ''
+}
+
+// ---------------------------------------------------------------------
+// Output buffers.
+//
+// festina/codegen.py assembles the module from sections, and the order
+// they are GENERATED in is not the order they are printed in: every
+// function body is emitted before __festina_main, so the shared
+// counters give function temps the lower numbers. Two buffers keep
+// that straight; `CUR` aliases whichever one is being filled (an
+// arr[T] is a reference, claude.md #79).
+
+// Whether the block just emitted ended in a terminator of its own. A
+// `return` ends its block, so the enclosing `if`/`while`/`for` must NOT
+// then emit its usual fall-through branch -- LLVM allows exactly one
+// terminator per basic block, and festina/codegen.py tracks the same
+// thing as ctx["terminated"].
+bool CG_TERM = false
+
+arr[text] CG_FUNCS = []
+arr[text] CG_MAIN = []
+arr[text] CUR = []
+
+void func cgOut(line:text) {
+    if CG_UNPORTED { return }
+    CUR.push(line)
+}
+
+// A block's statements. parseBlock wraps them in a Block node rather
+// than storing a bare list, so a statement body is reached through two
+// hops, not one.
+arr[Node] func cgBlockStmts(b:Node) {
+    arr[Node] empty = []
+    if b == null { return empty }
+    if b.kind != 'Block' { return empty }
+    return listOf(b, 'body')
+}
+
+// ---------------------------------------------------------------------
+// Alloca hoisting.
+//
+// claude.md #191: every static alloca moves to the top of its
+// function's entry block, so a slot declared inside a loop is
+// allocated once per call instead of once per iteration. This is a
+// post-pass over the finished text in festina/codegen.py and it is one
+// here too, for the same reason: it is a property of the module, not of
+// any one statement, and doing it inline would mean knowing a local's
+// existence before reaching its declaration.
+//
+// A dynamic alloca -- one whose element count is an SSA value rather
+// than a constant -- is left alone, because moving it would change how
+// much stack a single execution reserves. Neither generator emits one
+// today; the guard keeps a future one safe by construction.
+bool func cgIsStaticAlloca(line:text) {
+    if line.length < 4 { return false }
+    if line.charCodeAt(0) != 32 { return false }
+    if line.charCodeAt(1) != 32 { return false }
+    if line.charCodeAt(2) != 37 { return false }
+    arr[text] halves = line.split(' = alloca ')
+    if halves.length != 2 { return false }
+    arr[text] chunks = halves[1].split(',')
+    int i = 1
+    while i < chunks.length {
+        int j = 0
+        while j < chunks[i].length {
+            if chunks[i].charCodeAt(j) == 37 { return false }
+            j++
+        }
+        i++
+    }
+    return true
+}
+
+bool func cgOpensDefine(line:text) {
+    if line.length < 8 { return false }
+    if line.split(' ')[0] != 'define' { return false }
+    return line.charCodeAt(line.length - 1) == 123
+}
+
+bool func cgIsLabelLine(line:text) {
+    if line.length < 2 { return false }
+    if line.charCodeAt(0) == 32 { return false }
+    return line.charCodeAt(line.length - 1) == 58
+}
+
+arr[text] func cgHoistAllocas(src:arr[text]) {
+    arr[text] out = []
+    arr[text] body = []
+    bool inDefine = false
+    int i = 0
+    while i < src.length {
+        text line = src[i]
+        if inDefine == false {
+            out.push(line)
+            if cgOpensDefine(line) {
+                inDefine = true
+                arr[text] fresh = []
+                body = fresh
+            }
+            i++
+            continue
+        }
+        if line == '}' {
+            arr[text] hoisted = []
+            arr[text] kept = []
+            int b = 0
+            while b < body.length {
+                if cgIsStaticAlloca(body[b]) { hoisted.push(body[b]) }
+                else { kept.push(body[b]) }
+                b++
+            }
+            // Insertion point: after the entry label when the block has
+            // one, which this generator always emits.
+            int insertAt = 0
+            if kept.length > 0 {
+                if cgIsLabelLine(kept[0]) { insertAt = 1 }
+            }
+            int k = 0
+            while k < insertAt {
+                out.push(kept[k])
+                k++
+            }
+            int h = 0
+            while h < hoisted.length {
+                out.push(hoisted[h])
+                h++
+            }
+            int k2 = insertAt
+            while k2 < kept.length {
+                out.push(kept[k2])
+                k2++
+            }
+            out.push(line)
+            inDefine = false
+            i++
+            continue
+        }
+        body.push(line)
+        i++
+    }
+    return out
+}
+
+// ---------------------------------------------------------------------
+// Expressions.
+
+Val func cgExpr(e:Node) {
+    Val none
+    if CG_UNPORTED { return none }
+    if e == null {
+        cgUnported('missing expression')
+        return none
+    }
+
+    if e.kind == 'NumberLit' {
+        // The parser keeps only the literal's text, not the lexer's
+        // int/float tag -- and a '.' is exactly what the lexer used to
+        // decide, with its float normalization always leaving one digit
+        // after the point, so the same test recovers the same answer.
+        text raw = fieldOf(e, 'value').raw
+        bool isFloat = false
+        int i = 0
+        while i < raw.length {
+            if raw.charCodeAt(i) == 46 { isFloat = true }
+            i++
+        }
+        if isFloat {
+            float f = cgParseFloat(raw)
+            if CG_NUM_OK == false {
+                cgUnported('float literal outside the exact-conversion window')
+                return none
+            }
+            return cgVal(cgDoubleHex(f), 'double', 'float')
+        }
+        if raw.length > 18 {
+            cgUnported('integer literal too long to convert')
+            return none
+        }
+        return cgVal(`${raw.toInt()}`, 'i64', 'int')
+    }
+
+    if e.kind == 'BoolLit' {
+        if fieldOf(e, 'value').raw == 'true' { return cgVal('1', 'i8', 'bool') }
+        return cgVal('0', 'i8', 'bool')
+    }
+
+    if e.kind == 'StringLit' {
+        return cgVal(cgStringConst(rawText(e, 'value')), 'ptr', 'text')
+    }
+
+    if e.kind == 'Identifier' {
+        text name = rawText(e, 'name')
+        text slot = cgSlotOf(name)
+        text fty = cgFtyOf(name)
+        if slot == '' || cgLtyOf(fty) == '' {
+            cgUnported(`read of ${name}`)
+            return none
+        }
+        text lty = cgLtyOf(fty)
+        text t = cgTmp()
+        cgOut(`  ${t} = load ${lty}, ptr ${slot}`)
+        return cgVal(t, lty, fty)
+    }
+
+    if e.kind == 'BinOp' { return cgBinOp(e) }
+    if e.kind == 'Call' { return cgCall(e, true) }
+
+    cgUnported(`expression ${e.kind}`)
+    return none
+}
+
+Val func cgBinOp(e:Node) {
+    Val none
+    Val l = cgExpr(childOf(e, 'left'))
+    if CG_UNPORTED { return none }
+    Val r = cgExpr(childOf(e, 'right'))
+    if CG_UNPORTED { return none }
+    text op = rawText(e, 'op')
+
+    // int/float mix: whichever side is int gets an sitofp, exactly as
+    // though .toFloat() had been written on it (claude.md #143).
+    if l.fty == 'int' && r.fty == 'float' {
+        text c = cgTmp()
+        cgOut(`  ${c} = sitofp i64 ${l.v} to double`)
+        l = cgVal(c, 'double', 'float')
+    }
+    if l.fty == 'float' && r.fty == 'int' {
+        text c = cgTmp()
+        cgOut(`  ${c} = sitofp i64 ${r.v} to double`)
+        r = cgVal(c, 'double', 'float')
+    }
+    bool useFloat = l.fty == 'float'
+
+    if op == '/' || op == '%' {
+        cgUnported(`operator ${op}`)
+        return none
+    }
+
+    // The result temp is taken BEFORE the comparison temp, which is
+    // what festina/codegen.py does and therefore what the numbering
+    // has to be: `out = self.tmp()` runs above the icmp branch.
+    text out = cgTmp()
+
+    if op == '+' || op == '-' || op == '*' {
+        text ins = 'add'
+        if op == '-' { ins = 'sub' }
+        if op == '*' { ins = 'mul' }
+        if useFloat {
+            if op == '+' { ins = 'fadd' }
+            if op == '-' { ins = 'fsub' }
+            if op == '*' { ins = 'fmul' }
+        }
+        text ty = 'i64'
+        if useFloat { ty = 'double' }
+        cgOut(`  ${out} = ${ins} ${ty} ${l.v}, ${r.v}`)
+        if useFloat { return cgVal(out, 'double', 'float') }
+        return cgVal(out, 'i64', 'int')
+    }
+
+    if op == '<' || op == '>' || op == '<=' || op == '>=' || op == '==' || op == '!=' {
+        text cmpName = 'icmp'
+        text pred = ''
+        if useFloat {
+            cmpName = 'fcmp'
+            if op == '<' { pred = 'olt' }
+            if op == '>' { pred = 'ogt' }
+            if op == '<=' { pred = 'ole' }
+            if op == '>=' { pred = 'oge' }
+            if op == '==' { pred = 'oeq' }
+            if op == '!=' { pred = 'one' }
+        } else {
+            if op == '<' { pred = 'slt' }
+            if op == '>' { pred = 'sgt' }
+            if op == '<=' { pred = 'sle' }
+            if op == '>=' { pred = 'sge' }
+            if op == '==' { pred = 'eq' }
+            if op == '!=' { pred = 'ne' }
+        }
+        text cmpOut = cgTmp()
+        text ty = 'i64'
+        if useFloat { ty = 'double' }
+        if useFloat == false && l.fty == 'bool' { ty = 'i8' }
+        cgOut(`  ${cmpOut} = ${cmpName} ${pred} ${ty} ${l.v}, ${r.v}`)
+        cgOut(`  ${out} = zext i1 ${cmpOut} to i8`)
+        return cgVal(out, 'i8', 'bool')
+    }
+
+    cgUnported(`operator ${op}`)
+    return none
+}
+
+// A call to a user-declared function. `wantValue` distinguishes an
+// expression position from a bare statement, because a void call has no
+// result temp to take.
+Val func cgCall(e:Node, wantValue:bool) {
+    Val none
+    Node callee = childOf(e, 'callee')
+    if callee == null || callee.kind != 'Identifier' {
+        cgUnported('call through a non-identifier callee')
+        return none
+    }
+    text name = rawText(callee, 'name')
+    if FN_RET[name] == null {
+        cgUnported(`call to ${name}`)
+        return none
+    }
+    text retF = FN_RET[name]
+    arr[Node] args = listOf(e, 'args')
+    arr[text] parts = []
+    int i = 0
+    while i < args.length {
+        Val a = cgExpr(args[i])
+        if CG_UNPORTED { return none }
+        parts.push(`${a.lty} ${a.v}`)
+        i++
+    }
+    text joined = ''
+    int j = 0
+    while j < parts.length {
+        if j > 0 { joined = joined + ', ' }
+        joined = joined + parts[j]
+        j++
+    }
+    if retF == 'void' {
+        cgOut(`  call void @${name}(${joined})`)
+        return cgVal('', 'void', 'void')
+    }
+    text lty = cgLtyOf(retF)
+    text t = cgTmp()
+    cgOut(`  ${t} = call ${lty} @${name}(${joined})`)
+    return cgVal(t, lty, retF)
+}
 
 // ---------------------------------------------------------------------
 // Statements.
-//
-// v1 covers exactly one statement shape: `log(<string literal>)`, which
-// is what `benchmarks/hello.f` is made of. Everything else reports
-// unported. That is deliberately a narrow start -- the point of this
-// slice is the HARNESS, and a harness is only believable once one real
-// file matches end to end.
+
+void func cgLog(args:arr[Node]) {
+    if args.length != 1 {
+        cgUnported('log() with other than one argument')
+        return
+    }
+    Val a = cgExpr(args[0])
+    if CG_UNPORTED { return }
+    if a.fty == 'int' {
+        cgOut(`  call void @festina_log_int(i64 ${a.v})`)
+        return
+    }
+    if a.fty == 'float' {
+        cgOut(`  call void @festina_log_float(double ${a.v})`)
+        return
+    }
+    if a.fty == 'bool' {
+        cgOut(`  call void @festina_log_bool(i8 ${a.v})`)
+        return
+    }
+    if a.fty == 'text' {
+        cgOut(`  call void @festina_log_text(ptr ${a.v})`)
+        return
+    }
+    cgUnported(`log(${a.fty})`)
+}
 
 void func cgStmt(s:Node) {
-    // A top-level declaration's storage was already emitted by
-    // cgGlobals; what remains in main is the store its initializer
-    // performs, in source order alongside every other statement.
+    // Pure type information: the definition was emitted with the
+    // module's type section and nothing reaches main.
+    if s.kind == 'StructDecl' { return }
+    if s.kind == 'FuncDecl' { return }
+
     if s.kind == 'VarDecl' {
         if fieldOf(s, 'is_const').raw == 'true' {
             cgUnported('const declaration')
@@ -684,50 +1133,308 @@ void func cgStmt(s:Node) {
             cgUnported('manually-managed declaration')
             return
         }
-        text ty = cgLlvmType(resolveTypeField(s, 'type_expr'))
-        if ty == '' {
+        text fty = cgDeclFty(s)
+        if fty == '' {
             cgUnported('declaration of a non-scalar type')
             return
         }
+        text name = rawText(s, 'name')
+        text lty = cgLtyOf(fty)
+        // A local declaration allocates its own slot; a global's
+        // storage was emitted with the module's globals.
+        if cgSlotOf(name) == '' || cgIsLocal(name) == false {
+            if CUR.length > 0 && G_SLOT[name] == null {
+                text slot = `%${name}.${cgUid()}`
+                cgOut(`  ${slot} = alloca ${lty}`)
+                L_SLOT[name] = slot
+                L_FTY[name] = fty
+            }
+        }
         Node init = childOf(s, 'init')
         if init == null { return }
-        text value = cgConstFor(ty, init)
+        Val v = cgExpr(init)
         if CG_UNPORTED { return }
-        cgEmit(`  store ${ty} ${value}, ptr @${rawText(s, 'name')}`)
+        if v.fty != fty && cgNumericPair(v.fty, fty) == false {
+            cgUnported(`initializer of type ${v.fty} for ${fty}`)
+            return
+        }
+        cgOut(`  store ${lty} ${v.v}, ptr ${cgSlotOf(name)}`)
         return
     }
-    // A struct declaration is pure type information: its definition
-    // was already emitted above, and it contributes nothing to main.
-    if s.kind == 'StructDecl' { return }
-    if s.kind != 'ExprStmt' {
-        cgUnported(`statement ${s.kind}`)
+
+    if s.kind == 'ExprStmt' {
+        cgEvalForEffect(childOf(s, 'expr'))
         return
     }
-    Node call = childOf(s, 'expr')
-    if call == null || call.kind != 'Call' {
-        cgUnported('expression statement that is not a call')
+
+    if s.kind == 'WhileStmt' { cgWhile(s)  return }
+    if s.kind == 'ForStmt' { cgFor(s)  return }
+    if s.kind == 'IfStmt' { cgIf(s)  return }
+    if s.kind == 'Return' { cgReturn(s)  return }
+
+    cgUnported(`statement ${s.kind}`)
+}
+
+// An expression evaluated for its effect and not its value -- a bare
+// statement, or a `for` loop's update clause, which is an expression
+// in the grammar rather than a statement.
+void func cgEvalForEffect(ex:Node) {
+    if ex == null {
+        cgUnported('empty expression statement')
         return
     }
-    Node callee = childOf(call, 'callee')
-    if callee == null || callee.kind != 'Identifier' {
-        cgUnported('call through a non-identifier callee')
+    if ex.kind == 'Call' {
+        Node callee = childOf(ex, 'callee')
+        if callee != null && callee.kind == 'Identifier'
+                && rawText(callee, 'name') == 'log' {
+            cgLog(listOf(ex, 'args'))
+            return
+        }
+        cgCall(ex, false)
         return
     }
-    if rawText(callee, 'name') != 'log' {
-        cgUnported(`call to ${rawText(callee, 'name')}`)
+    if ex.kind == 'Assign' {
+        cgAssign(ex)
         return
     }
-    arr[Node] args = listOf(call, 'args')
-    if args.length != 1 {
-        cgUnported('log() with other than one argument')
+    if ex.kind == 'PostfixOp' {
+        cgPostfix(ex)
         return
     }
-    if args[0].kind != 'StringLit' {
-        cgUnported(`log(${args[0].kind})`)
+    cgUnported(`expression statement ${ex.kind}`)
+}
+
+// Runs a block's statements and leaves CG_TERM saying whether it ended
+// in a terminator. Reset on entry so the answer is about THIS block and
+// not one a sibling already closed.
+void func cgBlockInto(b:Node) {
+    CG_TERM = false
+    arr[Node] body = cgBlockStmts(b)
+    int i = 0
+    while i < body.length {
+        cgStmt(body[i])
+        i++
+    }
+}
+
+// An `if` always emits all three blocks, even with no `else` -- the
+// else block then holds nothing but the branch to the end. Matching
+// that matters: skipping it would renumber every label after it.
+void func cgIf(s:Node) {
+    Val c = cgExpr(childOf(s, 'test'))
+    if CG_UNPORTED { return }
+    text thenL = cgLabel('if.then')
+    text elseL = cgLabel('if.else')
+    text endL = cgLabel('if.end')
+    text t = cgTmp()
+    cgOut(`  ${t} = icmp ne i8 ${c.v}, 0`)
+    cgOut(`  br i1 ${t}, label %${thenL}, label %${elseL}`)
+    cgOut(`${thenL}:`)
+    cgBlockInto(childOf(s, 'then'))
+    if CG_TERM == false { cgOut(`  br label %${endL}`) }
+    cgOut(`${elseL}:`)
+    CG_TERM = false
+    Node orelse = childOf(s, 'orelse')
+    if orelse != null {
+        if orelse.kind == 'Block' {
+            cgBlockInto(orelse)
+        } else {
+            cgStmt(orelse)
+        }
+    }
+    if CG_TERM == false { cgOut(`  br label %${endL}`) }
+    cgOut(`${endL}:`)
+    // The end block itself falls through, so whatever follows the `if`
+    // is reachable regardless of what the arms did.
+    CG_TERM = false
+}
+
+// Labels in allocation order cond, body, update, end -- so the branch
+// out of the condition names an `end` whose number is higher than the
+// update block's.
+void func cgFor(s:Node) {
+    cgStmt(childOf(s, 'init'))
+    if CG_UNPORTED { return }
+    text condL = cgLabel('for.cond')
+    text bodyL = cgLabel('for.body')
+    text updateL = cgLabel('for.update')
+    text endL = cgLabel('for.end')
+    cgOut(`  br label %${condL}`)
+    cgOut(`${condL}:`)
+    Val c = cgExpr(childOf(s, 'test'))
+    if CG_UNPORTED { return }
+    text t = cgTmp()
+    cgOut(`  ${t} = icmp ne i8 ${c.v}, 0`)
+    cgOut(`  br i1 ${t}, label %${bodyL}, label %${endL}`)
+    cgOut(`${bodyL}:`)
+    cgBlockInto(childOf(s, 'body'))
+    if CG_TERM == false { cgOut(`  br label %${updateL}`) }
+    cgOut(`${updateL}:`)
+    cgEvalForEffect(childOf(s, 'update'))
+    cgOut(`  br label %${condL}`)
+    cgOut(`${endL}:`)
+    CG_TERM = false
+}
+
+bool func cgNumericPair(a:text, b:text) {
+    if a == 'int' && b == 'float' { return true }
+    if a == 'float' && b == 'int' { return true }
+    return false
+}
+
+text func cgDeclFty(d:Node) {
+    Ty t = resolveTypeField(d, 'type_expr')
+    if t == null { return '' }
+    if t.kind != 'prim' { return '' }
+    if t.name == 'int' { return 'int' }
+    if t.name == 'float' { return 'float' }
+    if t.name == 'bool' { return 'bool' }
+    return ''
+}
+
+void func cgAssign(e:Node) {
+    Node target = childOf(e, 'target')
+    if target == null || target.kind != 'Identifier' {
+        cgUnported('assignment to a non-identifier target')
         return
     }
-    text name = cgStringConst(rawText(args[0], 'value'))
-    cgEmit(`  call void @festina_log_text(ptr ${name})`)
+    text name = rawText(target, 'name')
+    text slot = cgSlotOf(name)
+    text fty = cgFtyOf(name)
+    if slot == '' || cgLtyOf(fty) == '' {
+        cgUnported(`assignment to ${name}`)
+        return
+    }
+    Val v = cgExpr(childOf(e, 'value'))
+    if CG_UNPORTED { return }
+    cgOut(`  store ${cgLtyOf(fty)} ${v.v}, ptr ${slot}`)
+}
+
+void func cgPostfix(e:Node) {
+    Node operand = childOf(e, 'operand')
+    if operand == null || operand.kind != 'Identifier' {
+        cgUnported('postfix on a non-identifier')
+        return
+    }
+    text name = rawText(operand, 'name')
+    text slot = cgSlotOf(name)
+    if slot == '' || cgFtyOf(name) != 'int' {
+        cgUnported(`postfix on ${name}`)
+        return
+    }
+    text op = rawText(e, 'op')
+    text ins = 'add'
+    if op == '--' { ins = 'sub' }
+    text cur = cgTmp()
+    cgOut(`  ${cur} = load i64, ptr ${slot}`)
+    text nxt = cgTmp()
+    cgOut(`  ${nxt} = ${ins} i64 ${cur}, 1`)
+    cgOut(`  store i64 ${nxt}, ptr ${slot}`)
+}
+
+void func cgWhile(s:Node) {
+    // Labels are allocated cond, body, end -- the order
+    // festina/codegen.py takes them in, and therefore the numbering.
+    text condL = cgLabel('while.cond')
+    text bodyL = cgLabel('while.body')
+    text endL = cgLabel('while.end')
+    cgOut(`  br label %${condL}`)
+    cgOut(`${condL}:`)
+    Val c = cgExpr(childOf(s, 'test'))
+    if CG_UNPORTED { return }
+    text t = cgTmp()
+    cgOut(`  ${t} = icmp ne i8 ${c.v}, 0`)
+    cgOut(`  br i1 ${t}, label %${bodyL}, label %${endL}`)
+    cgOut(`${bodyL}:`)
+    cgBlockInto(childOf(s, 'body'))
+    if CG_TERM == false { cgOut(`  br label %${condL}`) }
+    cgOut(`${endL}:`)
+    CG_TERM = false
+}
+
+void func cgReturn(s:Node) {
+    Node v = childOf(s, 'value')
+    if v == null {
+        cgOut('  ret void')
+        CG_TERM = true
+        return
+    }
+    Val r = cgExpr(v)
+    if CG_UNPORTED { return }
+    cgOut(`  ret ${r.lty} ${r.v}`)
+    CG_TERM = true
+}
+
+// ---------------------------------------------------------------------
+// Functions.
+//
+// Emitted into CG_FUNCS before main is emitted at all, because the
+// shared temp/label/uid counters must reach them first.
+
+void func cgFunc(d:Node) {
+    text name = rawText(d, 'name')
+    text retF = FN_RET[name]
+    text retL = 'void'
+    if retF != 'void' { retL = cgLtyOf(retF) }
+
+    arr[Node] params = listOf(d, 'params')
+    arr[text] sig = []
+    arr[text] pnames = []
+    arr[text] pftys = []
+    int i = 0
+    while i < params.length {
+        text pf = cgDeclFty(params[i])
+        if pf == '' {
+            cgUnported('parameter of a non-scalar type')
+            return
+        }
+        text pn = rawText(params[i], 'name')
+        sig.push(`${cgLtyOf(pf)} %arg.${pn}`)
+        pnames.push(pn)
+        pftys.push(pf)
+        i++
+    }
+    text joined = ''
+    int j = 0
+    while j < sig.length {
+        if j > 0 { joined = joined + ', ' }
+        joined = joined + sig[j]
+        j++
+    }
+
+    // A fresh local scope per function. Festina has no way to clear a
+    // map in place, so the maps are replaced outright.
+    map[text] freshSlot = {}
+    map[text] freshFty = {}
+    L_SLOT = freshSlot
+    L_FTY = freshFty
+
+    CUR = CG_FUNCS
+    cgOut(`define ${retL} @${name}(${joined}) {`)
+    cgOut(`${cgLabel('entry')}:`)
+    int p = 0
+    while p < pnames.length {
+        text slot = `%${pnames[p]}.${cgUid()}`
+        cgOut(`  ${slot} = alloca ${cgLtyOf(pftys[p])}`)
+        L_SLOT[pnames[p]] = slot
+        L_FTY[pnames[p]] = pftys[p]
+        p++
+    }
+    int q = 0
+    while q < pnames.length {
+        cgOut(`  store ${cgLtyOf(pftys[q])} %arg.${pnames[q]}, ptr ${L_SLOT[pnames[q]]}`)
+        q++
+    }
+    // Through cgBlockInto, not a loop of its own: the helper resets
+    // CG_TERM on entry, and without that a function whose body does not
+    // return inherits the flag from whichever function was emitted
+    // before it and silently loses its `ret void`.
+    cgBlockInto(childOf(d, 'body'))
+    if retF == 'void' {
+        if CG_TERM == false { cgOut('  ret void') }
+    }
+    cgOut('}')
+    cgOut('')
 }
 
 // ---------------------------------------------------------------------
@@ -769,53 +1476,97 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     cgEmit('@argv.header = global {i64, %struct._FestinaArray} {i64 -1, %struct._FestinaArray zeroinitializer}')
     cgEmit('@argv = global ptr getelementptr({i64, %struct._FestinaArray}, ptr @argv.header, i32 0, i32 1)')
 
-    // Every top-level declaration's storage, in source order, right
-    // after argv's -- the globals section festina/codegen.py builds in
-    // _toplevel. The initializers themselves are statements, emitted
-    // inside __festina_main below.
+    // Every top-level declaration's storage, in source order.
     int g = 0
     while g < body.length {
         Node d = body[g]
         if d.kind == 'VarDecl' {
-            text gty = cgLlvmType(resolveTypeField(d, 'type_expr'))
-            if gty != '' {
-                cgEmit(`@${rawText(d, 'name')} = global ${gty} ${cgZeroFor(gty)}`)
+            text gf = cgDeclFty(d)
+            if gf != '' {
+                text gl = cgLtyOf(gf)
+                cgEmit(`@${rawText(d, 'name')} = global ${gl} ${cgZeroFor(gl)}`)
+                G_SLOT[rawText(d, 'name')] = `@${rawText(d, 'name')}`
+                G_FTY[rawText(d, 'name')] = gf
             }
         }
         g++
     }
 
-    // Three blank lines: the globals, struct-definition and function
-    // sections are each joined with a trailing blank, and all three are
-    // empty for a program this simple. Emitted from that structure
-    // rather than as a magic constant, so the shape stays honest when
-    // the sections start carrying content.
-    cgEmit('')
-    cgEmit('')
-    cgEmit('')
+    // Function signatures are registered before any body is emitted,
+    // so a call can precede its declaration -- function hoisting
+    // (claude.md #58) is a language rule, not an ordering accident.
+    int fs2 = 0
+    while fs2 < body.length {
+        if body[fs2].kind == 'FuncDecl' {
+            Ty rt = resolveTypeField(body[fs2], 'return_type')
+            text rf = 'void'
+            if rt != null {
+                if rt.kind == 'prim' { rf = rt.name }
+                else { rf = '' }
+            }
+            if rf == 'void' || cgLtyOf(rf) != '' {
+                FN_RET[rawText(body[fs2], 'name')] = rf
+            }
+        }
+        fs2++
+    }
 
-    cgEmit('define void @__festina_main() {')
-    cgEmit('entry:')
+    // Bodies next, into their own buffer, so the shared counters reach
+    // them before main.
+    int fb = 0
+    while fb < body.length {
+        if body[fb].kind == 'FuncDecl' {
+            cgFunc(body[fb])
+        }
+        fb++
+    }
+
+    // Then main's own statements.
+    CUR = CG_MAIN
+    cgOut('define void @__festina_main() {')
+    cgOut('entry:')
+    CG_TERM = false
     int s = 0
     while s < body.length {
         cgStmt(body[s])
         s++
     }
-    cgEmit('  ret void')
-    cgEmit('}')
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    cgOut('define i32 @main(i32 %argc, ptr %argv_raw) {')
+    cgOut('entry:')
+    cgOut('  call void @festina_runtime_init()')
+    cgOut('  %argv_arr = call ptr @festina_argv_array(i32 %argc, ptr %argv_raw)')
+    cgOut('  store ptr %argv_arr, ptr @argv')
+    cgOut('  call void @__festina_main()')
+    cgOut('  ret i32 0')
+    cgOut('}')
+
+    // The section layout festina/codegen.py's own `generate` builds:
+    // an empty extra-globals section and its separator, then the
+    // function definitions (each already followed by its own blank
+    // line), then a separator, then the entry points, then a separator
+    // and the string constants.
     cgEmit('')
-    cgEmit('define i32 @main(i32 %argc, ptr %argv_raw) {')
-    cgEmit('entry:')
-    cgEmit('  call void @festina_runtime_init()')
-    cgEmit('  %argv_arr = call ptr @festina_argv_array(i32 %argc, ptr %argv_raw)')
-    cgEmit('  store ptr %argv_arr, ptr @argv')
-    cgEmit('  call void @__festina_main()')
-    cgEmit('  ret i32 0')
-    cgEmit('}')
+    cgEmit('')
+    int ff = 0
+    while ff < CG_FUNCS.length {
+        cgEmit(CG_FUNCS[ff])
+        ff++
+    }
+    cgEmit('')
+    int mm = 0
+    while mm < CG_MAIN.length {
+        cgEmit(CG_MAIN[mm])
+        mm++
+    }
     cgEmit('')
     int c = 0
     while c < CG_STRS.length {
         cgEmit(CG_STRS[c])
         c++
     }
+
+    CG_IR = cgHoistAllocas(CG_IR)
 }

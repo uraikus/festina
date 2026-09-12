@@ -44,15 +44,14 @@ python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 97-file repository corpus:
+Over the 98-file repository corpus:
 
-- **lexer: 97 match, 0 differ.**
-- **parser: 97 match, 0 differ, 0 unported.**
-- **semantic: 97 match, 0 differ, 0 unported.**
-- **codegen: 3 match, 0 differ, 83 unported, 11 rejected by both** —
-  103 of 155,742 file-specific IR lines. See below for why that is the
-  number reported rather than a file count, and why it is expected to
-  stay flat for several more increments.
+- **lexer: 98 match, 0 differ.**
+- **parser: 98 match, 0 differ, 0 unported.**
+- **semantic: 98 match, 0 differ, 0 unported.**
+- **codegen: 6 match, 0 differ, 81 unported, 11 rejected by both** —
+  370 of 166,387 file-specific IR lines. See below for why that is the
+  number reported rather than a file count.
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
 `parser.f`, the largest source in the corpus at ~1,200 lines, takes
@@ -103,7 +102,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 97-file repository corpus is a strong oracle for ordinary code and
+The 98-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -139,7 +138,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Semantic analysis: 97 match, 0 differ, 0 unported
+## Semantic analysis: 98 match, 0 differ, 0 unported
 
 All three stages of the front end agree with their originals over the
 whole corpus. `semantic.f` resolves declarations, merges imports,
@@ -189,7 +188,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 103 of 155,742 file-specific IR lines
+## Codegen: 370 of 166,387 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -256,46 +255,42 @@ times and so could not have varied either way.
 
 ### What is left
 
-`StructDecl` is done: one `%struct.Name = type { ... }` per declaration,
-every field lowered to its LLVM scalar. The trap there is `color`, which
-is the only type outside int/float/bool that does **not** lower to
-`ptr` — a packed RGBA value in an `i64` — so treating "not a scalar
-primitive" as "pointer" silently mislays the layout of every struct
-with a color field.
+The scalar core is in: expressions (literals, variable reads, arithmetic
+and comparison with int/float mixing), `log` of every scalar type,
+assignment, postfix `++`/`--`, `if`/`else`, `while`, `for`, `return`,
+and function declarations with parameters, locals and calls. Two pieces
+of that are subtler than they look and both are covered by
+`cases/control_flow.f`:
 
-**Closing it unlocked nothing**, and that is the useful part. It was
-listed against 22 files; after it landed, coverage stayed at exactly 103
-lines and 3 files. Every one of those 22 simply hit whatever was behind
-it. The blocker table had been a histogram of *first* blockers, which
-reads as a promise it cannot keep, so `cgUnported` now records every
-distinct reason and the table carries two columns:
+- **Alloca hoisting** (claude.md #191) is a post-pass over the finished
+  text, exactly as in the original, because it is a property of the
+  module rather than of any statement.
+- **Terminator tracking**: an `if` arm ending in `return` must not also
+  branch to `if.end`, since LLVM allows one terminator per block.
+
+Neither was covered by anything. Disabling the hoister left all five
+then-matching corpus files still matching — `fib.f`'s only slot is a
+parameter, already at the top of its entry block, and no other matching
+file declared a local at all. `cases/control_flow.f` now catches both
+breaks, verified by making each one.
+
+The blocker table, with the column that predicts unlocks:
 
 |blocks|only|construct|
 |---:|---:|---|
-|42|1|`FuncDecl`|
-|40|2|`WhileStmt`|
-|37|0|`log(Identifier)`|
-|36|1|a declaration of a non-scalar type|
+|48|6|a declaration of a non-scalar type|
+|24|4|a parameter of a non-scalar type|
 |19|0|`EventHandler`|
-|19|0|a non-call expression statement|
 |18|0|`ThreadDecl`|
-|14|1|`ForStmt`|
-|12|0|`log(Call)`|
-|10|0|`BinOp` initializer|
-|10|0|a call through a non-identifier callee|
-|10|0|`TableDecl`|
+|16|0|a call through a non-identifier callee|
+|13|0|assignment to a non-identifier target|
+|10|1|`TableDecl`|
+|8|0|`ImportDecl`|
 
-Only the second column predicts anything. `FuncDecl` appears in 42
-files and is the last thing in the way for **one**.
-
-**How far each file is, measured rather than guessed:** across the 83
-unported files the median is **4 distinct blockers**, the maximum 12,
-and only **5 files are a single construct away** (11 within two). So
-codegen coverage will stay near zero through several more increments and
-then move in steps, rather than climbing steadily the way the lexer's
-did. That is what a real program using most of the language looks like
-from the inside, and it is worth knowing before a run of flat numbers
-gets read as no progress.
+`text`, `arr[T]`, `map[T]` and struct-typed declarations are the whole
+of the top two rows, and between them the last thing in the way for ten
+files — the clear next target, and the point at which reference
+counting enters the port.
 
 The structural obstacles are unchanged:
 
