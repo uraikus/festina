@@ -5975,3 +5975,44 @@ That printed **0**. The map has one entry.
 **Verified.** 2865 passed, 90 skipped.
 
 **A process note, recorded because it cost real work.** This session's container was reclaimed mid-test-run, which discarded everything uncommitted -- this fix, `bootstrap/escape.f`, and its two harness files. The three pushed commits restored from the remote with `git fetch` and `git reset --hard`, and nothing pushed was lost. The lesson is not about the reclaim, which is ordinary: it is that "verify the full suite, then commit" leaves a wide window, and a small, independently-verified change is better committed on its own evidence than held back to ride along with a larger one.
+
+
+299. ESCAPE ANALYSIS PORTED, AND A FIFTH HARNESS FOR IT
+
+`festina/escape_analysis.py` in Festina: `bootstrap/escape.f`, plus `escdump.py`, `escdumpf.f`, `escdiff.py` and `tests/test_bootstrap_escape.py`.
+
+**Result: 84 of 102 corpus files produce an identical record sequence, 0 differ, 7 unported, 11 rejected by both -- 1,477 of 1,530 records, 96.5%.** Unlike the codegen port, this one is nearly finished on its first slice, because the module is 379 lines of purely syntactic walking with no target-machine detail in it at all.
+
+**Why it earns a harness rather than being tested through the IR.** This stage decides, for every container and struct local in a program, whether its storage lives in the frame or behind a heap refcount header. A disagreement therefore surfaces in the IR as a wholly different allocation strategy, many lines from the name that caused it, in a file that also differs for ten other reasons. Diffing the answer itself says which name, in which body. It is also the thing the codegen port is blocked on: `bootstrap/codegen.f` cannot emit a single container local until it agrees here.
+
+**THE ORDER IS PART OF THE ANSWER, and that shaped the whole design.** claude.md #74 stage 2 exempts a call argument only once the callee's own body has been walked, so two implementations that analyse the same bodies in a different order produce the same set of records and disagree about every exemption. Each record carries its own index, and the comparison is sequence equality rather than set equality.
+
+**The oracle instruments the real compiler instead of reimplementing its traversal.** `escdump.py` hooks `CodeGen._emit_param_bindings` and `escape_analysis.find_escaping_names` and records what a genuine `generate_ir` actually asks for. Writing a separate driver would have meant guessing the traversal order -- which is precisely the thing most likely to be wrong, and the thing the harness exists to check. Everything below about ordering was READ OFF that instrumentation, not inferred:
+
+- Every FuncDecl and EventHandler comes first, in source order, and the top-level statement list LAST -- even when functions are declared after the statements that call them.
+- A thread body is not source order. `_emit_thread_decl` emits every private function first, then the four HTTP-shaped handlers in the fixed order request, upgrade, socketMessage, socketClose (before `on load`, whose registration prologue needs their symbols), then load, message, exit.
+- **A pool repeats the whole sequence once per instance.** `thread pool[3]` contributes three copies of every record, because each instance is separately compiled (claude.md #128).
+- An arrow function's body is analysed where its expression is EMITTED, which lands after the enclosing body's own record rather than in source order.
+
+**Three differences that were not escape-analysis differences at all**, and finding that out is most of what this slice bought:
+
+1. **`match` is desugared away by `semantic.analyze()`, in place.** claude.md #252 says the sugar is zero-cost because semantic.py rewrites every MatchStmt into a right-nested `IfStmt`/`TypeofExpr` chain before codegen runs -- so escape analysis never sees a MatchStmt. `bootstrap/semantic.f` is a checker that mutates nothing, so the node survives and the walk skips it, missing every name the arms touch. Reported unported.
+2. **`DatabaseURL = <expr>` is not a statement by the time codegen sees it.** `festina/imports.py` lifts it off the entry file's list onto the Program, so codegen evaluates it in main's prologue before `festina_db_open` -- and the name is therefore absent from the top-level escaping set. Ported: the same AST shape is dropped from the entry statement list.
+3. Thread bodies, above.
+
+**AN AUTO-SIZED POOL WOULD MAKE THIS ORACLE MACHINE-DEPENDENT.** `thread pool[] { }` is `cpu_count()` wide and every body is emitted once per instance, so the record COUNT would differ between machines. No corpus file uses one today; `escdumpf.f` refuses such a file rather than answering, and a pytest case asserts the refusal is currently unreachable -- so if a corpus file ever grows one, the reason the harness starts skipping it is already written down rather than discovered later as a mysterious per-machine difference.
+
+**Four canaries, each confirmed by breaking the port on purpose, with the number of files each one moves:**
+
+|break|files that differ|
+|---|---:|
+|the member-base exemption (`v.field` escapes `v`)|63|
+|the non-retaining builtin list (`log(x)` escapes `x`)|14|
+|stage 2 interprocedural registration|13|
+|a pool emitting one copy instead of N|6|
+
+The first number is reassuring rather than surprising -- that exemption is the entire analysis. The others matter more: each is a rule that could have been quietly omitted with most of the corpus still agreeing.
+
+**A representation note.** Festina has no set type, so an escaping-name set is a `map[int]` with 1 for every member, and `escaping_params`'s `{name: set[int]}` is two flat maps -- `EP_KNOWN` for "this function has been analysed at all" and `EP_POS` keyed `'<func>#<index>'`. The distinction between an ABSENT entry and a PRESENT BUT EMPTY one is load-bearing: absent means "every argument escapes", empty means "none does", and collapsing them would silently weaken or strengthen the analysis everywhere.
+
+**Verified.** 2639 passed, 344 skipped. Lexer 102/102, parser 102/102, semantic 102/102, escape 84 match 0 differ. Codegen unchanged at 13 match, 0 differ. This container cannot run the graphics tests (Xvfb with no window manager) or the leak-stress suite (its ASan link path cannot resolve the graphics runtime symbols); those failures were reproduced identically on the pristine tree.

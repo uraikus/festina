@@ -27,12 +27,17 @@ the Python implementation it mirrors.
 | `irdumpf.f` | entry point: dumps LLVM IR |
 | `irdump.py` | the Python side's IR, which needs no canonical form of its own |
 | `irdiff.py` | diffs both code generators over the same corpus |
+| `escape.f` | `festina/escape_analysis.py`, ported (imports `semantic.f`) |
+| `escdumpf.f` | entry point: dumps the escaping-name sets |
+| `escdump.py` | the Python side's, taken by instrumenting the real compiler |
+| `escdiff.py` | diffs both escape analyses over the same corpus |
 | `cases/*.f` | targeted sources covering what the corpus doesn't reach |
 
 `tests/test_bootstrap_lexer.py`, `test_bootstrap_parser.py`,
-`test_bootstrap_semantic.py` and `test_bootstrap_codegen.py` run the
-same comparisons from pytest, so a divergence fails CI rather than
-waiting to be noticed — on Linux, for the reason below.
+`test_bootstrap_semantic.py`, `test_bootstrap_escape.py` and
+`test_bootstrap_codegen.py` run the same comparisons from pytest, so a
+divergence fails CI rather than waiting to be noticed — on Linux, for
+the reason below.
 
 ## Running it
 
@@ -40,17 +45,20 @@ waiting to be noticed — on Linux, for the reason below.
 python bootstrap/difftest.py                        # lexer, whole corpus
 python bootstrap/astdiff.py                         # parser, whole corpus
 python bootstrap/semdiff.py                         # analyzer, whole corpus
+python bootstrap/escdiff.py                         # escape analysis, whole corpus
 python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 100-file repository corpus:
+Over the 102-file repository corpus:
 
-- **lexer: 100 match, 0 differ.**
-- **parser: 100 match, 0 differ, 0 unported.**
-- **semantic: 100 match, 0 differ, 0 unported.**
-- **codegen: 13 match, 0 differ, 76 unported, 11 rejected by both** —
-  1,554 of 180,340 file-specific IR lines. See below for why that is the
+- **lexer: 102 match, 0 differ.**
+- **parser: 102 match, 0 differ, 0 unported.**
+- **semantic: 102 match, 0 differ, 0 unported.**
+- **escape analysis: 84 match, 0 differ, 7 unported, 11 rejected by
+  both** — 1,477 of 1,530 records.
+- **codegen: 13 match, 0 differ, 78 unported, 11 rejected by both** —
+  1,554 of 226,560 file-specific IR lines. See below for why that is the
   number reported rather than a file count, and for the caveat that
   comes with this particular figure.
 
@@ -103,7 +111,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 100-file repository corpus is a strong oracle for ordinary code and
+The 102-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -116,7 +124,7 @@ line passes whether or not the denylist works at all, because a failed
 regex attempt falls back to division on its own. Two `/` on one line is
 what actually tests it.
 
-All three harnesses carry verified negative controls:
+Every harness carries verified negative controls:
 
 | break this | and this many files differ |
 |---|---|
@@ -127,6 +135,10 @@ All three harnesses carry verified negative controls:
 | postfix `++` | 24 |
 | assignability checking (accept everything) | 2 |
 | the arrow-function counter (never advance it) | 1 |
+| the member-base exemption (`v.field` escapes `v`) | 63 |
+| the non-retaining builtin list (`log(x)` escapes `x`) | 14 |
+| stage-2 interprocedural registration | 13 |
+| a thread pool emitting one copy instead of N | 6 |
 
 That last row is why `cases/arrow_numbering.f` exists. Freezing the
 counter changed nothing across the entire repository corpus, because no
@@ -139,7 +151,57 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Semantic analysis: 100 match, 0 differ, 0 unported
+## Escape analysis: 1,477 of 1,530 records
+
+`escape_analysis.py` answers one purely syntactic question per function
+body — which names appear anywhere other than as the immediate base of
+a field or element access — and codegen turns that answer into a
+stack-versus-heap decision for every container and struct local. The
+codegen port is blocked on it: it cannot emit a single such declaration
+without agreeing here first.
+
+**It gets its own harness rather than being checked through the IR**
+because a disagreement surfaces there as a wholly different allocation
+strategy, many lines from the name that caused it, in a file that
+usually differs for ten other reasons too. Diffing the answer itself
+says which name, in which body.
+
+**The ORDER is part of the answer.** claude.md #74 stage 2 exempts a
+call argument only once the callee's own body has been walked, so two
+implementations analyzing the same bodies in a different order produce
+the same records and disagree about every exemption. Each record
+carries its index, and the comparison is sequence equality.
+
+**The oracle instruments the real compiler** rather than reimplementing
+its traversal — `escdump.py` hooks `_emit_param_bindings` and
+`find_escaping_names` and records what a genuine `generate_ir` asks
+for. Writing a separate driver would have meant guessing the traversal
+order, which is exactly the thing most likely to be wrong. Everything
+below was read off that instrumentation:
+
+- functions and handlers first, in source order; the top-level
+  statement list last, even when functions are declared after the
+  statements calling them;
+- a thread body is **not** source order — private functions, then the
+  four HTTP handlers in the fixed order request/upgrade/socketMessage/
+  socketClose, then load, message, exit;
+- a pool repeats the whole sequence **once per instance** (claude.md
+  #128);
+- an arrow function's body is analyzed where its expression is emitted,
+  which lands after the enclosing body's record.
+
+**An auto-sized pool would make this oracle machine-dependent** —
+`thread pool[] { }` is `cpu_count()` wide and every body is emitted per
+instance, so the record count would differ between machines. No corpus
+file uses one; `escdumpf.f` refuses such a file rather than answering,
+and a pytest case asserts that refusal is currently unreachable.
+
+Not in: arrow functions (6 files), and `match` (1 file) — which
+`semantic.analyze()` desugars away in place before codegen ever runs,
+so escape analysis never sees a MatchStmt, while `bootstrap/semantic.f`
+mutates nothing and leaves the node standing.
+
+## Semantic analysis: 102 match, 0 differ, 0 unported
 
 All three stages of the front end agree with their originals over the
 whole corpus. `semantic.f` resolves declarations, merges imports,
@@ -189,7 +251,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 1,554 of 180,340 file-specific IR lines
+## Codegen: 1,554 of 226,560 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -270,7 +332,7 @@ the implementation. But a number that grows because the input grew says
 nothing about the remaining 178,000 lines, and the two facts are worth
 keeping separate when reading the table below.
 
-**The budget is not fixed, either.** It went 175,080 → 180,340 across
+**The budget is not fixed, either.** It went 175,080 → 226,560 across
 one session with `festina/codegen.py` untouched, because
 `bootstrap/codegen.f` is itself a corpus file: every line added to the
 port enlarges the denominator. Self-hosting is a moving goal by
@@ -280,7 +342,7 @@ construction.
 
 The **bootstrap's own eight files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f` and the four entry points — are **137,331 of
-the 180,340 file-specific IR lines, 76% of the budget**, and they need
+the 226,560 file-specific IR lines**, and they need
 none of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the

@@ -95,6 +95,21 @@ round-by-round design and implementation record predating 0.1 lives in
   `bootstrap/semdiff.py` runs the comparison (decisions.md #281, #282,
   #285, #286).
 
+- **`bootstrap/escape.f`** — `festina/escape_analysis.py` ported to
+  Festina, the fifth module the codegen port turned out to need and one
+  that was not in its original estimate: **84 of 102 corpus files
+  produce an identical record sequence, 0 differ, 7 not yet ported, 11
+  rejected by both** — 1,477 of 1,530 records. It decides whether every
+  container and struct local lives in the frame or behind a heap
+  refcount header, so the codegen port cannot emit one without agreeing
+  here first. The ORDER bodies are analyzed in is part of the answer
+  (claude.md #74 stage 2 exempts a call argument only once the callee
+  has been walked), so `bootstrap/escdump.py` takes its oracle by
+  instrumenting the real compiler rather than reimplementing its
+  traversal. Not in: arrow functions, and `match` — which
+  `semantic.analyze()` desugars away in place before codegen runs
+  (decisions.md #299).
+
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
   the fourth and last stage, **in progress**: **13 of 100 corpus files
   emit byte-identical LLVM IR, 0 differ, 76 not yet ported, 11 rejected

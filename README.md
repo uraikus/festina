@@ -11,7 +11,7 @@ directly into the language, not bolted on as libraries.
 
 Version 0.44 — see [CHANGELOG.md](CHANGELOG.md).
 
-[![Tests](https://img.shields.io/badge/tests-2861%20passing-brightgreen)](tests/CONTRACT.md)
+[![Tests](https://img.shields.io/badge/tests-3070-brightgreen)](tests/CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ```festina
@@ -235,8 +235,8 @@ frame about twice as fast as Chromium's.
 ## Project status
 
 The compiler frontend, LLVM codegen backend, and native C runtime are
-real and tested: **2861 tests, 0 failures** (the rest skip cleanly when
-their platform or optional tooling isn't present — see
+real and tested: **3,070 tests**, of which the ones whose platform
+and optional tooling are present all pass — the rest skip cleanly (see
 [setup.md](setup.md#running-the-test-suite)). Every language construct
 in the [specification](specification.md) is implemented end to end, not just
 parsed. That includes a leak stress suite —
