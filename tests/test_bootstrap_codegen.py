@@ -242,6 +242,75 @@ class TestTheCoverageNumberIsHonest:
             "every text parameter is copied, so nothing here shows a "
             "borrowed one")
 
+    def test_the_array_literal_case_really_has_all_three_mechanisms(self):
+        """`cases/array_literals.f` exists because the corpus could not
+        see three of the four ways an array literal can be got wrong.
+
+        Measured, not assumed: with the port broken on purpose four
+        separate ways -- header allocated before the elements, an empty
+        literal computing a size it has no elements for, a
+        with-initializer local stack-allocated when it must be
+        refcounted, and a retain skipped on an aliasing initializer --
+        only the third showed up anywhere in the corpus. The other
+        three were invisible, because every array literal in every
+        matching file was a non-empty list of constants bound to a name
+        that never aliased anything.
+
+        Each of the three is asserted here rather than assumed, the
+        same way `cases/float_bits.f` (decisions.md #290) had to learn:
+        a case file that drifts away from the shape it was written for
+        keeps passing while measuring nothing.
+        """
+        dump = irdump.dump_file("bootstrap/cases/array_literals.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/array_literals.f no longer compiles, so it measures "
+            "nothing at all: " + dump[0])
+        body = "\n".join(dump)
+        # Mechanism 1: an element that emits instructions of its own,
+        # so "elements first, then the header" is observable at all.
+        assert "@bump(" in body, (
+            "no call inside an array literal, so nothing here pins the "
+            "order of element evaluation against header allocation")
+        # Mechanism 2: an empty literal's malloc(0), with no size
+        # computation in front of it.
+        assert "@malloc(i64 0)" in body, (
+            "no empty array literal, so the one literal shape that "
+            "computes no element size is unmeasured")
+        # Mechanism 3: both allocation strategies for a with-init local.
+        assert ".storage." in body, (
+            "no frame-allocated container local, so the stack half of "
+            "claude.md #81 is unmeasured")
+        assert "@festina_retain(" in body, (
+            "no retaining initializer, so the half of the rule that "
+            "says a non-literal initializer aliases rather than owns "
+            "is unmeasured")
+        assert "@festina_release_array(" in body, (
+            "no refcounted container local, so the heap half of "
+            "claude.md #81 is unmeasured")
+
+    @pytest.mark.parametrize("case", ["indexing.f", "array_literals.f"])
+    def test_the_container_cases_really_run(self, compile_and_run, case):
+        """The two container case files are PROGRAMS, not only sources
+        of IR, and this runs them to prove it.
+
+        The first version of `cases/indexing.f` declared its arrays
+        empty and then wrote through them. Festina does not bounds-check
+        an index, so it segfaulted -- and the differential test was
+        perfectly happy with it, because a file that crashes still
+        produces IR to compare. Nothing in the harness noticed; the
+        program's own exit status did.
+
+        So these two are executed as well as dumped. It is the only
+        check in this file that can tell "the port emits the same IR"
+        apart from "the IR either side emits actually works."
+        """
+        source = os.path.join(difftest.REPO_ROOT, "bootstrap", "cases", case)
+        with open(source, encoding="utf-8") as handle:
+            text = handle.read()
+        result = compile_and_run(text, filename=case)
+        assert result.returncode == 0, (
+            f"cases/{case} exits {result.returncode}: {result.stderr}")
+
     def test_the_line_budget_excludes_the_shared_preamble(self):
         total, specific = irdiff.line_budget()
         assert specific < total, (
@@ -292,6 +361,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 1896, (
+        assert reproduced >= 2713, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 1896")
+            f"the port previously emitted at least 2713")

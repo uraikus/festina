@@ -50,15 +50,15 @@ python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 103-file repository corpus:
+Over the 106-file repository corpus:
 
-- **lexer: 103 match, 0 differ.**
-- **parser: 103 match, 0 differ, 0 unported.**
-- **semantic: 103 match, 0 differ, 0 unported.**
-- **escape analysis: 84 match, 0 differ, 7 unported, 11 rejected by
-  both** — 1,477 of 1,530 records.
-- **codegen: 14 match, 0 differ, 78 unported, 11 rejected by both** —
-  1,829 of 231,677 file-specific IR lines. See below for why that is the
+- **lexer: 106 match, 0 differ.**
+- **parser: 106 match, 0 differ, 0 unported.**
+- **semantic: 106 match, 0 differ, 0 unported.**
+- **escape analysis: 88 match, 0 differ, 7 unported, 11 rejected by
+  both** — 1,551 of 1,604 records.
+- **codegen: 17 match, 0 differ, 78 unported, 11 rejected by both** —
+  2,713 of 238,402 file-specific IR lines. See below for why that is the
   number reported rather than a file count, and for the caveat that
   comes with this particular figure.
 
@@ -155,7 +155,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Escape analysis: 1,477 of 1,530 records
+## Escape analysis: 1,551 of 1,604 records
 
 `escape_analysis.py` answers one purely syntactic question per function
 body — which names appear anywhere other than as the immediate base of
@@ -255,7 +255,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 1,829 of 231,677 file-specific IR lines
+## Codegen: 2,713 of 238,402 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -322,13 +322,21 @@ times and so could not have varied either way.
 
 ### And the caveat that comes with the current figure
 
-**1,041 of the 1,829 lines come from three `cases/` files written for
+**1,701 of the 2,713 lines come from five `cases/` files written for
 the slices that claim them** — `struct_fields.f` (348),
-`text_building.f` (418) and `escape_locals.f` (275). Struct fields and container globals unlocked
-zero pre-existing files: none is one construct away, because every file
-with a struct also has a container local, a non-scalar parameter or an
-event handler behind it. Templates and text concatenation did better,
-bringing in `benchmarks/string_concat.f`.
+`text_building.f` (418), `escape_locals.f` (342), `array_literals.f`
+(341) and `indexing.f` (252). Struct fields and container globals
+unlocked zero pre-existing files: none is one construct away, because
+every file with a struct also has a container local, a non-scalar
+parameter or an event handler behind it. Templates and text
+concatenation did better, bringing in `benchmarks/string_concat.f`.
+
+That proportion is the honest reading of this figure, and it is
+growing rather than shrinking. It is also the reason each of those
+files carries pytest assertions about its own CONTENT: a case file that
+drifts away from the shape it was written for keeps passing while
+measuring nothing, and a number made mostly of case files can only be
+trusted as far as the canaries behind them.
 
 A `cases/` file is a legitimate corpus member — the oracle is still
 `festina/codegen.py`, and each one has canaries confirmed by breaking
@@ -336,7 +344,7 @@ the implementation. But a number that grows because the input grew says
 nothing about the remaining 178,000 lines, and the two facts are worth
 keeping separate when reading the table below.
 
-**The budget is not fixed, either.** It went 175,080 → 231,677 across
+**The budget is not fixed, either.** It went 175,080 → 238,402 across
 one session with `festina/codegen.py` untouched, because
 `bootstrap/codegen.f` is itself a corpus file: every line added to the
 port enlarges the denominator. Self-hosting is a moving goal by
@@ -344,9 +352,9 @@ construction.
 
 ### The target is self-hosting
 
-The **bootstrap's own eight files** — `lexer.f`, `parser.f`,
-`semantic.f`, `codegen.f` and the four entry points — are **137,331 of
-the 231,677 file-specific IR lines**, and they need
+The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
+`semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
+**206,448 of the 238,402 file-specific IR lines**, and they need
 none of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
@@ -366,10 +374,13 @@ definitions; scalar globals and locals; `text` globals **and** locals;
 `arr[T]`/`map[T]`/struct **globals**; struct field reads and writes;
 template literals; `+` and `==`/`!=` on `text`; `text` parameters;
 struct **locals**, stack or heap by claude.md #74's own answer;
-assignment to a refcounted binding; and imports merged before either
-stage runs.
+`arr[T]`/`map[T]` **locals** of a scalar element type, on the same
+decision; `.length` on `text` and `arr[T]`; array indexing, read and
+written; `arr[T]` **literals** in every position with a declared
+element type to take; assignment to a refcounted binding; and imports
+merged before either stage runs.
 
-Eight pieces are subtler than they look:
+Eleven pieces are subtler than they look:
 
 - **Alloca hoisting** (claude.md #191) is a post-pass over the finished
   text, exactly as in the original, because it is a property of the
@@ -417,6 +428,19 @@ Eight pieces are subtler than they look:
   remembered length trusted only while the binding still holds that
   exact pointer. The near misses matter as much — `` `x${s}` `` and
   `s = t + 'x'` must NOT take that path.
+- **An array literal evaluates every element before it allocates its
+  header**, and stack-allocates that header only when it is a local's
+  own initializer written right there (claude.md #81) — never when the
+  initializer aliases some other binding, whose size this declaration
+  cannot see. Both are invisible in a literal made of constants bound
+  to a name that aliases nothing, which is every array literal in the
+  pre-existing corpus; `cases/array_literals.f` exists for them.
+- **`.length` is one spelling over two mechanisms** — a runtime
+  code-point walk on a `text`, a header field on an `arr[T]` — and on a
+  receiver the expression itself allocated it is also the one place
+  `.length` frees. An index is emitted **before** the data pointer, and
+  on a write the whole slot is computed before the value; neither shows
+  in `xs[0] = 1`, which is why `cases/indexing.f` indexes with a call.
 
 **Why ASan is not in this loop.** A missing release in the emitted IR
 would be a leak in every program the compiler produces — but the
@@ -430,21 +454,23 @@ sanitizer for this stage rather than needing it alongside.
 
 |blocks|only|construct|
 |---:|---:|---|
-|50|0|a call through a non-identifier callee (method calls)|
-|30|0|a declaration of a non-scalar type (`blob`, `img`, `regex`, …)|
-|29|0|an `arr[T]` **local**|
-|29|0|computed member access (indexing)|
-|21|2|a parameter of a non-scalar type|
-|21|0|a struct **local**|
-|20|0|a `text` parameter|
+|56|0|a call through a non-identifier callee (method calls)|
+|34|0|a declaration of a non-scalar type (`blob`, `img`, `regex`, …)|
+|24|0|a struct local with a non-scalar field|
+|23|2|a parameter of a non-scalar type|
+|22|0|an `arr[T]` local of a non-scalar element type|
 |19|0|`EventHandler`|
+|18|0|`ThreadDecl`|
+|18|0|an `arr[text]` local|
+|17|0|a `map[T]` literal|
 
 `blocks` counts every file a construct appears in; `only` counts the
 files where it is the last thing in the way, and so the number that
 would actually become matches.
 
-**The `only` column is three files, total** — a struct parameter for
-two of them and `try`/`catch` for the third. Nothing else in this
+**The `only` column is five files, total** — a non-scalar parameter for
+two, `table` declarations for two more, and `try`/`catch` for the
+fifth. Nothing else in this
 corpus is one construct from matching, and the earlier tables that
 implied otherwise were measuring wrong: the walk stopped at the first
 reason inside an expression, so `examples/ascii_scan.f` claimed a
@@ -455,12 +481,13 @@ that was fixed, and indexing did not appear at all before.
 Read the first column for where the volume is and the second for what
 finishing one thing would buy.
 
-**Container and struct locals need a fifth module.** The stack-versus-
-heap choice comes from `festina/escape_analysis.py` — 379 lines, six
-functions, entry `find_escaping_names(block, escaping_params=None)` —
-which the port does not have and which was not counted in the
-14,500-line codegen.py figure above. Globals need none of it, which is
-why they are in and locals are not.
+**Container and struct locals needed a fifth module, and now have
+one.** The stack-versus-heap choice comes from
+`festina/escape_analysis.py` — 379 lines, six functions, entry
+`find_escaping_names(block, escaping_params=None)` — which was not
+counted in the 14,500-line codegen.py figure above. `bootstrap/
+escape.f` ports it and `escdiff.py` checks it name by name, in order;
+locals of a scalar element type followed.
 
 The structural obstacles are unchanged:
 

@@ -130,6 +130,16 @@ open:
   (`at`, `esc`, `known`) and exactly what a code generator's locals
   want to be called, so this will keep coming up.
 
+- **One half of claude.md #81 is unmeasured until non-scalar returns
+  land.** A refcounted container local with an initializer retains its
+  value unless the source already owns a fresh reference, and the only
+  owning source that is not a literal is a call returning a container.
+  The port refuses those, so a case file containing one would be
+  classified unported and would measure nothing else either.
+  `cases/array_literals.f` says so in its own header; the line to add
+  is `arr[int] owned = fresh()`, next to the `alias` declaration that
+  covers the retaining half today (decisions.md #303).
+
 ## Deliberate behavior (documented, not planned work)
 
 - **Array indexing is not bounds-checked** — a performance choice, see

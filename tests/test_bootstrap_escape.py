@@ -112,6 +112,6 @@ class TestBootstrapEscapeMatchesPython:
         """A ratchet, not a target. Raise it as the port grows; never
         lower it to make a run green."""
         reproduced, total = escdiff.records_reproduced(escape_binary)
-        assert reproduced >= 1477, (
+        assert reproduced >= 1551, (
             f"records reproduced fell to {reproduced} of {total}; the "
-            f"port previously reproduced at least 1477")
+            f"port previously reproduced at least 1551")

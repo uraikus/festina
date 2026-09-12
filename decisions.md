@@ -6097,3 +6097,35 @@ That choice has a consequence worth stating rather than discovering: a struct IS
 **Four existing tests asserted the opposite and were rewritten, not deleted** — two map-literal cases, one indexing case, and `troubleshoot()`'s own fields-literal check. The last is the one that would have been missed: `troubleshoot(event, fields:map[text])` validates its literal directly rather than through generic inference, so it has its own copy of the key rule. Each rewrite keeps the same corner and answers it the other way, and each gained a control asserting a type with no text form is still refused.
 
 **Verified.** 2666 passed, 345 skipped, plus valgrind on the new stress program. specification.md §8.8/§8.21/§16.3 and api.md updated first, per claude.md §2's spec-then-tests-then-code order.
+
+
+303. .length, INDEXING, ARRAY LITERALS, AND THE CASE FILE THAT WAS ONLY IR
+
+Three reads that every real program does — `.length`, `xs[i]`, and `[...]` — plus writing through an index. **2,713 of 238,402 file-specific IR lines, up from 1,896; 17 files match, up from 14.** Two of the three new matches are case files written for this slice.
+
+**`.length` is one spelling over two mechanisms.** On a `text` it is a runtime call, a UTF-8 code-point walk, because a `text` carries no length of its own — this is claude.md #253's own reason for `ascii` existing. On an `arr[T]` it is a field of the header the array already has, so it is a GEP and a load. And on a receiver the expression itself allocated (`build().length`) the text form is the one place `.length` is not a pure read: nothing owns that buffer once the length is taken, so it is freed right there.
+
+**An index is emitted before the data pointer**, which only shows when the index has side effects of its own; and on a write, the whole SLOT is computed before the value, because the index belongs to the target and a target's effects precede the value's. Both are the original's order, read off its output rather than reasoned about, and both are invisible in `xs[0] = 1`.
+
+**An `arr[T]` value has to carry its element type.** The header is the same shape whatever T is, so a `Val` holding one cannot recover the element type from the value itself — `ety` travels alongside, through locals, globals, struct fields and the phi that lazily-created field storage produces.
+
+Then array literals, in every position with a declared type to take an element type from: a global's initializer, a local's, and an assignment.
+
+**A case file that segfaults is still a perfectly good source of IR**, and that is how this slice started. `cases/indexing.f` -- written last slice to measure `.length` and `[i]` -- declared its arrays empty and then wrote through them. Festina does not bounds-check an index, so it crashed on the first write. The differential harness noticed nothing at all, because a program that crashes still produces IR to compare, and both implementations produced the same IR for it. Only running the thing found it.
+
+So the two container case files are now executed as well as dumped, and the negative control is recorded: reverting `indexing.f` to its empty declarations makes the new test report `exits -11`. That is the one check in the codegen suite that can tell "both sides emit the same IR" apart from "the IR either side emits actually works."
+
+**Four deliberate breakages, one detected.** Before writing anything new, the four ways this mechanism can go wrong were each patched into the port on purpose and run against the whole corpus:
+
+    header allocated BEFORE the elements       not detected
+    empty literal computing an element size    not detected
+    with-init local stack-allocated always     DETECTED (1 differ)
+    retain skipped on an aliasing initializer  not detected
+
+Three of four invisible. The reason is the same in each case: every array literal in every matching corpus file is a non-empty list of CONSTANTS bound to a name that never aliases anything. Constants emit no instructions, so "elements first" has nothing to order; a non-empty literal never reaches the empty path; a literal initializer never reaches the aliasing one. `cases/array_literals.f` exists for exactly those three, and with it all four canaries fire.
+
+**claude.md #81 is a rule about the INITIALIZER, not about escaping.** A container local keeps its header in the frame when it does not escape AND either has no initializer or is initialized from a literal written right there -- because only then is the element count, and so the buffer size, known at the declaration. Initialized from anything else (another binding, a call result, a field) it is always refcounted, escaping or not, since the size of a value whose history the declaration cannot see is not knowable. Getting this backwards is the one breakage the corpus already caught, and it is the one whose consequence is worst: a stack header handed to `festina_release_array`.
+
+**One half is deliberately absent and said so in the file.** A refcounted with-initializer local retains unless its source already owns a fresh reference, and the only owning non-literal source is a call returning a container. Those do not compile in the port yet, so a case file containing one would be classified unported and would measure none of the other three mechanisms. It goes in the day non-scalar returns land.
+
+**Verified.** Codegen 17 match, 0 differ, 78 unported. Lexer 106/106, parser 106/106, semantic 106/106, escape analysis 88 match with 1,551 of 1,604 records. 2,731 passed, 345 skipped; the 24 graphics failures and 12 leak-stress failures are this container's limits (Xvfb with no window manager; an ASan link path that cannot resolve the graphics runtime's symbols), reproduced identically on the pristine tree. Both new case files are valgrind-clean: zero definitely-lost bytes, zero errors.

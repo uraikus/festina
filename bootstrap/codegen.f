@@ -749,6 +749,11 @@ struct Val {
     lty:text
     fty:text
     sname:text
+    // An `arr[T]` value's own element field-type. Needed the moment
+    // indexing exists: the header is the same shape whatever T is, so
+    // the element type is not recoverable from the value itself and has
+    // to travel with it.
+    ety:text
 }
 
 Val func cgVal(v:text, lty:text, fty:text) {
@@ -761,6 +766,15 @@ Val func cgVal(v:text, lty:text, fty:text) {
 
 // A struct-typed value has to carry WHICH struct, or a field access
 // through it has no layout to GEP against.
+Val func cgArrVal(v:text, ety:text) {
+    Val r
+    r.v = v
+    r.lty = 'ptr'
+    r.fty = 'arr'
+    r.ety = ety
+    return r
+}
+
 Val func cgStructVal(v:text, sname:text) {
     Val r
     r.v = v
@@ -858,6 +872,7 @@ map[int] SF_IDX = {}
 map[text] SF_LTY = {}
 map[text] SF_FTY = {}
 map[text] SF_SNAME = {}
+map[text] SF_ETY = {}
 
 // Structs every one of whose fields is a scalar. Only those can have a
 // LOCAL yet: a struct with a struct/arr/map/text field is released
@@ -880,7 +895,15 @@ text func cgSlotOf(name:text) {
 }
 
 map[text] G_SNAME = {}
+map[text] G_ETY = {}
 map[text] L_SNAME = {}
+map[text] L_ETY = {}
+
+text func cgEtyOf(name:text) {
+    if L_ETY[name] != null { return L_ETY[name] }
+    if G_ETY[name] != null { return G_ETY[name] }
+    return ''
+}
 
 text func cgSnameOf(name:text) {
     if L_SNAME[name] != null { return L_SNAME[name] }
@@ -1163,6 +1186,7 @@ Val func cgExpr(e:Node) {
         text t = cgTmp()
         cgOut(`  ${t} = load ${lty}, ptr ${slot}`)
         if fty == 'struct' { return cgStructVal(t, cgSnameOf(name)) }
+        if fty == 'arr' { return cgArrVal(t, cgEtyOf(name)) }
         return cgVal(t, lty, fty)
     }
 
@@ -1170,7 +1194,7 @@ Val func cgExpr(e:Node) {
     if e.kind == 'LogicalOp' { return cgLogical(e) }
     if e.kind == 'UnaryOp' { return cgUnary(e) }
     if e.kind == 'Ternary' { return cgTernary(e) }
-    if e.kind == 'Member' { return cgMemberRead(e) }
+    if e.kind == 'Member' { return cgMemberAccess(e) }
     if e.kind == 'Call' { return cgCall(e, true) }
     if e.kind == 'TemplateLit' { return cgTemplate(e) }
 
@@ -1387,6 +1411,7 @@ Val func cgFieldPtr(e:Node) {
     cgOut(`  ${fp} = getelementptr %struct.${obj.sname}, ptr ${obj.v}, i32 0, i32 ${SF_IDX[key]}`)
     Val r = cgVal(fp, SF_LTY[key], SF_FTY[key])
     if SF_FTY[key] == 'struct' { r.sname = SF_SNAME[key] }
+    if SF_FTY[key] == 'arr' && SF_ETY[key] != null { r.ety = SF_ETY[key] }
     return r
 }
 
@@ -1444,7 +1469,101 @@ Val func cgLoadFieldValue(fp:Val) {
     text out = cgTmp()
     cgOut(`  ${out} = phi ptr [ ${loaded}, %${loadPred} ], [ ${made}, %${makePred} ]`)
     if fp.fty == 'struct' { return cgStructVal(out, fp.sname) }
+    if fp.fty == 'arr' { return cgArrVal(out, fp.ety) }
     return cgVal(out, 'ptr', fp.fty)
+}
+
+// `[a, b, c]` -- a fresh header, then a malloc'd data buffer.
+//
+// **Every element is evaluated BEFORE the header is allocated**, not
+// interleaved with the stores. Read off the original's output rather
+// than assumed, and it is the kind of ordering that changes every temp
+// number downstream without changing what the program does.
+//
+// An empty literal is its own shape: length 0 and a bare `malloc(0)`,
+// with no element-size computation at all -- there is nothing to
+// multiply.
+//
+// Scalar element types only. A refcounted or text element needs its own
+// retain-or-copy per slot, which is a different piece of work.
+//
+// `header` is claude.md #81: a non-escaping local declared directly
+// from a literal knows its own element count right here, so its buffer
+// size is known too and the header can be built straight into the
+// frame slot the declaration already allocated. '' means "allocate a
+// fresh heap one", which is every other position a literal can appear
+// in.
+Val func cgArrayLit(e:Node, ety:text, header:text) {
+    Val none
+    if ety == '' || cgLtyOf(ety) == '' {
+        cgUnported('array literal of a non-scalar type')
+        return none
+    }
+    text elemLty = cgLtyOf(ety)
+    arr[Node] elems = listOf(e, 'elements')
+
+    arr[text] vals = []
+    int i = 0
+    while i < elems.length {
+        Val v = cgExpr(elems[i])
+        if CG_STUCK { return none }
+        if v.fty != ety {
+            cgUnported(`array literal element of type ${v.fty} in an array of ${ety}`)
+            return none
+        }
+        vals.push(v.v)
+        i++
+    }
+
+    text into = header
+    if into == '' { into = cgFreshHeader('%struct._FestinaArray') }
+    text lenP = cgTmp()
+    cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${into}, i32 0, i32 0`)
+    cgOut(`  store i64 ${elems.length}, ptr ${lenP}`)
+
+    text total = '0'
+    if elems.length > 0 {
+        text sz = cgTmp()
+        cgOut(`  ${sz} = getelementptr ${elemLty}, ptr null, i64 1`)
+        text szi = cgTmp()
+        cgOut(`  ${szi} = ptrtoint ptr ${sz} to i64`)
+        text mul = cgTmp()
+        cgOut(`  ${mul} = mul i64 ${szi}, ${elems.length}`)
+        total = mul
+    }
+    text data = cgTmp()
+    cgOut(`  ${data} = call ptr @malloc(i64 ${total})`)
+
+    int k = 0
+    while k < vals.length {
+        text slot = cgTmp()
+        cgOut(`  ${slot} = getelementptr ${elemLty}, ptr ${data}, i64 ${k}`)
+        cgOut(`  store ${elemLty} ${vals[k]}, ptr ${slot}`)
+        k++
+    }
+
+    text dataP = cgTmp()
+    cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr ${into}, i32 0, i32 1`)
+    cgOut(`  store ptr ${data}, ptr ${dataP}`)
+    return cgArrVal(into, ety)
+}
+
+// An expression in a position whose type is already known, which is
+// what festina/codegen.py's own _emit_value_for is for. Only an array
+// literal actually needs it -- `[]` and `[1, 2]` carry no element type
+// of their own, so a bare cgExpr could not know what to emit -- but
+// routing every typed position through one function is what keeps the
+// two from drifting.
+Val func cgExprExpecting(e:Node, fty:text, ety:text) {
+    if e.kind == 'ArrayLit' {
+        if fty != 'arr' {
+            Val none
+            cgUnported(`array literal in a ${fty} position`)
+            return none
+        }
+        return cgArrayLit(e, ety, '')
+    }
+    return cgExpr(e)
 }
 
 Val func cgMemberRead(e:Node) {
@@ -1456,6 +1575,80 @@ Val func cgMemberRead(e:Node) {
         return none
     }
     return cgLoadFieldValue(fp)
+}
+
+// `.length` on a `text` or an `arr[T]`. Two different mechanisms behind
+// one spelling: a text length is a runtime call (a UTF-8 code-point
+// walk -- claude.md #253's own reason for `ascii` existing), while an
+// array's is a field of the header it already has.
+Val func cgLengthOf(e:Node, obj:Val) {
+    Val none
+    if obj.fty == 'text' {
+        text out = cgTmp()
+        cgOut(`  ${out} = call i64 @festina_text_length(ptr ${obj.v})`)
+        // A receiver this expression allocated -- `f().length` -- has
+        // no owner left once the length is taken.
+        cgFreeTextTemp(childOf(e, 'obj'), obj)
+        return cgVal(out, 'i64', 'int')
+    }
+    if obj.fty == 'arr' {
+        text lenP = cgTmp()
+        cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 0`)
+        text out = cgTmp()
+        cgOut(`  ${out} = load i64, ptr ${lenP}`)
+        return cgVal(out, 'i64', 'int')
+    }
+    cgUnported(`.length on ${obj.fty}`)
+    return none
+}
+
+// `xs[i]` on an array: the object, then the INDEX, then the data
+// pointer. That order is the original's and it is observable -- an
+// index expression with side effects of its own runs before the data
+// pointer is loaded, not after.
+Val func cgIndexRead(e:Node, obj:Val) {
+    Val none
+    if obj.fty != 'arr' {
+        cgUnported(`indexing a ${obj.fty}`)
+        return none
+    }
+    if obj.ety == '' {
+        cgUnported('indexing an array of a non-scalar type')
+        return none
+    }
+    Val idx = cgExpr(childOf(e, 'prop'))
+    if CG_STUCK { return none }
+    if idx.fty != 'int' {
+        cgUnported(`array index of type ${idx.fty}`)
+        return none
+    }
+    text elemLty = cgLtyOf(obj.ety)
+    text dataP = cgTmp()
+    cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 1`)
+    text dataV = cgTmp()
+    cgOut(`  ${dataV} = load ptr, ptr ${dataP}`)
+    text slot = cgTmp()
+    cgOut(`  ${slot} = getelementptr ${elemLty}, ptr ${dataV}, i64 ${idx.v}`)
+    text out = cgTmp()
+    cgOut(`  ${out} = load ${elemLty}, ptr ${slot}`)
+    return cgVal(out, elemLty, obj.ety)
+}
+
+// Every member access, computed or not, dispatched on the receiver's
+// own type once it has been emitted exactly once.
+Val func cgMemberAccess(e:Node) {
+    Val none
+    bool computed = fieldOf(e, 'computed').raw == 'true'
+    if computed == false {
+        // A struct field still goes the long way round, because
+        // cgFieldPtr is shared with the assignment path and emits the
+        // object itself.
+        if rawText(e, 'prop') != 'length' { return cgMemberRead(e) }
+    }
+    Val obj = cgExpr(childOf(e, 'obj'))
+    if CG_STUCK { return none }
+    if computed { return cgIndexRead(e, obj) }
+    return cgLengthOf(e, obj)
 }
 
 // Numbers and bools only. A text ternary owns its value inside each
@@ -1842,13 +2035,23 @@ void func cgStmt(s:Node) {
             }
             // A managed GLOBAL with no initializer is already fully
             // described by its header in the globals section, so there
-            // is nothing for main to do.
+            // is nothing for main to do. With one, the declaration is
+            // an ASSIGNMENT into that header: the empty one the globals
+            // section already built is released and the initializer's
+            // value stored over it, exactly as a later `ns = [...]`
+            // would do.
             text gname = rawText(s, 'name')
             if G_SLOT[gname] != null {
-                if childOf(s, 'init') != null {
-                    cgUnported(`${managed} initializer`)
+                Node ginit = childOf(s, 'init')
+                if ginit == null { return }
+                Val gv = cgExprExpecting(ginit, managed, cgEtyOf(gname))
+                if CG_STUCK { return }
+                if gv.fty != managed {
+                    cgUnported(`initializer of type ${gv.fty} for ${managed}`)
                     return
                 }
+                cgStoreRefcounted(G_SLOT[gname], managed,
+                                  gv.v, cgIsOwningRefcountedSource(ginit))
                 return
             }
             if managed == 'struct' {
@@ -1856,7 +2059,9 @@ void func cgStmt(s:Node) {
                     cgUnported('struct local with a non-scalar field')
                     return
                 }
-            } else {
+            }
+            text declEty = ''
+            if managed != 'struct' {
                 // An `arr[T]`/`map[T]` whose T is itself refcounted
                 // releases every element through a generated per-element
                 // cascade wrapper rather than the plain release. That is
@@ -1871,11 +2076,9 @@ void func cgStmt(s:Node) {
                     cgUnported(`${managed} local of ${et.name}`)
                     return
                 }
+                declEty = et.name
             }
-            if childOf(s, 'init') != null {
-                cgUnported(`${managed} initializer`)
-                return
-            }
+            Node linit = childOf(s, 'init')
 
             // claude.md #74: THE decision escape analysis exists for.
             // A struct local no one can reach any other way lives in
@@ -1888,11 +2091,51 @@ void func cgStmt(s:Node) {
             // zeroinitializer: alloca does not zero and calloc does,
             // and "an unassigned field reads as its zero" is a language
             // rule, not an allocation detail.
+            //
+            // claude.md #81 narrows that for a container declared WITH
+            // an initializer: frame storage only when the initializer
+            // is a literal written right here, because only then is the
+            // element count -- and so the buffer size -- known at the
+            // declaration. Any other initializer (another binding, a
+            // call result) aliases a value whose history this cannot
+            // see, so it is always refcounted, escaping or not. The uid
+            // is taken first either way, which is what keeps the
+            // numbering identical across the three shapes.
             text payload = cgPayloadFor(dt)
             int uid = cgUid()
             text slot = `%${gname}.${uid}`
-            if cgEscapes(gname) == false {
-                text backing = `%${gname}.storage.${uid}`
+            text backing = `%${gname}.storage.${uid}`
+            bool stackable = cgEscapes(gname) == false
+            if linit != null {
+                if managed != 'arr' { stackable = false }
+                if linit.kind != 'ArrayLit' { stackable = false }
+            }
+            if linit != null && stackable {
+                // The header is built straight into the frame slot:
+                // zeroed first (an empty literal never writes a data
+                // pointer of its own), then filled by the literal, and
+                // only then published to the binding's own slot.
+                cgOut(`  ${backing} = alloca ${payload}`)
+                cgOut(`  store ${payload} zeroinitializer, ptr ${backing}`)
+                cgArrayLit(linit, declEty, backing)
+                if CG_STUCK { return }
+                cgOut(`  ${slot} = alloca ptr`)
+                cgOut(`  store ptr ${backing}, ptr ${slot}`)
+                cgTrackLive('arr.stack', slot)
+            } else if linit != null {
+                Val lv = cgExprExpecting(linit, managed, declEty)
+                if CG_STUCK { return }
+                if lv.fty != managed {
+                    cgUnported(`initializer of type ${lv.fty} for ${managed}`)
+                    return
+                }
+                if cgIsOwningRefcountedSource(linit) == false {
+                    cgOut(`  call void @festina_retain(ptr ${lv.v})`)
+                }
+                cgOut(`  ${slot} = alloca ptr`)
+                cgOut(`  store ptr ${lv.v}, ptr ${slot}`)
+                cgTrackLive(managed, slot)
+            } else if stackable {
                 cgOut(`  ${backing} = alloca ${payload}`)
                 cgOut(`  store ${payload} zeroinitializer, ptr ${backing}`)
                 cgOut(`  ${slot} = alloca ptr`)
@@ -1911,6 +2154,9 @@ void func cgStmt(s:Node) {
             L_SLOT[gname] = slot
             L_FTY[gname] = managed
             if managed == 'struct' { L_SNAME[gname] = dt.name }
+            if managed == 'arr' && dt.elem != null {
+                if dt.elem.kind == 'prim' { L_ETY[gname] = dt.elem.name }
+            }
             return
         }
         text name = rawText(s, 'name')
@@ -2379,9 +2625,50 @@ void func cgEmitAppendAssign(slot:text, pieces:arr[Node]) {
     cgOut(`  store ptr ${cur}, ptr ${ptrSlot}`)
 }
 
+// `xs[i] = v`: the slot, then the value, then the store. The slot is
+// computed first because the index and the data pointer are part of the
+// TARGET, and an index expression's own side effects run before the
+// value's -- the same left-to-right rule every other assignment follows.
+void func cgIndexAssign(e:Node, target:Node) {
+    Val obj = cgExpr(childOf(target, 'obj'))
+    if CG_STUCK { return }
+    if obj.fty != 'arr' {
+        cgUnported(`assignment through an index on ${obj.fty}`)
+        return
+    }
+    if obj.ety == '' {
+        cgUnported('assignment into an array of a non-scalar type')
+        return
+    }
+    Val idx = cgExpr(childOf(target, 'prop'))
+    if CG_STUCK { return }
+    if idx.fty != 'int' {
+        cgUnported(`array index of type ${idx.fty}`)
+        return
+    }
+    text elemLty = cgLtyOf(obj.ety)
+    text dataP = cgTmp()
+    cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 1`)
+    text dataV = cgTmp()
+    cgOut(`  ${dataV} = load ptr, ptr ${dataP}`)
+    text slot = cgTmp()
+    cgOut(`  ${slot} = getelementptr ${elemLty}, ptr ${dataV}, i64 ${idx.v}`)
+    Val v = cgExpr(childOf(e, 'value'))
+    if CG_STUCK { return }
+    if v.fty != obj.ety {
+        cgUnported(`assigning ${v.fty} into an array of ${obj.ety}`)
+        return
+    }
+    cgOut(`  store ${elemLty} ${v.v}, ptr ${slot}`)
+}
+
 void func cgAssign(e:Node) {
     Node target = childOf(e, 'target')
     if target != null && target.kind == 'Member' {
+        if fieldOf(target, 'computed').raw == 'true' {
+            cgIndexAssign(e, target)
+            return
+        }
         // The object and its GEP come first, then the value -- the
         // order festina/codegen.py's own _emit_assign uses, because it
         // resolves the target's type before emitting the value so an
@@ -2422,32 +2709,35 @@ void func cgAssign(e:Node) {
         }
     }
 
-    Val v = cgExpr(value)
+    Val v = cgExprExpecting(value, fty, cgEtyOf(name))
     if CG_STUCK { return }
     if fty == 'text' {
         cgStoreText(slot, `${slot}.ap`, v, cgIsOwningTextSource(value))
         return
     }
     if fty == 'struct' || fty == 'arr' || fty == 'map' {
-        // claude.md #79/#80: a refcounted binding hands its old
-        // reference back and takes one on the new value. Retain BEFORE
-        // release, because the two can be the same object -- `g = g`
-        // releasing first would drop the last reference to the value it
-        // is about to store.
-        //
-        // A call result already owns a fresh +1 that nothing else
-        // references, so it is stored directly; anything else (another
-        // binding, a field read) is shared and needs its own count.
-        text old = cgTmp()
-        cgOut(`  ${old} = load ptr, ptr ${slot}`)
-        if cgIsOwningRefcountedSource(value) == false {
-            cgOut(`  call void @festina_retain(ptr ${v.v})`)
-        }
-        cgOut(`  call void ${cgReleaseFn(fty)}(ptr ${old})`)
-        cgOut(`  store ptr ${v.v}, ptr ${slot}`)
+        cgStoreRefcounted(slot, fty, v.v, cgIsOwningRefcountedSource(value))
         return
     }
     cgOut(`  store ${cgLtyOf(fty)} ${v.v}, ptr ${slot}`)
+}
+
+// claude.md #79/#80: a refcounted binding hands its old reference back
+// and takes one on the new value. Retain BEFORE release, because the
+// two can be the same object -- `g = g` releasing first would drop the
+// last reference to the value it is about to store.
+//
+// An owning source already holds a fresh +1 that nothing else
+// references, so it is stored directly; anything else (another
+// binding, a field read) is shared and needs its own count.
+void func cgStoreRefcounted(slot:text, fty:text, v:text, owning:bool) {
+    text old = cgTmp()
+    cgOut(`  ${old} = load ptr, ptr ${slot}`)
+    if owning == false {
+        cgOut(`  call void @festina_retain(ptr ${v})`)
+    }
+    cgOut(`  call void ${cgReleaseFn(fty)}(ptr ${old})`)
+    cgOut(`  store ptr ${v}, ptr ${slot}`)
 }
 
 // Whether an expression already hands back a buffer nothing else
@@ -2471,6 +2761,7 @@ text func cgReleaseFn(fty:text) {
 
 bool func cgIsOwningRefcountedSource(e:Node) {
     if e == null { return false }
+    if e.kind == 'ArrayLit' { return true }
     return e.kind == 'Call'
 }
 
@@ -2746,6 +3037,9 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 if ffty == '' { ffty = cgManagedFty(ft) }
                 SF_FTY[key] = ffty
                 if ffty == 'struct' { SF_SNAME[key] = ft.name }
+                if ffty == 'arr' && ft.elem != null {
+                    if ft.elem.kind == 'prim' { SF_ETY[key] = ft.elem.name }
+                }
                 fi++
             }
             bool plain = true
@@ -2802,6 +3096,9 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                     G_SLOT[gn] = `@${gn}`
                     G_FTY[gn] = cgManagedFty(gt)
                     if gt.kind == 'struct' { G_SNAME[gn] = gt.name }
+                    if gt.kind == 'arr' && gt.elem != null {
+                        if gt.elem.kind == 'prim' { G_ETY[gn] = gt.elem.name }
+                    }
                 }
             }
         }
