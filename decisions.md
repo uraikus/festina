@@ -5787,3 +5787,24 @@ That is three times a `cases/` file has found something the repository corpus co
 **What is next is now unambiguous.** `declaration of a non-scalar type` blocks 48 files and is the last thing in the way for 6; `parameter of a non-scalar type` blocks 24 and is sole blocker for 4. Between them that is ten files, and they are `text`/`arr[T]`/`map[T]`/struct -- the point at which reference counting enters the port.
 
 **Verified.** 2846 passed, 95 skipped. Lexer 98/98, parser 98/98, semantic 98/98. Codegen 6 match, 0 differ, 81 unported, 11 rejected by both.
+
+
+293. `text` GLOBALS, AND A GUARD THAT WAS BOTH NECESSARY AND TOO STRICT
+
+The fifth codegen slice. `declaration of a non-scalar type` blocked 48 files and was the sole blocker for 6, so this starts on it -- and starts rather than finishes, deliberately.
+
+**Measured first.** Of the six files one construct away, the types actually needed were `text` (three files), `arr[T]`, `regex` and `ascii`. `text` is both the most common and the one with the most distinctive ownership rule, so it went first: `cases/strings_and_escapes.f` is pure text globals and was the cleanest possible target.
+
+**A text global is three globals**, not one -- `@n`, `@n.ap` and `@n.aplen`, the latter two being claude.md #243's in-place append shadow. And a text store is five instructions, not one: load the old buffer, copy the new one through `festina_text_own`, free the old, null the append shadow, store the new. claude.md #83's copy-on-alias rule made visible. Load-then-own-then-free rather than free-then-own, because the new value may be derived from the old.
+
+**THE GUARD, which was necessary.** Before this slice, `s + 'x'` on two `text` operands would have emitted `add i64` over two POINTERS. Valid LLVM, catastrophically wrong, and -- worse -- a silent *difference* rather than an honest "not ported yet". `text` has its own branch in festina/codegen.py (`festina_str_eq`, `festina_str_concat`), so refusing it here is correct rather than merely cautious. Arithmetic and ordered comparison now accept int/float only.
+
+**And which was too strict.** The first version required int/float on *both* sides of every operator, which broke `done == true` -- an ordinary bool equality that the original compiles to `icmp eq i8`. Caught immediately by `cases/control_flow.f`, which had been matching. Equality now admits bool as well. A conservative guard still has to be right about what it refuses: "refuse what you do not understand" is only safe if the set you claim to understand is accurate.
+
+**A second wrong distinction, also caught by control_flow.f.** Locality was first keyed on "am I inside a function" -- which is wrong, because a `for` loop's own variable at the TOP level is a local in `__festina_main` while a top-level `int n = 5` is a global. What separates them is whether cgProgram registered the name as a global, which it does only for declarations directly in the program body. Two regressions in one slice, both found by one case file written in the previous slice, which is the argument for writing them early rather than at the end.
+
+**Result: 454 of 167,209 file-specific IR lines, up from 370.** Seven files match.
+
+**Where this stops, and why that line is real.** `text` LOCALS are not in: a text local needs three allocas, the append shadow initialized, and a free at every scope exit. `arr[T]`/`map[T]`/struct declarations need a refcount header allocated and released. That is the point where automatic reclamation enters the port and the leak suite starts having an opinion, and it deserves its own slice rather than being tacked onto this one.
+
+**Verified.** 2847 passed, 94 skipped. Lexer 98/98, parser 98/98, semantic 98/98. Codegen 7 match, 0 differ, 80 unported, 11 rejected by both. Canary confirmed: dropping the `festina_text_own` copy turns `strings_and_escapes.f` from a match into a difference at the exact line.

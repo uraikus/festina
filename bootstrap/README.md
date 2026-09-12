@@ -49,8 +49,8 @@ Over the 98-file repository corpus:
 - **lexer: 98 match, 0 differ.**
 - **parser: 98 match, 0 differ, 0 unported.**
 - **semantic: 98 match, 0 differ, 0 unported.**
-- **codegen: 6 match, 0 differ, 81 unported, 11 rejected by both** —
-  370 of 166,387 file-specific IR lines. See below for why that is the
+- **codegen: 7 match, 0 differ, 80 unported, 11 rejected by both** —
+  454 of 167,209 file-specific IR lines. See below for why that is the
   number reported rather than a file count.
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
@@ -188,7 +188,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 370 of 166,387 file-specific IR lines
+## Codegen: 454 of 167,209 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -255,42 +255,55 @@ times and so could not have varied either way.
 
 ### What is left
 
-The scalar core is in: expressions (literals, variable reads, arithmetic
-and comparison with int/float mixing), `log` of every scalar type,
-assignment, postfix `++`/`--`, `if`/`else`, `while`, `for`, `return`,
-and function declarations with parameters, locals and calls. Two pieces
-of that are subtler than they look and both are covered by
-`cases/control_flow.f`:
+The scalar core is in: expressions (literals, variable reads,
+arithmetic and comparison with int/float mixing), `log` of every scalar
+type, assignment, postfix `++`/`--`, `if`/`else`, `while`, `for`,
+`return`, function declarations with parameters, locals and calls, and
+`text` **globals**. Three pieces are subtler than they look:
 
 - **Alloca hoisting** (claude.md #191) is a post-pass over the finished
   text, exactly as in the original, because it is a property of the
   module rather than of any statement.
 - **Terminator tracking**: an `if` arm ending in `return` must not also
   branch to `if.end`, since LLVM allows one terminator per block.
+- **A `text` store owns and frees.** claude.md #83: text is copied on
+  alias and freed outright rather than refcounted, so every store
+  reads the old buffer, copies the new one through
+  `festina_text_own`, frees the old, and nulls the claude.md #243
+  append shadow. A text global is three globals, not one.
 
-Neither was covered by anything. Disabling the hoister left all five
-then-matching corpus files still matching — `fib.f`'s only slot is a
-parameter, already at the top of its entry block, and no other matching
-file declared a local at all. `cases/control_flow.f` now catches both
-breaks, verified by making each one.
+The first two were covered by nothing until `cases/control_flow.f`;
+disabling the hoister left all five then-matching corpus files still
+matching. The third is covered by `cases/strings_and_escapes.f`, which
+the corpus already had.
+
+**What is NOT in yet, and it is the line where the port gets harder:**
+`text` locals, and `arr[T]`/`map[T]`/struct declarations of any kind. A
+text local needs three allocas, the append shadow initialized, and a
+free at every scope exit; the container types need a refcount header
+allocated and released. That is where automatic reclamation enters the
+port, and where the leak suite starts having an opinion.
+
+Operator coverage is deliberately narrow and guarded: arithmetic and
+ordered comparison accept `int`/`float`, equality also accepts `bool`,
+and everything else reports unported. Without that guard `s + 'x'` on
+two `text` operands emitted `add i64` over two pointers — valid LLVM,
+catastrophically wrong, and a silent difference rather than an honest
+gap.
 
 The blocker table, with the column that predicts unlocks:
 
 |blocks|only|construct|
 |---:|---:|---|
-|48|6|a declaration of a non-scalar type|
-|24|4|a parameter of a non-scalar type|
+|48|5|a declaration of a non-scalar type|
 |19|0|`EventHandler`|
 |18|0|`ThreadDecl`|
-|16|0|a call through a non-identifier callee|
-|13|0|assignment to a non-identifier target|
+|18|0|a call through a non-identifier callee|
+|18|0|assignment to a non-identifier target|
+|16|1|a parameter of a non-scalar type|
+|10|0|a `text` local|
 |10|1|`TableDecl`|
-|8|0|`ImportDecl`|
-
-`text`, `arr[T]`, `map[T]` and struct-typed declarations are the whole
-of the top two rows, and between them the last thing in the way for ten
-files — the clear next target, and the point at which reference
-counting enters the port.
+|9|1|`TemplateLit`|
 
 The structural obstacles are unchanged:
 

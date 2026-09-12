@@ -638,6 +638,7 @@ text func cgFieldType(t:Ty) {
 
 text func cgZeroFor(ty:text) {
     if ty == 'double' { return '0.0' }
+    if ty == 'ptr' { return 'null' }
     return '0'
 }
 
@@ -774,6 +775,11 @@ text func cgFtyOf(name:text) {
 // terminator per basic block, and festina/codegen.py tracks the same
 // thing as ctx["terminated"].
 bool CG_TERM = false
+
+// Whether statements are being emitted into a function body rather
+// than into __festina_main's top level. A declaration's storage and
+// its lifetime both depend on this.
+bool CG_IN_FUNC = false
 
 arr[text] CG_FUNCS = []
 arr[text] CG_MAIN = []
@@ -989,6 +995,33 @@ Val func cgBinOp(e:Node) {
     }
     bool useFloat = l.fty == 'float'
 
+    // What each operator class actually accepts. Without this guard
+    // `s + 'x'` on two `text` operands emitted `add i64` over two
+    // POINTERS -- valid LLVM, catastrophically wrong, and a silent
+    // difference rather than an honest "not ported yet". `text` has its
+    // own branch in festina/codegen.py (festina_str_eq and
+    // festina_str_concat), so refusing it here is correct rather than
+    // merely cautious.
+    //
+    // Equality admits bool as well as the numbers, which is what makes
+    // `done == true` work -- the first version of this guard required
+    // int/float on both sides and broke exactly that.
+    bool isEquality = op == '==' || op == '!='
+    bool lOk = l.fty == 'int' || l.fty == 'float'
+    bool rOk = r.fty == 'int' || r.fty == 'float'
+    if isEquality {
+        if l.fty == 'bool' { lOk = true }
+        if r.fty == 'bool' { rOk = true }
+    }
+    if lOk == false {
+        cgUnported(`operator ${op} on ${l.fty}`)
+        return none
+    }
+    if rOk == false {
+        cgUnported(`operator ${op} on ${r.fty}`)
+        return none
+    }
+
     if op == '/' || op == '%' {
         cgUnported(`operator ${op}`)
         return none
@@ -1140,15 +1173,31 @@ void func cgStmt(s:Node) {
         }
         text name = rawText(s, 'name')
         text lty = cgLtyOf(fty)
-        // A local declaration allocates its own slot; a global's
-        // storage was emitted with the module's globals.
-        if cgSlotOf(name) == '' || cgIsLocal(name) == false {
-            if CUR.length > 0 && G_SLOT[name] == null {
-                text slot = `%${name}.${cgUid()}`
-                cgOut(`  ${slot} = alloca ${lty}`)
-                L_SLOT[name] = slot
-                L_FTY[name] = fty
+
+        // Local or global? Not "inside a function": a `for` loop's
+        // own variable at the TOP level is a local in
+        // __festina_main, while a top-level `int n = 5` is a global.
+        // What separates them is whether cgProgram registered the
+        // name as a global, which it does only for declarations
+        // directly in the program body. Inside a function every
+        // declaration is local, even one shadowing a global name.
+        bool isLocalDecl = CG_IN_FUNC
+        if G_SLOT[name] == null { isLocalDecl = true }
+
+        if isLocalDecl {
+            // A `text` local needs three allocas, the append-shadow
+            // initialized, and a free at every scope exit -- real
+            // ownership machinery, not yet ported. A `text` GLOBAL
+            // needs none of it: text globals are deliberately never
+            // freed (todo.md).
+            if fty == 'text' {
+                cgUnported('text local')
+                return
             }
+            text slot = `%${name}.${cgUid()}`
+            cgOut(`  ${slot} = alloca ${lty}`)
+            L_SLOT[name] = slot
+            L_FTY[name] = fty
         }
         Node init = childOf(s, 'init')
         if init == null { return }
@@ -1156,6 +1205,11 @@ void func cgStmt(s:Node) {
         if CG_UNPORTED { return }
         if v.fty != fty && cgNumericPair(v.fty, fty) == false {
             cgUnported(`initializer of type ${v.fty} for ${fty}`)
+            return
+        }
+        if fty == 'text' {
+            cgStoreText(cgSlotOf(name), `${cgSlotOf(name)}.ap`, v,
+                        cgIsOwningTextSource(init))
             return
         }
         cgOut(`  store ${lty} ${v.v}, ptr ${cgSlotOf(name)}`)
@@ -1289,7 +1343,31 @@ text func cgDeclFty(d:Node) {
     if t.name == 'int' { return 'int' }
     if t.name == 'float' { return 'float' }
     if t.name == 'bool' { return 'bool' }
+    if t.name == 'text' { return 'text' }
     return ''
+}
+
+// Storing into a `text` binding. claude.md #83: text is copied on
+// alias and freed outright rather than refcounted, so a store owns a
+// fresh buffer (festina_text_own) and frees whatever the slot held.
+//
+// The `.ap` shadow is claude.md #243's in-place append tracking: a
+// plain store invalidates it, so it is nulled on the way through. The
+// ordering is load-old, own-new, free-old, null-ap, store-new, and it
+// is load-then-own-then-free rather than free-then-own because the new
+// value may be derived from the old one.
+void func cgStoreText(slot:text, apSlot:text, v:Val, owning:bool) {
+    text old = cgTmp()
+    cgOut(`  ${old} = load ptr, ptr ${slot}`)
+    text val = v.v
+    if owning == false {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${val})`)
+        val = owned
+    }
+    cgOut(`  call void @free(ptr ${old})`)
+    cgOut(`  store ptr null, ptr ${apSlot}`)
+    cgOut(`  store ptr ${val}, ptr ${slot}`)
 }
 
 void func cgAssign(e:Node) {
@@ -1305,9 +1383,22 @@ void func cgAssign(e:Node) {
         cgUnported(`assignment to ${name}`)
         return
     }
-    Val v = cgExpr(childOf(e, 'value'))
+    Node value = childOf(e, 'value')
+    Val v = cgExpr(value)
     if CG_UNPORTED { return }
+    if fty == 'text' {
+        cgStoreText(slot, `${slot}.ap`, v, cgIsOwningTextSource(value))
+        return
+    }
     cgOut(`  store ${cgLtyOf(fty)} ${v.v}, ptr ${slot}`)
+}
+
+// Whether an expression already hands back a buffer nothing else
+// holds, so storing it needs no copy. A string literal is NOT one: it
+// is a pointer into .rodata that every use of that literal shares.
+bool func cgIsOwningTextSource(e:Node) {
+    if e == null { return false }
+    return false
 }
 
 void func cgPostfix(e:Node) {
@@ -1410,6 +1501,7 @@ void func cgFunc(d:Node) {
     L_FTY = freshFty
 
     CUR = CG_FUNCS
+    CG_IN_FUNC = true
     cgOut(`define ${retL} @${name}(${joined}) {`)
     cgOut(`${cgLabel('entry')}:`)
     int p = 0
@@ -1435,6 +1527,7 @@ void func cgFunc(d:Node) {
     }
     cgOut('}')
     cgOut('')
+    CG_IN_FUNC = false
 }
 
 // ---------------------------------------------------------------------
@@ -1483,10 +1576,18 @@ void func cgProgram(body:arr[Node], srcPath:text) {
         if d.kind == 'VarDecl' {
             text gf = cgDeclFty(d)
             if gf != '' {
+                text gn = rawText(d, 'name')
                 text gl = cgLtyOf(gf)
-                cgEmit(`@${rawText(d, 'name')} = global ${gl} ${cgZeroFor(gl)}`)
-                G_SLOT[rawText(d, 'name')] = `@${rawText(d, 'name')}`
-                G_FTY[rawText(d, 'name')] = gf
+                cgEmit(`@${gn} = global ${gl} ${cgZeroFor(gl)}`)
+                // claude.md #243: a text binding carries an append
+                // shadow -- the buffer it is growing in place and how
+                // much of it is used -- alongside the pointer itself.
+                if gf == 'text' {
+                    cgEmit(`@${gn}.ap = global ptr null`)
+                    cgEmit(`@${gn}.aplen = global i64 0`)
+                }
+                G_SLOT[gn] = `@${gn}`
+                G_FTY[gn] = gf
             }
         }
         g++
