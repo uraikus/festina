@@ -65,15 +65,17 @@ class TestMapLiteral:
         program = parser.parse("map[int] m = {'a': 1}")
         semantic.analyze(program)
 
-    def test_non_text_key_is_a_compile_error(self, parser, semantic, errors):
+    def test_an_int_literal_key_is_accepted_and_rendered(self, parser, semantic):
+        """claude.md #302: `{5: 1}` is `{'5': 1}`. These two tests
+        asserted the opposite until the rule changed, and are rewritten
+        rather than removed -- what they pin now is the same corner,
+        answered the other way."""
         program = parser.parse("map[int] m = {5: 1}")
-        with pytest.raises(errors.CompileError, match="map key must be text"):
-            semantic.analyze(program)
+        semantic.analyze(program)
 
-    def test_bool_key_is_a_compile_error(self, parser, semantic, errors):
+    def test_a_bool_literal_key_is_accepted_and_rendered(self, parser, semantic):
         program = parser.parse("map[int] m = {true: 1}")
-        with pytest.raises(errors.CompileError, match="map key must be text"):
-            semantic.analyze(program)
+        semantic.analyze(program)
 
     def test_duplicate_string_literal_key_is_a_compile_error(self, parser, semantic, errors):
         # Both keys are plain string literals here -- the duplicate is
@@ -136,11 +138,15 @@ class TestMapIndexing:
         program = parser.parse(source)
         semantic.analyze(program)
 
-    def test_int_key_is_a_compile_error(self, parser, semantic, errors):
+    def test_an_int_key_is_accepted_and_rendered(self, parser, semantic):
+        """claude.md #302: keys are always text, but a key EXPRESSION
+        need not be -- `m[5]` means `m['5']`. This test asserted the
+        opposite until the rule changed; it is rewritten rather than
+        deleted, because the old behaviour is exactly what a reader
+        would otherwise assume still holds."""
         source = "map[int] m = {'a': 1}\nlog(m[5])"
         program = parser.parse(source)
-        with pytest.raises(errors.CompileError, match="map key must be text"):
-            semantic.analyze(program)
+        semantic.analyze(program)
 
     def test_write_to_a_new_key_parses(self, parser, semantic):
         source = "map[int] m = {}\nm['a'] = 5"
@@ -328,3 +334,63 @@ class TestAmorPrefix:
         """)
         with pytest.raises(errors.CompileError, match="cannot assign"):
             semantic.analyze(program)
+
+
+class TestNonTextMapKeys:
+    """claude.md #302: a key expression of any type with a text form is
+    rendered as if by `.toText()` (specification.md 8.21), in every key
+    position -- read, write, delete and literal alike.
+
+    The rule is deliberately the one `log()` and `${...}` already use
+    rather than a second, narrower one: a type either has a text form or
+    it does not, and a map key is one more place that form is taken.
+    """
+
+    def test_int_read(self, parser, semantic):
+        program = parser.parse("map[int] m = {}\nint k = 7\nlog(m[k])")
+        semantic.analyze(program)
+
+    def test_int_write(self, parser, semantic):
+        program = parser.parse("map[int] m = {}\nm[7] = 1")
+        semantic.analyze(program)
+
+    def test_float_and_bool_keys(self, parser, semantic):
+        program = parser.parse("map[int] m = {}\nm[1.5] = 1\nm[true] = 2")
+        semantic.analyze(program)
+
+    def test_delete_with_a_non_text_key(self, parser, semantic):
+        program = parser.parse("map[int] m = {}\nm[7] = 1\ndelete m[7]")
+        semantic.analyze(program)
+
+    def test_a_literal_key_may_be_non_text(self, parser, semantic):
+        program = parser.parse("int k = 2\nmap[int] m = {k: 1}")
+        semantic.analyze(program)
+
+    def test_an_expression_key_is_rendered(self, parser, semantic):
+        program = parser.parse("map[int] m = {}\nint a = 2\nm[a * 3] = 1")
+        semantic.analyze(program)
+
+    def test_a_struct_key_is_its_json_rendering(self, parser, semantic):
+        """Not a recommendation -- a consequence. specification.md 8.21
+        gives a struct a text form, so it has one here too; ruling it
+        out would be a second rule with its own edge cases."""
+        source = "struct P { x:int }\nP p\nmap[int] m = {}\nm[p] = 1"
+        program = parser.parse(source)
+        semantic.analyze(program)
+
+    def test_a_type_with_no_text_form_is_still_an_error(self, parser, semantic, errors):
+        """The rule is "render it", not "accept anything". A `color` has
+        no text form in log() either, so it has none here."""
+        source = "color c = '#ffffff'\nmap[int] m = {}\nlog(m[c])"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="map key"):
+            semantic.analyze(program)
+
+    def test_environment_still_requires_text(self, parser, semantic, errors):
+        """`environment` is not a map: it names an operating-system
+        variable, where a non-text subscript is a mistake rather than a
+        shorthand (specification.md 8.8)."""
+        program = parser.parse("log(environment[5])")
+        with pytest.raises(errors.CompileError, match="key must be text"):
+            semantic.analyze(program)
+

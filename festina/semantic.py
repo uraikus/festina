@@ -243,6 +243,31 @@ def _is_blob_type(t):
     return isinstance(t, types_mod.PrimitiveType) and t.name == "blob"
 
 
+def _has_text_form(t):
+    """claude.md #302 / specification.md 8.21: whether a value of this
+    type can be rendered as text at all.
+
+    The same question `log()` and `${...}` ask, asked in one more place
+    -- a `map[T]` key. Deliberately NOT a second, narrower rule: a type
+    either has a text form or it does not, and inventing a separate
+    "may be a key" set would be two lists to keep in step.
+
+    Conservative in the usual direction (see this module's own
+    docstring): an unknown type answers True, so a partial checker can
+    miss an error but never invent one. Codegen's `_to_text` is the
+    backstop and raises for anything this lets through.
+    """
+    if t is None or t is NULL:
+        return True
+    if t in (_TEXT, _INT, _FLOAT, _BOOL):
+        return True
+    if _is_ascii_type(t) or _is_blob_type(t):
+        return True
+    return isinstance(t, (types_mod.StructType, types_mod.TableType,
+                          types_mod.ArrayType, types_mod.MapType,
+                          types_mod.EnumType))
+
+
 def _is_ascii_type(t):
     """claude.md #256: `ascii`'s own counterpart to _is_blob_type just
     above -- same reason, same rule. `ascii` is refcounted and so `T?`
@@ -1786,9 +1811,10 @@ def analyze(program, filename="<string>"):
                 and isinstance(expr, ast.MapLit)):
             for key, value in expr.entries:
                 ktype = infer(key, scope)
-                if ktype is not None and ktype is not NULL and ktype != _TEXT:
+                if not _has_text_form(ktype):
                     raise CompileError(
-                        f"map key must be text, found {types_mod.type_name(ktype)}",
+                        f"a map key of type {types_mod.type_name(ktype)} has no "
+                        f"text form, so it cannot be a key",
                         file=filename, line=getattr(key, "line", 0),
                         column=getattr(key, "column", 0),
                         category="invalid operand type",
@@ -1895,9 +1921,10 @@ def analyze(program, filename="<string>"):
             seen_literal_keys = {}
             for key_expr, val_expr in expr.entries:
                 key_type = infer(key_expr, scope)
-                if key_type is not None and key_type is not NULL and key_type != _TEXT:
+                if not _has_text_form(key_type):
                     raise CompileError(
-                        f"map key must be text, found {types_mod.type_name(key_type)}",
+                        f"a map key of type {types_mod.type_name(key_type)} has no "
+                        f"text form, so it cannot be a key",
                         file=filename, line=getattr(key_expr, "line", 0), column=getattr(key_expr, "column", 0),
                         category="invalid operand type",
                     )
@@ -2440,9 +2467,15 @@ def analyze(program, filename="<string>"):
                 # "returns null" runtime behavior -- see codegen.py's
                 # _emit_map_get), so there's nothing else to check here
                 # beyond the key's own type.
-                if idx_type is not None and idx_type is not NULL and idx_type != _TEXT:
+                # claude.md #302: keys are always text, but a key
+                # EXPRESSION need not be -- anything with a text form is
+                # rendered as if by .toText(). Only a type with no text
+                # form at all (img, color, a func value) is refused, and
+                # it is refused for the same reason log() refuses it.
+                if not _has_text_form(idx_type):
                     raise CompileError(
-                        f"map key must be text, found {types_mod.type_name(idx_type)}",
+                        f"a map key of type {types_mod.type_name(idx_type)} has no "
+                        f"text form, so it cannot be a key",
                         file=filename, line=getattr(expr, "line", 0), column=getattr(expr, "column", 0),
                         category="invalid operand type",
                     )
@@ -3060,9 +3093,9 @@ def analyze(program, filename="<string>"):
                         # instead of through generic inference.
                         for key_expr, val_expr in fields_expr.entries:
                             key_type = infer(key_expr, scope)
-                            if key_type is not None and key_type is not NULL and key_type != _TEXT:
+                            if not _has_text_form(key_type):
                                 raise CompileError(
-                                    f"{name}()'s fields map key must be text, found "
+                                    f"{name}()'s fields map key has no text form: "
                                     f"{types_mod.type_name(key_type)}",
                                     file=filename, line=getattr(key_expr, "line", 0),
                                     column=getattr(key_expr, "column", 0),
@@ -5532,12 +5565,14 @@ def analyze(program, filename="<string>"):
             obj_type = infer(tgt.obj, scope)
             if isinstance(obj_type, types_mod.MapType):
                 if tgt.computed:
+                    # claude.md #302: the same key rule every other map
+                    # position uses -- rendered if it has a text form,
+                    # refused only if it has none.
                     key_type = infer(tgt.prop, scope)
-                    if (key_type is not None and key_type is not NULL
-                            and key_type != _TEXT):
+                    if not _has_text_form(key_type):
                         raise CompileError(
-                            f"delete on a map takes a text key, found "
-                            f"{types_mod.type_name(key_type)}",
+                            f"delete on a map takes a key with a text form, "
+                            f"found {types_mod.type_name(key_type)}",
                             file=filename, line=stmt.line, column=stmt.column,
                             category="invalid statement",
                         )

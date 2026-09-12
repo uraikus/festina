@@ -6064,3 +6064,36 @@ The array path loads a length it never uses. That is the original's output, not 
 **Refused, specifically rather than generically.** An `arr[T]`/`map[T]` whose T is itself refcounted releases every element through a generated per-element cascade wrapper; that is its own mechanism. The blocker table now reads `arr local of a non-scalar type` (22 files) rather than `arr local` (31), and the difference between those two numbers is the part that is actually done.
 
 **Verified.** Codegen 14 match, 0 differ, 78 unported. `cases/escape_locals.f` grew the container shapes and is pinned in pytest against losing them -- it must contain a released array local and a `festina_map_free_entries` call, or the container half of the decision is unmeasured.
+
+
+302. A MAP KEY EXPRESSION NEED NOT BE text
+
+`myMap[myNumber]` now means `myMap[myNumber.toText()]`. Keys are still always `text`; what changed is that a key EXPRESSION may be any type with a text form.
+
+**The rule is §8.21's, not a new one.** A key is rendered exactly as `log()` and `${...}` render — int/float/bool through their stringifiers, `ascii`/`blob` through their own conversions, struct/table/`arr`/`map`/enum through the JSON walk — and a type with NO text form (`img`, `aud`, `thread`, `func`, `regex`, `http`, `socket`, `url`, `color`, `font`) is refused, with the same reason it is refused in `log()`. Inventing a separate "may be a key" set would have been two lists to keep in step, and the first divergence between them would be a puzzle rather than a rule.
+
+That choice has a consequence worth stating rather than discovering: a struct IS a legal key, rendered as its JSON. Not a recommendation — a consequence of having one rule.
+
+**Three properties follow from the key being the rendering rather than the value**, and each is documented in specification.md §8.8 and api.md rather than left to be found:
+
+- `.keys()` answers `arr[text]`, so a key read back is its text form. `counts[7] = 1` then `counts.keys()[0]` is `'7'`.
+- `1` and `'1'` are the same key. So are `true` and `'true'`.
+- A `float` key is its exact decimal rendering, so `0.1 + 0.2` and `0.3` are DIFFERENT keys.
+
+**`environment[...]` is deliberately excluded.** It is not a map: it names an operating-system variable, where a non-text subscript is a mistake rather than a shorthand. A test pins that.
+
+**Four key positions, four different places the rendered buffer is freed**, which is the part that would have leaked:
+
+    read       m[k]           freed at the call site after festina_map_get
+    write      m[k] = v       freed inside _emit_map_set
+    delete     delete m[k]    freed in the delete statement's own emitter
+    literal    {k: v}         through the set path, but with the KEY
+                              expression's ownership answer, not the value's
+
+`festina_map_set` `strdup`s the key (its own comment says why it never aliases the caller's pointer), so the compiler's copy has no owner the moment the call returns. The ownership answer could not be re-derived at the free site either: a rendered key is a fresh buffer whose source expression is a plain literal, so the expression says "borrowed" while the value is owned. `_emit_map_key` returns `(val, owned)` and `_emit_map_set` takes `key_owned` to override the source-expression test.
+
+**Leak-freedom is measured, not asserted.** `tests/stress/map_rendered_key_churn.f` runs 3,000 iterations across all four positions under valgrind: zero diagnostics, exit 0. **And the canary fires** — deleting the one free makes valgrind report `11,714 bytes in 2,000 blocks are definitely lost`, so the clean run is evidence rather than an absence of evidence. (The ASan path this project normally uses cannot link in this container, so valgrind stood in; the canary is what makes that substitution honest.)
+
+**Four existing tests asserted the opposite and were rewritten, not deleted** — two map-literal cases, one indexing case, and `troubleshoot()`'s own fields-literal check. The last is the one that would have been missed: `troubleshoot(event, fields:map[text])` validates its literal directly rather than through generic inference, so it has its own copy of the key rule. Each rewrite keeps the same corner and answers it the other way, and each gained a control asserting a type with no text form is still refused.
+
+**Verified.** 2666 passed, 345 skipped, plus valgrind on the new stress program. specification.md §8.8/§8.21/§16.3 and api.md updated first, per claude.md §2's spec-then-tests-then-code order.

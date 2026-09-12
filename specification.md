@@ -746,19 +746,42 @@ may be any type except `arr[...]` or `map[...]`. A map is a
 reference-counted hash table with average O(1) get, set and delete and
 **unspecified iteration order**. [#72, #175]
 
-- **Literals**: `{ key: value, ... }` and `{}`. Every key is a `text`
-  expression: a string literal, or any other expression of type `text`
-  (an unquoted identifier is a variable reference, never a bareword
-  key). `{ name }` is shorthand for `{ 'name': name }`. All values must
-  have one type (`null` excepted). Two identical string-literal keys in
-  one literal are a compile error; otherwise the last value for a key
-  wins. [#154, #162] A `{...}` written where a struct is expected is a
-  struct literal instead (§8.9.4); the expected type is what
-  distinguishes them.
+**Keys are always `text`, but a key EXPRESSION need not be.** In every
+key position a value of another type is rendered as if by `.toText()`
+(§8.21), so `scores[level]` on an `int` means `scores[level.toText()]`.
+A type with no text form (`img`, `aud`, `thread`, `func`, `regex`,
+`http`, `socket`, `url`, `color`, `font`) is a compile error as a key,
+exactly as it is in `log()`. [#302]
+
+Three consequences follow from the key being the rendered text rather
+than the original value, and none is a defect to be worked around:
+
+- `.keys()` answers `arr[text]`, so a key read back is its text form.
+  `counts[7] = 1` then `counts.keys()[0]` is `'7'`, not `7`.
+- `1` and `'1'` are the same key. So are `true` and `'true'`.
+- A `float` key is its exact decimal rendering, so `0.1 + 0.2` and
+  `0.3` are DIFFERENT keys. Prefer `int` or `text` where keys must
+  compare equal.
+
+**Forms:**
+
+- **Literals**: `{ key: value, ... }` and `{}`. A key is a string
+  literal, or any other expression with a text rendering (an unquoted
+  identifier is a variable reference, never a bareword key).
+  `{ name }` is shorthand for `{ 'name': name }`. All values must have
+  one type (`null` excepted). Two identical string-literal keys in one
+  literal are a compile error; otherwise the last value for a key wins.
+  [#154, #162] A `{...}` written where a struct is expected is a struct
+  literal instead (§8.9.4); the expected type is what distinguishes
+  them.
 - **Access**: `m[key]` reads a value, yielding `null` for a missing
   key; `m[key] = v` adds or replaces.
 - **Removal**: `delete m[key]` / `delete m.key` (§10.11).
 - **Methods**: `.forEach(fn)`, `.keys()`, `.values()` (§16.3). [#186]
+
+`environment[...]` is NOT a map and takes `text` only (§16.5): it names
+an operating-system variable, where a non-text subscript is a mistake
+rather than a shorthand.
 
 ### 8.9 Structs
 
@@ -1059,8 +1082,9 @@ and `table` of the same shape, and `blob` and `text` are all distinct.
 ### 8.21 Text rendering of values
 
 `log()`, template substitution, `throw`, `troubleshoot()`, `fail()`, a
-`body` in an `http` literal and `socket.send()` render a value as
-text; `.toText()` is the explicit form. [#114, #115, #190, #192]
+`body` in an `http` literal, `socket.send()` and a `map[T]` key (§8.8)
+render a value as text; `.toText()` is the explicit form.
+[#114, #115, #190, #192, #302]
 
 | Type | Rendering |
 |---|---|
@@ -2042,7 +2066,8 @@ A user declaration may not reuse any of these names (§6.7).
 | `.join(sep:text)` | `text` | elements of `text`/`int`/`float`/`bool`; `null` renders empty |
 | `.toText()` | `text` | JSON (§8.21) |
 
-**`map[T]`** [#72, #186]: `m[key]`, `m[key] = v`, `delete m[key]`,
+**`map[T]`** [#72, #186, #302]: `m[key]`, `m[key] = v`, `delete m[key]`
+(a non-`text` key renders per §8.21),
 `.forEach(fn)` with `fn` the bare name of a `void` function taking
 `(value:T, key:text)`, `.keys():arr[text]`, `.values():arr[T]`
 (independent snapshots, unspecified order), `.toText()`.

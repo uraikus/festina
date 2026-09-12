@@ -1170,6 +1170,10 @@ npcHealths['missing']       // -> null -- a missing key, not an error
 npcHealths['npc1'] = 30     // updates an existing key
 npcHealths['npc3'] = 5      // adds a new one
 
+map[int] scores = {}
+scores[7] = 100             // a non-text key is rendered: same as scores['7']
+scores[level]               // an int variable -- same as scores[level.toText()]
+
 void func logHealth(h:int, key:text) {
     log(`${key} ${h.toText()}`)
 }
@@ -1181,6 +1185,22 @@ arr[int] hps = npcHealths.values()    // no callback, no extra globals needed
 
 An unquoted identifier key (`npc2Id` above) is a reference to that
 variable's own text value, not bareword-as-string-name shorthand.
+
+**Keys are always `text`, but a key expression need not be.** A value of
+any other type is rendered as if by `.toText()` — the same rendering
+`log()` and `${...}` use — so `scores[7]` and `scores['7']` are one key,
+not two. A type with no text form at all (`img`, `aud`, `color`,
+`regex`, a `func` value, …) is a compile error as a key, exactly as it
+is in `log()`.
+
+Three things follow, and none is a bug to work around:
+
+- `.keys()` returns `arr[text]`, so a key read back is its rendering:
+  `scores[7] = 1` then `scores.keys()[0]` is `'7'`.
+- `1` and `'1'` are the same key. So are `true` and `'true'`.
+- A `float` key is its exact decimal rendering, so `0.1 + 0.2` and `0.3`
+  are **different** keys. Use `int` or `text` where keys must compare
+  equal.
 `map[T]`'s `T` may be any type
 except `arr[...]`/`map[...]` itself (a map value is stored in one
 fixed-size slot, which those two don't fit in). `.forEach()`'s callback

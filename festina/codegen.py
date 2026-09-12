@@ -4799,9 +4799,9 @@ class CodeGen:
             # tombstone); capacity is read-only (delete never grows the
             # table).
             if tgt.computed:
-                key_val, key_type = self._emit_expr(tgt.prop, env, lines)
+                key_val, key_owned = self._emit_map_key(tgt.prop, env, lines)
             else:
-                key_val, key_type = self.string_const(tgt.prop), None
+                key_val, key_owned = self.string_const(tgt.prop), False
             count_ptr = self.tmp()
             lines.append(f"  {count_ptr} = getelementptr {FESTINA_MAP_LLVM_TYPE}, "
                          f"ptr {obj_val}, i32 0, i32 0")
@@ -4824,8 +4824,8 @@ class CodeGen:
             lines.append(f"  call i8 @festina_map_delete(ptr {count_ptr}, "
                          f"ptr {entries_ptr}, i64 {cap_val}, ptr {tomb_ptr}, "
                          f"ptr {key_val}, ptr {tramp})")
-            if tgt.computed:
-                self._free_text_temp(tgt.prop, key_val, key_type, lines)
+            if key_owned:
+                lines.append(f"  call void @free(ptr {key_val})")
             return
 
         ptr, ftype = self._member_ptr_from(obj_val, obj_type, tgt, lines)
@@ -6448,13 +6448,15 @@ class CodeGen:
                     return "null", TEXT
                 obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
                 if isinstance(obj_type, types_mod.MapType):
-                    key_val, key_type = self._emit_expr(expr.prop, env, lines)
+                    key_val, key_owned = self._emit_map_key(expr.prop, env, lines)
                     out = self._emit_map_get(obj_val, obj_type.value, key_val, lines)
                     # claude.md #97: festina_map_get only READS the key
                     # (it strcmp's against each entry's own copy), so a
-                    # key this expression allocated -- `m[`k${i}`]` --
+                    # key this expression allocated -- `m[`k${i}`]`, or
+                    # claude.md #302's own rendering of a non-text one --
                     # is finished the moment the lookup returns.
-                    self._free_text_temp(expr.prop, key_val, key_type, lines)
+                    if key_owned:
+                        lines.append(f"  call void @free(ptr {key_val})")
                     out = self._mint_and_release_computed(
                         expr, out[0], obj_val, obj_type, obj_type.value, lines)
                     return out, obj_type.value
@@ -6612,6 +6614,38 @@ class CodeGen:
             lines.append(f"  {owned} = call ptr @festina_text_own(ptr {result})")
             result = owned
         return result
+
+    def _emit_map_key(self, key_expr, env, lines):
+        """claude.md #302: a map key expression, rendered to text.
+
+        Returns (key_val, owned). Keys are always `text`, but a key
+        EXPRESSION need not be: anything with a text form (§8.21) is
+        rendered as if by `.toText()`, so `scores[level]` on an int is
+        `scores[level.toText()]`. `_to_text` is reused rather than
+        reimplemented, which is what makes "has a text form" one rule
+        instead of two -- and what makes a `color` key fail with the
+        same message a `log(color)` does.
+
+        `owned` says whether the caller must free the result once the
+        map call has copied it. A rendered key is ALWAYS owned: every
+        stringifier mallocs. A genuine text key is owned only when its
+        own expression already was, which is the existing
+        `_free_text_temp` rule unchanged.
+        """
+        val, vtype = self._emit_expr(key_expr, env, lines)
+        # A bare `null` key emits as `null` with no type at all, which
+        # festina_map_set already maps to the empty string -- there is
+        # nothing to render, and rendering it would mean inventing a
+        # text form for a value that has none.
+        if vtype == TEXT or vtype is None:
+            return val, self._is_owning_text_source(key_expr)
+        rendered = self._to_text(val, vtype, lines)
+        # claude.md #192: a container the key expression itself owns --
+        # `m[make()]` -- is rendered and then done with, so the
+        # container's own reference has to go somewhere. Exactly what
+        # _emit_template does with an interpolated call result.
+        self._release_owned_receiver(key_expr, val, vtype, lines)
+        return rendered, True
 
     def _to_text(self, val, type_, lines):
         """claude.md #114: every non-text value in log() or `${}`
@@ -8212,7 +8246,7 @@ class CodeGen:
             # correctly (a plain LLVM `null` pointer, which
             # festina_map_set/_get and festina_str_eq all already treat
             # as an empty string, same as everywhere else text does).
-            key_val, _ = self._emit_value_for(key_expr, env, lines, TEXT)
+            key_val, key_owned = self._emit_map_key(key_expr, env, lines)
             val_val, vtype = self._emit_value_for(val_expr, env, lines, expected_value)
             pre_coerce_type = vtype   # claude.md #118: for the freshness test
             if expected_value is not None:
@@ -8222,7 +8256,8 @@ class CodeGen:
             value_type = value_type or vtype
             self._emit_map_set(header, value_type, key_val, val_val, val_expr, lines,
                                 key_source_expr=key_expr,
-                                value_pre_coerce_type=pre_coerce_type)
+                                value_pre_coerce_type=pre_coerce_type,
+                                key_owned=key_owned)
 
         if value_type is None:
             raise CodegenError(
@@ -8315,7 +8350,8 @@ class CodeGen:
         return self._i64_to_map_value(raw, value_type, lines), value_type
 
     def _emit_map_set(self, map_ptr, value_type, key_val, value_val, value_source_expr, lines,
-                       key_source_expr=None, value_pre_coerce_type=None):
+                       key_source_expr=None, value_pre_coerce_type=None,
+                       key_owned=None):
         """claude.md #72/#175: npcHealths['npc1'] = 30 (and the
         equivalent per-entry calls a map literal builds itself out of
         -- see _emit_map_lit). Unlike a read, this needs the map's own
@@ -8413,9 +8449,17 @@ class CodeGen:
         # a key the caller ALLOCATED -- `m[`s${i}`] = v`, `m[a + b] = v`
         # -- has no owner left once this returns. Freed here rather than
         # at each call site so both the literal path and the assignment
-        # path get it from one place; `key_source_expr` is None only
-        # where the key is a compile-time constant with nothing to free.
-        if key_source_expr is not None:
+        # path get it from one place.
+        #
+        # claude.md #302: `key_owned` overrides the source-expression
+        # test, because a RENDERED key (`m[7] = v`) is a fresh buffer
+        # whose own expression is a plain literal -- the expression says
+        # "borrowed" and the value is owned. Passing the answer beats
+        # re-deriving it here, where the rendering is not visible.
+        if key_owned is not None:
+            if key_owned:
+                lines.append(f"  call void @free(ptr {key_val})")
+        elif key_source_expr is not None:
             self._free_text_temp(key_source_expr, key_val, TEXT, lines)
 
     def _emit_environment_get(self, expr, env, lines):
@@ -10902,13 +10946,15 @@ class CodeGen:
                             "a map assignment target must be a plain variable or field, "
                             "not an arbitrary expression",
                             file=self.filename, line=getattr(expr.target, "line", 0))
-                    key_val, _ = self._emit_expr(expr.target.prop, env, lines)
+                    key_val, key_owned = self._emit_map_key(
+                        expr.target.prop, env, lines)
                     val, vtype = self._emit_value_for(expr.value, env, lines, obj_type.value)
                     val = self._coerce(val, vtype, obj_type.value, lines,
                                        source_expr=expr.value)
                     self._emit_map_set(obj_val, obj_type.value, key_val, val, expr.value, lines,
                                         key_source_expr=expr.target.prop,
-                                        value_pre_coerce_type=vtype)
+                                        value_pre_coerce_type=vtype,
+                                        key_owned=key_owned)
                     return val, obj_type.value
                 if not isinstance(obj_type, types_mod.ArrayType):
                     raise CodegenError(f"cannot index into {types_mod.type_name(obj_type)}",

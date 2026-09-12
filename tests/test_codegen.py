@@ -19735,3 +19735,107 @@ class TestALocalShadowingAFunctionName:
         result = compile_and_run(source)
         assert result.returncode == 0, result.stdout + result.stderr
         assert result.stdout.strip() == "2"
+
+
+class TestNonTextMapKeys:
+    """claude.md #302 / specification.md 8.8: a map key expression of
+    any type with a text form is rendered as if by `.toText()`, so
+    `scores[level]` on an `int` means `scores[level.toText()]`.
+
+    The rule is deliberately §8.21's, the one `log()` and `${...}`
+    already use, rather than a second narrower one -- which is why a
+    `color` key fails and a struct key does not.
+    """
+
+    def test_an_int_key_round_trips_through_its_text_form(self, compile_and_run):
+        source = """
+        map[int] m = {}
+        m[7] = 70
+        int k = 7
+        log(m[k])
+        log(m['7'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        # Both, because the key IS the rendered text: 7 and '7' are one
+        # key, not two.
+        assert result.stdout.split() == ["70", "70"]
+
+    def test_float_and_bool_keys(self, compile_and_run):
+        source = """
+        map[int] m = {}
+        m[1.5] = 15
+        m[true] = 1
+        log(m[1.5])
+        log(m['1.5'])
+        log(m[true])
+        log(m['true'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.split() == ["15", "15", "1", "1"]
+
+    def test_a_literal_key_is_rendered_too(self, compile_and_run):
+        source = """
+        map[text] m = {3: 'three', 'a': 'ay'}
+        log(m[3])
+        log(m['3'])
+        log(m['a'])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.split() == ["three", "three", "ay"]
+
+    def test_delete_takes_a_rendered_key(self, compile_and_run):
+        source = """
+        map[int] m = {}
+        m[7] = 70
+        log(m.keys().length)
+        delete m[7]
+        log(m.keys().length)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.split() == ["1", "0"]
+
+    def test_keys_come_back_as_their_text_form(self, compile_and_run):
+        """A consequence worth pinning rather than discovering: the map
+        stores the rendering, so `.keys()` answers `'7'`, never `7`.
+        Round-tripping a key through a map is lossy by construction."""
+        source = """
+        map[int] m = {}
+        m[7] = 70
+        arr[text] ks = m.keys()
+        log(ks[0])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "7"
+
+    def test_an_expression_key_works_in_a_loop(self, compile_and_run):
+        source = """
+        map[int] m = {}
+        int i = 0
+        while i < 5 {
+            m[i * 2] = i
+            i++
+        }
+        log(m.keys().length)
+        log(m[8])
+        log(m[3])
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        out = result.stdout.split()
+        assert out[0] == "5"
+        assert out[1] == "4"
+        # A key nothing ever set: the int missing-key sentinel, exactly
+        # as for a text key that is absent.
+        assert out[2] == "-9223372036854775808"
+
+    def test_a_key_with_no_text_form_is_a_compile_error(
+            self, parser, semantic, errors):
+        source = "color c = '#ffffff'\nmap[int] m = {}\nlog(m[c])"
+        program = parser.parse(source)
+        with pytest.raises(errors.CompileError, match="map key"):
+            semantic.analyze(program)

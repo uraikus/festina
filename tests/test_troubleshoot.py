@@ -38,10 +38,22 @@ class TestSemanticErrors:
         with pytest.raises(errors.CompileError, match="expects text"):
             semantic.analyze(program)
 
-    def test_fields_literal_with_a_non_text_key_is_rejected(self, parser, semantic):
-        # A computed non-text key: claude.md #72's existing key-must-be-
-        # text rule, exercised through this bypass path specifically.
+    def test_a_non_text_fields_key_is_rendered_like_any_other_map_key(
+            self, parser, semantic):
+        """claude.md #302: `fields` is a `map[text]`, so its keys follow
+        the same rule every other map key does -- rendered as if by
+        `.toText()`. This asserted the opposite while the old
+        key-must-be-text rule stood, and is rewritten rather than
+        deleted: `troubleshoot` validates its fields literal directly
+        rather than through generic inference, so it is exactly the kind
+        of place a rule change gets missed."""
         program = parser.parse("int k = 1\ntroubleshoot('x', {k: 'v'})")
+        semantic.analyze(program)
+
+    def test_a_fields_key_with_no_text_form_is_still_rejected(
+            self, parser, semantic):
+        """The control: relaxing the rule must not have removed it."""
+        program = parser.parse("color c = '#fff'\ntroubleshoot('x', {c: 'v'})")
         with pytest.raises(Exception):
             semantic.analyze(program)
 

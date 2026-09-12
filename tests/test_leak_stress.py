@@ -508,6 +508,17 @@ class TestLeakStress:
             # lifetime (freeing/deleting from the map right after
             # collecting must leave the returned array untouched).
             "map_keys_values_churn.f",
+            # claude.md #302: a non-text map key is RENDERED as if by
+            # .toText(), and every rendering allocates a buffer the map
+            # then strdup's -- so the compiler's own copy has no owner
+            # left the moment the call returns. Four key positions free
+            # in four different places (a get at its call site, a set
+            # inside _emit_map_set, a delete in the delete emitter, a
+            # literal through the set path with the key EXPRESSION's
+            # ownership answer rather than the source expression's), so
+            # a miss in any one of them is one leaked string per
+            # iteration.
+            "map_rendered_key_churn.f",
             # claude.md #190: the JSON-rendering optimization itself --
             # festina_sb_append_n's own length-aware append (no
             # runtime strlen() rescan) and festina_sb_append_json_
