@@ -49,8 +49,8 @@ Over the 98-file repository corpus:
 - **lexer: 98 match, 0 differ.**
 - **parser: 98 match, 0 differ, 0 unported.**
 - **semantic: 98 match, 0 differ, 0 unported.**
-- **codegen: 7 match, 0 differ, 80 unported, 11 rejected by both** —
-  454 of 167,209 file-specific IR lines. See below for why that is the
+- **codegen: 10 match, 0 differ, 77 unported, 11 rejected by both** —
+  729 of 171,168 file-specific IR lines. See below for why that is the
   number reported rather than a file count.
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
@@ -188,7 +188,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 454 of 167,209 file-specific IR lines
+## Codegen: 729 of 171,168 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -253,13 +253,30 @@ which is what caught the reproducibility tests being pointed at
 `benchmarks/hello.f`, a program that calls `_unique()` exactly zero
 times and so could not have varied either way.
 
-### What is left
+### The target is self-hosting
 
-The scalar core is in: expressions (literals, variable reads,
-arithmetic and comparison with int/float mixing), `log` of every scalar
-type, assignment, postfix `++`/`--`, `if`/`else`, `while`, `for`,
-`return`, function declarations with parameters, locals and calls, and
-`text` **globals**. Three pieces are subtler than they look:
+The **bootstrap's own eight files** — `lexer.f`, `parser.f`,
+`semantic.f`, `codegen.f` and the four entry points — are **137,331 of
+the 171,168 file-specific IR lines, 80% of the budget**, and they need
+none of the graphics, audio, HTTP, thread, sqlite, regex or table
+machinery. Getting them to match means the compiler reproduces its own
+compilation: a crisp milestone, and a much smaller target than the
+whole corpus. That is what this port is driving at; whether the
+remaining subsystems are worth porting afterwards is a separate
+question.
+
+### What is in
+
+Expressions: literals, variable reads, arithmetic and comparison with
+int/float mixing, `&&`/`||` short-circuiting through real blocks,
+unary `-`/`!`, the ternary, and `/`/`%` with claude.md #57's
+divide-by-zero control flow. Statements: `log` of every scalar type,
+assignment, postfix, `if`/`else`, `while`, `for`, `return`. Plus
+function declarations with parameters, locals and calls; struct type
+definitions; scalar globals and locals; `text` globals **and** locals;
+and imports merged before either stage runs.
+
+Four pieces are subtler than they look:
 
 - **Alloca hoisting** (claude.md #191) is a post-pass over the finished
   text, exactly as in the original, because it is a property of the
@@ -267,43 +284,39 @@ type, assignment, postfix `++`/`--`, `if`/`else`, `while`, `for`,
 - **Terminator tracking**: an `if` arm ending in `return` must not also
   branch to `if.end`, since LLVM allows one terminator per block.
 - **A `text` store owns and frees.** claude.md #83: text is copied on
-  alias and freed outright rather than refcounted, so every store
-  reads the old buffer, copies the new one through
-  `festina_text_own`, frees the old, and nulls the claude.md #243
-  append shadow. A text global is three globals, not one.
+  alias and freed outright rather than refcounted. A text global is
+  three globals; a text local is three allocas plus a free at every
+  scope exit, tracked with a frame stack that a `return` unwinds
+  entirely and a block's end unwinds by one.
+- **Label allocation order is not emission order.** `&&` takes its
+  labels rhs, end, *start*; a `while` takes cond, body, end. Taking
+  them in the order they are printed renumbers every label and changes
+  nothing else.
 
-The first two were covered by nothing until `cases/control_flow.f`;
-disabling the hoister left all five then-matching corpus files still
-matching. The third is covered by `cases/strings_and_escapes.f`, which
-the corpus already had.
+**Why ASan is not in this loop.** A missing release in the emitted IR
+would be a leak in every program the compiler produces — but the
+comparison here is the IR itself, byte for byte. If the port's output
+matches `festina/codegen.py`'s output exactly, the generated program
+has exactly the original's memory behaviour, which `leak_stress.sh`
+already covers on the original. The differential test subsumes the
+sanitizer for this stage rather than needing it alongside.
 
-**What is NOT in yet, and it is the line where the port gets harder:**
-`text` locals, and `arr[T]`/`map[T]`/struct declarations of any kind. A
-text local needs three allocas, the append shadow initialized, and a
-free at every scope exit; the container types need a refcount header
-allocated and released. That is where automatic reclamation enters the
-port, and where the leak suite starts having an opinion.
-
-Operator coverage is deliberately narrow and guarded: arithmetic and
-ordered comparison accept `int`/`float`, equality also accepts `bool`,
-and everything else reports unported. Without that guard `s + 'x'` on
-two `text` operands emitted `add i64` over two pointers — valid LLVM,
-catastrophically wrong, and a silent difference rather than an honest
-gap.
-
-The blocker table, with the column that predicts unlocks:
+### What is not in
 
 |blocks|only|construct|
 |---:|---:|---|
-|48|5|a declaration of a non-scalar type|
+|48|5|a declaration of a non-scalar type (`arr[T]`, `map[T]`, struct)|
+|21|1|a parameter of a non-scalar type|
+|21|0|a call through a non-identifier callee (method calls)|
+|21|0|assignment to a non-identifier target (fields, elements)|
 |19|0|`EventHandler`|
 |18|0|`ThreadDecl`|
-|18|0|a call through a non-identifier callee|
-|18|0|assignment to a non-identifier target|
-|16|1|a parameter of a non-scalar type|
-|10|0|a `text` local|
-|10|1|`TableDecl`|
-|9|1|`TemplateLit`|
+|13|1|`TemplateLit`|
+|10|0|`close()`|
+
+The container declarations are the next real piece: a refcount header
+allocated, the stack-versus-heap choice taken from escape analysis, a
+retain on alias and a release at scope exit.
 
 The structural obstacles are unchanged:
 
@@ -315,8 +328,3 @@ The structural obstacles are unchanged:
 - **`map[T]` keys are `text`.** Three side tables keyed by node identity
   become a field on the node itself.
 - **One return value per function**, so 259 tuple returns become structs.
-
-What codegen needs from the analyzer is small and already mostly there:
-`structs`, `tables`, `enums`, `threads`, and the two message types.
-`codegen.f` imports `semantic.f` and reads them the way `CodeGen` reads
-them off `AnalyzedProgram`.

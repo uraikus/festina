@@ -5808,3 +5808,22 @@ The fifth codegen slice. `declaration of a non-scalar type` blocked 48 files and
 **Where this stops, and why that line is real.** `text` LOCALS are not in: a text local needs three allocas, the append shadow initialized, and a free at every scope exit. `arr[T]`/`map[T]`/struct declarations need a refcount header allocated and released. That is the point where automatic reclamation enters the port and the leak suite starts having an opinion, and it deserves its own slice rather than being tacked onto this one.
 
 **Verified.** 2847 passed, 94 skipped. Lexer 98/98, parser 98/98, semantic 98/98. Codegen 7 match, 0 differ, 80 unported, 11 rejected by both. Canary confirmed: dropping the `festina_text_own` copy turns `strings_and_escapes.f` from a match into a difference at the exact line.
+
+
+294. IMPORTS, text LOCALS, AND THE REST OF THE EXPRESSION CORE
+
+The sixth codegen slice, and the first taken against an agreed target: **self-hosting**. The bootstrap's own eight files -- lexer.f, parser.f, semantic.f, codegen.f and the four entry points -- are **137,331 of 171,168 file-specific IR lines, 80% of the budget**, and they need none of the graphics, audio, HTTP, thread, sqlite, regex or table machinery. Measured before choosing, and it is what makes "finished" a crisp question rather than an open-ended one.
+
+**Result: 729 of 171,168 lines, up from 454. Ten files match, up from seven.** `loop_sum.f`, `fizzbuzz.f` and `operators.f` came in.
+
+**Imports first, because they were the root of five other entries.** `expandImports` already existed in semantic.f; what was needed was calling it ONCE, before either stage, and handing the same merged list to both. Expanding twice is not merely wasteful but wrong: `parseImported` records each resolved path in `IMPORTED` and returns nothing for a repeat, so a second expansion hands back a body with every imported declaration missing. That also cleared "assignment to POS", "assignment to TOKS", "call to initLexer", "call to eat" and "call to sortLines" -- all symptoms of imported declarations being invisible, none of them real constructs.
+
+**`text` locals needed a frame stack.** Three allocas, the append shadow initialized, and a free at every scope exit -- with frees in DECLARATION order, read off the original's output for two locals in one block rather than assumed. A `return` unwinds every frame at once; a block's natural end unwinds one. A text return copies the value BEFORE freeing the locals, since returning a local's own buffer and then freeing it hands back a dangling pointer. A fresh local's store skips the load-free-null dance a global's needs, because its slot holds nothing yet.
+
+**Label allocation order is not emission order, and that is now three constructs deep.** `&&`/`||` take their labels rhs, end, *start*; `while` takes cond, body, end; `for` takes cond, body, update, end. Taking them in printed order renumbers every label and changes nothing else -- a difference that looks like a mystery until you read the original's own sequence of `label()` calls.
+
+**A correction to something claimed in #293.** That entry said containers were "where the leak suite starts having an opinion". It does not, and the reason is worth stating: the comparison here is the IR itself, byte for byte. If the port's output matches festina/codegen.py's output exactly, the generated program has exactly the original's memory behaviour, which `leak_stress.sh` already covers on the original. **The differential test subsumes the sanitizer for this stage** rather than needing it alongside. The frame stack above emits frees into the generated IR, and their correctness is established by the diff, not by running anything.
+
+**Deliberately refused rather than generalized.** A text ternary owns its value inside each arm -- observed once, in one program. One observation of a two-branch construct is not enough to port from, so it reports unported while the numeric and bool cases are implemented. Same rule as the operator guard in #293, applied before rather than after being caught.
+
+**Verified.** 2850 passed, 91 skipped. Lexer 98/98, parser 98/98, semantic 98/98. Codegen 10 match, 0 differ, 77 unported, 11 rejected by both.

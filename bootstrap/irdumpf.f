@@ -56,19 +56,37 @@ if FAILED {
     close(0)
 }
 
+// Imports are merged BEFORE either stage runs, because both stages
+// need the same flat statement list -- festina/imports.build_program
+// hands codegen one already-merged ast.Program and there is no
+// per-file namespacing anywhere downstream (claude.md #5).
+//
+// Expanding exactly once is load-bearing: parseImported records each
+// resolved path in IMPORTED and returns nothing for a repeat, so a
+// second expansion would hand back a body with every imported
+// declaration missing. analyzeProgram expands again internally, which
+// is a no-op on an already-merged list -- the ImportDecl statements
+// are gone by then -- so passing `merged` to it is safe rather than
+// merely convenient.
+arr[Node] merged = expandImports(body)
+if SEM_FAILED {
+    log(`SEMERR|${SEM_LINE}|${SEM_COL}`)
+    close(0)
+}
+
 // The analyzer runs for its rejections: a program festina/codegen.py
 // never sees is one this must not emit IR for either. Its binding
 // records are discarded here -- what codegen needs off the analyzer
 // (structs, tables, enums, threads, the message types) it reads from
 // semantic.f's own globals, exactly as CodeGen reads them off
 // AnalyzedProgram.
-arr[text] records = analyzeProgram(body)
+arr[text] records = analyzeProgram(merged)
 if SEM_FAILED {
     log(`SEMERR|${SEM_LINE}|${SEM_COL}`)
     close(0)
 }
 
-cgProgram(body, argv[1])
+cgProgram(merged, argv[1])
 
 if CG_UNPORTED {
     // One line per distinct reason: irdiff.py already de-duplicates and

@@ -781,6 +781,16 @@ bool CG_TERM = false
 // its lifetime both depend on this.
 bool CG_IN_FUNC = false
 
+// Values needing a free when their scope ends, and where each scope
+// began. festina/codegen.py keeps the same thing as a frame stack and
+// frees "down to" a given frame; this is that, with the frames as
+// indices into one flat list.
+//
+// Frees are emitted in DECLARATION order, not reverse -- read off the
+// original's output for two locals in one block, not assumed.
+arr[text] CG_LIVE = []
+arr[int] CG_FRAME = []
+
 arr[text] CG_FUNCS = []
 arr[text] CG_MAIN = []
 arr[text] CUR = []
@@ -967,6 +977,9 @@ Val func cgExpr(e:Node) {
     }
 
     if e.kind == 'BinOp' { return cgBinOp(e) }
+    if e.kind == 'LogicalOp' { return cgLogical(e) }
+    if e.kind == 'UnaryOp' { return cgUnary(e) }
+    if e.kind == 'Ternary' { return cgTernary(e) }
     if e.kind == 'Call' { return cgCall(e, true) }
 
     cgUnported(`expression ${e.kind}`)
@@ -1023,8 +1036,28 @@ Val func cgBinOp(e:Node) {
     }
 
     if op == '/' || op == '%' {
-        cgUnported(`operator ${op}`)
-        return none
+        // claude.md #57: division or modulo by zero answers null rather
+        // than trapping, and for int that has to be real control flow
+        // -- sdiv/srem by zero is undefined at the hardware level, so
+        // checking afterwards is too late and a `select` would still
+        // execute the trapping instruction.
+        //
+        // claude.md #143: `/` always answers float, so two int operands
+        // are BOTH converted first and the whole thing goes through the
+        // float path.
+        bool asFloat = useFloat
+        if op == '/' { asFloat = true }
+        text lv = l.v
+        text rv = r.v
+        if asFloat && useFloat == false {
+            text lc = cgTmp()
+            cgOut(`  ${lc} = sitofp i64 ${lv} to double`)
+            text rc = cgTmp()
+            cgOut(`  ${rc} = sitofp i64 ${rv} to double`)
+            lv = lc
+            rv = rc
+        }
+        return cgDivMod(op, lv, rv, asFloat)
     }
 
     // The result temp is taken BEFORE the comparison temp, which is
@@ -1078,6 +1111,171 @@ Val func cgBinOp(e:Node) {
 
     cgUnported(`operator ${op}`)
     return none
+}
+
+// `test ? cons : alt`, as two real blocks joined by a phi. Each arm's
+// value is computed INSIDE its own block, which is what makes the
+// short-circuit real rather than decorative.
+//
+// Numbers and bools only. A text ternary owns its value inside each
+// arm -- observed once, in one program -- and one observation of a
+// two-branch construct is not enough to port from, so it reports
+// unported rather than being generalized from a single sample.
+Val func cgTernary(e:Node) {
+    Val none
+    Val c = cgExpr(childOf(e, 'test'))
+    if CG_UNPORTED { return none }
+    if c.fty != 'bool' {
+        cgUnported(`ternary condition of type ${c.fty}`)
+        return none
+    }
+    text cond = cgTmp()
+    cgOut(`  ${cond} = icmp ne i8 ${c.v}, 0`)
+    text thenL = cgLabel('tern.then')
+    text elseL = cgLabel('tern.else')
+    text endL = cgLabel('tern.end')
+    cgOut(`  br i1 ${cond}, label %${thenL}, label %${elseL}`)
+    cgOut(`${thenL}:`)
+    Val a = cgExpr(childOf(e, 'cons'))
+    if CG_UNPORTED { return none }
+    cgOut(`  br label %${endL}`)
+    cgOut(`${elseL}:`)
+    Val b = cgExpr(childOf(e, 'alt'))
+    if CG_UNPORTED { return none }
+    cgOut(`  br label %${endL}`)
+    cgOut(`${endL}:`)
+    if a.fty != 'int' && a.fty != 'float' && a.fty != 'bool' {
+        cgUnported(`ternary of type ${a.fty}`)
+        return none
+    }
+    if a.fty != b.fty {
+        cgUnported(`ternary mixing ${a.fty} and ${b.fty}`)
+        return none
+    }
+    text out = cgTmp()
+    cgOut(`  ${out} = phi ${a.lty} [ ${a.v}, %${thenL} ], [ ${b.v}, %${elseL} ]`)
+    return cgVal(out, a.lty, a.fty)
+}
+
+Val func cgUnary(e:Node) {
+    Val none
+    Val v = cgExpr(childOf(e, 'operand'))
+    if CG_UNPORTED { return none }
+    text op = rawText(e, 'op')
+
+    if op == '-' {
+        if v.fty == 'int' {
+            text out = cgTmp()
+            cgOut(`  ${out} = sub i64 0, ${v.v}`)
+            return cgVal(out, 'i64', 'int')
+        }
+        if v.fty == 'float' {
+            text out = cgTmp()
+            cgOut(`  ${out} = fneg double ${v.v}`)
+            return cgVal(out, 'double', 'float')
+        }
+        cgUnported(`unary - on ${v.fty}`)
+        return none
+    }
+
+    if op == '!' {
+        if v.fty != 'bool' {
+            cgUnported(`unary ! on ${v.fty}`)
+            return none
+        }
+        // The result temp is taken before the two intermediates, the
+        // same inversion the comparison path has: LLVM's xor works on
+        // a genuine i1, so the i8 the language uses for bool is a zext
+        // of it rather than the thing itself.
+        text out = cgTmp()
+        text cond = cgTmp()
+        text notted = cgTmp()
+        cgOut(`  ${cond} = icmp ne i8 ${v.v}, 0`)
+        cgOut(`  ${notted} = xor i1 ${cond}, 1`)
+        cgOut(`  ${out} = zext i1 ${notted} to i8`)
+        return cgVal(out, 'i8', 'bool')
+    }
+
+    cgUnported(`unary ${op}`)
+    return none
+}
+
+Val func cgDivMod(op:text, lv:text, rv:text, asFloat:bool) {
+    text ty = 'i64'
+    text zero = '0'
+    text sentinel = '-9223372036854775808'
+    if asFloat {
+        ty = 'double'
+        zero = '0.0'
+        // The float null sentinel is a quiet NaN (see the module
+        // docstring in festina/codegen.py on null encodings).
+        sentinel = '0x7FF8000000000000'
+    }
+    text isZero = cgTmp()
+    if asFloat { cgOut(`  ${isZero} = fcmp oeq ${ty} ${rv}, ${zero}`) }
+    else { cgOut(`  ${isZero} = icmp eq ${ty} ${rv}, ${zero}`) }
+    text zeroL = cgLabel('divzero')
+    text nonzeroL = cgLabel('divnonzero')
+    text endL = cgLabel('divend')
+    cgOut(`  br i1 ${isZero}, label %${zeroL}, label %${nonzeroL}`)
+    cgOut(`${zeroL}:`)
+    cgOut(`  br label %${endL}`)
+    cgOut(`${nonzeroL}:`)
+    text res = cgTmp()
+    text ins = 'srem'
+    if op == '/' { ins = 'fdiv' }
+    else {
+        if asFloat { ins = 'frem' }
+    }
+    cgOut(`  ${res} = ${ins} ${ty} ${lv}, ${rv}`)
+    cgOut(`  br label %${endL}`)
+    cgOut(`${endL}:`)
+    text out = cgTmp()
+    cgOut(`  ${out} = phi ${ty} [ ${sentinel}, %${zeroL} ], [ ${res}, %${nonzeroL} ]`)
+    if asFloat { return cgVal(out, 'double', 'float') }
+    return cgVal(out, 'i64', 'int')
+}
+
+// `&&` and `||`, short-circuiting through real blocks and joining with
+// a phi.
+//
+// The labels are allocated rhs, end, START -- in that order, not in the
+// order they are emitted. Taking them in emission order would number
+// every one of them differently and change nothing else, which is the
+// kind of difference that looks like a mystery until you read the
+// original's own sequence of label() calls.
+Val func cgLogical(e:Node) {
+    Val none
+    Val l = cgExpr(childOf(e, 'left'))
+    if CG_UNPORTED { return none }
+    if l.fty != 'bool' {
+        cgUnported(`logical operator on ${l.fty}`)
+        return none
+    }
+    text cond = cgTmp()
+    cgOut(`  ${cond} = icmp ne i8 ${l.v}, 0`)
+    text rhsL = cgLabel('logic.rhs')
+    text endL = cgLabel('logic.end')
+    text startL = cgLabel('logic.start')
+    cgOut(`  br label %${startL}`)
+    cgOut(`${startL}:`)
+    if rawText(e, 'op') == '&&' {
+        cgOut(`  br i1 ${cond}, label %${rhsL}, label %${endL}`)
+    } else {
+        cgOut(`  br i1 ${cond}, label %${endL}, label %${rhsL}`)
+    }
+    cgOut(`${rhsL}:`)
+    Val r = cgExpr(childOf(e, 'right'))
+    if CG_UNPORTED { return none }
+    if r.fty != 'bool' {
+        cgUnported(`logical operator on ${r.fty}`)
+        return none
+    }
+    cgOut(`  br label %${endL}`)
+    cgOut(`${endL}:`)
+    text out = cgTmp()
+    cgOut(`  ${out} = phi i8 [ ${l.v}, %${startL} ], [ ${r.v}, %${rhsL} ]`)
+    return cgVal(out, 'i8', 'bool')
 }
 
 // A call to a user-declared function. `wantValue` distinguishes an
@@ -1146,6 +1344,7 @@ void func cgLog(args:arr[Node]) {
     }
     if a.fty == 'text' {
         cgOut(`  call void @festina_log_text(ptr ${a.v})`)
+        cgFreeTextTemp(args[0], a)
         return
     }
     cgUnported(`log(${a.fty})`)
@@ -1184,20 +1383,25 @@ void func cgStmt(s:Node) {
         bool isLocalDecl = CG_IN_FUNC
         if G_SLOT[name] == null { isLocalDecl = true }
 
+        bool freshLocal = false
         if isLocalDecl {
-            // A `text` local needs three allocas, the append-shadow
-            // initialized, and a free at every scope exit -- real
-            // ownership machinery, not yet ported. A `text` GLOBAL
-            // needs none of it: text globals are deliberately never
-            // freed (todo.md).
-            if fty == 'text' {
-                cgUnported('text local')
-                return
-            }
             text slot = `%${name}.${cgUid()}`
             cgOut(`  ${slot} = alloca ${lty}`)
+            if fty == 'text' {
+                // claude.md #243's append shadow gets storage of its
+                // own and is initialized empty. The allocas are hoisted
+                // to the entry block; these stores are not, so they run
+                // once per execution of the declaration -- which is
+                // what makes a declaration inside a loop correct.
+                cgOut(`  ${slot}.ap = alloca ptr`)
+                cgOut(`  ${slot}.aplen = alloca i64`)
+                cgOut(`  store ptr null, ptr ${slot}.ap`)
+                cgOut(`  store i64 0, ptr ${slot}.aplen`)
+                CG_LIVE.push(slot)
+            }
             L_SLOT[name] = slot
             L_FTY[name] = fty
+            freshLocal = true
         }
         Node init = childOf(s, 'init')
         if init == null { return }
@@ -1208,6 +1412,21 @@ void func cgStmt(s:Node) {
             return
         }
         if fty == 'text' {
+            // A fresh local's slot holds nothing yet, so there is no
+            // old buffer to free and no stale append shadow to null --
+            // only the owning copy and the store. A global's slot may
+            // already hold a value from an earlier execution, which is
+            // why it goes the long way round.
+            if freshLocal {
+                text owned = v.v
+                if cgIsOwningTextSource(init) == false {
+                    text o = cgTmp()
+                    cgOut(`  ${o} = call ptr @festina_text_own(ptr ${owned})`)
+                    owned = o
+                }
+                cgOut(`  store ptr ${owned}, ptr ${cgSlotOf(name)}`)
+                return
+            }
             cgStoreText(cgSlotOf(name), `${cgSlotOf(name)}.ap`, v,
                         cgIsOwningTextSource(init))
             return
@@ -1258,17 +1477,46 @@ void func cgEvalForEffect(ex:Node) {
     cgUnported(`expression statement ${ex.kind}`)
 }
 
+void func cgPushFrame() {
+    CG_FRAME.push(CG_LIVE.length)
+}
+
+// Frees every live value from `downTo` onward. A `return` passes 0, so
+// it unwinds every frame at once; a block's natural end passes its own
+// base and unwinds just itself.
+void func cgFreeFrom(downTo:int) {
+    int i = downTo
+    while i < CG_LIVE.length {
+        text t = cgTmp()
+        cgOut(`  ${t} = load ptr, ptr ${CG_LIVE[i]}`)
+        cgOut(`  call void @free(ptr ${t})`)
+        i++
+    }
+}
+
+// Closes the innermost frame. No frees when the block already ended in
+// a terminator: a `return` has freed everything itself, and emitting
+// them again would be a double free.
+void func cgPopFrame() {
+    int base = CG_FRAME[CG_FRAME.length - 1]
+    if CG_TERM == false { cgFreeFrom(base) }
+    while CG_LIVE.length > base { CG_LIVE.pop() }
+    CG_FRAME.pop()
+}
+
 // Runs a block's statements and leaves CG_TERM saying whether it ended
 // in a terminator. Reset on entry so the answer is about THIS block and
 // not one a sibling already closed.
 void func cgBlockInto(b:Node) {
     CG_TERM = false
+    cgPushFrame()
     arr[Node] body = cgBlockStmts(b)
     int i = 0
     while i < body.length {
         cgStmt(body[i])
         i++
     }
+    cgPopFrame()
 }
 
 // An `if` always emits all three blocks, even with no `else` -- the
@@ -1398,7 +1646,21 @@ void func cgAssign(e:Node) {
 // is a pointer into .rodata that every use of that literal shares.
 bool func cgIsOwningTextSource(e:Node) {
     if e == null { return false }
+    // A call's result is a buffer nothing else holds, so storing it
+    // needs no copy -- and, symmetrically, dropping it needs a free
+    // (see cgFreeTextTemp). A string literal is the opposite: a
+    // pointer into .rodata that every use of that literal shares.
+    if e.kind == 'Call' { return true }
     return false
+}
+
+// A text value that was produced fresh by an expression and is not
+// owned by any binding has to be freed once it has been used, or every
+// such call leaks. Only a call reaches this today.
+void func cgFreeTextTemp(e:Node, v:Val) {
+    if v.fty != 'text' { return }
+    if cgIsOwningTextSource(e) == false { return }
+    cgOut(`  call void @free(ptr ${v.v})`)
 }
 
 void func cgPostfix(e:Node) {
@@ -1446,13 +1708,27 @@ void func cgWhile(s:Node) {
 void func cgReturn(s:Node) {
     Node v = childOf(s, 'value')
     if v == null {
+        cgFreeFrom(0)
         cgOut('  ret void')
         CG_TERM = true
         return
     }
     Val r = cgExpr(v)
     if CG_UNPORTED { return }
-    cgOut(`  ret ${r.lty} ${r.v}`)
+    // Returning text hands the caller ownership, so the value is
+    // copied BEFORE the locals are freed -- returning a local's own
+    // buffer and then freeing it would hand back a dangling pointer.
+    // The order here (own, free, ret) is the original's.
+    text val = r.v
+    if r.fty == 'text' {
+        if cgIsOwningTextSource(v) == false {
+            text o = cgTmp()
+            cgOut(`  ${o} = call ptr @festina_text_own(ptr ${val})`)
+            val = o
+        }
+    }
+    cgFreeFrom(0)
+    cgOut(`  ret ${r.lty} ${val}`)
     CG_TERM = true
 }
 
@@ -1517,6 +1793,13 @@ void func cgFunc(d:Node) {
         cgOut(`  store ${cgLtyOf(pftys[q])} %arg.${pnames[q]}, ptr ${L_SLOT[pnames[q]]}`)
         q++
     }
+    // A fresh live-value list per function: a frame left over from a
+    // previous function would be freed inside this one.
+    arr[text] freshLive = []
+    arr[int] freshFrames = []
+    CG_LIVE = freshLive
+    CG_FRAME = freshFrames
+
     // Through cgBlockInto, not a loop of its own: the helper resets
     // CG_TERM on entry, and without that a function whose body does not
     // return inherits the flag from whichever function was emitted
@@ -1627,11 +1910,17 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     cgOut('define void @__festina_main() {')
     cgOut('entry:')
     CG_TERM = false
+    arr[text] mainLive = []
+    arr[int] mainFrames = []
+    CG_LIVE = mainLive
+    CG_FRAME = mainFrames
+    cgPushFrame()
     int s = 0
     while s < body.length {
         cgStmt(body[s])
         s++
     }
+    cgPopFrame()
     cgOut('  ret void')
     cgOut('}')
     cgOut('')
