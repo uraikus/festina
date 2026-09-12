@@ -71,7 +71,16 @@ if SEM_FAILED {
 cgProgram(body, argv[1])
 
 if CG_UNPORTED {
-    log(`UNPORTED|${CG_WHY}`)
+    // One line per distinct reason: irdiff.py already de-duplicates and
+    // joins every UNPORTED record it sees, so reporting them all turns
+    // its blocker table from a first-blocker histogram into something
+    // that can say how many files a construct is the ONLY thing
+    // holding back.
+    int w = 0
+    while w < CG_WHYS.length {
+        log(`UNPORTED|${CG_WHYS[w]}`)
+        w++
+    }
     close(0)
 }
 

@@ -5742,3 +5742,22 @@ Both conversions are **exact or unported, never approximate** -- the same rule s
 That is pre-existing and unrelated to this slice, and fixing it properly means shortest-round-trip float formatting in Festina. So the case file uses `0.0001` -- the smallest value Python still prints plainly, and still fourteen trips round the normalize loop -- and the limitation is recorded in todo.md rather than buried. The file's job is the codegen encoder, and it still does it.
 
 Worth noting for its own sake: this is the second time in two slices that adding a `cases/` file has found something the whole repository corpus could not. That is what the directory is for, and the hit rate is high enough to make it the default first move rather than an afterthought.
+
+
+291. STRUCT DECLARATIONS, AND A BLOCKER TABLE THAT WAS PROMISING SOMETHING IT COULD NOT KEEP
+
+The third codegen slice (#289, #290). `StructDecl` was the top blocker at 22 corpus files.
+
+**The work itself is small.** One `%struct.Name = type { ... }` per declaration, in source order, directly after the runtime's own type definitions, with every field lowered to its LLVM scalar. `color` is the trap: it is the only type outside the int/float/bool primitives that does NOT lower to `ptr` -- a packed RGBA value living in an i64 -- so treating "not a scalar primitive" as "pointer" silently mislays the layout of every struct carrying one. Found by enumerating what `_llvm_type` can return (exactly `i64` and `ptr`) and then asking which branch produced the `i64` that was not in the primitive dict, rather than by assuming the obvious rule.
+
+**CLOSING IT UNLOCKED NOTHING, AND THAT IS THE FINDING.** Coverage after: 3 match, 103 file-specific IR lines. Coverage before: 3 match, 103 lines. Identical. All 22 files simply hit whatever was behind `StructDecl` -- `FuncDecl` went from 11 to 19 in the table, non-scalar declarations from 13 to 15, `EventHandler` from 8 to 9.
+
+The table was a histogram of **first** blockers, because `cgUnported` kept only the earliest reason. Read as "22 files blocked by StructDecl" it promises 22 files of progress; what it actually says is "22 files whose first complaint is StructDecl". Those are very different numbers, and the difference is the whole distance between a plan and a guess.
+
+`cgUnported` now records every distinct reason and `irdiff.py` prints two columns -- *blocks*, the files mentioning a construct, and *only*, the files where it is the last thing in the way. The second column is the one that predicts anything, and it is brutal: `FuncDecl` appears in 42 files and is the sole blocker for **one**. `WhileStmt` blocks 40, sole blocker for two. Nothing in the table reaches three.
+
+**How far the port actually is, measured.** Across the 83 unported files the median is **4 distinct blockers**, the maximum 12; **5 files are one construct away**, 11 within two. So codegen coverage will stay near zero through several more increments and then move in steps -- which is what a real program using most of the language looks like from the inside, and is worth knowing before a run of flat numbers gets misread as no progress.
+
+That is the third measurement in this port to correct a number that flattered: #289's file count (12 reported, 1 real), #290's inert canary, and now the blocker table. The common shape is that each one looked like information until someone asked what it would say about a case where the answer was already known.
+
+**Verified.** Lexer 97/97, parser 97/97, semantic 97/97. Codegen 3 match, 0 differ, 83 unported, 11 rejected by both -- 103 of 155,742 file-specific IR lines, unchanged, which is the point.

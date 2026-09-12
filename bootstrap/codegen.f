@@ -30,18 +30,30 @@ arr[text] CG_STRS = []
 int CG_STR_N = 0
 bool CG_UNPORTED = false
 text CG_WHY = ''
+arr[text] CG_WHYS = []
 
 void func cgEmit(line:text) {
     CG_IR.push(line)
 }
 
-// First reason wins, so the reported blocker is the one encountered
-// earliest rather than the last one overwritten.
+// EVERY distinct reason, not just the first.
+//
+// It used to keep only the earliest, which made irdiff's blocker table
+// a histogram of FIRST blockers -- and that reads as a promise it
+// cannot keep. Closing `StructDecl`, listed against 22 files, unlocked
+// exactly zero of them: each one simply hit whatever was behind it.
+// Collecting them all lets the table distinguish "blocked by this" from
+// "blocked ONLY by this", and only the second number predicts what
+// implementing something will actually buy.
 void func cgUnported(what:text) {
-    if CG_UNPORTED == false {
-        CG_UNPORTED = true
-        CG_WHY = what
+    CG_UNPORTED = true
+    int i = 0
+    while i < CG_WHYS.length {
+        if CG_WHYS[i] == what { return }
+        i++
     }
+    CG_WHYS.push(what)
+    if CG_WHY == '' { CG_WHY = what }
 }
 
 // ---------------------------------------------------------------------
@@ -599,6 +611,25 @@ text func cgLlvmType(t:Ty) {
     return ''
 }
 
+// The LLVM type of a STRUCT FIELD, which unlike cgLlvmType always has
+// an answer: every type that is not int/float/bool/color is passed as a
+// pointer to its own storage.
+//
+// `color` is the trap. It is the only type outside the int/float/bool
+// primitives that does NOT lower to `ptr` -- a packed RGBA value living
+// in an i64 -- so treating "not a scalar primitive" as "pointer" gets
+// every struct with a color field silently wrong in its layout.
+text func cgFieldType(t:Ty) {
+    if t == null { return 'ptr' }
+    if t.kind == 'prim' {
+        if t.name == 'int' { return 'i64' }
+        if t.name == 'float' { return 'double' }
+        if t.name == 'bool' { return 'i8' }
+        if t.name == 'color' { return 'i64' }
+    }
+    return 'ptr'
+}
+
 text func cgZeroFor(ty:text) {
     if ty == 'double' { return '0.0' }
     return '0'
@@ -665,6 +696,9 @@ void func cgStmt(s:Node) {
         cgEmit(`  store ${ty} ${value}, ptr @${rawText(s, 'name')}`)
         return
     }
+    // A struct declaration is pure type information: its definition
+    // was already emitted above, and it contributes nothing to main.
+    if s.kind == 'StructDecl' { return }
     if s.kind != 'ExprStmt' {
         cgUnported(`statement ${s.kind}`)
         return
@@ -706,6 +740,27 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     while i < CG_PRE.length {
         cgEmit(CG_PRE[i])
         i++
+    }
+
+    // One type definition per declared struct, in source order,
+    // directly after the runtime's own -- the struct-definition section
+    // festina/codegen.py builds from `analyzed.structs`, whose key
+    // order is registration order.
+    int sd = 0
+    while sd < body.length {
+        Node d = body[sd]
+        if d.kind == 'StructDecl' {
+            arr[Node] fs = listOf(d, 'fields')
+            text row = ''
+            int fi = 0
+            while fi < fs.length {
+                if fi > 0 { row = row + ', ' }
+                row = row + cgFieldType(resolveTypeField(fs[fi], 'type_expr'))
+                fi++
+            }
+            cgEmit(`%struct.${rawText(d, 'name')} = type { ${row} }`)
+        }
+        sd++
     }
 
     // argv is registered with no VarDecl of its own (claude.md #150),

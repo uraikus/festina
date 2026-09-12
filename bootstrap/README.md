@@ -50,8 +50,9 @@ Over the 97-file repository corpus:
 - **parser: 97 match, 0 differ, 0 unported.**
 - **semantic: 97 match, 0 differ, 0 unported.**
 - **codegen: 3 match, 0 differ, 83 unported, 11 rejected by both** —
-  103 of 155,143 file-specific IR lines. See below for why that is the
-  number reported rather than a file count.
+  103 of 155,742 file-specific IR lines. See below for why that is the
+  number reported rather than a file count, and why it is expected to
+  stay flat for several more increments.
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
 `parser.f`, the largest source in the corpus at ~1,200 lines, takes
@@ -188,7 +189,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 103 of 155,143 file-specific IR lines
+## Codegen: 103 of 155,742 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -255,7 +256,48 @@ times and so could not have varied either way.
 
 ### What is left
 
-The obstacles are structural rather than semantic:
+`StructDecl` is done: one `%struct.Name = type { ... }` per declaration,
+every field lowered to its LLVM scalar. The trap there is `color`, which
+is the only type outside int/float/bool that does **not** lower to
+`ptr` — a packed RGBA value in an `i64` — so treating "not a scalar
+primitive" as "pointer" silently mislays the layout of every struct
+with a color field.
+
+**Closing it unlocked nothing**, and that is the useful part. It was
+listed against 22 files; after it landed, coverage stayed at exactly 103
+lines and 3 files. Every one of those 22 simply hit whatever was behind
+it. The blocker table had been a histogram of *first* blockers, which
+reads as a promise it cannot keep, so `cgUnported` now records every
+distinct reason and the table carries two columns:
+
+|blocks|only|construct|
+|---:|---:|---|
+|42|1|`FuncDecl`|
+|40|2|`WhileStmt`|
+|37|0|`log(Identifier)`|
+|36|1|a declaration of a non-scalar type|
+|19|0|`EventHandler`|
+|19|0|a non-call expression statement|
+|18|0|`ThreadDecl`|
+|14|1|`ForStmt`|
+|12|0|`log(Call)`|
+|10|0|`BinOp` initializer|
+|10|0|a call through a non-identifier callee|
+|10|0|`TableDecl`|
+
+Only the second column predicts anything. `FuncDecl` appears in 42
+files and is the last thing in the way for **one**.
+
+**How far each file is, measured rather than guessed:** across the 83
+unported files the median is **4 distinct blockers**, the maximum 12,
+and only **5 files are a single construct away** (11 within two). So
+codegen coverage will stay near zero through several more increments and
+then move in steps, rather than climbing steadily the way the lexer's
+did. That is what a real program using most of the language looks like
+from the inside, and it is worth knowing before a run of flat numbers
+gets read as no progress.
+
+The structural obstacles are unchanged:
 
 - **Festina structs have no methods.** 227 class methods and 77 AST and
   type classes become free functions over explicit state, the shape
@@ -270,20 +312,3 @@ What codegen needs from the analyzer is small and already mostly there:
 `structs`, `tables`, `enums`, `threads`, and the two message types.
 `codegen.f` imports `semantic.f` and reads them the way `CodeGen` reads
 them off `AnalyzedProgram`.
-
-The blockers, by how many corpus files each holds back:
-
-| | |
-|---|---|
-| `StructDecl` | 22 |
-| a declaration of a non-scalar type | 13 |
-| `FuncDecl` | 11 |
-| `EventHandler` | 8 |
-| `ImportDecl` | 8 |
-| `TableDecl` | 6 |
-| `ThreadDecl` | 5 |
-| a `BinOp` initializer | 3 |
-| `ForStmt` | 2 |
-| a non-call expression statement | 2 |
-| a `const` declaration | 2 |
-| `WhileStmt` | 1 |

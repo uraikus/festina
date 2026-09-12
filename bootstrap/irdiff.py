@@ -164,7 +164,7 @@ def main(argv):
         binary = build_codegen(os.path.join(tmp, "fir"))
         matched = differed = rejected = 0
         reproduced = 0
-        reasons = Counter()
+        blockers = []
         for path in paths:
             status, detail = compare(binary, path)
             rel = os.path.relpath(path, REPO_ROOT)
@@ -175,7 +175,8 @@ def main(argv):
             elif status == "rejected":
                 rejected += 1
             elif status == "unported":
-                reasons[detail] += 1
+                blockers.append(frozenset(
+                    r.strip() for r in detail.split(",") if r.strip()))
             else:
                 differed += 1
                 idx, want, got = detail
@@ -183,16 +184,31 @@ def main(argv):
                 print(f"        python:  {want}")
                 print(f"        festina: {got}")
         _, budget = line_budget(paths)
-    unported_total = sum(reasons.values())
+    unported_total = len(blockers)
     print(f"\n{matched} match, {differed} differ, {unported_total} unported, "
           f"{rejected} rejected by both (of {len(paths)} files)")
     share = (reproduced / budget) if budget else 0.0
     print(f"file-specific IR reproduced: {reproduced:,} of {budget:,} lines "
           f"({share:.3%})")
-    if reasons:
-        print("unported constructs, by how many files each blocks:")
-        for reason, count in reasons.most_common():
-            print(f"    {count:3}  {reason}")
+    if blockers:
+        # Two columns, because only the second one predicts anything.
+        # "blocks" counts every file a construct appears in; "only"
+        # counts the files where it is the last thing in the way, and so
+        # the number that would actually become matches. Closing
+        # StructDecl, which blocked 22 files, unlocked zero of them --
+        # every one had something else behind it.
+        blocks = Counter()
+        only = Counter()
+        for rs in blockers:
+            for r in rs:
+                blocks[r] += 1
+            if len(rs) == 1:
+                only[next(iter(rs))] += 1
+        print("unported constructs -- 'blocks' is files mentioning it, "
+              "'only' is files it alone holds back:")
+        print(f"    {'blocks':>6} {'only':>5}  construct")
+        for reason, count in blocks.most_common():
+            print(f"    {count:>6} {only[reason]:>5}  {reason}")
     return 1 if differed else 0
 
 
