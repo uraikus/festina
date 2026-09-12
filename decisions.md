@@ -5864,3 +5864,38 @@ A fourth property is asserted in pytest rather than left to a canary: `cases/str
 **What is actually in the way, measured.** `declaration of a non-scalar type` blocks 25 files and is sole blocker for 4; `parameter of a non-scalar type` 21 and 3; `struct local` 17 and 4; `arr local` 17 and 1; `call through a non-identifier callee` 21 and 0. `expression TemplateLit` blocks 13 -- templates are genuinely not ported, which the task list had recorded as done.
 
 **Verified.** 2855 passed, 91 skipped. Lexer 99/99, parser 99/99, semantic 99/99. Codegen 11 match, 0 differ, 77 unported, 11 rejected by both.
+
+
+296. TEMPLATE LITERALS, text CONCATENATION, AND TWO THINGS THE WHOLE CORPUS COULD NOT SEE
+
+The eighth codegen slice, and the first taken on the "cheap wins first" ordering: template literals, `+` and `==`/`!=` on `text`, claude.md #243's in-place append, and interned string constants.
+
+**Result: 1,554 of 180,328 file-specific IR lines, up from 1,077. Thirteen files match, up from eleven.** `benchmarks/string_concat.f` came in from the repository corpus; `cases/text_building.f` is new.
+
+**The budget is not a fixed target, and noticing why matters.** It went 175,080 → 177,006 → 179,910 → 180,328 across four runs in one session with the Python side untouched. `bootstrap/codegen.f` is itself a corpus file, so every line added to the port enlarges the denominator it is measured against. Self-hosting is a moving goal by construction -- the closer the port gets, the more of itself it has to reproduce.
+
+**Templates are three decisions, not one.** An EMPTY literal piece emits no concat at all (a bare `` `${x}` `` has an empty part on both sides, and `` `${a}${b}` `` one between them); every intermediate buffer is freed the moment the next concat has copied out of it; and the result is always a fresh buffer, which for the one shape that concatenates nothing means a `festina_text_own` copy on the way out. Getting any of the three wrong is a leak or a double free in every program the compiler emits.
+
+**STRING CONSTANTS ARE INTERNED, and the entire pre-existing corpus was blind to it.** `codegen.py`'s `string_const` keys a dict on the literal's own text and names each `@.str.<len(dict)>`, so a literal used three times is one global used three times. The port counted instead. Measured rather than reasoned about: with interning removed, **exactly one file in the 100-file corpus differs, and it is the `cases/` file written for this slice.** Not one of the 87 real programs repeats a string literal in a way the numbering exposes. This is the fourth time a `cases/` file has found something the repository corpus could not (#290's float range, #291's blocker table, #295's phi predecessor, this).
+
+**A SECOND SILENT WRONGNESS, found by reasoning rather than by the corpus.** A `text` parameter gets more than one alloca in the original: claude.md #243's `{pointer, length}` shadow beside its slot, plus -- if it escapes -- a `festina_text_own` copy and a scope-exit free. The port emitted a bare `alloca ptr`. Confirmed against a two-line probe, which differs at the first shadow line. No corpus file surfaced it because every file with a text parameter was already unported for some other reason, so it never reached a comparison.
+
+It is now **refused** rather than half-implemented, because whether the copy is needed is exactly what `festina/escape_analysis.py` answers, and hand-rolling a partial version of that rule would be the same mistake in a new place. It lifts with that module. The cost is visible and accepted: `text parameter` blocks 20 files and is the sole blocker for 2.
+
+**A measurement artifact worth knowing about.** Adding that refusal dropped `declaration of a non-scalar type` from 25 to 23 and `struct local` from 17 to 14 -- not because anything improved, but because `cgFunc` returns as soon as it reports, so an earlier refusal stops the walk before the later ones are collected. The `only` column is unaffected and remains the one to read.
+
+**The same language bug bit twice in one session.** #295 recorded a local named `at` shadowing `bootstrap/parser.f`'s `bool func at(kind:text)` and failing the compile at an unrelated interpolation. Writing the append emitter, a local named `known` shadowed `bootstrap/semantic.f`'s `bool func known(s:Scope, name:text)` and did it again, with the same `0:0` position and the same misleading message. Two independent hits while writing two unrelated functions is not bad luck; short helper names are exactly what both files export and exactly what a code generator's locals want to be called. The todo entry is updated to say so.
+
+**Five canaries, each confirmed by breaking the implementation on purpose**, all firing on `cases/text_building.f`:
+
+1. Interning removed -- differs, and (measured) is the only file in the corpus that does.
+2. The empty-piece concat emitted -- differs; invisible to `string_concat.f`.
+3. The `festina_text_own` on a bare template dropped -- differs; invisible to `string_concat.f`.
+4. The in-place append path disabled -- differs, and this one `string_concat.f` catches too.
+5. A concat chain's intermediates left unfreed -- differs; invisible to `string_concat.f`.
+
+Four of five are invisible to the only pre-existing file that builds strings at all, which is the argument for the case file rather than a claim about it. Its own properties are asserted in pytest -- append and concat counts, the presence of an own and an eq, and exactly one global for a literal used four times -- so it cannot quietly stop measuring them.
+
+**Deliberately still out.** Interpolating a struct/`arr[T]`/`map[T]` (a generated JSON walk), `blob` and `ascii` (their own runtime conversions), and the claude.md #192 release of a container the template itself owns -- which is a no-op for every type `cgToText` accepts, so it must arrive *with* container interpolation rather than after it.
+
+**Verified.** 2861 passed, 90 skipped. Lexer 100/100, parser 100/100, semantic 100/100. Codegen 13 match, 0 differ, 76 unported, 11 rejected by both.

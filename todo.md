@@ -118,8 +118,14 @@ open:
       type func[text]:bool
 
   — no line, no column, and a type that appears nowhere in the
-  statement at fault. Found by hitting it while porting struct field
-  access (decisions.md #295); worked around by renaming the local.
+  statement at fault. Worked around by renaming the local.
+
+  **It happened twice in one session**, in two unrelated functions: a
+  local named `at` shadowing parser.f's `at` (decisions.md #295), then
+  a local named `known` shadowing semantic.f's
+  `bool func known(s:Scope, name:text)` (decisions.md #296). Not bad
+  luck — short helper names are exactly what those files export and
+  exactly what a code generator's locals want to be called.
 
   Three consistent outcomes exist and the current behavior is none of
   them: the local wins everywhere (what every other expression position

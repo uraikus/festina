@@ -96,23 +96,25 @@ round-by-round design and implementation record predating 0.1 lives in
   #285, #286).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage, **in progress**: **11 of 99 corpus files
-  emit byte-identical LLVM IR, 0 differ, 77 not yet ported, 11 rejected
-  by both** — 1,077 of 175,080 file-specific IR lines. In are
+  the fourth and last stage, **in progress**: **13 of 100 corpus files
+  emit byte-identical LLVM IR, 0 differ, 76 not yet ported, 11 rejected
+  by both** — 1,554 of 180,328 file-specific IR lines. In are
   expressions (arithmetic and comparison with int/float mixing,
   `&&`/`||`, unary, the ternary, `/` and `%` with claude.md #57's
-  divide-by-zero control flow), statements (`log`, assignment, postfix,
-  `if`/`else`, `while`, `for`, `return`), functions with parameters and
-  locals, struct type definitions, scalar and `text` globals and
-  locals, `arr[T]`/`map[T]`/struct globals, struct field reads and
-  writes including claude.md #97's lazily-created field storage, and
-  imports merged before either stage runs. Not in: container and struct
-  *locals* (which need `festina/escape_analysis.py`, a fifth module),
-  non-scalar parameters and returns, method calls, indexing, template
-  literals, and the graphics/audio/HTTP/thread/sqlite/table subsystems.
+  divide-by-zero control flow, template literals, and `+` and `==`/`!=`
+  on `text` including claude.md #243's in-place append), statements
+  (`log`, assignment, postfix, `if`/`else`, `while`, `for`, `return`),
+  functions with parameters and locals, struct type definitions, scalar
+  and `text` globals and locals, `arr[T]`/`map[T]`/struct globals,
+  struct field reads and writes including claude.md #97's
+  lazily-created field storage, and imports merged before either stage
+  runs. Not in: container and struct *locals* and `text` parameters
+  (all of which need `festina/escape_analysis.py`, a fifth module),
+  other non-scalar parameters and returns, method calls, indexing, and
+  the graphics/audio/HTTP/thread/sqlite/table subsystems.
   `bootstrap/irdump.py` and `bootstrap/irdiff.py` run the comparison;
   the oracle is the IR text itself, so it needed no canonical form of
-  its own (decisions.md #289–#295).
+  its own (decisions.md #289–#296).
 
 - **Every bootstrap differential harness now runs in CI** — on Linux
   only. They compare two implementations of the lexer, parser, analyzer

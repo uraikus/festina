@@ -28,6 +28,15 @@ import semantic.f
 arr[text] CG_IR = []
 arr[text] CG_STRS = []
 int CG_STR_N = 0
+
+// String constants are INTERNED, not merely counted. codegen.py's
+// `string_const` keys a dict on the literal's own text and names each
+// one `@.str.<len(dict)>`, so a literal used twice is one global used
+// twice. Counting instead would agree with the original on every
+// program where no literal repeats -- which every file matching before
+// this happened to be -- and then renumber every constant from the
+// first repeat onward.
+map[text] CG_STR_MAP = {}
 bool CG_UNPORTED = false
 text CG_WHY = ''
 arr[text] CG_WHYS = []
@@ -100,8 +109,10 @@ text func cgStringConst(v:text) {
         }
         i++
     }
+    if CG_STR_MAP[v] != null { return CG_STR_MAP[v] }
     text name = `@.str.${CG_STR_N}`
     CG_STR_N++
+    CG_STR_MAP[v] = name
     int bytes = v.length + 1
     CG_STRS.push(`${name} = private unnamed_addr constant [${bytes} x i8] c"${cgCEscape(v)}\\00"`)
     return name
@@ -1062,6 +1073,7 @@ Val func cgExpr(e:Node) {
     if e.kind == 'Ternary' { return cgTernary(e) }
     if e.kind == 'Member' { return cgMemberRead(e) }
     if e.kind == 'Call' { return cgCall(e, true) }
+    if e.kind == 'TemplateLit' { return cgTemplate(e) }
 
     cgUnported(`expression ${e.kind}`)
     return none
@@ -1074,6 +1086,49 @@ Val func cgBinOp(e:Node) {
     Val r = cgExpr(childOf(e, 'right'))
     if CG_UNPORTED { return none }
     text op = rawText(e, 'op')
+
+    // `text` has its own branch, ahead of everything numeric: `==`/`!=`
+    // through festina_str_eq, `+` through festina_str_concat, and
+    // nothing else.
+    //
+    // Both operands are freed here when they were freshly allocated,
+    // and that placement is the point rather than a detail. Concat
+    // COPIES from both operands and keeps neither, so the `a + b`
+    // inside `a + b + c` is dead the moment the outer concat returns;
+    // freeing at the eventual binding site instead would leak one
+    // buffer per `+`. Equality is the same: a bool is not a text
+    // reference, so `f() == g()` has no later owner for either result.
+    if l.fty == 'text' || r.fty == 'text' {
+        if l.fty != 'text' || r.fty != 'text' {
+            cgUnported(`operator ${op} between ${l.fty} and ${r.fty}`)
+            return none
+        }
+        if op == '==' || op == '!=' {
+            text eq = cgTmp()
+            // i8 straight out of festina_str_eq, which only ever
+            // answers 0 or 1 -- already the final bool, no zext, unlike
+            // the icmp path below.
+            cgOut(`  ${eq} = call i8 @festina_str_eq(ptr ${l.v}, ptr ${r.v})`)
+            text res = eq
+            if op == '!=' {
+                text neg = cgTmp()
+                cgOut(`  ${neg} = xor i8 ${eq}, 1`)
+                res = neg
+            }
+            cgFreeTextTemp(childOf(e, 'left'), l)
+            cgFreeTextTemp(childOf(e, 'right'), r)
+            return cgVal(res, 'i8', 'bool')
+        }
+        if op == '+' {
+            text cat = cgTmp()
+            cgOut(`  ${cat} = call ptr @festina_str_concat(ptr ${l.v}, ptr ${r.v})`)
+            cgFreeTextTemp(childOf(e, 'left'), l)
+            cgFreeTextTemp(childOf(e, 'right'), r)
+            return cgVal(cat, 'ptr', 'text')
+        }
+        cgUnported(`operator ${op} on text`)
+        return none
+    }
 
     // int/float mix: whichever side is int gets an sitofp, exactly as
     // though .toFloat() had been written on it (claude.md #143).
@@ -1092,10 +1147,11 @@ Val func cgBinOp(e:Node) {
     // What each operator class actually accepts. Without this guard
     // `s + 'x'` on two `text` operands emitted `add i64` over two
     // POINTERS -- valid LLVM, catastrophically wrong, and a silent
-    // difference rather than an honest "not ported yet". `text` has its
-    // own branch in festina/codegen.py (festina_str_eq and
-    // festina_str_concat), so refusing it here is correct rather than
-    // merely cautious.
+    // difference rather than an honest "not ported yet". `text` now has
+    // its own branch above; everything else pointer-backed (struct,
+    // arr[T], map[T], blob, img, aud, regex, a table row) still reaches
+    // here and is still refused, which is what keeps the next type
+    // added an honest gap rather than wrong arithmetic.
     //
     // Equality admits bool as well as the numbers, which is what makes
     // `done == true` work -- the first version of this guard required
@@ -1355,6 +1411,123 @@ Val func cgTernary(e:Node) {
     text out = cgTmp()
     cgOut(`  ${out} = phi ${a.lty} [ ${a.v}, %${thenPred} ], [ ${b.v}, %${elsePred} ]`)
     return cgVal(out, a.lty, a.fty)
+}
+
+// claude.md #114's implicit `.toText()`: what a non-text value becomes
+// inside `${...}` or `log()`. int/float/bool only here --
+// struct/arr/map render through a generated JSON walk, `blob` and
+// `ascii` through their own runtime conversions, and img/aud/thread are
+// compile errors in the original rather than conversions.
+//
+// A `text` value is returned UNCHANGED, and that is load-bearing: the
+// caller distinguishes a piece it must free from one it must not by
+// asking whether the source expression owns it, and a conversion would
+// make every piece owned.
+Val func cgToText(a:Val) {
+    Val none
+    if a.fty == 'text' { return a }
+    text out = cgTmp()
+    if a.fty == 'int' {
+        cgOut(`  ${out} = call ptr @festina_str_from_int(i64 ${a.v})`)
+        return cgVal(out, 'ptr', 'text')
+    }
+    if a.fty == 'float' {
+        cgOut(`  ${out} = call ptr @festina_str_from_float(double ${a.v})`)
+        return cgVal(out, 'ptr', 'text')
+    }
+    if a.fty == 'bool' {
+        cgOut(`  ${out} = call ptr @festina_str_from_bool(i8 ${a.v})`)
+        return cgVal(out, 'ptr', 'text')
+    }
+    cgUnported(`interpolation of ${a.fty}`)
+    return none
+}
+
+// A template literal: alternating literal parts and interpolations,
+// folded left to right with @festina_str_concat.
+//
+// Three details, all of them observable in the output:
+//
+//   1. **An EMPTY literal part emits no concat at all.** `` `${x}` ``
+//      has an empty leading AND trailing part, and `` `${a}${b}` `` an
+//      empty one between them; concatenating with "" allocates and
+//      copies for nothing. Emitting those calls would double the
+//      concat count for the commonest template shape.
+//   2. **Every intermediate buffer is freed the moment the next
+//      concat has copied out of it.** claude.md #83: concat mallocs a
+//      fresh buffer and leaves both operands alone, so a chain leaks
+//      every intermediate otherwise. `resultOwned`/`pieceOwned` track
+//      whether the pointer in hand is a buffer THIS template allocated
+//      -- a `@.str.N` constant or another binding's buffer must never
+//      be freed here.
+//   3. **The result is always a fresh buffer.** A bare `` `${name}` ``
+//      concatenates nothing and would otherwise hand back `name`'s own
+//      pointer, indistinguishable from it, so freeing either would
+//      leave the other dangling. That case alone takes a
+//      festina_text_own copy on the way out.
+//
+// `exprs` is never empty -- the parser builds a TemplateLit only once
+// at least one `${...}` is seen, and a template with none is a plain
+// StringLit -- so the loop always runs and `result` is always set.
+//
+// festina/codegen.py also releases an interpolated value the template
+// OWNS (claude.md #192): `` `${make()}` `` renders a fresh container to
+// text and then must release the container itself. That call is a
+// no-op for int/float/bool/text, which is all cgToText accepts, so it
+// has no port here yet -- and must arrive with container interpolation
+// rather than after it.
+Val func cgTemplate(e:Node) {
+    Val none
+    arr[Node] parts = listOf(e, 'parts')
+    arr[Node] exprs = listOf(e, 'exprs')
+
+    text result = ''
+    bool resultOwned = false
+    if parts.length > 0 {
+        text head = rawText(parts[0], 'v')
+        if head != '' { result = cgStringConst(head) }
+    }
+
+    int i = 0
+    while i < exprs.length {
+        Val a = cgExpr(exprs[i])
+        if CG_UNPORTED { return none }
+        bool pieceOwned = a.fty != 'text'
+        if a.fty == 'text' { pieceOwned = cgIsOwningTextSource(exprs[i]) }
+        Val piece = cgToText(a)
+        if CG_UNPORTED { return none }
+
+        if result == '' {
+            result = piece.v
+            resultOwned = pieceOwned
+        } else {
+            text out = cgTmp()
+            cgOut(`  ${out} = call ptr @festina_str_concat(ptr ${result}, ptr ${piece.v})`)
+            if resultOwned { cgOut(`  call void @free(ptr ${result})`) }
+            if pieceOwned { cgOut(`  call void @free(ptr ${piece.v})`) }
+            result = out
+            resultOwned = true
+        }
+
+        text tail = ''
+        if i + 1 < parts.length { tail = rawText(parts[i + 1], 'v') }
+        if tail != '' {
+            text ts = cgStringConst(tail)
+            text out2 = cgTmp()
+            cgOut(`  ${out2} = call ptr @festina_str_concat(ptr ${result}, ptr ${ts})`)
+            if resultOwned { cgOut(`  call void @free(ptr ${result})`) }
+            result = out2
+            resultOwned = true
+        }
+        i++
+    }
+
+    if resultOwned == false {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${result})`)
+        result = owned
+    }
+    return cgVal(result, 'ptr', 'text')
 }
 
 Val func cgUnary(e:Node) {
@@ -1844,6 +2017,162 @@ void func cgStoreText(slot:text, apSlot:text, v:Val, owning:bool) {
     cgOut(`  store ptr ${val}, ptr ${slot}`)
 }
 
+// ---------------------------------------------------------------------
+// claude.md #243: in-place text append.
+//
+// `s = `${s}x`` and `s = s + x` used to compile like every other
+// concatenation -- a fresh buffer of the combined length, both operands
+// copied, the old one freed -- which is O(n^2) in bytes moved for a
+// string built one piece at a time. Instead the assignment's own old
+// value is handed to festina_text_append, which grows it in place. What
+// makes that sound is the rule the whole text model rests on
+// (claude.md #83): a text binding's buffer is exclusively its own, so
+// consuming it inside the very assignment that was about to free it
+// changes nothing anyone else can observe.
+//
+// The length is what the compiler carries. Every text slot has a
+// {pointer, length} shadow beside it; an append writes the new length
+// there and records which buffer it belongs to, and the next append
+// trusts that length only if the binding STILL holds that exact
+// pointer. Every other store clears the pointer shadow, so a remembered
+// length can never outlive the buffer it described.
+
+// Whether a piece is safe to evaluate in the middle of an append: it
+// must not call user code (which could reassign the target underneath)
+// and must not read the target again (whose buffer moves the moment it
+// grows).
+bool func cgAppendSimple(e:Node, targetName:text) {
+    if e == null { return false }
+    if e.kind == 'Identifier' { return rawText(e, 'name') != targetName }
+    if e.kind == 'StringLit' { return true }
+    if e.kind == 'NumberLit' { return true }
+    if e.kind == 'BoolLit' { return true }
+    if e.kind == 'Member' {
+        if fieldOf(e, 'computed').raw == 'true' { return false }
+        return cgAppendSimple(childOf(e, 'obj'), targetName)
+    }
+    return false
+}
+
+// The pieces to append, in order, when `target = v` is an append onto
+// `target`. An EMPTY answer means "not an append" -- there is no shape
+// this recognizes that would produce no pieces, so the two cases need
+// no separate signal.
+//
+// A const piece is carried as parser.f's own '#str' marker node, the
+// same way TemplateLit.parts already holds its literal halves, so one
+// list can hold both kinds without a parallel array of tags.
+arr[Node] func cgAppendPieces(targetName:text, v:Node) {
+    arr[Node] no = []
+    arr[Node] pieces = []
+    if v == null { return no }
+
+    if v.kind == 'TemplateLit' {
+        arr[Node] parts = listOf(v, 'parts')
+        arr[Node] exprs = listOf(v, 'exprs')
+        if exprs.length == 0 { return no }
+        if parts.length == 0 { return no }
+        // The template must START with the target and nothing else:
+        // `` `${s}x` `` appends, `` `a${s}` `` does not.
+        if rawText(parts[0], 'v') != '' { return no }
+        Node first = exprs[0]
+        if first.kind != 'Identifier' { return no }
+        if rawText(first, 'name') != targetName { return no }
+        if parts.length > 1 {
+            text p1 = rawText(parts[1], 'v')
+            if p1 != '' { pieces.push(mkStr(p1)) }
+        }
+        int i = 1
+        while i < exprs.length {
+            if cgAppendSimple(exprs[i], targetName) == false { return no }
+            pieces.push(exprs[i])
+            if i + 1 < parts.length {
+                text nx = rawText(parts[i + 1], 'v')
+                if nx != '' { pieces.push(mkStr(nx)) }
+            }
+            i++
+        }
+        return pieces
+    }
+
+    if v.kind == 'BinOp' {
+        if rawText(v, 'op') != '+' { return no }
+        // `s + a + b` parses left-associatively, so the chain is
+        // collected right to left and then walked back.
+        arr[Node] chain = []
+        Node cur = v
+        while cur != null && cur.kind == 'BinOp' && rawText(cur, 'op') == '+' {
+            chain.push(childOf(cur, 'right'))
+            cur = childOf(cur, 'left')
+        }
+        if cur == null { return no }
+        if cur.kind != 'Identifier' { return no }
+        if rawText(cur, 'name') != targetName { return no }
+        int k = chain.length - 1
+        while k >= 0 {
+            if cgAppendSimple(chain[k], targetName) == false { return no }
+            pieces.push(chain[k])
+            k--
+        }
+        return pieces
+    }
+
+    return no
+}
+
+void func cgEmitAppendAssign(slot:text, pieces:arr[Node]) {
+    text ptrSlot = `${slot}.ap`
+    text lenSlot = `${slot}.aplen`
+    text old = cgTmp()
+    cgOut(`  ${old} = load ptr, ptr ${slot}`)
+    text remembered = cgTmp()
+    cgOut(`  ${remembered} = load ptr, ptr ${ptrSlot}`)
+    text rememberedLen = cgTmp()
+    cgOut(`  ${rememberedLen} = load i64, ptr ${lenSlot}`)
+    text same = cgTmp()
+    cgOut(`  ${same} = icmp eq ptr ${old}, ${remembered}`)
+    // -1 means "measure it": the runtime never trusts the length for
+    // bounds -- capacity always comes from the allocator -- so a
+    // remembered length that no longer applies can only ever
+    // mis-position bytes inside the allocation, never outside it.
+    // `knownLen`, not the obvious `known`: bootstrap/semantic.f
+    // exports `bool func known(s:Scope, name:text)`, and a local that
+    // shadows a function name misresolves inside a template -- the
+    // same trap `at` set in cgFieldPtr, hit a second time in one
+    // session. See todo.md.
+    text knownLen = cgTmp()
+    cgOut(`  ${knownLen} = select i1 ${same}, i64 ${rememberedLen}, i64 -1`)
+
+    text cur = old
+    text curLen = knownLen
+    int i = 0
+    while i < pieces.length {
+        text pieceVal = ''
+        bool owned = false
+        if isStrType(pieces[i]) {
+            pieceVal = cgStringConst(rawText(pieces[i], 'v'))
+        } else {
+            Val a = cgExpr(pieces[i])
+            if CG_UNPORTED { return }
+            owned = a.fty != 'text'
+            if a.fty == 'text' { owned = cgIsOwningTextSource(pieces[i]) }
+            Val p = cgToText(a)
+            if CG_UNPORTED { return }
+            pieceVal = p.v
+        }
+        text grown = cgTmp()
+        cgOut(`  ${grown} = call ptr @festina_text_append(ptr ${cur}, i64 ${curLen}, ptr ${pieceVal}, i64 -1, ptr ${lenSlot})`)
+        if owned { cgOut(`  call void @free(ptr ${pieceVal})`) }
+        text newLen = cgTmp()
+        cgOut(`  ${newLen} = load i64, ptr ${lenSlot}`)
+        cur = grown
+        curLen = newLen
+        i++
+    }
+    cgOut(`  store ptr ${cur}, ptr ${slot}`)
+    cgOut(`  store ptr ${cur}, ptr ${ptrSlot}`)
+}
+
 void func cgAssign(e:Node) {
     Node target = childOf(e, 'target')
     if target != null && target.kind == 'Member' {
@@ -1875,6 +2204,18 @@ void func cgAssign(e:Node) {
         return
     }
     Node value = childOf(e, 'value')
+
+    // Checked BEFORE the value is emitted: the append path consumes the
+    // target's own old buffer instead of building a new one, so the
+    // ordinary emission must not have happened yet.
+    if fty == 'text' {
+        arr[Node] pieces = cgAppendPieces(name, value)
+        if pieces.length > 0 {
+            cgEmitAppendAssign(slot, pieces)
+            return
+        }
+    }
+
     Val v = cgExpr(value)
     if CG_UNPORTED { return }
     if fty == 'text' {
@@ -1894,6 +2235,17 @@ bool func cgIsOwningTextSource(e:Node) {
     // (see cgFreeTextTemp). A string literal is the opposite: a
     // pointer into .rodata that every use of that literal shares.
     if e.kind == 'Call' { return true }
+    // A template always hands back a fresh buffer -- cgTemplate
+    // guarantees it, taking a festina_text_own copy in the one case
+    // (a bare `${x}`) where it otherwise would not.
+    if e.kind == 'TemplateLit' { return true }
+    // In a text context `+` is concatenation, which is exactly one
+    // @festina_str_concat and mallocs unconditionally: there is no
+    // operand-passthrough path, not even for an empty operand. Leaving
+    // it out means every binding of a concatenation copies a buffer
+    // that was already exclusively owned and drops the original.
+    if e.kind == 'BinOp' { return rawText(e, 'op') == '+' }
+    if e.kind == 'Ternary' { return true }
     return false
 }
 
@@ -1996,6 +2348,26 @@ void func cgFunc(d:Node) {
         text pf = cgDeclFty(params[i])
         if pf == '' {
             cgUnported('parameter of a non-scalar type')
+            return
+        }
+        // A `text` parameter needs more than one alloca, and the port
+        // was silently getting it wrong: festina/codegen.py gives every
+        // text parameter claude.md #243's {pointer, length} append
+        // shadow beside its slot, and gives an ESCAPING one a
+        // festina_text_own copy plus a scope-exit free as well. The
+        // port emitted a bare `alloca ptr` and nothing else -- verified
+        // against a two-line probe, which differs at the first shadow
+        // line. No corpus file was affected (a file with a text
+        // parameter was already unported for other reasons, so the
+        // difference never surfaced), which is exactly why it stayed
+        // hidden.
+        //
+        // Refused rather than half-implemented: whether the copy is
+        // needed is what festina/escape_analysis.py answers, and
+        // hand-rolling a partial version of that rule here would be
+        // the same mistake in a new place. It lifts with that module.
+        if pf == 'text' {
+            cgUnported('text parameter')
             return
         }
         text pn = rawText(params[i], 'name')

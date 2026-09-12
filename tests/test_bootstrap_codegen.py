@@ -167,6 +167,48 @@ class TestTheCoverageNumberIsHonest:
             f"field or it cannot tell a correct phi predecessor from a "
             f"hardcoded label")
 
+    def test_the_text_case_really_reaches_every_text_path(self):
+        """`cases/text_building.f` is the only corpus file that
+        distinguishes four separate text-building decisions, and each is
+        asserted here rather than assumed.
+
+        Measured, not guessed: with string-constant interning removed
+        from the port, `cases/text_building.f` is the ONE file in the
+        whole corpus that differs. Three of the other four canaries are
+        invisible to `benchmarks/string_concat.f` too -- the only
+        pre-existing file that builds strings at all. A file that stops
+        containing a repeated literal, or an interpolation with no
+        surrounding text, silently stops measuring the thing it exists
+        for.
+        """
+        dump = irdump.dump_file("bootstrap/cases/text_building.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/text_building.f no longer compiles, so it measures "
+            "nothing at all: " + dump[0])
+        body = "\n".join(dump)
+        assert body.count("@festina_text_append(") > 5, (
+            "the in-place append path (decisions.md #243) is barely "
+            "reached; the file needs the `s = s + x` and "
+            "`s = `${s}x`` shapes, in a loop as well as straight-line")
+        assert body.count("@festina_str_concat(") > 5, (
+            "the ordinary concat path is barely reached, so the file no "
+            "longer distinguishes appending from concatenating")
+        assert "@festina_text_own(" in body, (
+            "no festina_text_own call, so nothing here is a bare "
+            "`${x}` -- the one template shape that must copy on the "
+            "way out rather than alias its only interpolation")
+        assert "@festina_str_eq(ptr" in body, (
+            "no text equality, which is its own operand-freeing rule")
+        # One constant per distinct literal, not per use. `'-'` appears
+        # four times in the source; if this finds two definitions of it,
+        # interning has regressed on the PYTHON side.
+        dashes = [line for line in dump
+                  if line.startswith("@.str.") and line.endswith('c"-\\00"')]
+        assert len(dashes) == 1, (
+            f"{len(dashes)} globals for the literal '-'; the file must "
+            f"keep repeating one literal, and codegen.py must keep "
+            f"interning it, or the port's own interning is unmeasured")
+
     def test_the_line_budget_excludes_the_shared_preamble(self):
         total, specific = irdiff.line_budget()
         assert specific < total, (
@@ -217,6 +259,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 1077, (
+        assert reproduced >= 1554, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 1077")
+            f"the port previously emitted at least 1554")

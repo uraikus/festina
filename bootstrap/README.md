@@ -44,13 +44,13 @@ python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 99-file repository corpus:
+Over the 100-file repository corpus:
 
-- **lexer: 99 match, 0 differ.**
-- **parser: 99 match, 0 differ, 0 unported.**
-- **semantic: 99 match, 0 differ, 0 unported.**
-- **codegen: 11 match, 0 differ, 77 unported, 11 rejected by both** —
-  1,077 of 175,080 file-specific IR lines. See below for why that is the
+- **lexer: 100 match, 0 differ.**
+- **parser: 100 match, 0 differ, 0 unported.**
+- **semantic: 100 match, 0 differ, 0 unported.**
+- **codegen: 13 match, 0 differ, 76 unported, 11 rejected by both** —
+  1,554 of 180,328 file-specific IR lines. See below for why that is the
   number reported rather than a file count, and for the caveat that
   comes with this particular figure.
 
@@ -103,7 +103,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 99-file repository corpus is a strong oracle for ordinary code and
+The 100-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -139,7 +139,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Semantic analysis: 99 match, 0 differ, 0 unported
+## Semantic analysis: 100 match, 0 differ, 0 unported
 
 All three stages of the front end agree with their originals over the
 whole corpus. `semantic.f` resolves declarations, merges imports,
@@ -189,7 +189,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 1,077 of 175,080 file-specific IR lines
+## Codegen: 1,554 of 180,328 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -256,24 +256,31 @@ times and so could not have varied either way.
 
 ### And the caveat that comes with the current figure
 
-**348 of the 1,077 lines come from `cases/struct_fields.f`, a file
-written for the slice that claims them.** Against the corpus as it
-stood before, struct fields and container globals unlocked zero files
-and zero lines: no existing corpus file is one construct away, because
-every file with a struct also has a template literal, a container
-local, a non-scalar parameter or an event handler behind it.
+**766 of the 1,554 lines come from two `cases/` files written for the
+slices that claim them** — `struct_fields.f` (348) and
+`text_building.f` (418). Struct fields and container globals unlocked
+zero pre-existing files: none is one construct away, because every file
+with a struct also has a container local, a non-scalar parameter or an
+event handler behind it. Templates and text concatenation did better,
+bringing in `benchmarks/string_concat.f`.
 
 A `cases/` file is a legitimate corpus member — the oracle is still
-`festina/codegen.py`, and each one has confirmed canaries. But a number
-that grows because the input grew says nothing about the remaining
-174,000 lines, and the two facts are worth keeping separate when
-reading the table below.
+`festina/codegen.py`, and each one has canaries confirmed by breaking
+the implementation. But a number that grows because the input grew says
+nothing about the remaining 178,000 lines, and the two facts are worth
+keeping separate when reading the table below.
+
+**The budget is not fixed, either.** It went 175,080 → 180,328 across
+one session with `festina/codegen.py` untouched, because
+`bootstrap/codegen.f` is itself a corpus file: every line added to the
+port enlarges the denominator. Self-hosting is a moving goal by
+construction.
 
 ### The target is self-hosting
 
 The **bootstrap's own eight files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f` and the four entry points — are **137,331 of
-the 175,080 file-specific IR lines, 78% of the budget**, and they need
+the 180,328 file-specific IR lines, 76% of the budget**, and they need
 none of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
@@ -291,9 +298,10 @@ assignment, postfix, `if`/`else`, `while`, `for`, `return`. Plus
 function declarations with parameters, locals and calls; struct type
 definitions; scalar globals and locals; `text` globals **and** locals;
 `arr[T]`/`map[T]`/struct **globals**; struct field reads and writes;
-and imports merged before either stage runs.
+template literals; `+` and `==`/`!=` on `text`; and imports merged
+before either stage runs.
 
-Six pieces are subtler than they look:
+Eight pieces are subtler than they look:
 
 - **Alloca hoisting** (claude.md #191) is a post-pass over the finished
   text, exactly as in the original, because it is a property of the
@@ -323,6 +331,24 @@ Six pieces are subtler than they look:
   `festina/codegen.py`'s `cur_block`, and every phi in the port reads
   it — ternary and `&&`/`||` included, which were right by luck rather
   than by construction before.
+- **String constants are interned**, keyed on the literal's own text,
+  so `'x'` used three times is one global used three times. A port
+  that counts instead agrees on every program where no literal repeats
+  and renumbers everything from the first repeat onward — and, measured,
+  **exactly one file in the corpus can tell the difference**, the
+  `cases/` file written for it.
+- **A template is three decisions.** An empty literal piece emits no
+  concat (concatenating with `""` allocates and copies for nothing);
+  every intermediate buffer is freed the moment the next concat has
+  copied out of it; and the result is always fresh, which for the one
+  shape that concatenates nothing (`` `${x}` ``) means a
+  `festina_text_own` copy on the way out. All three are leak-or-double-
+  free decisions, not cosmetics.
+- **`s = `${s}x`` is not a concatenation.** claude.md #243: it grows
+  s's own buffer in place through `festina_text_append`, with a
+  remembered length trusted only while the binding still holds that
+  exact pointer. The near misses matter as much — `` `x${s}` `` and
+  `s = t + 'x'` must NOT take that path.
 
 **Why ASan is not in this loop.** A missing release in the emitted IR
 would be a leak in every program the compiler produces — but the
@@ -336,14 +362,14 @@ sanitizer for this stage rather than needing it alongside.
 
 |blocks|only|construct|
 |---:|---:|---|
-|25|4|a declaration of a non-scalar type (`blob`, `img`, `regex`, …)|
+|23|4|a declaration of a non-scalar type (`blob`, `img`, `regex`, …)|
 |21|3|a parameter of a non-scalar type|
 |21|0|a call through a non-identifier callee (method calls)|
+|20|2|a `text` parameter|
 |19|0|`EventHandler`|
 |18|0|`ThreadDecl`|
-|17|4|an `arr[T]`/struct **local**|
-|13|1|`TemplateLit`|
-|10|1|`TableDecl`|
+|17|1|an `arr[T]` **local**|
+|14|2|a struct **local**|
 
 `blocks` counts every file a construct appears in; `only` counts the
 files where it is the last thing in the way, and so the number that
