@@ -6016,3 +6016,31 @@ The first number is reassuring rather than surprising -- that exemption is the e
 **A representation note.** Festina has no set type, so an escaping-name set is a `map[int]` with 1 for every member, and `escaping_params`'s `{name: set[int]}` is two flat maps -- `EP_KNOWN` for "this function has been analysed at all" and `EP_POS` keyed `'<func>#<index>'`. The distinction between an ABSENT entry and a PRESENT BUT EMPTY one is load-bearing: absent means "every argument escapes", empty means "none does", and collapsing them would silently weaken or strengthen the analysis everywhere.
 
 **Verified.** 2639 passed, 344 skipped. Lexer 102/102, parser 102/102, semantic 102/102, escape 84 match 0 differ. Codegen unchanged at 13 match, 0 differ. This container cannot run the graphics tests (Xvfb with no window manager) or the leak-stress suite (its ASan link path cannot resolve the graphics runtime symbols); those failures were reproduced identically on the pristine tree.
+
+
+300. ESCAPE ANALYSIS WIRED INTO THE CODEGEN PORT
+
+With #299's module in hand, three constructs the port had been refusing are now implemented: `text` parameters, struct locals, and assignment to a refcounted binding.
+
+**Result: 1,829 of 231,677 file-specific IR lines, up from 1,554. Fourteen files match, up from thirteen** -- the one new match being `cases/escape_locals.f`, written for this slice. No pre-existing corpus file was unlocked, which #297's corrected table already predicted: the `only` column is three files, and none of them is waiting on this.
+
+**A `text` parameter needs the escape answer and nothing else.** #296 refused it rather than half-implementing it, on the grounds that "does it escape" is exactly what the module answers. That turned out to be the right call for a reason I could not have known then: **20 of the 22 corpus files with a text parameter have an ESCAPING one, including all eight bootstrap files.** Implementing only the easy case would have bought two files and none of the self-hosting target.
+
+**And the free ORDER was the opposite of what the existing code did.** Measured on a two-parameter probe rather than reasoned about: a function with an escaping parameter `a` and a body local `loc` frees **`loc` first and `a` second**, on the return path and the fall-through path alike. `cgReturn` was doing `cgFreeFrom(0)` -- everything in one flat list, parameters first. Obvious in hindsight (a parameter is bound outside the body's scope, so the body's scope ends first) and easy to get backwards, which is why the probe came before the code. Parameters now live in their own list, freed after every block-scoped local.
+
+**Struct locals are the decision claude.md #74 exists for**, and the two answers are different allocation strategies for identical source:
+
+    P p            non-escaping -> alloca %struct.P + an explicit
+                   zeroinitializer, no refcount header, nothing released
+    P q            escaping     -> calloc'd {refcount, payload}, released
+                   at scope exit
+
+The explicit zeroinitializer is load-bearing rather than tidy: `alloca` does not zero and `calloc` does, and "an unassigned field reads as its zero" is a language rule. Without it the two strategies would be distinguishable from a Festina program, and this would be a behavior change rather than an optimization.
+
+**Refused, with the reason named rather than lumped in.** A struct with a struct, array, map or `text` field is released through a generated per-type cascade wrapper, and a NON-escaping one with a struct field still needs its FIELDS released even though its own storage is in the frame (festina/codegen.py's own `_StackStructFieldsOnly`). Both are separate mechanisms. `struct local` in the blocker table is now `struct local with a non-scalar field`, 24 files -- a more specific refusal is worth more than a shorter list.
+
+**Assignment to a refcounted binding, ported alongside** because a struct local is useless without it: load the old value, retain the new, release the old, store. **Retain BEFORE release**, because the two can be the same object -- `g = g` releasing first would drop the last reference to the value it is about to store. A call result is stored directly, since it already owns a fresh +1 nothing else holds.
+
+**Four canaries, each confirmed by breaking the implementation, all firing on `cases/escape_locals.f`:** every struct local forced onto the heap; every one forced onto the stack; every text parameter copied whether it escapes or not; and parameters freed before locals instead of after. Each differs at exactly the construct it targets. The case file's own properties are asserted in pytest -- it must contain a `.storage.` alloca, a `festina_release`, a `festina_text_own(ptr %arg.`, and a `store ptr %arg.` -- so a file that drifted to all-stack or all-heap cannot keep passing while measuring nothing.
+
+**Verified.** 2645 passed, 344 skipped. Lexer 103/103, parser 103/103, semantic 103/103, escape analysis unchanged, codegen 14 match, 0 differ. The 25 graphics failures and the deselected leak-stress suite are this container's limits, reproduced identically on the pristine tree.

@@ -50,15 +50,15 @@ python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 102-file repository corpus:
+Over the 103-file repository corpus:
 
-- **lexer: 102 match, 0 differ.**
-- **parser: 102 match, 0 differ, 0 unported.**
-- **semantic: 102 match, 0 differ, 0 unported.**
+- **lexer: 103 match, 0 differ.**
+- **parser: 103 match, 0 differ, 0 unported.**
+- **semantic: 103 match, 0 differ, 0 unported.**
 - **escape analysis: 84 match, 0 differ, 7 unported, 11 rejected by
   both** — 1,477 of 1,530 records.
-- **codegen: 13 match, 0 differ, 78 unported, 11 rejected by both** —
-  1,554 of 226,560 file-specific IR lines. See below for why that is the
+- **codegen: 14 match, 0 differ, 78 unported, 11 rejected by both** —
+  1,829 of 231,677 file-specific IR lines. See below for why that is the
   number reported rather than a file count, and for the caveat that
   comes with this particular figure.
 
@@ -111,7 +111,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 102-file repository corpus is a strong oracle for ordinary code and
+The 103-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -135,6 +135,10 @@ Every harness carries verified negative controls:
 | postfix `++` | 24 |
 | assignability checking (accept everything) | 2 |
 | the arrow-function counter (never advance it) | 1 |
+| every struct local forced onto the heap | `cases/escape_locals.f` |
+| every struct local forced onto the stack | `cases/escape_locals.f` |
+| every text parameter copied, escaping or not | `cases/escape_locals.f` |
+| parameters freed before locals rather than after | `cases/escape_locals.f` |
 | the member-base exemption (`v.field` escapes `v`) | 63 |
 | the non-retaining builtin list (`log(x)` escapes `x`) | 14 |
 | stage-2 interprocedural registration | 13 |
@@ -201,7 +205,7 @@ Not in: arrow functions (6 files), and `match` (1 file) — which
 so escape analysis never sees a MatchStmt, while `bootstrap/semantic.f`
 mutates nothing and leaves the node standing.
 
-## Semantic analysis: 102 match, 0 differ, 0 unported
+## Semantic analysis: 103 match, 0 differ, 0 unported
 
 All three stages of the front end agree with their originals over the
 whole corpus. `semantic.f` resolves declarations, merges imports,
@@ -251,7 +255,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 1,554 of 226,560 file-specific IR lines
+## Codegen: 1,829 of 231,677 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -318,9 +322,9 @@ times and so could not have varied either way.
 
 ### And the caveat that comes with the current figure
 
-**766 of the 1,554 lines come from two `cases/` files written for the
-slices that claim them** — `struct_fields.f` (348) and
-`text_building.f` (418). Struct fields and container globals unlocked
+**1,041 of the 1,829 lines come from three `cases/` files written for
+the slices that claim them** — `struct_fields.f` (348),
+`text_building.f` (418) and `escape_locals.f` (275). Struct fields and container globals unlocked
 zero pre-existing files: none is one construct away, because every file
 with a struct also has a container local, a non-scalar parameter or an
 event handler behind it. Templates and text concatenation did better,
@@ -332,7 +336,7 @@ the implementation. But a number that grows because the input grew says
 nothing about the remaining 178,000 lines, and the two facts are worth
 keeping separate when reading the table below.
 
-**The budget is not fixed, either.** It went 175,080 → 226,560 across
+**The budget is not fixed, either.** It went 175,080 → 231,677 across
 one session with `festina/codegen.py` untouched, because
 `bootstrap/codegen.f` is itself a corpus file: every line added to the
 port enlarges the denominator. Self-hosting is a moving goal by
@@ -342,7 +346,7 @@ construction.
 
 The **bootstrap's own eight files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f` and the four entry points — are **137,331 of
-the 226,560 file-specific IR lines**, and they need
+the 231,677 file-specific IR lines**, and they need
 none of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
@@ -360,8 +364,10 @@ assignment, postfix, `if`/`else`, `while`, `for`, `return`. Plus
 function declarations with parameters, locals and calls; struct type
 definitions; scalar globals and locals; `text` globals **and** locals;
 `arr[T]`/`map[T]`/struct **globals**; struct field reads and writes;
-template literals; `+` and `==`/`!=` on `text`; and imports merged
-before either stage runs.
+template literals; `+` and `==`/`!=` on `text`; `text` parameters;
+struct **locals**, stack or heap by claude.md #74's own answer;
+assignment to a refcounted binding; and imports merged before either
+stage runs.
 
 Eight pieces are subtler than they look:
 

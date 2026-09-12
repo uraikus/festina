@@ -20,7 +20,10 @@
 // difference, the same rule astdiff.py and semdiff.py use. Coverage
 // therefore only moves when something is really implemented.
 
-import semantic.f
+// escape.f rather than semantic.f: it imports semantic.f itself, and
+// codegen needs its answer before it can bind a single parameter
+// (claude.md #74).
+import escape.f
 
 // ---------------------------------------------------------------------
 // Output state.
@@ -785,6 +788,34 @@ text func cgLtyOf(fty:text) {
 // '' when the type is not one of them. This is the shape the
 // {refcount, payload} global header wraps -- the same layout
 // festina_retain/festina_release expect, with the count at payload-8.
+// A fresh, uniquely-owned heap block for a refcounted value: its own
+// i64 refcount prefix set to 1, with the visible pointer GEP'd past it
+// so every downstream GEP is unaffected. calloc zeroes the payload, so
+// every field starts at its own zero exactly as a global's
+// zeroinitializer storage does.
+//
+// sizeof comes from getelementptr-on-null, which is LLVM's own layout
+// rule rather than a reimplementation of it.
+//
+// Untagged only. A struct that is a member of a pure-struct enum needs
+// the wider {tag, refcount} header of claude.md #176; that is safe to
+// ignore here only because EnumDecl is itself unported, so no program
+// reaching this code has an enum at all.
+text func cgFreshHeader(payload:text) {
+    text sz = cgTmp()
+    cgOut(`  ${sz} = getelementptr ${payload}, ptr null, i64 1`)
+    text szi = cgTmp()
+    cgOut(`  ${szi} = ptrtoint ptr ${sz} to i64`)
+    text total = cgTmp()
+    cgOut(`  ${total} = add i64 ${szi}, 8`)
+    text raw = cgTmp()
+    cgOut(`  ${raw} = call ptr @calloc(i64 1, i64 ${total})`)
+    cgOut(`  store i64 1, ptr ${raw}`)
+    text made = cgTmp()
+    cgOut(`  ${made} = getelementptr i8, ptr ${raw}, i64 8`)
+    return made
+}
+
 text func cgPayloadFor(t:Ty) {
     if t == null { return '' }
     if t.amortized { return '' }
@@ -827,6 +858,16 @@ map[int] SF_IDX = {}
 map[text] SF_LTY = {}
 map[text] SF_FTY = {}
 map[text] SF_SNAME = {}
+
+// Structs every one of whose fields is a scalar. Only those can have a
+// LOCAL yet: a struct with a struct/arr/map/text field is released
+// through a generated per-type cascade wrapper rather than the plain
+// festina_release, and a non-escaping one with a struct-typed field
+// needs its FIELDS released even though its own storage is in the
+// frame (festina/codegen.py's _StackStructFieldsOnly). Both are their
+// own mechanisms; until they are ported, refusing is the honest
+// answer.
+map[int] SF_PLAIN = {}
 
 bool func cgIsLocal(name:text) {
     return L_SLOT[name] != null
@@ -904,6 +945,40 @@ bool CG_IN_FUNC = false
 // original's output for two locals in one block, not assumed.
 arr[text] CG_LIVE = []
 arr[int] CG_FRAME = []
+
+// A function's own escaping `text` parameters, freed AFTER every
+// block-scoped local rather than before.
+//
+// That order is measured, not reasoned about, and it is the opposite of
+// what the flat list above would give: a function with an escaping text
+// parameter `a` and a body local `loc` frees `loc` first and `a`
+// second, on the return path and the fall-through path alike. A
+// parameter is bound outside the body's own scope, so the body's scope
+// ends first -- obvious in hindsight and easy to get backwards, which
+// is why it was read off the original's output before anything was
+// written.
+arr[text] CG_PARAM_LIVE = []
+
+// The escaping-name set for the body currently being emitted --
+// festina/codegen.py's `_current_escaping_names`. Saved and restored
+// around a nested function rather than reset, for the reason that one
+// documents: a FuncDecl inside another body re-enters the emitter one
+// level deeper while the outer body is still being walked, and a bare
+// reset would silently turn the outer function's tracked locals back
+// into leaks for everything left to emit after it.
+map[int] CG_ESC = {}
+
+bool func cgEscapes(name:text) {
+    return CG_ESC[name] != null
+}
+
+void func cgFreeParams() {
+    int i = 0
+    while i < CG_PARAM_LIVE.length {
+        cgFreeOne(CG_PARAM_LIVE[i])
+        i++
+    }
+}
 
 arr[text] CG_FUNCS = []
 arr[text] CG_MAIN = []
@@ -1360,19 +1435,7 @@ Val func cgLoadFieldValue(fp:Val) {
     text loadPred = CG_BLOCK
 
     cgBlockLabel(makeL)
-    // sizeof via getelementptr-on-null: LLVM's own layout rules rather
-    // than a reimplementation of them.
-    text sz = cgTmp()
-    cgOut(`  ${sz} = getelementptr ${payload}, ptr null, i64 1`)
-    text szi = cgTmp()
-    cgOut(`  ${szi} = ptrtoint ptr ${sz} to i64`)
-    text total = cgTmp()
-    cgOut(`  ${total} = add i64 ${szi}, 8`)
-    text raw = cgTmp()
-    cgOut(`  ${raw} = call ptr @calloc(i64 1, i64 ${total})`)
-    cgOut(`  store i64 1, ptr ${raw}`)
-    text made = cgTmp()
-    cgOut(`  ${made} = getelementptr i8, ptr ${raw}, i64 8`)
+    text made = cgFreshHeader(payload)
     cgOut(`  store ptr ${made}, ptr ${fp.v}`)
     text makePred = CG_BLOCK
     cgOut(`  br label %${doneL}`)
@@ -1779,18 +1842,56 @@ void func cgStmt(s:Node) {
             }
             // A managed GLOBAL with no initializer is already fully
             // described by its header in the globals section, so there
-            // is nothing for main to do. Anything else -- a local, or
-            // an initializer of any kind -- needs the header allocated
-            // and released, which is not ported.
+            // is nothing for main to do.
             text gname = rawText(s, 'name')
-            if G_SLOT[gname] == null {
+            if G_SLOT[gname] != null {
+                if childOf(s, 'init') != null {
+                    cgUnported(`${managed} initializer`)
+                    return
+                }
+                return
+            }
+            if managed != 'struct' {
                 cgUnported(`${managed} local`)
                 return
             }
-            if childOf(s, 'init') != null {
-                cgUnported(`${managed} initializer`)
+            if SF_PLAIN[dt.name] == null {
+                cgUnported('struct local with a non-scalar field')
                 return
             }
+            if childOf(s, 'init') != null {
+                cgUnported('struct initializer')
+                return
+            }
+
+            // claude.md #74: THE decision escape analysis exists for.
+            // A struct local no one can reach any other way lives in
+            // the frame -- no refcount header, nothing to release. One
+            // that escapes gets the ordinary heap header and is
+            // released at scope exit like any other struct value.
+            //
+            // The two must be indistinguishable to a Festina program,
+            // which is why the stack path stores an explicit
+            // zeroinitializer: alloca does not zero and calloc does,
+            // and "an unassigned field reads as its zero" is a language
+            // rule, not an allocation detail.
+            int uid = cgUid()
+            text slot = `%${gname}.${uid}`
+            if cgEscapes(gname) == false {
+                text backing = `%${gname}.storage.${uid}`
+                cgOut(`  ${backing} = alloca %struct.${dt.name}`)
+                cgOut(`  store %struct.${dt.name} zeroinitializer, ptr ${backing}`)
+                cgOut(`  ${slot} = alloca ptr`)
+                cgOut(`  store ptr ${backing}, ptr ${slot}`)
+            } else {
+                text made = cgFreshHeader(`%struct.${dt.name}`)
+                cgOut(`  ${slot} = alloca ptr`)
+                cgOut(`  store ptr ${made}, ptr ${slot}`)
+                cgTrackLive('struct', slot)
+            }
+            L_SLOT[gname] = slot
+            L_FTY[gname] = 'struct'
+            L_SNAME[gname] = dt.name
             return
         }
         text name = rawText(s, 'name')
@@ -1820,7 +1921,7 @@ void func cgStmt(s:Node) {
                 cgOut(`  ${slot}.aplen = alloca i64`)
                 cgOut(`  store ptr null, ptr ${slot}.ap`)
                 cgOut(`  store i64 0, ptr ${slot}.aplen`)
-                CG_LIVE.push(slot)
+                cgTrackLive('text', slot)
             }
             L_SLOT[name] = slot
             L_FTY[name] = fty
@@ -1907,12 +2008,25 @@ void func cgPushFrame() {
 // Frees every live value from `downTo` onward. A `return` passes 0, so
 // it unwinds every frame at once; a block's natural end passes its own
 // base and unwinds just itself.
+// A live entry is '<kind>|<slot>'. `text` is freed outright
+// (claude.md #83: copy-on-alias, no refcount); a struct/arr[T]/map[T]
+// binding holds a counted reference and is released instead.
+void func cgTrackLive(kind:text, slot:text) {
+    CG_LIVE.push(`${kind}|${slot}`)
+}
+
+void func cgFreeOne(entry:text) {
+    arr[text] parts = entry.split('|')
+    text t = cgTmp()
+    cgOut(`  ${t} = load ptr, ptr ${parts[1]}`)
+    if parts[0] == 'text' { cgOut(`  call void @free(ptr ${t})`) }
+    else { cgOut(`  call void @festina_release(ptr ${t})`) }
+}
+
 void func cgFreeFrom(downTo:int) {
     int i = downTo
     while i < CG_LIVE.length {
-        text t = cgTmp()
-        cgOut(`  ${t} = load ptr, ptr ${CG_LIVE[i]}`)
-        cgOut(`  call void @free(ptr ${t})`)
+        cgFreeOne(CG_LIVE[i])
         i++
     }
 }
@@ -2250,12 +2364,41 @@ void func cgAssign(e:Node) {
         cgStoreText(slot, `${slot}.ap`, v, cgIsOwningTextSource(value))
         return
     }
+    if fty == 'struct' || fty == 'arr' || fty == 'map' {
+        // claude.md #79/#80: a refcounted binding hands its old
+        // reference back and takes one on the new value. Retain BEFORE
+        // release, because the two can be the same object -- `g = g`
+        // releasing first would drop the last reference to the value it
+        // is about to store.
+        //
+        // A call result already owns a fresh +1 that nothing else
+        // references, so it is stored directly; anything else (another
+        // binding, a field read) is shared and needs its own count.
+        text old = cgTmp()
+        cgOut(`  ${old} = load ptr, ptr ${slot}`)
+        if cgIsOwningRefcountedSource(value) == false {
+            cgOut(`  call void @festina_retain(ptr ${v.v})`)
+        }
+        cgOut(`  call void @festina_release(ptr ${old})`)
+        cgOut(`  store ptr ${v.v}, ptr ${slot}`)
+        return
+    }
     cgOut(`  store ${cgLtyOf(fty)} ${v.v}, ptr ${slot}`)
 }
 
 // Whether an expression already hands back a buffer nothing else
 // holds, so storing it needs no copy. A string literal is NOT one: it
 // is a pointer into .rodata that every use of that literal shares.
+// claude.md #79: whether an expression's value is a fresh reference
+// nothing else holds yet, so a binding can take it without its own
+// retain. A call result is -- every refcounted-value-returning path
+// hands back a +1. Anything else (another binding, a field read) is
+// shared.
+bool func cgIsOwningRefcountedSource(e:Node) {
+    if e == null { return false }
+    return e.kind == 'Call'
+}
+
 bool func cgIsOwningTextSource(e:Node) {
     if e == null { return false }
     // A call's result is a buffer nothing else holds, so storing it
@@ -2332,6 +2475,7 @@ void func cgReturn(s:Node) {
     Node v = childOf(s, 'value')
     if v == null {
         cgFreeFrom(0)
+        cgFreeParams()
         cgOut('  ret void')
         CG_TERM = true
         return
@@ -2351,6 +2495,7 @@ void func cgReturn(s:Node) {
         }
     }
     cgFreeFrom(0)
+    cgFreeParams()
     cgOut(`  ret ${r.lty} ${val}`)
     CG_TERM = true
 }
@@ -2378,26 +2523,6 @@ void func cgFunc(d:Node) {
             cgUnported('parameter of a non-scalar type')
             return
         }
-        // A `text` parameter needs more than one alloca, and the port
-        // was silently getting it wrong: festina/codegen.py gives every
-        // text parameter claude.md #243's {pointer, length} append
-        // shadow beside its slot, and gives an ESCAPING one a
-        // festina_text_own copy plus a scope-exit free as well. The
-        // port emitted a bare `alloca ptr` and nothing else -- verified
-        // against a two-line probe, which differs at the first shadow
-        // line. No corpus file was affected (a file with a text
-        // parameter was already unported for other reasons, so the
-        // difference never surfaced), which is exactly why it stayed
-        // hidden.
-        //
-        // Refused rather than half-implemented: whether the copy is
-        // needed is what festina/escape_analysis.py answers, and
-        // hand-rolling a partial version of that rule here would be
-        // the same mistake in a new place. It lifts with that module.
-        if pf == 'text' {
-            cgUnported('text parameter')
-            return
-        }
         text pn = rawText(params[i], 'name')
         sig.push(`${cgLtyOf(pf)} %arg.${pn}`)
         pnames.push(pn)
@@ -2419,41 +2544,94 @@ void func cgFunc(d:Node) {
     L_SLOT = freshSlot
     L_FTY = freshFty
 
+    // claude.md #74: the whole body's escaping-name set, computed
+    // BEFORE any parameter is bound, because binding is the first thing
+    // that needs it -- a text parameter the body lets escape takes an
+    // owning copy, one it only reads does not.
+    map[int] escSet = findEscapingNames(cgBlockStmts(childOf(d, 'body')))
+    if ESC_UNKNOWN {
+        cgUnported(`escape analysis: expression ${ESC_UNKNOWN_KIND}`)
+        return
+    }
+    map[int] savedEsc = CG_ESC
+    CG_ESC = escSet
+
     CUR = CG_FUNCS
     CG_IN_FUNC = true
     cgOut(`define ${retL} @${name}(${joined}) {`)
     cgBlockLabel(cgLabel('entry'))
+
+    // Allocas first, matching what alloca hoisting leaves behind: a
+    // text parameter's slot is followed immediately by claude.md #243's
+    // {pointer, length} append shadow, grouped per parameter rather
+    // than all slots then all shadows.
     int p = 0
     while p < pnames.length {
         text slot = `%${pnames[p]}.${cgUid()}`
         cgOut(`  ${slot} = alloca ${cgLtyOf(pftys[p])}`)
+        if pftys[p] == 'text' {
+            cgOut(`  ${slot}.ap = alloca ptr`)
+            cgOut(`  ${slot}.aplen = alloca i64`)
+        }
         L_SLOT[pnames[p]] = slot
         L_FTY[pnames[p]] = pftys[p]
         p++
     }
-    int q = 0
-    while q < pnames.length {
-        cgOut(`  store ${cgLtyOf(pftys[q])} %arg.${pnames[q]}, ptr ${L_SLOT[pnames[q]]}`)
-        q++
-    }
+
     // A fresh live-value list per function: a frame left over from a
-    // previous function would be freed inside this one.
+    // previous function would be freed inside this one. Both are reset
+    // before the parameter stores below, because an escaping text
+    // parameter is tracked there.
     arr[text] freshLive = []
     arr[int] freshFrames = []
+    arr[text] freshParams = []
     CG_LIVE = freshLive
     CG_FRAME = freshFrames
+    CG_PARAM_LIVE = freshParams
 
+    int q = 0
+    while q < pnames.length {
+        text slot = L_SLOT[pnames[q]]
+        text arg = `%arg.${pnames[q]}`
+        if pftys[q] == 'text' {
+            cgOut(`  store ptr null, ptr ${slot}.ap`)
+            cgOut(`  store i64 0, ptr ${slot}.aplen`)
+            if escSet[pnames[q]] != null {
+                // claude.md #83/#84: a parameter the body reassigns --
+                // or lets escape any other way -- must own its own
+                // buffer, because the CALLER still owns what it passed
+                // and will free it. One the body only reads borrows it
+                // for the call's duration and copies nothing.
+                text owned = cgTmp()
+                cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${arg})`)
+                arg = owned
+                CG_PARAM_LIVE.push(`text|${slot}`)
+            }
+        }
+        cgOut(`  store ${cgLtyOf(pftys[q])} ${arg}, ptr ${slot}`)
+        q++
+    }
     // Through cgBlockInto, not a loop of its own: the helper resets
     // CG_TERM on entry, and without that a function whose body does not
     // return inherits the flag from whichever function was emitted
     // before it and silently loses its `ret void`.
     cgBlockInto(childOf(d, 'body'))
     if retF == 'void' {
-        if CG_TERM == false { cgOut('  ret void') }
+        if CG_TERM == false {
+            cgFreeParams()
+            cgOut('  ret void')
+        }
     }
     cgOut('}')
     cgOut('')
     CG_IN_FUNC = false
+    CG_ESC = savedEsc
+
+    // claude.md #74 stage 2: registered AFTER the body, so a LATER
+    // function's own analysis can exempt a call argument this one
+    // proves safe -- and an earlier one cannot. The order functions are
+    // emitted in is part of the answer.
+    escRegisterParams(name, params, escSet)
 }
 
 // ---------------------------------------------------------------------
@@ -2495,6 +2673,15 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 if ffty == 'struct' { SF_SNAME[key] = ft.name }
                 fi++
             }
+            bool plain = true
+            int pf = 0
+            while pf < fs.length {
+                text pk = `${sn}.${rawText(fs[pf], 'name')}`
+                text pfty = SF_FTY[pk]
+                if pfty != 'int' && pfty != 'float' && pfty != 'bool' { plain = false }
+                pf++
+            }
+            if plain { SF_PLAIN[sn] = 1 }
             cgEmit(`%struct.${sn} = type { ${row} }`)
         }
         sd++

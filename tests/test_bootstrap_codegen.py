@@ -209,6 +209,32 @@ class TestTheCoverageNumberIsHonest:
             f"keep repeating one literal, and codegen.py must keep "
             f"interning it, or the port's own interning is unmeasured")
 
+    def test_the_escape_case_really_has_both_allocation_strategies(self):
+        """`cases/escape_locals.f` exists to measure claude.md #74's one
+        decision -- frame storage versus a refcount header for the same
+        source construct -- so it has to contain both answers.
+
+        A file that drifted to all-stack or all-heap would keep passing
+        while measuring nothing, which is the `cases/float_bits.f`
+        lesson (decisions.md #290) in a new place.
+        """
+        dump = irdump.dump_file("bootstrap/cases/escape_locals.f")
+        assert not dump[0].startswith("SEMERR"), dump[0]
+        body = "\n".join(dump)
+        assert ".storage." in body, (
+            "no frame-allocated struct local, so the stack half of the "
+            "decision is unmeasured")
+        assert "@festina_release(ptr" in body, (
+            "no released struct local, so the heap half is unmeasured")
+        assert "@festina_text_own(ptr %arg." in body, (
+            "no escaping text parameter takes its owning copy, so the "
+            "per-parameter half of the decision is unmeasured")
+        # The borrowed parameter is the other half: at least one text
+        # parameter must be stored straight from its own %arg register.
+        assert any(line.startswith("  store ptr %arg.") for line in dump), (
+            "every text parameter is copied, so nothing here shows a "
+            "borrowed one")
+
     def test_the_line_budget_excludes_the_shared_preamble(self):
         total, specific = irdiff.line_budget()
         assert specific < total, (
@@ -259,6 +285,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 1554, (
+        assert reproduced >= 1829, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 1554")
+            f"the port previously emitted at least 1829")

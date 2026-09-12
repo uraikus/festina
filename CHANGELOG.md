@@ -111,9 +111,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage, **in progress**: **13 of 100 corpus files
-  emit byte-identical LLVM IR, 0 differ, 76 not yet ported, 11 rejected
-  by both** — 1,554 of 180,340 file-specific IR lines. In are
+  the fourth and last stage, **in progress**: **14 of 103 corpus files
+  emit byte-identical LLVM IR, 0 differ, 78 not yet ported, 11 rejected
+  by both** — 1,829 of 231,677 file-specific IR lines. In are
   expressions (arithmetic and comparison with int/float mixing,
   `&&`/`||`, unary, the ternary, `/` and `%` with claude.md #57's
   divide-by-zero control flow, template literals, and `+` and `==`/`!=`
@@ -123,10 +123,13 @@ round-by-round design and implementation record predating 0.1 lives in
   and `text` globals and locals, `arr[T]`/`map[T]`/struct globals,
   struct field reads and writes including claude.md #97's
   lazily-created field storage, and imports merged before either stage
-  runs. Not in: container and struct *locals* and `text` parameters
-  (all of which need `festina/escape_analysis.py`, a fifth module),
-  other non-scalar parameters and returns, method calls, indexing, and
-  the graphics/audio/HTTP/thread/sqlite/table subsystems.
+  runs, plus `text` parameters and struct locals — the latter placed in
+  the frame or on the heap by `bootstrap/escape.f`'s own answer, which
+  is the decision claude.md #74 exists for — and assignment to a
+  refcounted binding. Not in: container locals, structs with a
+  non-scalar field, other non-scalar parameters and returns, method
+  calls, indexing, and the graphics/audio/HTTP/thread/sqlite/table
+  subsystems.
   `bootstrap/irdump.py` and `bootstrap/irdiff.py` run the comparison;
   the oracle is the IR text itself, so it needed no canonical form of
   its own (decisions.md #289–#296).
