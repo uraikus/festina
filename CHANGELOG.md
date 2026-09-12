@@ -48,6 +48,20 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Added
 
+- **Struct literals** — `User u = {'id': 1, 'name': 'Patrick'}`
+  (specification.md §8.9.4). The same `{...}` builds a map or a struct
+  depending on what the position expects, so a struct with a `map[T]`
+  field reads naturally with the outer braces the struct and the inner
+  ones the map. Fields left out keep their zero values, so a literal is
+  always a complete fresh instance — assigning one replaces the whole
+  value rather than updating the fields it names. Field names are
+  written as string literals, because an unquoted name is a variable
+  reference here exactly as it is in a map literal; writing
+  `{name: 'Brad'}` reports what to do about it. Literals nest into
+  struct-typed fields, `arr[Struct]` elements and `map[Struct]` values,
+  and work at declarations and assignments — the two positions where
+  the expected type is known. Arguments and `return` are deliberately
+  not literal positions (Annex D).
 - **`clear x`** — `free x` that overwrites the bytes with zero before
   releasing them, for a value whose contents should not outlive it
   (specification.md §10.11). The write goes through a volatile pointer

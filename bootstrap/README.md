@@ -39,11 +39,11 @@ python bootstrap/semdiff.py                         # analyzer, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 93-file repository corpus:
+Over the 94-file repository corpus:
 
-- **lexer: 93 match, 0 differ.**
-- **parser: 93 match, 0 differ, 0 unported.**
-- **semantic: 93 match, 0 differ, 0 unported.**
+- **lexer: 94 match, 0 differ.**
+- **parser: 94 match, 0 differ, 0 unported.**
+- **semantic: 94 match, 0 differ, 0 unported.**
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
 `parser.f`, the largest source in the corpus at ~1,200 lines, takes
@@ -94,7 +94,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 93-file repository corpus is a strong oracle for ordinary code and
+The 94-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -130,7 +130,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Semantic analysis: 93 match, 0 differ, 0 unported
+## Semantic analysis: 94 match, 0 differ, 0 unported
 
 All three stages of the front end now agree with their originals over
 the whole corpus. `semantic.f` resolves declarations, merges imports,

@@ -1680,6 +1680,124 @@ def analyze(program, filename="<string>"):
                 category="invalid condition type",
             )
 
+    def check_struct_lit(stype, lit, scope):
+        """claude.md #288: specification.md §8.9.4 -- `{...}` checked as
+        a struct literal against `stype`.
+
+        Keys are string literals by design, never expressions. A field
+        name is resolved at compile time, so there is nothing a runtime
+        text value could name; and keeping the rule means one `{...}`
+        spelling never means two things -- an unquoted identifier is a
+        variable reference here exactly as it is in a map literal
+        (§8.8), rather than silently becoming a bareword field name
+        when the target happens to be a struct.
+
+        `{ name }` shorthand needs no handling of its own: the parser
+        already desugars it to `('name', Identifier(name))`, which is a
+        StringLit key like any other."""
+        fields = structs.get(stype.name)
+        if fields is None:
+            # A struct whose fields have not been registered yet. Only
+            # reachable for a self-referencing declaration mid-analysis
+            # (analyze_struct deletes the half-registered name on the
+            # way through), so answering "no opinion" here is right --
+            # the declaration's own analysis reports the real error.
+            return
+        seen = set()
+        for key, value in lit.entries:
+            if not isinstance(key, ast.StringLit):
+                if isinstance(key, ast.Identifier):
+                    # The JavaScript habit, and by far the likeliest
+                    # mistake: `{name: 'Brad'}`. Without this the error
+                    # is `unknown variable 'name'` -- true, and useless,
+                    # because it describes the parse rather than the fix.
+                    raise CompileError(
+                        f"a struct literal's field name must be a string "
+                        f"literal -- write '{key.name}': rather than "
+                        f"{key.name}: (an unquoted name is a variable "
+                        f"reference, as it is in a map literal)",
+                        file=filename, line=getattr(key, "line", 0),
+                        column=getattr(key, "column", 0),
+                        category="invalid struct literal",
+                    )
+                raise CompileError(
+                    f"a struct literal's field name must be a string literal "
+                    f"naming a field of {stype.name} -- fields are resolved at "
+                    f"compile time, so an expression cannot name one",
+                    file=filename, line=getattr(key, "line", 0),
+                    column=getattr(key, "column", 0),
+                    category="invalid struct literal",
+                )
+            fname = key.value
+            if fname not in fields:
+                known = ", ".join(sorted(fields)) or "(none)"
+                raise CompileError(
+                    f"struct {stype.name} has no field '{fname}' -- "
+                    f"its fields are: {known}",
+                    file=filename, line=getattr(key, "line", 0),
+                    column=getattr(key, "column", 0),
+                    category="invalid struct literal",
+                )
+            if fname in seen:
+                raise CompileError(
+                    f"struct literal sets field '{fname}' of {stype.name} twice",
+                    file=filename, line=getattr(key, "line", 0),
+                    column=getattr(key, "column", 0),
+                    category="invalid struct literal",
+                )
+            seen.add(fname)
+            ftype = fields[fname]
+            if not check_typed_lit(ftype, value, scope):
+                check_assignable(ftype, infer(value, scope), value,
+                                 what=f"field '{fname}'")
+
+    def check_typed_lit(expected, expr, scope):
+        """claude.md #288: expected-type-directed literal checking.
+
+        Answers True when `expr` has been fully checked against
+        `expected` as a struct literal, or as a container literal whose
+        elements are -- meaning the caller must NOT also run the generic
+        infer() + check_assignable() path, since MapLit's own inference
+        has no notion of an expected type and would answer `map[...]`
+        for a struct literal every time.
+
+        Answers False for everything else, leaving every pre-existing
+        path exactly as it was. That is what keeps this additive: the
+        only programs whose meaning changes are the ones that did not
+        compile before."""
+        if expr is None:
+            return False
+        if isinstance(expected, types_mod.StructType) and isinstance(expr, ast.MapLit):
+            check_struct_lit(expected, expr, scope)
+            return True
+        # The expected type propagates one level into a container
+        # literal, so `arr[Point] ps = [{...}, {...}]` works. Gated on
+        # the element type actually being a struct, so no existing
+        # array/map literal path is touched.
+        if (isinstance(expected, types_mod.ArrayType)
+                and isinstance(expected.element, types_mod.StructType)
+                and isinstance(expr, ast.ArrayLit)):
+            for element in expr.elements:
+                if not check_typed_lit(expected.element, element, scope):
+                    check_assignable(expected.element, infer(element, scope), element)
+            return True
+        if (isinstance(expected, types_mod.MapType)
+                and isinstance(expected.value, types_mod.StructType)
+                and isinstance(expr, ast.MapLit)):
+            for key, value in expr.entries:
+                ktype = infer(key, scope)
+                if ktype is not None and ktype is not NULL and ktype != _TEXT:
+                    raise CompileError(
+                        f"map key must be text, found {types_mod.type_name(ktype)}",
+                        file=filename, line=getattr(key, "line", 0),
+                        column=getattr(key, "column", 0),
+                        category="invalid operand type",
+                    )
+                if not check_typed_lit(expected.value, value, scope):
+                    check_assignable(expected.value, infer(value, scope), value)
+            return True
+        return False
+
     def infer(expr, scope):
         if isinstance(expr, ast.NumberLit):
             return types_mod.PrimitiveType("float" if isinstance(expr.value, float) else "int")
@@ -2040,6 +2158,15 @@ def analyze(program, filename="<string>"):
                         category="invalid assignment",
                     )
             target_type = infer(expr.target, scope)
+            # claude.md #288: `p = {...}`, `s.origin = {...}`,
+            # `ps[0] = {...}` -- the assignment target's own type is the
+            # expected type, exactly as a declaration's declared type
+            # is. Checked before the generic infer() below for the same
+            # reason as at a declaration: MapLit infers as `map[...]`
+            # regardless of context, so the generic path could only
+            # reject a struct literal.
+            if check_typed_lit(target_type, expr.value, scope):
+                return target_type
             value_type = infer(expr.value, scope)
             check_assignable(target_type, value_type, expr)
             return target_type
@@ -4736,6 +4863,20 @@ def analyze(program, filename="<string>"):
                 # literal just built also gets sent."
                 lit = decl.init if isinstance(decl.init, ast.MapLit) else _http_send_lit_receiver(decl.init)
                 _validate_http_lit(lit, scope, filename, infer)
+            elif check_typed_lit(declared_type, decl.init, scope):
+                # claude.md #288: specification.md §8.9.4 -- a struct
+                # literal, or a container literal of them. Same bypass
+                # shape and same reason as the arr[img]/amor/http cases
+                # above: MapLit's own inference always answers
+                # `map[...]`, so the generic path below could only ever
+                # reject this. Placed BEFORE the manually-managed branch
+                # deliberately -- `Person? p = {...}` matches both (a
+                # MapLit is a fresh construction, claude.md #204), and
+                # that branch would infer the literal as a map and
+                # reject it against the bare struct type. Field checking
+                # does not care about the flag either way, since fields
+                # come from the struct's own registration.
+                pass
             elif decl.manually_managed and _is_fresh_construction(decl.init):
                 # claude.md #204: a manually-managed declaration's own
                 # initializer may adopt manually-managed-ness from a

@@ -648,6 +648,61 @@ b.m['k'] = 9
 The value is created once, on first reach, and stays — the read above
 and the `push` below it are talking about the same array.
 
+### Struct literals
+
+A `{...}` builds a struct wherever a struct is what's expected:
+
+```festina
+User a = {'id': 1, 'name': 'Patrick', 'active': true}
+User b = {'name': 'Brad'}     // id 0, active false
+User c = {}                   // same as `User c`
+```
+
+Fields you leave out keep their zero values, so a literal is always a
+complete, fresh instance. That matters on assignment: `a = {'id': 2}`
+gives you a *new* `User` whose name is empty — it does not update the
+one field and keep the rest.
+
+**Field names are quoted.** An unquoted name is a variable reference
+here just as it is in a map literal, so `{name: 'Brad'}` does not name
+the `name` field — it means "the key is whatever is in the variable
+`name`", and the compiler says so. The shorthand still works, and means
+what it looks like:
+
+```festina
+text name = 'Brad'
+User d = { name }             // d.name = 'Brad'
+```
+
+The same braces build a map when a map is what's expected, so a struct
+with a `map[T]` field reads naturally — the outer braces are the
+struct, the inner ones the map:
+
+```festina
+struct Bag { name:text  items:map[text] }
+Bag toolbox = {'name': 'toolbox', 'items': {'a': 'hammer'}}
+```
+
+Literals nest into struct-typed fields and into arrays of structs:
+
+```festina
+struct Point { x:int  y:int }
+struct Shape { origin:Point }
+
+Shape s = {'origin': {'x': 1, 'y': 2}}
+arr[Point] ps = [{'x': 1, 'y': 2}, {'x': 3, 'y': 4}]
+ps[0] = {'x': 9, 'y': 9}
+```
+
+Literals work at declarations and assignments — the two places the
+expected type is known. A function argument is not one of them, so
+build the value first and pass it:
+
+```festina
+Point p = {'x': 1, 'y': 2}
+draw(p)                       // not draw({'x': 1, 'y': 2})
+```
+
 ### A struct can name itself
 
 A field may have the type of the struct it is declared in, or the type

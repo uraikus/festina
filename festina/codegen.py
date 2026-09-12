@@ -7484,6 +7484,68 @@ class CodeGen:
         self.func_defs.extend(body)
         return fn_name
 
+    def _emit_struct_lit(self, node, env, lines, stype):
+        """claude.md #288: specification.md §8.9.4 -- `Person p = {...}`.
+
+        A fresh instance plus one store per named field, which is
+        deliberately the same shape `_from_json_struct_fn_for` already
+        builds a struct in, and the same per-field ownership rule
+        `_emit_assign`'s own `outer.field = value` path uses. Two things
+        make this simpler than that path, and both are properties of the
+        value being brand new rather than shortcuts:
+
+        - **No old value to release.** `_emit_fresh_heap_header` hands
+          back calloc'd storage, so every field starts NULL, and
+          semantic.py rejects a literal that names the same field twice
+          (§8.9.4), so no field here is ever written a second time. The
+          load-store-release dance those paths need exists to overwrite
+          a slot that may already own something; nothing here can.
+        - **Omitted fields need no code at all.** Zero IS the zero value
+          (§8.9.2), which the calloc already wrote.
+
+        Field names are not re-validated: semantic.py has already
+        checked every key is a string literal naming a real field of
+        this struct, so `struct_field_index` cannot fail here."""
+        struct_ty = self.struct_llvm_name(stype.name)
+        # The enum type tag, when this struct is a member of a
+        # pure-struct enum -- claude.md #267 is the record of what goes
+        # wrong when one construction site forgets it: the struct comes
+        # out untagged and crashes the moment it is used as its enum,
+        # and its release frees `payload - 8` where the tagged layout
+        # allocated from `payload - 16`.
+        type_tag = (self._enum_tag_const(stype)
+                    if stype.name in self._tagged_structs else None)
+        out = self._emit_fresh_heap_header(struct_ty, lines, type_tag=type_tag)
+        fields = self.struct_fields(stype.name)
+        ftypes = dict(fields)
+        for key, value in node.entries:
+            fname = key.value
+            idx = self.struct_field_index(stype.name, fname)
+            ftype = ftypes[fname]
+            val, vtype = self._emit_value_for(value, env, lines, ftype)
+            val = self._coerce(val, vtype, ftype, lines, source_expr=value)
+            if _is_refcounted(ftype):
+                # The freshness test rather than the bare owning-source
+                # one, for claude.md #118's reason: a text initializer
+                # coerced into a blob/img/aud field is already a fresh
+                # handle from _coerce's own load, and retaining it again
+                # would leak it.
+                if not self._refcounted_source_is_fresh(value, vtype, ftype):
+                    lines.append(f"  call void @festina_retain(ptr {val})")
+            elif ftype == TEXT:
+                # claude.md #83: text copies rather than retains, so a
+                # field holds a buffer it exclusively owns and can free
+                # outright.
+                if not self._is_owning_text_source(value):
+                    owned = self.tmp()
+                    lines.append(f"  {owned} = call ptr @festina_text_own(ptr {val})")
+                    val = owned
+            slot = self.tmp()
+            lines.append(f"  {slot} = getelementptr {struct_ty}, ptr {out}, "
+                         f"i32 0, i32 {idx}")
+            lines.append(f"  store {_llvm_type(ftype)} {val}, ptr {slot}")
+        return out, stype
+
     def _emit_value_for(self, node, env, lines, expected_type):
         """Like _emit_expr, but for positions where the *declared* type is
         already known (a var's declared type, a param's type, a function's
@@ -7494,6 +7556,21 @@ class CodeGen:
         (all pointer-backed), but the reserved sentinel constants for
         int/float/bool, none of which have a spare bit pattern for a
         real null (see the module docstring)."""
+        if isinstance(node, ast.MapLit) and isinstance(expected_type, types_mod.StructType):
+            # claude.md #288: a struct literal, checked before the
+            # generic ast.MapLit branch below for the identical reason
+            # the http bypass just after it exists -- a MapLit's generic
+            # handling wants one homogeneous value type across every
+            # entry, which a struct's field set generally cannot satisfy.
+            #
+            # Every position that can hold a struct literal reaches it
+            # through here: a declaration's initializer, and all three
+            # assignment shapes (`p = {...}`, `s.origin = {...}`,
+            # `ps[0] = {...}`), since _emit_assign already resolves its
+            # target's type first and routes the value through this
+            # function with it. That is why §8.9.4's "where the expected
+            # type is known" needs no enumeration in codegen.
+            return self._emit_struct_lit(node, env, lines, expected_type)
         if isinstance(node, ast.ArrayLit):
             # claude.md #174: ast.ArrayLit itself has no amor-vs-plain
             # distinction (the same `[...]` syntax either way) -- only

@@ -752,7 +752,9 @@ reference-counted hash table with average O(1) get, set and delete and
   key). `{ name }` is shorthand for `{ 'name': name }`. All values must
   have one type (`null` excepted). Two identical string-literal keys in
   one literal are a compile error; otherwise the last value for a key
-  wins. [#154, #162]
+  wins. [#154, #162] A `{...}` written where a struct is expected is a
+  struct literal instead (§8.9.4); the expected type is what
+  distinguishes them.
 - **Access**: `m[key]` reads a value, yielding `null` for a missing
   key; `m[key] = v` adds or replaces.
 - **Removal**: `delete m[key]` / `delete m.key` (§10.11).
@@ -766,9 +768,10 @@ reference-counted hash table with average O(1) get, set and delete and
 
 A struct is a record type declared at the top level; its fields are
 statically typed. A field may be of the struct's own
-type or of any struct or table declared anywhere in the program. There
-is no struct literal: a declaration `User u` creates a fresh instance,
-and fields are populated by assignment. [#27, #78, #106]
+type or of any struct or table declared anywhere in the program. A
+declaration `User u` creates a fresh instance whose fields hold their
+zero values (§8.9.2); fields are populated by assignment, or by a
+struct literal (§8.9.4). [#27, #78, #106, #288]
 
 ```festina
 struct User {
@@ -780,6 +783,8 @@ struct User {
 User user
 user.id = 1
 user.name = 'Patrick'
+
+User other = {'id': 2, 'name': 'Brad'}   // active keeps its zero value
 ```
 
 A struct value is a reference: `User b = a` makes `b` and `a` name the
@@ -799,6 +804,88 @@ first. [#97]
 
 Any struct whose fields are all of queryable types may receive the
 rows of a `sqlite()` query (§15.5). [#112]
+
+#### 8.9.4 Struct literals
+
+*StructLiteral* ::= `{` [ *FieldEntry* { `,` *FieldEntry* } ] `}`
+*FieldEntry* ::= *StringLiteral* `:` *Expression* | *Identifier*
+
+A struct literal builds a fresh instance and assigns its fields. It is
+spelled exactly like a map literal (§8.8); **the expected type at the
+position decides which one it is.** Where a `{...}` is expected to be a
+struct, it is a struct literal; everywhere else it remains a map
+literal. [#288]
+
+```festina
+struct User {
+    id:int
+    name:text
+    active:bool
+}
+
+User a = {'id': 1, 'name': 'Patrick', 'active': true}
+User b = {'name': 'Brad'}          // id 0, active false
+User c = {}                        // same as `User c`
+```
+
+**Keys are string literals.** A field name is resolved at compile time,
+so a key must be written as a string literal — never as a variable or
+any other expression. This is what keeps one `{...}` spelling from
+meaning two different things: an unquoted identifier is a variable
+reference in a struct literal exactly as it is in a map literal, and
+`{'name': x}` names the same key whatever the target type. `{ name }`
+remains shorthand for `{ 'name': name }` (§8.8), so a field may be
+filled from a same-named variable:
+
+```festina
+text name = 'Brad'
+User d = { name }                  // d.name = 'Brad'
+```
+
+Rules:
+
+- **Omitted fields keep their zero values** (§8.9.2). A literal always
+  produces a *complete, fresh* instance, so assigning one to an existing
+  binding replaces the whole value rather than updating the named fields
+  — `u = {'id': 2}` leaves `u.name` empty, it does not preserve it.
+- **An unknown field name is a compile error**, as is naming the same
+  field twice, and as is a key that is not a string literal.
+- **Each value must be assignable to that field's declared type** under
+  §10.2, including its coercions — so a `text` path may initialize an
+  `img`/`aud`/`blob` field exactly as it may a variable of that type.
+- **A struct value is a reference** (§8.9.1), so the literal's instance
+  is what the binding names; nothing is copied.
+
+**Where the expected type is known.** A struct literal may appear in a
+variable declaration's initializer and on the right of an assignment,
+including assignment to a field or an array/map element. The expected
+type propagates inward from there, so literals nest: into a struct-typed
+field's value, into the elements of an `arr[Struct]` literal, and into
+the values of a `map[Struct]` literal.
+
+```festina
+struct Point { x:int  y:int }
+struct Shape { origin:Point  tags:map[text] }
+
+Shape s = {'origin': {'x': 1, 'y': 2}, 'tags': {'kind': 'box'}}
+arr[Point] ps = [{'x': 1, 'y': 2}, {'x': 3, 'y': 4}]
+ps[0] = {'x': 9, 'y': 9}
+```
+
+In `Shape` above, `origin`'s `{...}` is a struct literal and `tags`'s is
+a map literal; the field's own declared type is what distinguishes them.
+
+A struct literal is a fresh construction, so it may initialize a
+manually-managed binding (§10.11):
+
+```festina
+User? u = {'name': 'Brad'}
+clear u
+```
+
+Function arguments and `return` expressions are **not** struct-literal
+positions; build the value in a local and pass that. Tables (§8.10) have
+no literal form.
 
 ### 8.10 Tables
 
@@ -2645,7 +2732,9 @@ unless this specification is changed: JavaScript truthiness; `var` and
 `let`; `===` and `!==`; `require()` and runtime module loading;
 dynamic typing; implicit type coercion beyond §8.3 and §8.20; closures
 and bound-argument callbacks; labeled `break`/`continue`; `finally`;
-variadic, default or named arguments; struct literals; bounds-checked
+variadic, default or named arguments; a struct literal in an argument or
+`return` position (§8.9.4 covers declarations and assignments only);
+bounds-checked
 array indexing; a TLS client certificate or SNI; WebSocket extensions;
 manual SQLite initialization or connection management; media formats
 beyond PNG, JPEG, WAV and MP3; a raw byte-buffer type; graphics or audio

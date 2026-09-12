@@ -5651,3 +5651,34 @@ The last row is the one that matters. `d1ed981` changed two documentation files 
 **The new coverage is the point.** `TestBootstrapSemanticMatchesPython` is the comparison itself, 93 parametrized files plus an assertion that the unported count is zero -- because an UNPORTED skip is invisible in a green run, and "the port is complete" has to be asserted rather than inferred from an absence of failures.
 
 **Verified.** 2765 passed, 14 skipped (up from 2671: the semantic differential adds 94). Lexer 93/93, parser 93/93, semantic 93/93. The gate was tested in both directions: a simulated non-Linux platform skips, and the env var un-skips.
+
+
+288. STRUCT LITERALS, WITH QUOTED FIELD NAMES
+
+Asked for: struct literals, as the small change that would exercise #278's spec-first order before the codegen port. The motivation was a real one rather than a hypothetical -- #283's own worked example, `person? brad = {'name': 'Brad'}`, does not compile, and was written by someone who was not looking for a gap.
+
+**What it actually did before.** Three different errors, none of which mentions structs:
+
+| written | reported |
+|---|---|
+| `Person p = {'name': 'Brad', 'age': 30}` | map literal values must all be the same type, found text and int |
+| `Person p = {'name': 'Brad'}` | cannot assign value of type map[text] to Person |
+| `Person p = {name: 'Brad', age: 30}` | unknown variable 'name' |
+
+The first is the common case, and the message describes a map the programmer never asked for.
+
+**The design question was the keys, not the braces.** `{...}` is a map literal, and §8.8 deliberately has no bareword-as-string shorthand: an unquoted identifier is a variable reference, so `{k: 'x'}` means "the key is the VALUE of k". A struct literal spelled `{name: 'Brad'}` would make that same text mean two different things depending on the expected type -- in `f({name: x})` you would have to know f's signature to know whether `name` is a field name or a variable read. Quoted keys keep one spelling with one meaning everywhere and only the target type deciding map-vs-struct, which is also what the original request happened to write. The cost is the JavaScript habit, paid down with a message that names the fix rather than describing the parse.
+
+**Positions were scoped to declarations and assignments** because that is where an expected type already exists. Every contextual reading of a literal this language has -- `arr[img] xs = ['a.png']` (#137), `http req = {...}` (#162), `amor arr[T]` (#174) -- is a branch in analyze_var_decl keyed on (declared type, literal shape); there is no expected type threaded through general inference. Arguments and `return` would need that threading, which is new machinery and where the bugs would be, so Annex D now records them as deliberately absent rather than merely missing.
+
+**One rule, applied recursively**, rather than a branch per position: where a `{...}` is expected to be a struct it is a struct literal, and the expected type propagates inward -- into a struct-typed field's value, into `arr[Struct]` elements, into `map[Struct]` values. `check_typed_lit` answers True only when it fully checked the literal, so every pre-existing path is untouched by construction and the only programs whose meaning changes are ones that did not compile.
+
+**Codegen needed exactly one branch.** `_emit_value_for` already takes the expected type, and `_emit_assign` already resolves its target's type before the value and routes through it -- so `p = {...}`, `s.origin = {...}` and `ps[0] = {...}` all arrived for free once `Person p = {...}` worked. §8.9.4's "where the expected type is known" needs no enumeration in codegen because the enumeration is already there.
+
+**The one place this emits LESS than the paths it copies, and why that is a claim rather than a shortcut.** Every other field write does load-store-release, to overwrite a slot that may already own something. A literal writes into a freshly calloc'd header, so every field starts NULL, and semantic.py rejects a literal naming the same field twice -- no field here is ever written a second time, and there is nothing to release. Omitted fields emit nothing at all, since zero already IS the zero value (§8.9.2).
+
+That reasoning is the kind a sanitizer exists to check, so `tests/stress/struct_literal_churn.f` checks it: a text field copied from an existing binding, a struct field retained from one, a nested literal that must NOT be retained twice, a literal reassigned over another, and a manually-managed one that is cleared. **Both canaries were confirmed to fire** -- dropping the field retain reports heap-use-after-free in `festina_release_check`, dropping the text copy reports a double free -- because a clean sanitizer run on a program that cannot fail proves nothing.
+
+**The test-design mistake worth recording.** The acceptance tests first stopped at `semantic.analyze()`, and `Person p = {}` passed them while failing in codegen with "cannot infer the value type of an empty map literal". A semantic-only acceptance test is satisfied by an implementation that type-checks a struct literal and then cannot emit one. Compiling all the way to IR is the check that means what it says. The same shape as #287's canary: what a test stops short of is invisible in a green run.
+
+**Verified.** 2807 passed, 14 skipped (up from 2765: 38 new struct-literal tests plus the new stress program and its inventory entry). Lexer 94/94, parser 94/94, semantic 94/94 -- the corpus grew by the stress program, and the ports needed no change at all, the grammar being unchanged. `scripts/leak_stress.sh` clean across all 42 programs.

@@ -720,6 +720,20 @@ class TestLeakStress:
             # slice() is really copying multi-byte sequences.
             "bytes_trim_churn.f",
             "clear_churn.f",
+            # decisions.md #288: struct literals. The one construction
+            # site that stores into a freshly calloc'd header rather
+            # than overwriting a slot that may already own something, so
+            # it deliberately skips the load-store-release every other
+            # field write performs. That skip is a claim about the
+            # value being brand new, and a sanitizer is what tests a
+            # claim like that: the loop mixes a text field copied from
+            # an existing binding, a struct field retained from one, a
+            # nested literal that must NOT be retained twice, a literal
+            # reassigned over another, and a manually-managed one that
+            # is cleared. Both canaries confirmed to fire -- dropping
+            # the field retain reports heap-use-after-free, dropping
+            # the text copy reports a double free.
+            "struct_literal_churn.f",
             # claude.md #245: pool.postMessage(x) with no index --
             # main plus 3 feeder threads all auto-selecting against the
             # SAME handles array and round-robin counter at once, 12,000
