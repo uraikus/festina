@@ -6044,3 +6044,23 @@ The explicit zeroinitializer is load-bearing rather than tidy: `alloca` does not
 **Four canaries, each confirmed by breaking the implementation, all firing on `cases/escape_locals.f`:** every struct local forced onto the heap; every one forced onto the stack; every text parameter copied whether it escapes or not; and parameters freed before locals instead of after. Each differs at exactly the construct it targets. The case file's own properties are asserted in pytest -- it must contain a `.storage.` alloca, a `festina_release`, a `festina_text_own(ptr %arg.`, and a `store ptr %arg.` -- so a file that drifted to all-stack or all-heap cannot keep passing while measuring nothing.
 
 **Verified.** 2645 passed, 344 skipped. Lexer 103/103, parser 103/103, semantic 103/103, escape analysis unchanged, codegen 14 match, 0 differ. The 25 graphics failures and the deselected leak-stress suite are this container's limits, reproduced identically on the pristine tree.
+
+
+301. CONTAINER LOCALS, AND A RELEASE THAT WAS NOT INTERCHANGEABLE
+
+`arr[T]`/`map[T]` locals, on the same stack-versus-heap decision #300 gave struct locals. **1,896 of 232,587 file-specific IR lines, up from 1,829; still 14 files.**
+
+**A frame-allocated CONTAINER is not like a frame-allocated struct**, and that is the whole difference. A non-escaping struct local owns nothing beyond its own frame storage, so its scope exit emits nothing at all. A non-escaping container's header is in the frame but **its elements never are** -- the data buffer is always heap. So its scope exit still has exactly one thing to do:
+
+    arr[T]   load the header, GEP length, load it, GEP data, load it,
+             free(data)
+    map[T]   load the header, GEP entries, GEP count, and hand both to
+             festina_map_free_entries
+
+The array path loads a length it never uses. That is the original's output, not a transcription slip: the same sequence releases each element first when the element type is refcounted, and the load sits above that branch. Reproducing it faithfully matters more than tidying it.
+
+**THE RELEASE FUNCTIONS ARE NOT INTERCHANGEABLE**, which a probe caught and reasoning had not. `cgAssign` released a global's old value with `festina_release` regardless of type. For a struct that is right; for an `arr[T]` the correct call is `festina_release_array`, and for a `map[T]` it is `festina_release_map` -- each knows a different thing about what its payload owns. The generic one would have run the refcount down correctly and **leaked the data buffer every time**, while looking entirely plausible in the IR. Caught by a two-function probe whose only purpose was to assign a container to a global.
+
+**Refused, specifically rather than generically.** An `arr[T]`/`map[T]` whose T is itself refcounted releases every element through a generated per-element cascade wrapper; that is its own mechanism. The blocker table now reads `arr local of a non-scalar type` (22 files) rather than `arr local` (31), and the difference between those two numbers is the part that is actually done.
+
+**Verified.** Codegen 14 match, 0 differ, 78 unported. `cases/escape_locals.f` grew the container shapes and is pinned in pytest against losing them -- it must contain a released array local and a `festina_map_free_entries` call, or the container half of the decision is unmeasured.

@@ -1851,16 +1851,29 @@ void func cgStmt(s:Node) {
                 }
                 return
             }
-            if managed != 'struct' {
-                cgUnported(`${managed} local`)
-                return
-            }
-            if SF_PLAIN[dt.name] == null {
-                cgUnported('struct local with a non-scalar field')
-                return
+            if managed == 'struct' {
+                if SF_PLAIN[dt.name] == null {
+                    cgUnported('struct local with a non-scalar field')
+                    return
+                }
+            } else {
+                // An `arr[T]`/`map[T]` whose T is itself refcounted
+                // releases every element through a generated per-element
+                // cascade wrapper rather than the plain release. That is
+                // its own mechanism; a scalar element type needs none of
+                // it.
+                Ty et = dt.elem
+                if et == null || et.kind != 'prim' {
+                    cgUnported(`${managed} local of a non-scalar type`)
+                    return
+                }
+                if et.name != 'int' && et.name != 'float' && et.name != 'bool' {
+                    cgUnported(`${managed} local of ${et.name}`)
+                    return
+                }
             }
             if childOf(s, 'init') != null {
-                cgUnported('struct initializer')
+                cgUnported(`${managed} initializer`)
                 return
             }
 
@@ -1875,23 +1888,29 @@ void func cgStmt(s:Node) {
             // zeroinitializer: alloca does not zero and calloc does,
             // and "an unassigned field reads as its zero" is a language
             // rule, not an allocation detail.
+            text payload = cgPayloadFor(dt)
             int uid = cgUid()
             text slot = `%${gname}.${uid}`
             if cgEscapes(gname) == false {
                 text backing = `%${gname}.storage.${uid}`
-                cgOut(`  ${backing} = alloca %struct.${dt.name}`)
-                cgOut(`  store %struct.${dt.name} zeroinitializer, ptr ${backing}`)
+                cgOut(`  ${backing} = alloca ${payload}`)
+                cgOut(`  store ${payload} zeroinitializer, ptr ${backing}`)
                 cgOut(`  ${slot} = alloca ptr`)
                 cgOut(`  store ptr ${backing}, ptr ${slot}`)
+                // A struct's frame storage owns nothing else, so it is
+                // not tracked at all. A container's owns its heap data
+                // buffer, which still has to be freed.
+                if managed == 'arr' { cgTrackLive('arr.stack', slot) }
+                if managed == 'map' { cgTrackLive('map.stack', slot) }
             } else {
-                text made = cgFreshHeader(`%struct.${dt.name}`)
+                text made = cgFreshHeader(payload)
                 cgOut(`  ${slot} = alloca ptr`)
                 cgOut(`  store ptr ${made}, ptr ${slot}`)
-                cgTrackLive('struct', slot)
+                cgTrackLive(managed, slot)
             }
             L_SLOT[gname] = slot
-            L_FTY[gname] = 'struct'
-            L_SNAME[gname] = dt.name
+            L_FTY[gname] = managed
+            if managed == 'struct' { L_SNAME[gname] = dt.name }
             return
         }
         text name = rawText(s, 'name')
@@ -2017,10 +2036,55 @@ void func cgTrackLive(kind:text, slot:text) {
 
 void func cgFreeOne(entry:text) {
     arr[text] parts = entry.split('|')
+    text kind = parts[0]
     text t = cgTmp()
     cgOut(`  ${t} = load ptr, ptr ${parts[1]}`)
-    if parts[0] == 'text' { cgOut(`  call void @free(ptr ${t})`) }
-    else { cgOut(`  call void @festina_release(ptr ${t})`) }
+
+    // claude.md #83: text is copied on alias and freed outright.
+    if kind == 'text' {
+        cgOut(`  call void @free(ptr ${t})`)
+        return
+    }
+    // A heap-backed binding hands back its counted reference. Each
+    // container type has its own release, because each knows a
+    // different thing about what it owns.
+    if kind == 'struct' || kind == 'arr' || kind == 'map' {
+        cgOut(`  call void ${cgReleaseFn(kind)}(ptr ${t})`)
+        return
+    }
+
+    // A frame-allocated container still owns a HEAP data buffer: the
+    // header lives in the frame, the elements never do. So there is no
+    // reference to release and exactly one buffer to free.
+    //
+    // The array path loads the length it does not use. That is the
+    // original's output, not an oversight of this port's -- the same
+    // sequence releases each element first when the element type is
+    // refcounted, and the load is hoisted above that branch.
+    if kind == 'arr.stack' {
+        text lenP = cgTmp()
+        cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${t}, i32 0, i32 0`)
+        text lenV = cgTmp()
+        cgOut(`  ${lenV} = load i64, ptr ${lenP}`)
+        text dataP = cgTmp()
+        cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr ${t}, i32 0, i32 1`)
+        text dataV = cgTmp()
+        cgOut(`  ${dataV} = load ptr, ptr ${dataP}`)
+        cgOut(`  call void @free(ptr ${dataV})`)
+        return
+    }
+    if kind == 'map.stack' {
+        text entP = cgTmp()
+        cgOut(`  ${entP} = getelementptr %struct._FestinaMap, ptr ${t}, i32 0, i32 1`)
+        text entV = cgTmp()
+        cgOut(`  ${entV} = load ptr, ptr ${entP}`)
+        text nP = cgTmp()
+        cgOut(`  ${nP} = getelementptr %struct._FestinaMap, ptr ${t}, i32 0, i32 2`)
+        text nV = cgTmp()
+        cgOut(`  ${nV} = load i64, ptr ${nP}`)
+        cgOut(`  call void @festina_map_free_entries(ptr ${entV}, i64 ${nV})`)
+        return
+    }
 }
 
 void func cgFreeFrom(downTo:int) {
@@ -2379,7 +2443,7 @@ void func cgAssign(e:Node) {
         if cgIsOwningRefcountedSource(value) == false {
             cgOut(`  call void @festina_retain(ptr ${v.v})`)
         }
-        cgOut(`  call void @festina_release(ptr ${old})`)
+        cgOut(`  call void ${cgReleaseFn(fty)}(ptr ${old})`)
         cgOut(`  store ptr ${v.v}, ptr ${slot}`)
         return
     }
@@ -2394,6 +2458,17 @@ void func cgAssign(e:Node) {
 // retain. A call result is -- every refcounted-value-returning path
 // hands back a +1. Anything else (another binding, a field read) is
 // shared.
+// The release each refcounted kind gets. They are NOT
+// interchangeable: an array's knows to reclaim its data buffer, a
+// map's its entry table. Getting this wrong leaks the payload while
+// looking perfectly correct, which is how it was caught -- a global
+// arr[T] assignment released its old value with the struct one.
+text func cgReleaseFn(fty:text) {
+    if fty == 'arr' { return '@festina_release_array' }
+    if fty == 'map' { return '@festina_release_map' }
+    return '@festina_release'
+}
+
 bool func cgIsOwningRefcountedSource(e:Node) {
     if e == null { return false }
     return e.kind == 'Call'

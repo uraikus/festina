@@ -231,6 +231,13 @@ class TestTheCoverageNumberIsHonest:
             "per-parameter half of the decision is unmeasured")
         # The borrowed parameter is the other half: at least one text
         # parameter must be stored straight from its own %arg register.
+        assert "@festina_release_array(ptr" in body, (
+            "no released array local, so the container half of the "
+            "decision is unmeasured")
+        assert "@festina_map_free_entries(" in body, (
+            "no frame-allocated map local -- a stack container still "
+            "owns a heap buffer, which is the one way its stack answer "
+            "differs from a struct's")
         assert any(line.startswith("  store ptr %arg.") for line in dump), (
             "every text parameter is copied, so nothing here shows a "
             "borrowed one")
@@ -285,6 +292,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 1829, (
+        assert reproduced >= 1896, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 1829")
+            f"the port previously emitted at least 1896")

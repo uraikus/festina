@@ -105,6 +105,27 @@ int func takesAndReturns(p:text) {
     return 1
 }
 
+// A container local gets the same decision, with one difference that
+// matters: a frame-allocated container still owns a HEAP data buffer,
+// because its elements never live in the frame. So the stack answer
+// means "no refcount header, but still free the buffer", not "free
+// nothing" the way a struct's does.
+arr[int] sharedNums
+map[float] sharedRates
+
+void func stackContainers() {
+    arr[int] xs
+    map[float] rs
+    log(1)
+}
+
+void func heapContainers() {
+    arr[int] ys
+    map[float] qs
+    sharedNums = ys
+    sharedRates = qs
+}
+
 log(stackOnly())
 log(twoStackLocals())
 escapesToAGlobal()
@@ -113,4 +134,6 @@ log(inALoop())
 takesBoth('a', 'b')
 takesAndDeclares('c')
 log(takesAndReturns('d'))
+stackContainers()
+heapContainers()
 log(sink)
