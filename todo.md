@@ -108,6 +108,28 @@ open:
   too, and the fast path there refuses values like
   `0.30000000000000004`.
 
+- **A local that shadows a function name resolves to the FUNCTION
+  inside a template literal.** `bootstrap/parser.f` exports
+  `bool func at(kind:text)`; a `text at = ...` local in a file that
+  imports it passes semantic analysis, and then the codegen stage
+  fails the whole compile with
+
+      bootstrap/codegen.f:0:0: error: cannot interpolate a value of
+      type func[text]:bool
+
+  — no line, no column, and a type that appears nowhere in the
+  statement at fault. Found by hitting it while porting struct field
+  access (decisions.md #295); worked around by renaming the local.
+
+  Three consistent outcomes exist and the current behavior is none of
+  them: the local wins everywhere (what every other expression position
+  already does), or the shadowing declaration is rejected where it is
+  written, or interpolating a `func` value is itself legal. Accepting
+  the declaration and then misresolving it at an unrelated
+  interpolation is the worst of the three. The position on the error is
+  worth fixing regardless — `0:0` on a whole-file failure gives nothing
+  to search for.
+
 ## Deliberate behavior (documented, not planned work)
 
 - **Array indexing is not bounds-checked** — a performance choice, see

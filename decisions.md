@@ -5827,3 +5827,40 @@ The sixth codegen slice, and the first taken against an agreed target: **self-ho
 **Deliberately refused rather than generalized.** A text ternary owns its value inside each arm -- observed once, in one program. One observation of a two-branch construct is not enough to port from, so it reports unported while the numeric and bool cases are implemented. Same rule as the operator guard in #293, applied before rather than after being caught.
 
 **Verified.** 2850 passed, 91 skipped. Lexer 98/98, parser 98/98, semantic 98/98. Codegen 10 match, 0 differ, 77 unported, 11 rejected by both.
+
+
+295. CONTAINER GLOBALS, STRUCT FIELDS, AND A METRIC THAT MOVED ONLY BECAUSE I WROTE THE FILE
+
+The seventh codegen slice: `arr[T]`/`map[T]`/struct globals, struct field reads and writes, and claude.md #97's lazily-created field storage.
+
+**Result: 1,077 of 175,080 file-specific IR lines, up from 729. Eleven files match, up from ten.**
+
+**That number needs its caveat stated first, because without it it is misleading.** All 348 new lines come from `cases/struct_fields.f`, a file written for this slice. Against the corpus as it stood before, this slice unlocked **zero** files and **zero** lines -- the same result #291 got from closing `StructDecl`, and for the same reason: no existing corpus file is one construct away from matching. Every file with a struct also has a template literal, a container local, a non-scalar parameter or an event handler behind it. A new case file is a legitimate corpus member (the oracle is still festina/codegen.py, and the three canaries below are real), but "348 lines gained" and "348 lines I supplied the input for" are the same fact, and only the second one predicts anything about the remaining 174,000.
+
+**A container global is storage and nothing else.** `{i64, payload}` with a `-1` immortal refcount, the visible pointer GEP'd past the count -- argv's own shape. A global is reachable until the process exits, so nothing ever releases it, which is why the globals came in this slice and the locals did not: a local needs the header allocated *and* released.
+
+**A struct-typed FIELD, by contrast, creates its own storage on first use.** claude.md #97: a field of struct/`arr[T]`/`map[T]` type starts as a null pointer -- calloc gives it no value of its own, unlike an int field whose zero IS 0 -- so reaching through an unassigned one emits a null check, a calloc with refcount 1, a store back through the same slot, and a phi over the two paths. `p.x` emits none of that; `b.origin.x` emits all of it. Both shapes had to be right.
+
+**THE BUG THIS FOUND IN THE PORT'S OWN DESIGN, which had been latent for three slices.** Every phi here named the label it branched to. That is correct exactly while no arm contains control flow of its own -- true of every construct the port could emit until now -- and wrong the moment one does. Nested field access is that case: the *second* reach through `b.origin` computes its incoming value in `field.done2`, not in `entry`. festina/codegen.py has carried a `cur_block` for this since it was written, with a docstring saying why; the port now carries `CG_BLOCK` and every phi reads it. Ternary, `&&`/`||` and the div-by-zero guard were all updated, not just the new code. **The port was not wrong yet, and would have been.**
+
+**A LANGUAGE BUG, found by hitting it.** A local named `at` inside `bootstrap/codegen.f` -- shadowing `bool func at(kind:text)` exported by `bootstrap/parser.f` -- passes semantic analysis and then fails the whole compile at the codegen stage with:
+
+    bootstrap/codegen.f:0:0: error: cannot interpolate a value of type func[text]:bool
+
+No line, no column, and the message names a type that appears nowhere in the statement at fault. Inside a template literal, `${at}` resolves to the FUNCTION rather than to the local that shadows it. Renaming the local to `fp` fixed it; the underlying inconsistency did not go away and is in todo.md. Either the local wins everywhere or the shadowing declaration is rejected where it is written -- being accepted at the declaration and then misresolved at an unrelated interpolation is the worst of the three.
+
+**Three canaries, each confirmed by breaking the implementation on purpose:**
+
+1. Naming the branch label in the field phi instead of the real predecessor: `cases/struct_fields.f` differs at the phi, and the line it differs on is inside a FUNCTION (`%entry1`), which is exactly where a hardcoded name is wrong.
+2. Removing auto-vivify entirely (a plain load for every field): reported as unported rather than as a difference, because the plain path loses the struct name a nested reach needs. It fires, through a different mechanism than expected -- worth knowing, since "the canary fired" and "the canary fired for the reason I predicted" are not the same claim.
+3. Widening the header from 8 to 16 bytes -- the tagged shape claude.md #176 uses -- differs at the `add i64`.
+
+A fourth property is asserted in pytest rather than left to a canary: `cases/struct_fields.f` must contain at least three `field.make` blocks. One reach cannot distinguish a correct phi predecessor from a hardcoded label, so a case file that quietly shrank to one access would keep passing while measuring nothing. That is `cases/float_bits.f`'s lesson (#290) turned into a test.
+
+**Every struct here is untagged, and that is a dependency rather than an assumption.** A struct that is a member of a pure-struct enum needs a wider `{tag, refcount}` header. The port emits the plain one, which is safe only because `EnumDecl` is itself unported -- no program reaching this code has an enum at all. Porting enums means porting the tagged header with them.
+
+**A scope discovery, reported rather than absorbed.** Container and struct *locals* need `festina/escape_analysis.py` -- 379 lines, six functions, entry `find_escaping_names(block, escaping_params=None)` -- to choose stack storage over heap. That is a FIFTH module the port depends on, alongside lexer/parser/semantic/codegen, and it was not in the 14,500-line codegen.py estimate the target was set against.
+
+**What is actually in the way, measured.** `declaration of a non-scalar type` blocks 25 files and is sole blocker for 4; `parameter of a non-scalar type` 21 and 3; `struct local` 17 and 4; `arr local` 17 and 1; `call through a non-identifier callee` 21 and 0. `expression TemplateLit` blocks 13 -- templates are genuinely not ported, which the task list had recorded as done.
+
+**Verified.** 2855 passed, 91 skipped. Lexer 99/99, parser 99/99, semantic 99/99. Codegen 11 match, 0 differ, 77 unported, 11 rejected by both.

@@ -95,15 +95,34 @@ round-by-round design and implementation record predating 0.1 lives in
   `bootstrap/semdiff.py` runs the comparison (decisions.md #281, #282,
   #285, #286).
 
-- **All three bootstrap differential harnesses now run in CI**, the
-  semantic one for the first time — on Linux only. They compare two
-  implementations of the lexer, parser and analyzer against each other,
+- **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
+  the fourth and last stage, **in progress**: **11 of 99 corpus files
+  emit byte-identical LLVM IR, 0 differ, 77 not yet ported, 11 rejected
+  by both** — 1,077 of 175,080 file-specific IR lines. In are
+  expressions (arithmetic and comparison with int/float mixing,
+  `&&`/`||`, unary, the ternary, `/` and `%` with claude.md #57's
+  divide-by-zero control flow), statements (`log`, assignment, postfix,
+  `if`/`else`, `while`, `for`, `return`), functions with parameters and
+  locals, struct type definitions, scalar and `text` globals and
+  locals, `arr[T]`/`map[T]`/struct globals, struct field reads and
+  writes including claude.md #97's lazily-created field storage, and
+  imports merged before either stage runs. Not in: container and struct
+  *locals* (which need `festina/escape_analysis.py`, a fifth module),
+  non-scalar parameters and returns, method calls, indexing, template
+  literals, and the graphics/audio/HTTP/thread/sqlite/table subsystems.
+  `bootstrap/irdump.py` and `bootstrap/irdiff.py` run the comparison;
+  the oracle is the IR text itself, so it needed no canonical form of
+  its own (decisions.md #289–#295).
+
+- **Every bootstrap differential harness now runs in CI** — on Linux
+  only. They compare two implementations of the lexer, parser, analyzer
+  and code generator against each other,
   which is compiler-development tooling rather than platform coverage,
   and nothing in them is platform-specific. Windows stops paying the
   roughly four minutes the lexer and parser harnesses cost it, which is
-  what makes room for the semantic harness to run at all (on Linux all
-  three together cost about 15 seconds). `FESTINA_BOOTSTRAP_EVERYWHERE=1`
-  runs them anywhere. The cheap pure-Python tests in the same modules
+  what makes room for the semantic and codegen ones to run at all (on
+  Linux the front-end three together cost about 15 seconds).
+  `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anywhere. The cheap pure-Python tests in the same modules
   keep running on every platform (decisions.md #287).
 
 ### Unchanged

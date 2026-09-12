@@ -44,14 +44,15 @@ python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 98-file repository corpus:
+Over the 99-file repository corpus:
 
-- **lexer: 98 match, 0 differ.**
-- **parser: 98 match, 0 differ, 0 unported.**
-- **semantic: 98 match, 0 differ, 0 unported.**
-- **codegen: 10 match, 0 differ, 77 unported, 11 rejected by both** —
-  729 of 171,168 file-specific IR lines. See below for why that is the
-  number reported rather than a file count.
+- **lexer: 99 match, 0 differ.**
+- **parser: 99 match, 0 differ, 0 unported.**
+- **semantic: 99 match, 0 differ, 0 unported.**
+- **codegen: 11 match, 0 differ, 77 unported, 11 rejected by both** —
+  1,077 of 175,080 file-specific IR lines. See below for why that is the
+  number reported rather than a file count, and for the caveat that
+  comes with this particular figure.
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
 `parser.f`, the largest source in the corpus at ~1,200 lines, takes
@@ -102,7 +103,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 98-file repository corpus is a strong oracle for ordinary code and
+The 99-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -138,7 +139,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Semantic analysis: 98 match, 0 differ, 0 unported
+## Semantic analysis: 99 match, 0 differ, 0 unported
 
 All three stages of the front end agree with their originals over the
 whole corpus. `semantic.f` resolves declarations, merges imports,
@@ -188,7 +189,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 729 of 171,168 file-specific IR lines
+## Codegen: 1,077 of 175,080 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -253,11 +254,26 @@ which is what caught the reproducibility tests being pointed at
 `benchmarks/hello.f`, a program that calls `_unique()` exactly zero
 times and so could not have varied either way.
 
+### And the caveat that comes with the current figure
+
+**348 of the 1,077 lines come from `cases/struct_fields.f`, a file
+written for the slice that claims them.** Against the corpus as it
+stood before, struct fields and container globals unlocked zero files
+and zero lines: no existing corpus file is one construct away, because
+every file with a struct also has a template literal, a container
+local, a non-scalar parameter or an event handler behind it.
+
+A `cases/` file is a legitimate corpus member — the oracle is still
+`festina/codegen.py`, and each one has confirmed canaries. But a number
+that grows because the input grew says nothing about the remaining
+174,000 lines, and the two facts are worth keeping separate when
+reading the table below.
+
 ### The target is self-hosting
 
 The **bootstrap's own eight files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f` and the four entry points — are **137,331 of
-the 171,168 file-specific IR lines, 80% of the budget**, and they need
+the 175,080 file-specific IR lines, 78% of the budget**, and they need
 none of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
@@ -274,9 +290,10 @@ divide-by-zero control flow. Statements: `log` of every scalar type,
 assignment, postfix, `if`/`else`, `while`, `for`, `return`. Plus
 function declarations with parameters, locals and calls; struct type
 definitions; scalar globals and locals; `text` globals **and** locals;
+`arr[T]`/`map[T]`/struct **globals**; struct field reads and writes;
 and imports merged before either stage runs.
 
-Four pieces are subtler than they look:
+Six pieces are subtler than they look:
 
 - **Alloca hoisting** (claude.md #191) is a post-pass over the finished
   text, exactly as in the original, because it is a property of the
@@ -292,6 +309,20 @@ Four pieces are subtler than they look:
   labels rhs, end, *start*; a `while` takes cond, body, end. Taking
   them in the order they are printed renumbers every label and changes
   nothing else.
+- **A struct-typed FIELD creates its own storage on first use.**
+  claude.md #97: a field of struct/`arr[T]`/`map[T]` type starts null,
+  so reaching through an unassigned one emits a null check, a calloc
+  with refcount 1, a store back through the same slot, and a phi. Every
+  struct here is untagged, which is safe only because `EnumDecl` is
+  itself unported — a member of a pure-struct enum needs the wider
+  `{tag, refcount}` header of claude.md #176.
+- **A phi's predecessor is the block its value was computed in**, not
+  the label it branched to. The two coincide until an arm contains
+  control flow of its own, which nested field access is the first
+  construct to do. `CG_BLOCK` tracks it, mirroring
+  `festina/codegen.py`'s `cur_block`, and every phi in the port reads
+  it — ternary and `&&`/`||` included, which were right by luck rather
+  than by construction before.
 
 **Why ASan is not in this loop.** A missing release in the emitted IR
 would be a leak in every program the compiler produces — but the
@@ -305,18 +336,26 @@ sanitizer for this stage rather than needing it alongside.
 
 |blocks|only|construct|
 |---:|---:|---|
-|48|5|a declaration of a non-scalar type (`arr[T]`, `map[T]`, struct)|
-|21|1|a parameter of a non-scalar type|
+|25|4|a declaration of a non-scalar type (`blob`, `img`, `regex`, …)|
+|21|3|a parameter of a non-scalar type|
 |21|0|a call through a non-identifier callee (method calls)|
-|21|0|assignment to a non-identifier target (fields, elements)|
 |19|0|`EventHandler`|
 |18|0|`ThreadDecl`|
+|17|4|an `arr[T]`/struct **local**|
 |13|1|`TemplateLit`|
-|10|0|`close()`|
+|10|1|`TableDecl`|
 
-The container declarations are the next real piece: a refcount header
-allocated, the stack-versus-heap choice taken from escape analysis, a
-retain on alias and a release at scope exit.
+`blocks` counts every file a construct appears in; `only` counts the
+files where it is the last thing in the way, and so the number that
+would actually become matches. The first column has overpromised twice
+now (#291, #295) and the second one has not.
+
+**Container and struct locals need a fifth module.** The stack-versus-
+heap choice comes from `festina/escape_analysis.py` — 379 lines, six
+functions, entry `find_escaping_names(block, escaping_params=None)` —
+which the port does not have and which was not counted in the
+14,500-line codegen.py figure above. Globals need none of it, which is
+why they are in and locals are not.
 
 The structural obstacles are unchanged:
 

@@ -142,6 +142,31 @@ class TestTheCoverageNumberIsHonest:
             "the corpus should still contain the deliberate "
             "lexer/parser edge cases that never reach codegen")
 
+    def test_the_struct_field_case_really_reaches_the_lazy_path(self):
+        """`cases/struct_fields.f` exists to measure the auto-vivify
+        path claude.md #97 describes, and the differential test can only
+        measure what the corpus actually contains.
+
+        So the property is asserted rather than assumed: more than one
+        `field.make` block, because a single reach through a
+        struct-typed field cannot distinguish a phi that names the
+        block its value was computed in from one that names the label
+        it branched to -- the two agree on the first access and diverge
+        on every one after it. This is the `cases/float_bits.f` lesson:
+        a case file whose literal was quietly outside the range it was
+        written for measured nothing and looked fine.
+        """
+        dump = irdump.dump_file("bootstrap/cases/struct_fields.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/struct_fields.f no longer compiles, so it measures "
+            "nothing at all: " + dump[0])
+        makes = [line for line in dump if line.startswith("field.make")]
+        assert len(makes) >= 3, (
+            f"only {len(makes)} lazy-field blocks in the expected IR; "
+            f"the file needs several reaches through a struct-typed "
+            f"field or it cannot tell a correct phi predecessor from a "
+            f"hardcoded label")
+
     def test_the_line_budget_excludes_the_shared_preamble(self):
         total, specific = irdiff.line_budget()
         assert specific < total, (
@@ -192,6 +217,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 729, (
+        assert reproduced >= 1077, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 729")
+            f"the port previously emitted at least 1077")

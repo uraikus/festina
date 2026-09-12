@@ -710,6 +710,7 @@ struct Val {
     v:text
     lty:text
     fty:text
+    sname:text
 }
 
 Val func cgVal(v:text, lty:text, fty:text) {
@@ -720,11 +721,51 @@ Val func cgVal(v:text, lty:text, fty:text) {
     return r
 }
 
+// A struct-typed value has to carry WHICH struct, or a field access
+// through it has no layout to GEP against.
+Val func cgStructVal(v:text, sname:text) {
+    Val r
+    r.v = v
+    r.lty = 'ptr'
+    r.fty = 'struct'
+    r.sname = sname
+    return r
+}
+
 text func cgLtyOf(fty:text) {
     if fty == 'int' { return 'i64' }
     if fty == 'float' { return 'double' }
     if fty == 'bool' { return 'i8' }
     if fty == 'text' { return 'ptr' }
+    // arr[T], map[T] and struct values are all a pointer to their own
+    // storage -- never the aggregate inline (claude.md #79), which is
+    // what gives two bindings a shared identity on assignment.
+    if fty == 'arr' { return 'ptr' }
+    if fty == 'map' { return 'ptr' }
+    if fty == 'struct' { return 'ptr' }
+    return ''
+}
+
+// The LLVM payload type sitting behind a managed value's pointer, or
+// '' when the type is not one of them. This is the shape the
+// {refcount, payload} global header wraps -- the same layout
+// festina_retain/festina_release expect, with the count at payload-8.
+text func cgPayloadFor(t:Ty) {
+    if t == null { return '' }
+    if t.amortized { return '' }
+    if t.kind == 'arr' { return '%struct._FestinaArray' }
+    if t.kind == 'map' { return '%struct._FestinaMap' }
+    if t.kind == 'struct' { return `%struct.${t.name}` }
+    return ''
+}
+
+// The Festina-level tag for a managed type, matching cgLtyOf above.
+text func cgManagedFty(t:Ty) {
+    if t == null { return '' }
+    if t.amortized { return '' }
+    if t.kind == 'arr' { return 'arr' }
+    if t.kind == 'map' { return 'map' }
+    if t.kind == 'struct' { return 'struct' }
     return ''
 }
 
@@ -743,6 +784,15 @@ map[text] L_SLOT = {}
 map[text] L_FTY = {}
 map[text] FN_RET = {}
 
+// Struct field layout, keyed '<Struct>.<field>'. codegen.py reads this
+// off `analyzed.structs`; here it is collected while the type
+// definitions are emitted, which is the same information in the same
+// order.
+map[int] SF_IDX = {}
+map[text] SF_LTY = {}
+map[text] SF_FTY = {}
+map[text] SF_SNAME = {}
+
 bool func cgIsLocal(name:text) {
     return L_SLOT[name] != null
 }
@@ -750,6 +800,15 @@ bool func cgIsLocal(name:text) {
 text func cgSlotOf(name:text) {
     if L_SLOT[name] != null { return L_SLOT[name] }
     if G_SLOT[name] != null { return G_SLOT[name] }
+    return ''
+}
+
+map[text] G_SNAME = {}
+map[text] L_SNAME = {}
+
+text func cgSnameOf(name:text) {
+    if L_SNAME[name] != null { return L_SNAME[name] }
+    if G_SNAME[name] != null { return G_SNAME[name] }
     return ''
 }
 
@@ -775,6 +834,26 @@ text func cgFtyOf(name:text) {
 // terminator per basic block, and festina/codegen.py tracks the same
 // thing as ctx["terminated"].
 bool CG_TERM = false
+
+// The label of the block currently being emitted into --
+// festina/codegen.py's `cur_block`, kept for the same reason its own
+// _start_block docstring gives: a phi's predecessor is the block the
+// incoming value was actually computed in, which is NOT the label that
+// block started with once the arm contains control flow of its own.
+//
+// Every phi here reads this rather than the label it branched to. The
+// earlier version named the branch labels directly, which agreed with
+// the original for every construct the port could then emit -- no arm
+// contained a nested branch -- and would have started diverging
+// silently the moment one did. Nested struct-field access is exactly
+// that case: reading `b.origin.x` twice puts the second read's `load`
+// in `field.done2`, not in `entry`.
+text CG_BLOCK = ''
+
+void func cgBlockLabel(l:text) {
+    CG_BLOCK = l
+    cgOut(`${l}:`)
+}
 
 // Whether statements are being emitted into a function body rather
 // than into __festina_main's top level. A declaration's storage and
@@ -973,6 +1052,7 @@ Val func cgExpr(e:Node) {
         text lty = cgLtyOf(fty)
         text t = cgTmp()
         cgOut(`  ${t} = load ${lty}, ptr ${slot}`)
+        if fty == 'struct' { return cgStructVal(t, cgSnameOf(name)) }
         return cgVal(t, lty, fty)
     }
 
@@ -980,6 +1060,7 @@ Val func cgExpr(e:Node) {
     if e.kind == 'LogicalOp' { return cgLogical(e) }
     if e.kind == 'UnaryOp' { return cgUnary(e) }
     if e.kind == 'Ternary' { return cgTernary(e) }
+    if e.kind == 'Member' { return cgMemberRead(e) }
     if e.kind == 'Call' { return cgCall(e, true) }
 
     cgUnported(`expression ${e.kind}`)
@@ -1116,7 +1197,124 @@ Val func cgBinOp(e:Node) {
 // `test ? cons : alt`, as two real blocks joined by a phi. Each arm's
 // value is computed INSIDE its own block, which is what makes the
 // short-circuit real rather than decorative.
+// The address of a struct field: evaluate the object, then GEP to the
+// field's own index. Answers an empty `v` when the shape is not one
+// this understands, having already reported why.
 //
+// The local here is `fp`, not the obvious `at`: bootstrap/parser.f
+// exports `bool func at(kind:text)`, and a local that shadows a
+// function name passes semantic analysis but resolves to the FUNCTION
+// inside a template, so `${at}` failed the whole compile with
+// `cannot interpolate a value of type func[text]:bool` and no line
+// number. Recorded in todo.md -- the shadowing itself is legal and
+// should either resolve to the local everywhere or be rejected at the
+// declaration, not at an unrelated interpolation.
+Val func cgFieldPtr(e:Node) {
+    Val none
+    if e.fields.length > 0 {
+        if fieldOf(e, 'computed').raw == 'true' {
+            cgUnported('computed member access')
+            return none
+        }
+    }
+    Val obj = cgExpr(childOf(e, 'obj'))
+    if CG_UNPORTED { return none }
+    if obj.fty != 'struct' {
+        cgUnported(`member access on ${obj.fty}`)
+        return none
+    }
+    text key = `${obj.sname}.${rawText(e, 'prop')}`
+    if SF_LTY[key] == null {
+        cgUnported(`field ${rawText(e, 'prop')} of ${obj.sname}`)
+        return none
+    }
+    text fp = cgTmp()
+    cgOut(`  ${fp} = getelementptr %struct.${obj.sname}, ptr ${obj.v}, i32 0, i32 ${SF_IDX[key]}`)
+    Val r = cgVal(fp, SF_LTY[key], SF_FTY[key])
+    if SF_FTY[key] == 'struct' { r.sname = SF_SNAME[key] }
+    return r
+}
+
+// The LLVM payload type behind a managed field, which is what the
+// auto-vivify path calloc's. Derivable from the field type rather than
+// recorded: an `amor arr[T]` field has no managed field type at all
+// (cgManagedFty answers '' for it), so `arr` here is always the one
+// plain %struct._FestinaArray shape and there is no amortized variant
+// to confuse it with.
+text func cgFieldPayload(fp:Val) {
+    if fp.fty == 'struct' { return `%struct.${fp.sname}` }
+    if fp.fty == 'arr' { return '%struct._FestinaArray' }
+    if fp.fty == 'map' { return '%struct._FestinaMap' }
+    return ''
+}
+
+// Loads one field, giving a struct/arr[T]/map[T]-typed one real storage
+// the first time it is reached.
+//
+// claude.md #97: those three field types start as a null pointer --
+// calloc/zeroinitializer gives them no value of their own, unlike an
+// int field whose zero IS 0. So the storage is created on first use,
+// stored back through the same slot so every later read sees the same
+// one, and the two paths join in a phi.
+//
+// Every struct here is untagged. A tagged one -- a member of a
+// pure-struct enum, claude.md #176 -- needs a wider {tag, refcount}
+// header, and this emits the plain one; that is safe only because an
+// EnumDecl is itself unported, so no program reaching here has an enum
+// at all. Porting enums means porting the tagged header with them.
+Val func cgLoadFieldValue(fp:Val) {
+    text payload = cgFieldPayload(fp)
+    if payload == '' {
+        text plain = cgTmp()
+        cgOut(`  ${plain} = load ${fp.lty}, ptr ${fp.v}`)
+        return cgVal(plain, fp.lty, fp.fty)
+    }
+
+    text loaded = cgTmp()
+    cgOut(`  ${loaded} = load ptr, ptr ${fp.v}`)
+    text isNull = cgTmp()
+    cgOut(`  ${isNull} = icmp eq ptr ${loaded}, null`)
+    text makeL = cgLabel('field.make')
+    text doneL = cgLabel('field.done')
+    cgOut(`  br i1 ${isNull}, label %${makeL}, label %${doneL}`)
+    text loadPred = CG_BLOCK
+
+    cgBlockLabel(makeL)
+    // sizeof via getelementptr-on-null: LLVM's own layout rules rather
+    // than a reimplementation of them.
+    text sz = cgTmp()
+    cgOut(`  ${sz} = getelementptr ${payload}, ptr null, i64 1`)
+    text szi = cgTmp()
+    cgOut(`  ${szi} = ptrtoint ptr ${sz} to i64`)
+    text total = cgTmp()
+    cgOut(`  ${total} = add i64 ${szi}, 8`)
+    text raw = cgTmp()
+    cgOut(`  ${raw} = call ptr @calloc(i64 1, i64 ${total})`)
+    cgOut(`  store i64 1, ptr ${raw}`)
+    text made = cgTmp()
+    cgOut(`  ${made} = getelementptr i8, ptr ${raw}, i64 8`)
+    cgOut(`  store ptr ${made}, ptr ${fp.v}`)
+    text makePred = CG_BLOCK
+    cgOut(`  br label %${doneL}`)
+
+    cgBlockLabel(doneL)
+    text out = cgTmp()
+    cgOut(`  ${out} = phi ptr [ ${loaded}, %${loadPred} ], [ ${made}, %${makePred} ]`)
+    if fp.fty == 'struct' { return cgStructVal(out, fp.sname) }
+    return cgVal(out, 'ptr', fp.fty)
+}
+
+Val func cgMemberRead(e:Node) {
+    Val none
+    Val fp = cgFieldPtr(e)
+    if CG_UNPORTED { return none }
+    if cgLtyOf(fp.fty) == '' {
+        cgUnported(`read of a ${fp.fty} field`)
+        return none
+    }
+    return cgLoadFieldValue(fp)
+}
+
 // Numbers and bools only. A text ternary owns its value inside each
 // arm -- observed once, in one program -- and one observation of a
 // two-branch construct is not enough to port from, so it reports
@@ -1135,15 +1333,17 @@ Val func cgTernary(e:Node) {
     text elseL = cgLabel('tern.else')
     text endL = cgLabel('tern.end')
     cgOut(`  br i1 ${cond}, label %${thenL}, label %${elseL}`)
-    cgOut(`${thenL}:`)
+    cgBlockLabel(thenL)
     Val a = cgExpr(childOf(e, 'cons'))
     if CG_UNPORTED { return none }
+    text thenPred = CG_BLOCK
     cgOut(`  br label %${endL}`)
-    cgOut(`${elseL}:`)
+    cgBlockLabel(elseL)
     Val b = cgExpr(childOf(e, 'alt'))
     if CG_UNPORTED { return none }
+    text elsePred = CG_BLOCK
     cgOut(`  br label %${endL}`)
-    cgOut(`${endL}:`)
+    cgBlockLabel(endL)
     if a.fty != 'int' && a.fty != 'float' && a.fty != 'bool' {
         cgUnported(`ternary of type ${a.fty}`)
         return none
@@ -1153,7 +1353,7 @@ Val func cgTernary(e:Node) {
         return none
     }
     text out = cgTmp()
-    cgOut(`  ${out} = phi ${a.lty} [ ${a.v}, %${thenL} ], [ ${b.v}, %${elseL} ]`)
+    cgOut(`  ${out} = phi ${a.lty} [ ${a.v}, %${thenPred} ], [ ${b.v}, %${elsePred} ]`)
     return cgVal(out, a.lty, a.fty)
 }
 
@@ -1218,9 +1418,10 @@ Val func cgDivMod(op:text, lv:text, rv:text, asFloat:bool) {
     text nonzeroL = cgLabel('divnonzero')
     text endL = cgLabel('divend')
     cgOut(`  br i1 ${isZero}, label %${zeroL}, label %${nonzeroL}`)
-    cgOut(`${zeroL}:`)
+    cgBlockLabel(zeroL)
+    text zeroPred = CG_BLOCK
     cgOut(`  br label %${endL}`)
-    cgOut(`${nonzeroL}:`)
+    cgBlockLabel(nonzeroL)
     text res = cgTmp()
     text ins = 'srem'
     if op == '/' { ins = 'fdiv' }
@@ -1228,10 +1429,11 @@ Val func cgDivMod(op:text, lv:text, rv:text, asFloat:bool) {
         if asFloat { ins = 'frem' }
     }
     cgOut(`  ${res} = ${ins} ${ty} ${lv}, ${rv}`)
+    text nonzeroPred = CG_BLOCK
     cgOut(`  br label %${endL}`)
-    cgOut(`${endL}:`)
+    cgBlockLabel(endL)
     text out = cgTmp()
-    cgOut(`  ${out} = phi ${ty} [ ${sentinel}, %${zeroL} ], [ ${res}, %${nonzeroL} ]`)
+    cgOut(`  ${out} = phi ${ty} [ ${sentinel}, %${zeroPred} ], [ ${res}, %${nonzeroPred} ]`)
     if asFloat { return cgVal(out, 'double', 'float') }
     return cgVal(out, 'i64', 'int')
 }
@@ -1258,23 +1460,28 @@ Val func cgLogical(e:Node) {
     text endL = cgLabel('logic.end')
     text startL = cgLabel('logic.start')
     cgOut(`  br label %${startL}`)
-    cgOut(`${startL}:`)
+    cgBlockLabel(startL)
     if rawText(e, 'op') == '&&' {
         cgOut(`  br i1 ${cond}, label %${rhsL}, label %${endL}`)
     } else {
         cgOut(`  br i1 ${cond}, label %${endL}, label %${rhsL}`)
     }
-    cgOut(`${rhsL}:`)
+    cgBlockLabel(rhsL)
     Val r = cgExpr(childOf(e, 'right'))
     if CG_UNPORTED { return none }
     if r.fty != 'bool' {
         cgUnported(`logical operator on ${r.fty}`)
         return none
     }
+    text rhsPred = CG_BLOCK
     cgOut(`  br label %${endL}`)
-    cgOut(`${endL}:`)
+    cgBlockLabel(endL)
     text out = cgTmp()
-    cgOut(`  ${out} = phi i8 [ ${l.v}, %${startL} ], [ ${r.v}, %${rhsL} ]`)
+    // The left edge always leaves startL, which is why startL exists at
+    // all -- evaluating the left operand may have opened blocks of its
+    // own, but this branch is emitted from a block the generator
+    // controls. The right edge is wherever the right operand finished.
+    cgOut(`  ${out} = phi i8 [ ${l.v}, %${startL} ], [ ${r.v}, %${rhsPred} ]`)
     return cgVal(out, 'i8', 'bool')
 }
 
@@ -1367,7 +1574,26 @@ void func cgStmt(s:Node) {
         }
         text fty = cgDeclFty(s)
         if fty == '' {
-            cgUnported('declaration of a non-scalar type')
+            Ty dt = resolveTypeField(s, 'type_expr')
+            text managed = cgManagedFty(dt)
+            if managed == '' {
+                cgUnported('declaration of a non-scalar type')
+                return
+            }
+            // A managed GLOBAL with no initializer is already fully
+            // described by its header in the globals section, so there
+            // is nothing for main to do. Anything else -- a local, or
+            // an initializer of any kind -- needs the header allocated
+            // and released, which is not ported.
+            text gname = rawText(s, 'name')
+            if G_SLOT[gname] == null {
+                cgUnported(`${managed} local`)
+                return
+            }
+            if childOf(s, 'init') != null {
+                cgUnported(`${managed} initializer`)
+                return
+            }
             return
         }
         text name = rawText(s, 'name')
@@ -1531,10 +1757,10 @@ void func cgIf(s:Node) {
     text t = cgTmp()
     cgOut(`  ${t} = icmp ne i8 ${c.v}, 0`)
     cgOut(`  br i1 ${t}, label %${thenL}, label %${elseL}`)
-    cgOut(`${thenL}:`)
+    cgBlockLabel(thenL)
     cgBlockInto(childOf(s, 'then'))
     if CG_TERM == false { cgOut(`  br label %${endL}`) }
-    cgOut(`${elseL}:`)
+    cgBlockLabel(elseL)
     CG_TERM = false
     Node orelse = childOf(s, 'orelse')
     if orelse != null {
@@ -1545,7 +1771,7 @@ void func cgIf(s:Node) {
         }
     }
     if CG_TERM == false { cgOut(`  br label %${endL}`) }
-    cgOut(`${endL}:`)
+    cgBlockLabel(endL)
     // The end block itself falls through, so whatever follows the `if`
     // is reachable regardless of what the arms did.
     CG_TERM = false
@@ -1562,19 +1788,19 @@ void func cgFor(s:Node) {
     text updateL = cgLabel('for.update')
     text endL = cgLabel('for.end')
     cgOut(`  br label %${condL}`)
-    cgOut(`${condL}:`)
+    cgBlockLabel(condL)
     Val c = cgExpr(childOf(s, 'test'))
     if CG_UNPORTED { return }
     text t = cgTmp()
     cgOut(`  ${t} = icmp ne i8 ${c.v}, 0`)
     cgOut(`  br i1 ${t}, label %${bodyL}, label %${endL}`)
-    cgOut(`${bodyL}:`)
+    cgBlockLabel(bodyL)
     cgBlockInto(childOf(s, 'body'))
     if CG_TERM == false { cgOut(`  br label %${updateL}`) }
-    cgOut(`${updateL}:`)
+    cgBlockLabel(updateL)
     cgEvalForEffect(childOf(s, 'update'))
     cgOut(`  br label %${condL}`)
-    cgOut(`${endL}:`)
+    cgBlockLabel(endL)
     CG_TERM = false
 }
 
@@ -1620,6 +1846,23 @@ void func cgStoreText(slot:text, apSlot:text, v:Val, owning:bool) {
 
 void func cgAssign(e:Node) {
     Node target = childOf(e, 'target')
+    if target != null && target.kind == 'Member' {
+        // The object and its GEP come first, then the value -- the
+        // order festina/codegen.py's own _emit_assign uses, because it
+        // resolves the target's type before emitting the value so an
+        // array-literal right-hand side can pick its element type from
+        // context.
+        Val fp = cgFieldPtr(target)
+        if CG_UNPORTED { return }
+        if fp.fty != 'int' && fp.fty != 'float' && fp.fty != 'bool' {
+            cgUnported(`assignment to a ${fp.fty} field`)
+            return
+        }
+        Val fv = cgExpr(childOf(e, 'value'))
+        if CG_UNPORTED { return }
+        cgOut(`  store ${fp.lty} ${fv.v}, ptr ${fp.v}`)
+        return
+    }
     if target == null || target.kind != 'Identifier' {
         cgUnported('assignment to a non-identifier target')
         return
@@ -1692,16 +1935,16 @@ void func cgWhile(s:Node) {
     text bodyL = cgLabel('while.body')
     text endL = cgLabel('while.end')
     cgOut(`  br label %${condL}`)
-    cgOut(`${condL}:`)
+    cgBlockLabel(condL)
     Val c = cgExpr(childOf(s, 'test'))
     if CG_UNPORTED { return }
     text t = cgTmp()
     cgOut(`  ${t} = icmp ne i8 ${c.v}, 0`)
     cgOut(`  br i1 ${t}, label %${bodyL}, label %${endL}`)
-    cgOut(`${bodyL}:`)
+    cgBlockLabel(bodyL)
     cgBlockInto(childOf(s, 'body'))
     if CG_TERM == false { cgOut(`  br label %${condL}`) }
-    cgOut(`${endL}:`)
+    cgBlockLabel(endL)
     CG_TERM = false
 }
 
@@ -1779,7 +2022,7 @@ void func cgFunc(d:Node) {
     CUR = CG_FUNCS
     CG_IN_FUNC = true
     cgOut(`define ${retL} @${name}(${joined}) {`)
-    cgOut(`${cgLabel('entry')}:`)
+    cgBlockLabel(cgLabel('entry'))
     int p = 0
     while p < pnames.length {
         text slot = `%${pnames[p]}.${cgUid()}`
@@ -1833,15 +2076,26 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     while sd < body.length {
         Node d = body[sd]
         if d.kind == 'StructDecl' {
+            text sn = rawText(d, 'name')
             arr[Node] fs = listOf(d, 'fields')
             text row = ''
             int fi = 0
             while fi < fs.length {
+                Ty ft = resolveTypeField(fs[fi], 'type_expr')
+                text flty = cgFieldType(ft)
                 if fi > 0 { row = row + ', ' }
-                row = row + cgFieldType(resolveTypeField(fs[fi], 'type_expr'))
+                row = row + flty
+                text fname = rawText(fs[fi], 'name')
+                text key = `${sn}.${fname}`
+                SF_IDX[key] = fi
+                SF_LTY[key] = flty
+                text ffty = cgDeclFty(fs[fi])
+                if ffty == '' { ffty = cgManagedFty(ft) }
+                SF_FTY[key] = ffty
+                if ffty == 'struct' { SF_SNAME[key] = ft.name }
                 fi++
             }
-            cgEmit(`%struct.${rawText(d, 'name')} = type { ${row} }`)
+            cgEmit(`%struct.${sn} = type { ${row} }`)
         }
         sd++
     }
@@ -1857,9 +2111,9 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     while g < body.length {
         Node d = body[g]
         if d.kind == 'VarDecl' {
+            text gn = rawText(d, 'name')
             text gf = cgDeclFty(d)
             if gf != '' {
-                text gn = rawText(d, 'name')
                 text gl = cgLtyOf(gf)
                 cgEmit(`@${gn} = global ${gl} ${cgZeroFor(gl)}`)
                 // claude.md #243: a text binding carries an append
@@ -1871,6 +2125,22 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 }
                 G_SLOT[gn] = `@${gn}`
                 G_FTY[gn] = gf
+            } else {
+                // A managed global's storage is its payload wrapped in
+                // a {refcount, payload} header, with the visible
+                // pointer GEP'd past the count -- exactly argv's own
+                // shape above. The count is -1, the immortal sentinel:
+                // a global is reachable until the process exits, so
+                // nothing ever releases it.
+                Ty gt = resolveTypeField(d, 'type_expr')
+                text payload = cgPayloadFor(gt)
+                if payload != '' {
+                    cgEmit(`@${gn}.header = global {i64, ${payload}} {i64 -1, ${payload} zeroinitializer}`)
+                    cgEmit(`@${gn} = global ptr getelementptr({i64, ${payload}}, ptr @${gn}.header, i32 0, i32 1)`)
+                    G_SLOT[gn] = `@${gn}`
+                    G_FTY[gn] = cgManagedFty(gt)
+                    if gt.kind == 'struct' { G_SNAME[gn] = gt.name }
+                }
             }
         }
         g++
@@ -1908,7 +2178,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // Then main's own statements.
     CUR = CG_MAIN
     cgOut('define void @__festina_main() {')
-    cgOut('entry:')
+    cgBlockLabel('entry')
     CG_TERM = false
     arr[text] mainLive = []
     arr[int] mainFrames = []
@@ -1925,7 +2195,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     cgOut('}')
     cgOut('')
     cgOut('define i32 @main(i32 %argc, ptr %argv_raw) {')
-    cgOut('entry:')
+    cgBlockLabel('entry')
     cgOut('  call void @festina_runtime_init()')
     cgOut('  %argv_arr = call ptr @festina_argv_array(i32 %argc, ptr %argv_raw)')
     cgOut('  store ptr %argv_arr, ptr @argv')
