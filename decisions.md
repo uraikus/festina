@@ -5711,3 +5711,34 @@ So `irdiff.py` now reports "rejected by both" separately from "match", and cover
 **The first slice.** `bootstrap/codegen.f` emits the module header, the 382-line runtime declaration block, the argv globals, `@__festina_main`, the `main` wrapper, and `log(<string literal>)`. That is `benchmarks/hello.f`, matching all 406 lines. A non-ASCII string literal reports unported rather than guessing, since `text.length` is code points and the constant's length must be bytes -- conservative in the one safe direction, the same rule `semantic.f`'s `inferExpr` follows.
 
 **Verified.** 2835 passed, 98 skipped -- 14 as before, plus the 84 corpus files codegen has not reached, which are skips rather than silence because `test_coverage_does_not_go_backwards` asserts the floor separately. Lexer 96/96, parser 96/96, semantic 96/96; all three now handle `codegen.f` and `irdumpf.f`, their own new corpus members. Codegen: 1 match, 0 differ, 84 unported, 11 rejected by both. Canary confirmed: corrupting one preamble line turns the match into a difference naming the exact line.
+
+
+290. SCALAR GLOBALS, AND IEEE-754 WITHOUT BITWISE OPERATORS
+
+The second codegen slice (#289). `VarDecl` was the top blocker at 36 corpus files; this closes it for `int`/`float`/`bool` globals and their initializing stores.
+
+**The interesting part is the float literal**, and it surfaced two things Festina does not have.
+
+LLVM takes a double constant as `0x` followed by the raw IEEE-754 bit pattern, which `_format_double` gets from `struct.pack`. **Festina has no bitwise operators and no float-bit access at all.** It also has no `text.toFloat()` -- `toFloat()` exists only on `int` -- so there is no decimal-to-double conversion either. Two primitives missing, both needed, and neither one added: this is the first bootstrap gap answered entirely inside the language rather than by growing it.
+
+**Decimal to double**, by the classic exact fast path: all the digits as an integer, divided by a power of ten. Both operands are exactly representable while the digits fit in 2^53 and the scale in 10^22, and IEEE division is correctly rounded, so the result is the correctly-rounded double. Verified against Python's own strtod over 50,000 generated literals: zero mismatches, with `0.30000000000000004` and `1.7976931348623157` correctly *refused* rather than approximated.
+
+**Double to bits**, by arithmetic: normalize into [1, 2) counting the exponent, then scale the mantissa by 2^52. The sign and exponent are printed as three hex digits and the mantissa as thirteen, rather than assembled into one integer, because setting bit 63 would overflow a signed i64. Verified against `struct.pack` over 60,000 values: exact everywhere except subnormals, which the normalize loop cannot reach and which are refused.
+
+Negative zero would also be wrong, since it compares equal to zero -- and is unreachable, which was checked rather than assumed: Festina has no negative literal, unary minus being a separate operator that festina/codegen.py emits as a runtime negation (`store double %t1`) rather than folding to a constant. `_format_double` never sees one.
+
+Both conversions are **exact or unported, never approximate** -- the same rule semantic.f's `inferExpr` follows, for the same reason.
+
+**A canary that could not have fired, and why that was worth learning.** The first perturbation tried on the new `cases/float_bits.f` was `Math.round` to `Math.trunc` in the mantissa. It changed nothing, and not because the case file is weak: `(av - 1.0) * 2^52` is *exactly* an integer for every double, the mantissa being exactly 52 bits, so round and trunc provably agree there. The perturbation was inert by construction. Shifting the exponent bias from 1023 to 1022 fires on both float files with exact diffs. A negative control has to perturb something that can change the answer, and whether it does is itself a measurement -- #287 and #289 each learned a version of this; here the lesson is that an inert canary looks exactly like a robust implementation.
+
+`cases/float_bits.f` exists because the corpus contains exactly eight distinct float literals, all between 0.1 and 127.0 -- enough to pass an encoder that only works on small tidy numbers. It adds a power of two, a repeating fraction, values either side of 1.0 so the normalize loop runs both ways, a large exponent and a small one.
+
+**Scope held deliberately.** `text` globals need three globals and an own-then-free dance at every assignment; every other type needs a header allocation. Both report unported rather than being half-emitted.
+
+**Verified.** 2840 passed, 97 skipped. Codegen 3 match, 0 differ, 83 unported, 11 rejected by both: **103 of 155,143 file-specific IR lines, 0.066%**, up from 23. The top blocker is now `StructDecl` at 22 files. Lexer 97/97, parser 97/97, semantic 97/97.
+
+**A divergence the new case file found, in a different component.** `cases/float_bits.f` failed the LEXER and PARSER harnesses on its first full run: Python's token dump renders `0.0000000001` as `1e-10`, because the Python lexer stores `float(text)` and the dump uses Python's `str()`, which switches to exponent form below 1e-4. `bootstrap/lexer.f` reproduces the trailing-zero half of `repr()` -- there is a comment in it saying exactly that, added when `1.50` needed to agree with `1.5` -- but keeps the source spelling otherwise. No corpus file has a literal outside the plain-decimal range, so eight years of corpus never reached it.
+
+That is pre-existing and unrelated to this slice, and fixing it properly means shortest-round-trip float formatting in Festina. So the case file uses `0.0001` -- the smallest value Python still prints plainly, and still fourteen trips round the normalize loop -- and the limitation is recorded in todo.md rather than buried. The file's job is the codegen encoder, and it still does it.
+
+Worth noting for its own sake: this is the second time in two slices that adding a `cases/` file has found something the whole repository corpus could not. That is what the directory is for, and the hit rate is high enough to make it the default first move rather than an afterthought.

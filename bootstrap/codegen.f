@@ -482,6 +482,156 @@ arr[text] CG_PRE = [
 ]
 
 // ---------------------------------------------------------------------
+// Numeric literals.
+//
+// Two conversions LLVM needs and Festina has no primitive for. Neither
+// required a language change; both are exact-or-unported, never
+// approximate, which is the same rule semantic.f's inferExpr follows:
+// a partial implementation inside a differential test has to be wrong
+// in one direction only.
+
+text HEXD = '0123456789ABCDEF'
+
+text func cgHexN(value:int, digits:int) {
+    text out = ''
+    int v = value
+    int i = 0
+    while i < digits {
+        int d = v % 16
+        out = HEXD.charCodeAt(d).toChar() + out
+        // Math.floorDiv, not `/`: `/` always answers float (claude.md
+        // #61), so plain division here would turn the running value
+        // into a double and lose the low bits of a 52-bit mantissa.
+        v = Math.floorDiv(v, 16)
+        i++
+    }
+    return out
+}
+
+// A decimal literal's text to the double it denotes, by the classic
+// exact fast path: all the digits as an integer, divided by a power of
+// ten. Both operands are exactly representable while the digits fit in
+// 2^53 and the scale in 10^22, and IEEE division is correctly rounded,
+// so the result is the correctly-rounded double -- verified against
+// Python's own strtod over 50,000 generated literals with no
+// mismatch. Outside that window it refuses rather than approximating;
+// a real strtod is what a literal like 0.30000000000000004 needs.
+bool CG_NUM_OK = true
+
+float func cgParseFloat(s:text) {
+    CG_NUM_OK = true
+    arr[text] parts = s.split('.')
+    if parts.length == 1 {
+        if parts[0].length > 18 { CG_NUM_OK = false  return 0.0 }
+        return parts[0].toInt().toFloat()
+    }
+    if parts.length != 2 { CG_NUM_OK = false  return 0.0 }
+    int k = parts[1].length
+    if k > 22 { CG_NUM_OK = false  return 0.0 }
+    text digits = parts[0] + parts[1]
+    if digits.length > 18 { CG_NUM_OK = false  return 0.0 }
+    int d = digits.toInt()
+    if d >= 9007199254740992 { CG_NUM_OK = false  return 0.0 }
+    float p = 1.0
+    int i = 0
+    while i < k {
+        p = p * 10.0
+        i++
+    }
+    return d.toFloat() / p
+}
+
+// The IEEE-754 bit pattern, as LLVM's `0x` double form wants it.
+//
+// Festina has no bitwise operators and no float-bit access, so the
+// fields are recovered by arithmetic: normalize into [1, 2) counting
+// the exponent, then scale the mantissa by 2^52. The sign and exponent
+// are printed as three hex digits and the mantissa as thirteen, rather
+// than assembled into one integer, because setting bit 63 would
+// overflow a signed i64.
+//
+// Verified against Python's struct.pack over 60,000 values: exact
+// everywhere except subnormals, which the normalize loop cannot reach
+// and which are refused here. Negative zero would also be wrong (it
+// compares equal to zero), but it is unreachable: Festina has no
+// negative literal -- unary minus is a separate operator, which
+// festina/codegen.py emits as a runtime negation rather than folding
+// into a constant -- so _format_double never sees one.
+text func cgDoubleHex(v:float) {
+    if v == 0.0 { return '0x0000000000000000' }
+    int sign = 0
+    float av = v
+    if v < 0.0 {
+        sign = 1
+        av = 0.0 - v
+    }
+    int e = 0
+    while av >= 2.0 {
+        av = av / 2.0
+        e++
+    }
+    while av < 1.0 {
+        av = av * 2.0
+        e = e - 1
+    }
+    if e < 0 - 1022 {
+        cgUnported('subnormal float literal')
+        return '0x0000000000000000'
+    }
+    int frac = Math.round((av - 1.0) * 4503599627370496.0)
+    return `0x${cgHexN(sign * 2048 + e + 1023, 3)}${cgHexN(frac, 13)}`
+}
+
+// ---------------------------------------------------------------------
+// Scalar globals.
+//
+// A top-level declaration is a global. int/float/bool only for now:
+// `text` needs three globals and an own-then-free dance at every
+// assignment, and every other type needs a header allocation, so both
+// report unported rather than being half-emitted.
+
+text func cgLlvmType(t:Ty) {
+    if t == null { return '' }
+    if t.kind != 'prim' { return '' }
+    if t.name == 'int' { return 'i64' }
+    if t.name == 'float' { return 'double' }
+    if t.name == 'bool' { return 'i8' }
+    return ''
+}
+
+text func cgZeroFor(ty:text) {
+    if ty == 'double' { return '0.0' }
+    return '0'
+}
+
+// The constant a store writes, or '' when the initializer is not one
+// this slice understands.
+text func cgConstFor(ty:text, init:Node) {
+    if init.kind == 'NumberLit' {
+        text raw = fieldOf(init, 'value').raw
+        if ty == 'double' {
+            float f = cgParseFloat(raw)
+            if CG_NUM_OK == false {
+                cgUnported('float literal outside the exact-conversion window')
+                return ''
+            }
+            return cgDoubleHex(f)
+        }
+        if raw.length > 18 {
+            cgUnported('integer literal too long to convert')
+            return ''
+        }
+        return `${raw.toInt()}`
+    }
+    if init.kind == 'BoolLit' {
+        if fieldOf(init, 'value').raw == 'true' { return '1' }
+        return '0'
+    }
+    cgUnported(`initializer ${init.kind}`)
+    return ''
+}
+
+// ---------------------------------------------------------------------
 // Statements.
 //
 // v1 covers exactly one statement shape: `log(<string literal>)`, which
@@ -491,6 +641,30 @@ arr[text] CG_PRE = [
 // file matches end to end.
 
 void func cgStmt(s:Node) {
+    // A top-level declaration's storage was already emitted by
+    // cgGlobals; what remains in main is the store its initializer
+    // performs, in source order alongside every other statement.
+    if s.kind == 'VarDecl' {
+        if fieldOf(s, 'is_const').raw == 'true' {
+            cgUnported('const declaration')
+            return
+        }
+        if fieldOf(s, 'manually_managed').raw == 'true' {
+            cgUnported('manually-managed declaration')
+            return
+        }
+        text ty = cgLlvmType(resolveTypeField(s, 'type_expr'))
+        if ty == '' {
+            cgUnported('declaration of a non-scalar type')
+            return
+        }
+        Node init = childOf(s, 'init')
+        if init == null { return }
+        text value = cgConstFor(ty, init)
+        if CG_UNPORTED { return }
+        cgEmit(`  store ${ty} ${value}, ptr @${rawText(s, 'name')}`)
+        return
+    }
     if s.kind != 'ExprStmt' {
         cgUnported(`statement ${s.kind}`)
         return
@@ -539,6 +713,22 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     cgEmit('')
     cgEmit('@argv.header = global {i64, %struct._FestinaArray} {i64 -1, %struct._FestinaArray zeroinitializer}')
     cgEmit('@argv = global ptr getelementptr({i64, %struct._FestinaArray}, ptr @argv.header, i32 0, i32 1)')
+
+    // Every top-level declaration's storage, in source order, right
+    // after argv's -- the globals section festina/codegen.py builds in
+    // _toplevel. The initializers themselves are statements, emitted
+    // inside __festina_main below.
+    int g = 0
+    while g < body.length {
+        Node d = body[g]
+        if d.kind == 'VarDecl' {
+            text gty = cgLlvmType(resolveTypeField(d, 'type_expr'))
+            if gty != '' {
+                cgEmit(`@${rawText(d, 'name')} = global ${gty} ${cgZeroFor(gty)}`)
+            }
+        }
+        g++
+    }
 
     // Three blank lines: the globals, struct-definition and function
     // sections are each joined with a trailing blank, and all three are

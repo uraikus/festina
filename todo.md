@@ -86,6 +86,28 @@ open:
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.
 
+## The bootstrap compiler
+
+- **`bootstrap/lexer.f` does not follow Python's `repr()` into
+  scientific notation.** The canonical token dump renders a float with
+  Python's `str()`, which switches to exponent form below 1e-4 and at
+  1e17 and above (`0.0000000001` prints as `1e-10`); the Festina lexer
+  reproduces the trailing-zero half of `repr()` but keeps the source
+  spelling otherwise, so it emits `0.0000000001`. No corpus file
+  contains a literal outside the plain-decimal range, so the
+  differential test has never seen it — found by adding
+  `cases/float_bits.f` for the codegen port (decisions.md #290), whose
+  small value is `0.0001` for exactly this reason.
+
+  Fixing it properly means shortest-round-trip float formatting in
+  Festina (Grisu/Ryū), which is its own piece of work. The alternative
+  worth weighing first is changing what the dump renders: the IEEE-754
+  bit pattern is exact, machine-independent, and something both sides
+  can already produce — `bootstrap/codegen.f` has the encoder — but it
+  would require the *reverse* conversion to be exact for every literal
+  too, and the fast path there refuses values like
+  `0.30000000000000004`.
+
 ## Deliberate behavior (documented, not planned work)
 
 - **Array indexing is not bounds-checked** — a performance choice, see

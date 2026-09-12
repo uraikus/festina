@@ -44,13 +44,13 @@ python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 96-file repository corpus:
+Over the 97-file repository corpus:
 
-- **lexer: 96 match, 0 differ.**
-- **parser: 96 match, 0 differ, 0 unported.**
-- **semantic: 96 match, 0 differ, 0 unported.**
-- **codegen: 1 match, 0 differ, 84 unported, 11 rejected by both** —
-  23 of 153,320 file-specific IR lines. See below for why that is the
+- **lexer: 97 match, 0 differ.**
+- **parser: 97 match, 0 differ, 0 unported.**
+- **semantic: 97 match, 0 differ, 0 unported.**
+- **codegen: 3 match, 0 differ, 83 unported, 11 rejected by both** —
+  103 of 155,143 file-specific IR lines. See below for why that is the
   number reported rather than a file count.
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
@@ -102,7 +102,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 96-file repository corpus is a strong oracle for ordinary code and
+The 97-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -138,7 +138,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Semantic analysis: 96 match, 0 differ, 0 unported
+## Semantic analysis: 97 match, 0 differ, 0 unported
 
 All three stages of the front end agree with their originals over the
 whole corpus. `semantic.f` resolves declarations, merges imports,
@@ -188,7 +188,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 23 of 153,320 file-specific IR lines
+## Codegen: 103 of 155,143 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -275,11 +275,15 @@ The blockers, by how many corpus files each holds back:
 
 | | |
 |---|---|
-| `VarDecl` | 36 |
 | `StructDecl` | 22 |
+| a declaration of a non-scalar type | 13 |
+| `FuncDecl` | 11 |
+| `EventHandler` | 8 |
 | `ImportDecl` | 8 |
-| `FuncDecl` | 6 |
 | `TableDecl` | 6 |
-| `ThreadDecl` | 3 |
+| `ThreadDecl` | 5 |
+| a `BinOp` initializer | 3 |
+| `ForStmt` | 2 |
 | a non-call expression statement | 2 |
-| `ForStmt` | 1 |
+| a `const` declaration | 2 |
+| `WhileStmt` | 1 |
