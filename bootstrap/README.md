@@ -50,7 +50,7 @@ Over the 100-file repository corpus:
 - **parser: 100 match, 0 differ, 0 unported.**
 - **semantic: 100 match, 0 differ, 0 unported.**
 - **codegen: 13 match, 0 differ, 76 unported, 11 rejected by both** —
-  1,554 of 180,328 file-specific IR lines. See below for why that is the
+  1,554 of 180,340 file-specific IR lines. See below for why that is the
   number reported rather than a file count, and for the caveat that
   comes with this particular figure.
 
@@ -189,7 +189,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 1,554 of 180,328 file-specific IR lines
+## Codegen: 1,554 of 180,340 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -270,7 +270,7 @@ the implementation. But a number that grows because the input grew says
 nothing about the remaining 178,000 lines, and the two facts are worth
 keeping separate when reading the table below.
 
-**The budget is not fixed, either.** It went 175,080 → 180,328 across
+**The budget is not fixed, either.** It went 175,080 → 180,340 across
 one session with `festina/codegen.py` untouched, because
 `bootstrap/codegen.f` is itself a corpus file: every line added to the
 port enlarges the denominator. Self-hosting is a moving goal by
@@ -280,7 +280,7 @@ construction.
 
 The **bootstrap's own eight files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f` and the four entry points — are **137,331 of
-the 180,328 file-specific IR lines, 76% of the budget**, and they need
+the 180,340 file-specific IR lines, 76% of the budget**, and they need
 none of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
@@ -362,19 +362,30 @@ sanitizer for this stage rather than needing it alongside.
 
 |blocks|only|construct|
 |---:|---:|---|
-|23|4|a declaration of a non-scalar type (`blob`, `img`, `regex`, …)|
-|21|3|a parameter of a non-scalar type|
-|21|0|a call through a non-identifier callee (method calls)|
-|20|2|a `text` parameter|
+|50|0|a call through a non-identifier callee (method calls)|
+|30|0|a declaration of a non-scalar type (`blob`, `img`, `regex`, …)|
+|29|0|an `arr[T]` **local**|
+|29|0|computed member access (indexing)|
+|21|2|a parameter of a non-scalar type|
+|21|0|a struct **local**|
+|20|0|a `text` parameter|
 |19|0|`EventHandler`|
-|18|0|`ThreadDecl`|
-|17|1|an `arr[T]` **local**|
-|14|2|a struct **local**|
 
 `blocks` counts every file a construct appears in; `only` counts the
 files where it is the last thing in the way, and so the number that
-would actually become matches. The first column has overpromised twice
-now (#291, #295) and the second one has not.
+would actually become matches.
+
+**The `only` column is three files, total** — a struct parameter for
+two of them and `try`/`catch` for the third. Nothing else in this
+corpus is one construct from matching, and the earlier tables that
+implied otherwise were measuring wrong: the walk stopped at the first
+reason inside an expression, so `examples/ascii_scan.f` claimed a
+single blocker while calling a method on every line of its loop
+(decisions.md #297). Method calls alone went from 21 files to 50 once
+that was fixed, and indexing did not appear at all before.
+
+Read the first column for where the volume is and the second for what
+finishing one thing would buy.
 
 **Container and struct locals need a fifth module.** The stack-versus-
 heap choice comes from `festina/escape_analysis.py` — 379 lines, six

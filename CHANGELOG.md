@@ -98,7 +98,7 @@ round-by-round design and implementation record predating 0.1 lives in
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
   the fourth and last stage, **in progress**: **13 of 100 corpus files
   emit byte-identical LLVM IR, 0 differ, 76 not yet ported, 11 rejected
-  by both** — 1,554 of 180,328 file-specific IR lines. In are
+  by both** — 1,554 of 180,340 file-specific IR lines. In are
   expressions (arithmetic and comparison with int/float mixing,
   `&&`/`||`, unary, the ternary, `/` and `%` with claude.md #57's
   divide-by-zero control flow, template literals, and `+` and `==`/`!=`

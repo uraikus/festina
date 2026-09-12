@@ -5899,3 +5899,37 @@ Four of five are invisible to the only pre-existing file that builds strings at 
 **Deliberately still out.** Interpolating a struct/`arr[T]`/`map[T]` (a generated JSON walk), `blob` and `ascii` (their own runtime conversions), and the claude.md #192 release of a container the template itself owns -- which is a no-op for every type `cgToText` accepts, so it must arrive *with* container interpolation rather than after it.
 
 **Verified.** 2861 passed, 90 skipped. Lexer 100/100, parser 100/100, semantic 100/100. Codegen 13 match, 0 differ, 76 unported, 11 rejected by both.
+
+
+297. THE SAME MEASUREMENT FLAW, A THIRD TIME -- AND WHAT THE CORRECTED TABLE SAYS
+
+No new construct in this one. It fixes irdiff's blocker table, which had been a first-blocker histogram for the third time, and the corrected numbers change what to do next.
+
+**How it hid.** #291 found cgUnported keeping only the earliest reason and fixed that. #292 found early-return guards stopping the walk outright and fixed that too -- for STATEMENTS. Both fixes missed the expression level, because `cgExpr` began with `if CG_UNPORTED { return }` and CG_UNPORTED is sticky for the whole file. So after the first statement failed, **no expression anywhere in that file was ever examined again.**
+
+The symptom, once looked for, was unmistakable: `examples/ascii_scan.f` reported `declaration of a non-scalar type` as its ONLY blocker, while every line of its loop calls a method. A file whose real blocker list is four items long was presented as one construct away.
+
+**The fix is two flags instead of one.** `CG_UNPORTED` stays sticky and means "do not print this module". `CG_STUCK` clears before every statement and is what every "my subexpression failed, stop" guard reads. The failing statement abandons its own walk -- so a subexpression that returned nothing does not cascade into a pile of nonsense reasons -- and the next statement starts clean.
+
+**Before and after, same binary's coverage, same 13 matches:**
+
+|construct|blocks (before)|blocks (after)|
+|---|---:|---:|
+|call through a non-identifier callee (method calls)|21|**50**|
+|declaration of a non-scalar type|23|30|
+|`arr[T]` local|17|29|
+|computed member access (indexing)|—|**29**|
+|struct local|14|21|
+
+Indexing did not appear in the old table at all. Method calls went from 21 files to 50 of the 76 unported ones.
+
+**And the `only` column collapsed to three files**, which is the finding that matters:
+
+- `examples/geometry.f`, `examples/multifile.f` -- a struct parameter.
+- `tests/valgrind_stress/json_parse_fail_churn.f` -- `try`/`catch`.
+
+That is the whole of what any single construct would unlock. **Nothing left in this corpus is cheap in the sense of buying files**, and saying otherwise was an artifact. The two real fronts are method calls (volume: 50 files, 0 of them alone) and `festina/escape_analysis.py` (which gates container locals, struct locals, struct parameters and `text` parameters -- 21, 21, 21 and 20 files respectively).
+
+**The general rule, now with three data points.** Every time this measurement has been wrong it has been wrong in the same direction: flattering, and specifically promising that one more construct would unlock a pile of files. Twice the mechanism was "stop at the first reason"; once it was "stop at the first reason, but only inside expressions". The question that catches it is the same one #290's file count needed: *what would this metric say about an implementation that gave up immediately?* A first-blocker histogram says "you are one step away" no matter how far away you are.
+
+**Verified.** 2861 passed, 90 skipped. Codegen 13 match, 0 differ, 76 unported, 11 rejected by both -- identical coverage to #296, which is the point: this slice changes only what the port can say about itself.

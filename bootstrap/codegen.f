@@ -38,6 +38,29 @@ int CG_STR_N = 0
 // first repeat onward.
 map[text] CG_STR_MAP = {}
 bool CG_UNPORTED = false
+
+// Whether the statement currently being walked has given up.
+//
+// CG_UNPORTED is sticky for the whole file -- it says "do not print
+// this module" and never clears. This one clears before every
+// statement, and it is what every "my subexpression failed, stop"
+// guard reads.
+//
+// The distinction exists because collapsing the two made irdiff's
+// blocker table a first-blocker histogram for the THIRD time. #291
+// found it when cgUnported kept only the earliest reason; #292 found
+// it again when early-return guards stopped the walk outright; and it
+// survived both fixes at the expression level, because cgExpr returned
+// immediately whenever CG_UNPORTED was already set -- so after one
+// statement failed, no expression in the file was ever examined again.
+// examples/ascii_scan.f reported `declaration of a non-scalar type` as
+// its ONLY blocker while also needing method calls on every line of
+// its loop.
+//
+// A per-statement flag gets both: the failing statement abandons its
+// own walk (so no cascade of nonsense reasons from a subexpression
+// that returned nothing), and the next statement starts clean.
+bool CG_STUCK = false
 text CG_WHY = ''
 arr[text] CG_WHYS = []
 
@@ -62,6 +85,7 @@ void func cgEmit(line:text) {
 // implementing something will actually buy.
 void func cgUnported(what:text) {
     CG_UNPORTED = true
+    CG_STUCK = true
     int i = 0
     while i < CG_WHYS.length {
         if CG_WHYS[i] == what { return }
@@ -1010,7 +1034,7 @@ arr[text] func cgHoistAllocas(src:arr[text]) {
 
 Val func cgExpr(e:Node) {
     Val none
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     if e == null {
         cgUnported('missing expression')
         return none
@@ -1082,9 +1106,9 @@ Val func cgExpr(e:Node) {
 Val func cgBinOp(e:Node) {
     Val none
     Val l = cgExpr(childOf(e, 'left'))
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     Val r = cgExpr(childOf(e, 'right'))
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     text op = rawText(e, 'op')
 
     // `text` has its own branch, ahead of everything numeric: `==`/`!=`
@@ -1274,7 +1298,7 @@ Val func cgFieldPtr(e:Node) {
         }
     }
     Val obj = cgExpr(childOf(e, 'obj'))
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     if obj.fty != 'struct' {
         cgUnported(`member access on ${obj.fty}`)
         return none
@@ -1363,7 +1387,7 @@ Val func cgLoadFieldValue(fp:Val) {
 Val func cgMemberRead(e:Node) {
     Val none
     Val fp = cgFieldPtr(e)
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     if cgLtyOf(fp.fty) == '' {
         cgUnported(`read of a ${fp.fty} field`)
         return none
@@ -1378,7 +1402,7 @@ Val func cgMemberRead(e:Node) {
 Val func cgTernary(e:Node) {
     Val none
     Val c = cgExpr(childOf(e, 'test'))
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     if c.fty != 'bool' {
         cgUnported(`ternary condition of type ${c.fty}`)
         return none
@@ -1391,12 +1415,12 @@ Val func cgTernary(e:Node) {
     cgOut(`  br i1 ${cond}, label %${thenL}, label %${elseL}`)
     cgBlockLabel(thenL)
     Val a = cgExpr(childOf(e, 'cons'))
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     text thenPred = CG_BLOCK
     cgOut(`  br label %${endL}`)
     cgBlockLabel(elseL)
     Val b = cgExpr(childOf(e, 'alt'))
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     text elsePred = CG_BLOCK
     cgOut(`  br label %${endL}`)
     cgBlockLabel(endL)
@@ -1491,11 +1515,11 @@ Val func cgTemplate(e:Node) {
     int i = 0
     while i < exprs.length {
         Val a = cgExpr(exprs[i])
-        if CG_UNPORTED { return none }
+        if CG_STUCK { return none }
         bool pieceOwned = a.fty != 'text'
         if a.fty == 'text' { pieceOwned = cgIsOwningTextSource(exprs[i]) }
         Val piece = cgToText(a)
-        if CG_UNPORTED { return none }
+        if CG_STUCK { return none }
 
         if result == '' {
             result = piece.v
@@ -1533,7 +1557,7 @@ Val func cgTemplate(e:Node) {
 Val func cgUnary(e:Node) {
     Val none
     Val v = cgExpr(childOf(e, 'operand'))
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     text op = rawText(e, 'op')
 
     if op == '-' {
@@ -1622,7 +1646,7 @@ Val func cgDivMod(op:text, lv:text, rv:text, asFloat:bool) {
 Val func cgLogical(e:Node) {
     Val none
     Val l = cgExpr(childOf(e, 'left'))
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     if l.fty != 'bool' {
         cgUnported(`logical operator on ${l.fty}`)
         return none
@@ -1641,7 +1665,7 @@ Val func cgLogical(e:Node) {
     }
     cgBlockLabel(rhsL)
     Val r = cgExpr(childOf(e, 'right'))
-    if CG_UNPORTED { return none }
+    if CG_STUCK { return none }
     if r.fty != 'bool' {
         cgUnported(`logical operator on ${r.fty}`)
         return none
@@ -1679,7 +1703,7 @@ Val func cgCall(e:Node, wantValue:bool) {
     int i = 0
     while i < args.length {
         Val a = cgExpr(args[i])
-        if CG_UNPORTED { return none }
+        if CG_STUCK { return none }
         parts.push(`${a.lty} ${a.v}`)
         i++
     }
@@ -1709,7 +1733,7 @@ void func cgLog(args:arr[Node]) {
         return
     }
     Val a = cgExpr(args[0])
-    if CG_UNPORTED { return }
+    if CG_STUCK { return }
     if a.fty == 'int' {
         cgOut(`  call void @festina_log_int(i64 ${a.v})`)
         return
@@ -1805,7 +1829,7 @@ void func cgStmt(s:Node) {
         Node init = childOf(s, 'init')
         if init == null { return }
         Val v = cgExpr(init)
-        if CG_UNPORTED { return }
+        if CG_STUCK { return }
         if v.fty != fty && cgNumericPair(v.fty, fty) == false {
             cgUnported(`initializer of type ${v.fty} for ${fty}`)
             return
@@ -1912,6 +1936,10 @@ void func cgBlockInto(b:Node) {
     arr[Node] body = cgBlockStmts(b)
     int i = 0
     while i < body.length {
+        // Cleared per statement, not per file: see CG_STUCK's own
+        // comment for why collapsing the two flags made the blocker
+        // table lie three times over.
+        CG_STUCK = false
         cgStmt(body[i])
         i++
     }
@@ -1923,7 +1951,7 @@ void func cgBlockInto(b:Node) {
 // that matters: skipping it would renumber every label after it.
 void func cgIf(s:Node) {
     Val c = cgExpr(childOf(s, 'test'))
-    if CG_UNPORTED { return }
+    if CG_STUCK { return }
     text thenL = cgLabel('if.then')
     text elseL = cgLabel('if.else')
     text endL = cgLabel('if.end')
@@ -1955,7 +1983,7 @@ void func cgIf(s:Node) {
 // update block's.
 void func cgFor(s:Node) {
     cgStmt(childOf(s, 'init'))
-    if CG_UNPORTED { return }
+    if CG_STUCK { return }
     text condL = cgLabel('for.cond')
     text bodyL = cgLabel('for.body')
     text updateL = cgLabel('for.update')
@@ -1963,7 +1991,7 @@ void func cgFor(s:Node) {
     cgOut(`  br label %${condL}`)
     cgBlockLabel(condL)
     Val c = cgExpr(childOf(s, 'test'))
-    if CG_UNPORTED { return }
+    if CG_STUCK { return }
     text t = cgTmp()
     cgOut(`  ${t} = icmp ne i8 ${c.v}, 0`)
     cgOut(`  br i1 ${t}, label %${bodyL}, label %${endL}`)
@@ -2153,11 +2181,11 @@ void func cgEmitAppendAssign(slot:text, pieces:arr[Node]) {
             pieceVal = cgStringConst(rawText(pieces[i], 'v'))
         } else {
             Val a = cgExpr(pieces[i])
-            if CG_UNPORTED { return }
+            if CG_STUCK { return }
             owned = a.fty != 'text'
             if a.fty == 'text' { owned = cgIsOwningTextSource(pieces[i]) }
             Val p = cgToText(a)
-            if CG_UNPORTED { return }
+            if CG_STUCK { return }
             pieceVal = p.v
         }
         text grown = cgTmp()
@@ -2182,13 +2210,13 @@ void func cgAssign(e:Node) {
         // array-literal right-hand side can pick its element type from
         // context.
         Val fp = cgFieldPtr(target)
-        if CG_UNPORTED { return }
+        if CG_STUCK { return }
         if fp.fty != 'int' && fp.fty != 'float' && fp.fty != 'bool' {
             cgUnported(`assignment to a ${fp.fty} field`)
             return
         }
         Val fv = cgExpr(childOf(e, 'value'))
-        if CG_UNPORTED { return }
+        if CG_STUCK { return }
         cgOut(`  store ${fp.lty} ${fv.v}, ptr ${fp.v}`)
         return
     }
@@ -2217,7 +2245,7 @@ void func cgAssign(e:Node) {
     }
 
     Val v = cgExpr(value)
-    if CG_UNPORTED { return }
+    if CG_STUCK { return }
     if fty == 'text' {
         cgStoreText(slot, `${slot}.ap`, v, cgIsOwningTextSource(value))
         return
@@ -2289,7 +2317,7 @@ void func cgWhile(s:Node) {
     cgOut(`  br label %${condL}`)
     cgBlockLabel(condL)
     Val c = cgExpr(childOf(s, 'test'))
-    if CG_UNPORTED { return }
+    if CG_STUCK { return }
     text t = cgTmp()
     cgOut(`  ${t} = icmp ne i8 ${c.v}, 0`)
     cgOut(`  br i1 ${t}, label %${bodyL}, label %${endL}`)
@@ -2309,7 +2337,7 @@ void func cgReturn(s:Node) {
         return
     }
     Val r = cgExpr(v)
-    if CG_UNPORTED { return }
+    if CG_STUCK { return }
     // Returning text hands the caller ownership, so the value is
     // copied BEFORE the locals are freed -- returning a local's own
     // buffer and then freeing it would hand back a dangling pointer.
@@ -2542,6 +2570,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     int fb = 0
     while fb < body.length {
         if body[fb].kind == 'FuncDecl' {
+            CG_STUCK = false
             cgFunc(body[fb])
         }
         fb++
@@ -2559,6 +2588,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     cgPushFrame()
     int s = 0
     while s < body.length {
+        CG_STUCK = false
         cgStmt(body[s])
         s++
     }
