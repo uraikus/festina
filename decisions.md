@@ -6129,3 +6129,31 @@ Three of four invisible. The reason is the same in each case: every array litera
 **One half is deliberately absent and said so in the file.** A refcounted with-initializer local retains unless its source already owns a fresh reference, and the only owning non-literal source is a call returning a container. Those do not compile in the port yet, so a case file containing one would be classified unported and would measure none of the other three mechanisms. It goes in the day non-scalar returns land.
 
 **Verified.** Codegen 17 match, 0 differ, 78 unported. Lexer 106/106, parser 106/106, semantic 106/106, escape analysis 88 match with 1,551 of 1,604 records. 2,731 passed, 345 skipped; the 24 graphics failures and 12 leak-stress failures are this container's limits (Xvfb with no window manager; an ASan link path that cannot resolve the graphics runtime's symbols), reproduced identically on the pristine tree. Both new case files are valgrind-clean: zero definitely-lost bytes, zero errors.
+
+
+304. MAPS, AND A CORPUS THAT COULD NOT SEE ANY OF IT
+
+`map[T]` literals, reads, writes and `delete`, for scalar value types. **3,234 of 242,821 file-specific IR lines, up from 2,713; 18 files match, up from 17.** The one new match is the case file this slice had to write.
+
+**Four deliberate breakages, ZERO detected.** Every canary was invisible to the whole 107-file corpus:
+
+    literal's header allocated after its entries      not detected
+    the `bool` missing-key sentinel changed           not detected
+    a rendered key never freed                        not detected
+    `delete` handed capacity by pointer, not value    not detected
+
+Not three of four this time — four of four. The reason is blunter than last slice's: **not one corpus file that currently matches uses a map for anything at all.** Array literals at least appeared in matching files, in a shape too simple to order; maps appeared in none. `cases/maps.f` is the entire evidential basis for this slice, and with it all four fire.
+
+**One canary was itself broken, and that is the more useful half.** The first header-ordering patch moved `cgFreshHeader` from before the entry list to before the entry loop — both of which are before the entries — so it changed nothing and "passed". A canary that does not actually break the implementation reports exactly what a corpus that cannot see the mechanism reports, and the two are indistinguishable from the summary line. The rebuilt one evaluates every key and value first, the array literal's real shape, and fires.
+
+**A map literal and an array literal build in OPPOSITE orders.** An array literal evaluates its elements, then allocates the header (decisions.md #303). A map literal allocates the header FIRST, then mutates it once per entry through `festina_map_set`. They look like the same construct and are not: an array's buffer size is known once the elements are counted, while a map's table is grown by the sets themselves.
+
+**Every map runtime call deals in a raw i64, whatever T is.** `festina_map_get` never learns what a given map's values are, so the compiler reinterprets at each boundary — `bitcast` for a float, `zext`/`trunc` for a bool, the value itself for an int — and chooses the "key not present" answer at compile time. The three sentinels are unrelated constants: INT64_MIN, a NaN bit pattern, and **2 for a bool**, a value no real `bool` can hold.
+
+**`delete` is not a set with a different name.** count and tombstones are out-params, because a delete either removes a live entry or turns it into a tombstone; capacity is passed by VALUE, because a delete never grows the table. A set passes all four by pointer. Both are i64-shaped at the call, so LLVM catches nothing.
+
+**A silent miscompile the slice created and then caught.** A `map[text]` global was safe while nothing could assign to it — a global is never released — and stopped being safe the moment literals gave it an initializer, because the store released the old value with `@festina_release_map` when `map[text]`'s release is a GENERATED per-type cascade (`@__festina_release_map_1`). That leaks every value in the table while looking entirely correct. This is decisions.md #301's finding in a new place, so the guard is now a named predicate rather than an inline check, and it refuses rather than picking a release it cannot justify.
+
+**The target got closer and the remaining list got shorter.** `bootstrap/lexer.f` — the smallest of the bootstrap's own ten files — was blocked by five mechanisms; map literals and map indexing were two of them. Three remain: `arr[text]` locals, non-scalar parameters, and method calls.
+
+**Verified.** Codegen 18 match, 0 differ, 78 unported. Lexer 107/107, parser 107/107, semantic 107/107, escape analysis 89 match with 1,575 of 1,628 records. 2,738 passed, 345 skipped; the 24 graphics and 12 leak-stress failures are this container's limits, reproduced identically on the pristine tree. `cases/maps.f` is valgrind-clean — **and the canary fires**: disabling the rendered-key free makes valgrind report `10 bytes in 4 blocks are definitely lost`, so the clean run is evidence rather than an absence of evidence.

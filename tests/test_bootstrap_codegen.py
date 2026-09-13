@@ -288,7 +288,61 @@ class TestTheCoverageNumberIsHonest:
             "no refcounted container local, so the heap half of "
             "claude.md #81 is unmeasured")
 
-    @pytest.mark.parametrize("case", ["indexing.f", "array_literals.f"])
+    def test_the_map_case_really_has_all_four_mechanisms(self):
+        """`cases/maps.f` is the ONLY thing standing behind any of the
+        map work, and that is measured rather than feared.
+
+        With the port broken on purpose four separate ways -- the
+        literal's header allocated after its entries rather than before,
+        the `bool` missing-sentinel changed, a rendered key never freed,
+        and `delete` handed capacity by pointer instead of by value --
+        the whole corpus reported no difference at all. Not one file
+        that currently matches uses a map for anything. With this file
+        present all four canaries fire.
+
+        So each of the four is asserted here. A drift in this file is
+        not a cosmetic loss: it takes the entire map mechanism back to
+        unmeasured without a single test turning red.
+        """
+        dump = irdump.dump_file("bootstrap/cases/maps.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/maps.f no longer compiles, so it measures nothing at "
+            "all: " + dump[0])
+        body = "\n".join(dump)
+        # 1: a literal entry that emits instructions of its own, so
+        # "header first" is orderable against something.
+        assert "@bump(" in body, (
+            "no call inside a map literal, so nothing here pins the "
+            "header allocation against entry evaluation -- and a map "
+            "literal builds in the OPPOSITE order to an array one")
+        # 2: all three missing-value sentinels, which are unrelated
+        # constants chosen per value type at compile time.
+        for sentinel, why in (
+                ("i64 -9223372036854775808)", "int"),
+                ("i64 9221120237041090560)", "float"),
+                ("i64 2)", "bool")):
+            assert sentinel in body, (
+                f"no festina_map_get with the {why} missing-key "
+                f"sentinel; that value type is unmeasured")
+        # 3: a rendered key, which is freed, next to a constant one,
+        # which must not be.
+        assert "@festina_str_from_int(" in body, (
+            "no non-text map key, so claude.md #302's rendering -- an "
+            "expression that reads as borrowed producing an owned "
+            "pointer -- is unmeasured")
+        # 4: delete, whose capacity argument is by value where a set's
+        # is by pointer.
+        assert "@festina_map_delete(" in body, (
+            "no delete, so the one map call that takes capacity by "
+            "value rather than by pointer is unmeasured")
+        # The container half of claude.md #81, for a map specifically.
+        assert "@festina_map_free_entries(" in body, (
+            "no frame-allocated map local, so the stack half of the "
+            "decision is unmeasured for maps")
+        assert "@festina_release_map(" in body, (
+            "no refcounted map local, so the heap half is unmeasured")
+
+    @pytest.mark.parametrize("case", ["indexing.f", "array_literals.f", "maps.f"])
     def test_the_container_cases_really_run(self, compile_and_run, case):
         """The two container case files are PROGRAMS, not only sources
         of IR, and this runs them to prove it.
@@ -361,6 +415,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 2713, (
+        assert reproduced >= 3234, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 2713")
+            f"the port previously emitted at least 3234")

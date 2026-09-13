@@ -97,9 +97,9 @@ round-by-round design and implementation record predating 0.1 lives in
 
 - **`bootstrap/escape.f`** — `festina/escape_analysis.py` ported to
   Festina, the fifth module the codegen port turned out to need and one
-  that was not in its original estimate: **88 of 106 corpus files
+  that was not in its original estimate: **89 of 107 corpus files
   produce an identical record sequence, 0 differ, 7 not yet ported, 11
-  rejected by both** — 1,551 of 1,604 records. It decides whether every
+  rejected by both** — 1,575 of 1,628 records. It decides whether every
   container and struct local lives in the frame or behind a heap
   refcount header, so the codegen port cannot emit one without agreeing
   here first. The ORDER bodies are analyzed in is part of the answer
@@ -111,9 +111,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage, **in progress**: **17 of 106 corpus files
+  the fourth and last stage, **in progress**: **18 of 107 corpus files
   emit byte-identical LLVM IR, 0 differ, 78 not yet ported, 11 rejected
-  by both** — 2,713 of 238,402 file-specific IR lines. In are
+  by both** — 3,234 of 242,821 file-specific IR lines. In are
   expressions (arithmetic and comparison with int/float mixing,
   `&&`/`||`, unary, the ternary, `/` and `%` with claude.md #57's
   divide-by-zero control flow, template literals, and `+` and `==`/`!=`
@@ -128,14 +128,15 @@ round-by-round design and implementation record predating 0.1 lives in
   is the decision claude.md #74 exists for — and assignment to a
   refcounted binding, `arr[T]`/`map[T]` locals of a scalar element
   type, `.length` on `text` and `arr[T]`, array indexing read and
-  written, and `arr[T]` literals in every position that has a declared
-  element type to take. Not in: structs with a non-scalar field,
-  containers of a non-scalar element type, `map[T]` literals, other
-  non-scalar parameters and returns, method calls, and the
-  graphics/audio/HTTP/thread/sqlite/table subsystems.
+  written, `arr[T]` and `map[T]` literals in every position that has a
+  declared type to take their element type from, and map reads, writes
+  and `delete`. Not in: structs with a non-scalar field, containers of
+  a non-scalar element type, other non-scalar parameters and returns,
+  method calls, and the graphics/audio/HTTP/thread/sqlite/table
+  subsystems.
   `bootstrap/irdump.py` and `bootstrap/irdiff.py` run the comparison;
   the oracle is the IR text itself, so it needed no canonical form of
-  its own (decisions.md #289–#303).
+  its own (decisions.md #289–#304).
 
 - **Every bootstrap differential harness now runs in CI** — on Linux
   only. They compare two implementations of the lexer, parser, analyzer

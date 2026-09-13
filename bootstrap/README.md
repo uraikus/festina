@@ -50,15 +50,15 @@ python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 106-file repository corpus:
+Over the 107-file repository corpus:
 
-- **lexer: 106 match, 0 differ.**
-- **parser: 106 match, 0 differ, 0 unported.**
-- **semantic: 106 match, 0 differ, 0 unported.**
-- **escape analysis: 88 match, 0 differ, 7 unported, 11 rejected by
-  both** — 1,551 of 1,604 records.
-- **codegen: 17 match, 0 differ, 78 unported, 11 rejected by both** —
-  2,713 of 238,402 file-specific IR lines. See below for why that is the
+- **lexer: 107 match, 0 differ.**
+- **parser: 107 match, 0 differ, 0 unported.**
+- **semantic: 107 match, 0 differ, 0 unported.**
+- **escape analysis: 89 match, 0 differ, 7 unported, 11 rejected by
+  both** — 1,575 of 1,628 records.
+- **codegen: 18 match, 0 differ, 78 unported, 11 rejected by both** —
+  3,234 of 242,821 file-specific IR lines. See below for why that is the
   number reported rather than a file count, and for the caveat that
   comes with this particular figure.
 
@@ -155,7 +155,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Escape analysis: 1,551 of 1,604 records
+## Escape analysis: 1,575 of 1,628 records
 
 `escape_analysis.py` answers one purely syntactic question per function
 body — which names appear anywhere other than as the immediate base of
@@ -255,7 +255,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 2,713 of 238,402 file-specific IR lines
+## Codegen: 3,234 of 242,821 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -322,9 +322,9 @@ times and so could not have varied either way.
 
 ### And the caveat that comes with the current figure
 
-**1,701 of the 2,713 lines come from five `cases/` files written for
-the slices that claim them** — `struct_fields.f` (348),
-`text_building.f` (418), `escape_locals.f` (342), `array_literals.f`
+**2,222 of the 3,234 lines come from six `cases/` files written for
+the slices that claim them** — `maps.f` (521), `text_building.f` (418),
+`struct_fields.f` (348), `escape_locals.f` (342), `array_literals.f`
 (341) and `indexing.f` (252). Struct fields and container globals
 unlocked zero pre-existing files: none is one construct away, because
 every file with a struct also has a container local, a non-scalar
@@ -344,7 +344,7 @@ the implementation. But a number that grows because the input grew says
 nothing about the remaining 178,000 lines, and the two facts are worth
 keeping separate when reading the table below.
 
-**The budget is not fixed, either.** It went 175,080 → 238,402 across
+**The budget is not fixed, either.** It went 175,080 → 242,821 across
 one session with `festina/codegen.py` untouched, because
 `bootstrap/codegen.f` is itself a corpus file: every line added to the
 port enlarges the denominator. Self-hosting is a moving goal by
@@ -354,7 +354,7 @@ construction.
 
 The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
-**206,448 of the 238,402 file-specific IR lines**, and they need
+**210,346 of the 242,821 file-specific IR lines**, and they need
 none of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
@@ -376,11 +376,12 @@ template literals; `+` and `==`/`!=` on `text`; `text` parameters;
 struct **locals**, stack or heap by claude.md #74's own answer;
 `arr[T]`/`map[T]` **locals** of a scalar element type, on the same
 decision; `.length` on `text` and `arr[T]`; array indexing, read and
-written; `arr[T]` **literals** in every position with a declared
-element type to take; assignment to a refcounted binding; and imports
-merged before either stage runs.
+written; `arr[T]` and `map[T]` **literals** in every position with a
+declared type to take their element type from; map reads, writes and
+`delete`; assignment to a refcounted binding; and imports merged before
+either stage runs.
 
-Eleven pieces are subtler than they look:
+Twelve pieces are subtler than they look:
 
 - **Alloca hoisting** (claude.md #191) is a post-pass over the finished
   text, exactly as in the original, because it is a property of the
@@ -441,6 +442,15 @@ Eleven pieces are subtler than they look:
   `.length` frees. An index is emitted **before** the data pointer, and
   on a write the whole slot is computed before the value; neither shows
   in `xs[0] = 1`, which is why `cases/indexing.f` indexes with a call.
+- **A map literal builds in the OPPOSITE order to an array literal.**
+  An array's elements come first and its header last; a map's header
+  comes first and is then mutated once per entry, because a map's table
+  is grown by the sets themselves rather than sized up front. Every map
+  runtime call deals in a raw i64 whatever T is, so the compiler
+  reinterprets at each boundary and picks the "key not present" answer
+  at compile time — three unrelated constants, one of which is `2` for
+  a `bool`. And `delete` takes capacity by VALUE where a set takes it
+  by pointer, since a delete never grows the table.
 
 **Why ASan is not in this loop.** A missing release in the emitted IR
 would be a leak in every program the compiler produces — but the
@@ -462,7 +472,7 @@ sanitizer for this stage rather than needing it alongside.
 |19|0|`EventHandler`|
 |18|0|`ThreadDecl`|
 |18|0|an `arr[text]` local|
-|17|0|a `map[T]` literal|
+|15|0|`free`|
 
 `blocks` counts every file a construct appears in; `only` counts the
 files where it is the last thing in the way, and so the number that

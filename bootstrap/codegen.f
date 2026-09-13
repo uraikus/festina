@@ -775,6 +775,17 @@ Val func cgArrVal(v:text, ety:text) {
     return r
 }
 
+// The same for a map: its value type is no more recoverable from the
+// header than an array's element type is.
+Val func cgMapVal(v:text, ety:text) {
+    Val r
+    r.v = v
+    r.lty = 'ptr'
+    r.fty = 'map'
+    r.ety = ety
+    return r
+}
+
 Val func cgStructVal(v:text, sname:text) {
     Val r
     r.v = v
@@ -1187,6 +1198,7 @@ Val func cgExpr(e:Node) {
         cgOut(`  ${t} = load ${lty}, ptr ${slot}`)
         if fty == 'struct' { return cgStructVal(t, cgSnameOf(name)) }
         if fty == 'arr' { return cgArrVal(t, cgEtyOf(name)) }
+        if fty == 'map' { return cgMapVal(t, cgEtyOf(name)) }
         return cgVal(t, lty, fty)
     }
 
@@ -1411,7 +1423,7 @@ Val func cgFieldPtr(e:Node) {
     cgOut(`  ${fp} = getelementptr %struct.${obj.sname}, ptr ${obj.v}, i32 0, i32 ${SF_IDX[key]}`)
     Val r = cgVal(fp, SF_LTY[key], SF_FTY[key])
     if SF_FTY[key] == 'struct' { r.sname = SF_SNAME[key] }
-    if SF_FTY[key] == 'arr' && SF_ETY[key] != null { r.ety = SF_ETY[key] }
+    if SF_ETY[key] != null { r.ety = SF_ETY[key] }
     return r
 }
 
@@ -1470,6 +1482,7 @@ Val func cgLoadFieldValue(fp:Val) {
     cgOut(`  ${out} = phi ptr [ ${loaded}, %${loadPred} ], [ ${made}, %${makePred} ]`)
     if fp.fty == 'struct' { return cgStructVal(out, fp.sname) }
     if fp.fty == 'arr' { return cgArrVal(out, fp.ety) }
+    if fp.fty == 'map' { return cgMapVal(out, fp.ety) }
     return cgVal(out, 'ptr', fp.fty)
 }
 
@@ -1563,7 +1576,209 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
         }
         return cgArrayLit(e, ety, '')
     }
+    if e.kind == 'MapLit' {
+        if fty != 'map' {
+            Val none
+            cgUnported(`map literal in a ${fty} position`)
+            return none
+        }
+        return cgMapLit(e, ety, '')
+    }
     return cgExpr(e)
+}
+
+// ---------------------------------------------------------------------
+// Maps.
+//
+// Every map runtime function deals in a raw i64 payload whatever T is
+// -- `festina_map_get` has no idea what a given map's values are -- so
+// the compiler reinterprets in both directions at every boundary, and
+// picks the "key not present" answer itself at compile time.
+
+text func cgMapToI64(v:text, vlty:text) {
+    if vlty == 'i64' { return v }
+    text out = cgTmp()
+    if vlty == 'double' { cgOut(`  ${out} = bitcast double ${v} to i64`) }
+    else if vlty == 'i8' { cgOut(`  ${out} = zext i8 ${v} to i64`) }
+    else { cgOut(`  ${out} = ptrtoint ptr ${v} to i64`) }
+    return out
+}
+
+text func cgMapFromI64(raw:text, vlty:text) {
+    if vlty == 'i64' { return raw }
+    text out = cgTmp()
+    if vlty == 'double' { cgOut(`  ${out} = bitcast i64 ${raw} to double`) }
+    else if vlty == 'i8' { cgOut(`  ${out} = trunc i64 ${raw} to i8`) }
+    else { cgOut(`  ${out} = inttoptr i64 ${raw} to ptr`) }
+    return out
+}
+
+// claude.md #72: "if the key is not present, the result is null" --
+// and which bit pattern that is depends on T, which only the compiler
+// knows. The float one is a NaN; the bool one is 2, a value no real
+// `bool` can hold.
+text func cgMapMissing(vlty:text) {
+    if vlty == 'double' { return '9221120237041090560' }
+    if vlty == 'i8' { return '2' }
+    if vlty == 'ptr' { return '0' }
+    return '-9223372036854775808'
+}
+
+// A key expression and whether the buffer it produced has an owner.
+// The two cannot be recovered from each other: claude.md #302 renders
+// a non-text key, which makes a fresh buffer out of an expression that
+// looks borrowed.
+struct MapKey {
+    v:text
+    owned:bool
+}
+
+// claude.md #302: a key may be any type with a text form, rendered
+// exactly as `log()` and `${...}` render it. A `text` key is used as
+// it stands and is owned only if its own expression owns it.
+MapKey func cgMapKey(e:Node) {
+    MapKey k
+    Val v = cgExpr(e)
+    if CG_STUCK { return k }
+    if v.fty == 'text' {
+        k.v = v.v
+        k.owned = cgIsOwningTextSource(e)
+        return k
+    }
+    Val r = cgToText(v)
+    if CG_STUCK { return k }
+    k.v = r.v
+    k.owned = true
+    return k
+}
+
+// `m[k]` -- entries and capacity read straight out of the map's own
+// storage. No `count`: festina_map_get scans buckets by capacity, not
+// a dense range, so a read never needed it.
+Val func cgMapGet(objV:text, vty:text, keyV:text) {
+    text vlty = cgLtyOf(vty)
+    text entP = cgTmp()
+    cgOut(`  ${entP} = getelementptr %struct._FestinaMap, ptr ${objV}, i32 0, i32 1`)
+    text ent = cgTmp()
+    cgOut(`  ${ent} = load ptr, ptr ${entP}`)
+    text capP = cgTmp()
+    cgOut(`  ${capP} = getelementptr %struct._FestinaMap, ptr ${objV}, i32 0, i32 2`)
+    text cap = cgTmp()
+    cgOut(`  ${cap} = load i64, ptr ${capP}`)
+    text raw = cgTmp()
+    cgOut(`  ${raw} = call i64 @festina_map_get(ptr ${ent}, i64 ${cap}, ptr ${keyV}, i64 ${cgMapMissing(vlty)})`)
+    return cgVal(cgMapFromI64(raw, vlty), vlty, vty)
+}
+
+// `m[k] = v`, and every entry of a map literal, which is the same
+// call. Unlike a read this needs the map's own header ADDRESS: a set
+// can rehash the whole table and has to write the new
+// count/entries/capacity/tombstones back for the change to stick,
+// which is why all four fields are passed as pointers.
+//
+// Scalar value types only. A refcounted or `text` value has to find
+// and release whatever the key mapped to before -- there is no fixed
+// address to load an old value from, so it takes a festina_map_get of
+// its own first -- and that is its own piece of work.
+void func cgMapSet(mapPtr:text, vty:text, keyV:text, valV:text, keyOwned:bool) {
+    text vlty = cgLtyOf(vty)
+    text countP = cgTmp()
+    cgOut(`  ${countP} = getelementptr %struct._FestinaMap, ptr ${mapPtr}, i32 0, i32 0`)
+    text entP = cgTmp()
+    cgOut(`  ${entP} = getelementptr %struct._FestinaMap, ptr ${mapPtr}, i32 0, i32 1`)
+    text capP = cgTmp()
+    cgOut(`  ${capP} = getelementptr %struct._FestinaMap, ptr ${mapPtr}, i32 0, i32 2`)
+    text tombP = cgTmp()
+    cgOut(`  ${tombP} = getelementptr %struct._FestinaMap, ptr ${mapPtr}, i32 0, i32 3`)
+    text raw = cgMapToI64(valV, vlty)
+    cgOut(`  call void @festina_map_set(ptr ${countP}, ptr ${entP}, ptr ${capP}, ptr ${tombP}, ptr ${keyV}, i64 ${raw})`)
+    // claude.md #97: festina_map_set strdups the key, so a key the
+    // caller allocated has no owner left once this returns. Freed here
+    // rather than at each call site so the literal path and the
+    // assignment path get it from one place.
+    if keyOwned { cgOut(`  call void @free(ptr ${keyV})`) }
+}
+
+// `{ 'a': 1, 'b': 2 }`. Unlike an array literal the header comes
+// FIRST: festina_map_set mutates it in place once per entry, in source
+// order, so a repeated key ends up last-one-wins with no dedup pass.
+Val func cgMapLit(e:Node, vty:text, header:text) {
+    Val none
+    if vty == '' || cgLtyOf(vty) == '' {
+        cgUnported('map literal of a non-scalar type')
+        return none
+    }
+    text into = header
+    if into == '' { into = cgFreshHeader('%struct._FestinaMap') }
+    // Each entry is a `#pair` node -- festina/parser.py stores them as
+    // tuples, which the canonical dump renders exactly like a list, so
+    // the port models them as a node with an `a` and a `b`.
+    arr[Node] entries = listOf(e, 'entries')
+    int i = 0
+    while i < entries.length {
+        MapKey k = cgMapKey(childOf(entries[i], 'a'))
+        if CG_STUCK { return none }
+        Val v = cgExpr(childOf(entries[i], 'b'))
+        if CG_STUCK { return none }
+        if v.fty != vty {
+            cgUnported(`map literal value of type ${v.fty} in a map of ${vty}`)
+            return none
+        }
+        cgMapSet(into, vty, k.v, v.v, k.owned)
+        i++
+    }
+    return cgMapVal(into, vty)
+}
+
+// claude.md #111: `delete m[k]`, JS-shaped -- the entry stops existing,
+// the count drops and forEach skips it.
+//
+// count and tombstones are out-params (a delete either removes a live
+// entry or converts it into a tombstone); capacity is read by VALUE,
+// because a delete never grows the table. That asymmetry is the whole
+// difference between this call and a set's.
+//
+// The last argument is a per-value-type release trampoline, needed only
+// when the values themselves own something. A scalar map passes null.
+void func cgDelete(s:Node) {
+    Node target = childOf(s, 'target')
+    if target == null || target.kind != 'Member' {
+        cgUnported('delete of a non-member target')
+        return
+    }
+    Val obj = cgExpr(childOf(target, 'obj'))
+    if CG_STUCK { return }
+    if obj.fty != 'map' {
+        cgUnported(`delete through a ${obj.fty}`)
+        return
+    }
+    if obj.ety == '' {
+        cgUnported('delete from a map of a non-scalar type')
+        return
+    }
+    MapKey k
+    if fieldOf(target, 'computed').raw == 'true' {
+        k = cgMapKey(childOf(target, 'prop'))
+        if CG_STUCK { return }
+    } else {
+        // `delete m.name` -- the property is a bare name, so the key is
+        // a string constant rather than an expression, and nothing owns
+        // it.
+        k.v = cgStringConst(rawText(target, 'prop'))
+        k.owned = false
+    }
+    text countP = cgTmp()
+    cgOut(`  ${countP} = getelementptr %struct._FestinaMap, ptr ${obj.v}, i32 0, i32 0`)
+    text entP = cgTmp()
+    cgOut(`  ${entP} = getelementptr %struct._FestinaMap, ptr ${obj.v}, i32 0, i32 1`)
+    text capP = cgTmp()
+    cgOut(`  ${capP} = getelementptr %struct._FestinaMap, ptr ${obj.v}, i32 0, i32 2`)
+    text cap = cgTmp()
+    cgOut(`  ${cap} = load i64, ptr ${capP}`)
+    text tombP = cgTmp()
+    cgOut(`  ${tombP} = getelementptr %struct._FestinaMap, ptr ${obj.v}, i32 0, i32 3`)
+    cgOut(`  call i8 @festina_map_delete(ptr ${countP}, ptr ${entP}, i64 ${cap}, ptr ${tombP}, ptr ${k.v}, ptr null)`)
+    if k.owned { cgOut(`  call void @free(ptr ${k.v})`) }
 }
 
 Val func cgMemberRead(e:Node) {
@@ -1608,6 +1823,19 @@ Val func cgLengthOf(e:Node, obj:Val) {
 // pointer is loaded, not after.
 Val func cgIndexRead(e:Node, obj:Val) {
     Val none
+    if obj.fty == 'map' {
+        if obj.ety == '' {
+            cgUnported('indexing a map of a non-scalar type')
+            return none
+        }
+        MapKey k = cgMapKey(childOf(e, 'prop'))
+        if CG_STUCK { return none }
+        Val r = cgMapGet(obj.v, obj.ety, k.v)
+        // A key this expression rendered or allocated has no owner once
+        // the lookup is done -- festina_map_get only reads it.
+        if k.owned { cgOut(`  call void @free(ptr ${k.v})`) }
+        return r
+    }
     if obj.fty != 'arr' {
         cgUnported(`indexing a ${obj.fty}`)
         return none
@@ -2044,6 +2272,10 @@ void func cgStmt(s:Node) {
             if G_SLOT[gname] != null {
                 Node ginit = childOf(s, 'init')
                 if ginit == null { return }
+                if cgStorableRefcounted(managed, cgEtyOf(gname)) == false {
+                    cgUnported(`${managed} global of a non-scalar type`)
+                    return
+                }
                 Val gv = cgExprExpecting(ginit, managed, cgEtyOf(gname))
                 if CG_STUCK { return }
                 if gv.fty != managed {
@@ -2107,8 +2339,16 @@ void func cgStmt(s:Node) {
             text backing = `%${gname}.storage.${uid}`
             bool stackable = cgEscapes(gname) == false
             if linit != null {
-                if managed != 'arr' { stackable = false }
-                if linit.kind != 'ArrayLit' { stackable = false }
+                // claude.md #81 covers both container literals, and
+                // only a literal: the entry count of a `{ ... }` is as
+                // knowable at the declaration as an array's length.
+                if managed == 'arr' {
+                    if linit.kind != 'ArrayLit' { stackable = false }
+                } else if managed == 'map' {
+                    if linit.kind != 'MapLit' { stackable = false }
+                } else {
+                    stackable = false
+                }
             }
             if linit != null && stackable {
                 // The header is built straight into the frame slot:
@@ -2117,11 +2357,12 @@ void func cgStmt(s:Node) {
                 // only then published to the binding's own slot.
                 cgOut(`  ${backing} = alloca ${payload}`)
                 cgOut(`  store ${payload} zeroinitializer, ptr ${backing}`)
-                cgArrayLit(linit, declEty, backing)
+                if managed == 'arr' { cgArrayLit(linit, declEty, backing) }
+                else { cgMapLit(linit, declEty, backing) }
                 if CG_STUCK { return }
                 cgOut(`  ${slot} = alloca ptr`)
                 cgOut(`  store ptr ${backing}, ptr ${slot}`)
-                cgTrackLive('arr.stack', slot)
+                cgTrackLive(`${managed}.stack`, slot)
             } else if linit != null {
                 Val lv = cgExprExpecting(linit, managed, declEty)
                 if CG_STUCK { return }
@@ -2154,8 +2395,10 @@ void func cgStmt(s:Node) {
             L_SLOT[gname] = slot
             L_FTY[gname] = managed
             if managed == 'struct' { L_SNAME[gname] = dt.name }
-            if managed == 'arr' && dt.elem != null {
-                if dt.elem.kind == 'prim' { L_ETY[gname] = dt.elem.name }
+            if managed == 'arr' || managed == 'map' {
+                if dt.elem != null {
+                    if dt.elem.kind == 'prim' { L_ETY[gname] = dt.elem.name }
+                }
             }
             return
         }
@@ -2233,6 +2476,7 @@ void func cgStmt(s:Node) {
     if s.kind == 'ForStmt' { cgFor(s)  return }
     if s.kind == 'IfStmt' { cgIf(s)  return }
     if s.kind == 'Return' { cgReturn(s)  return }
+    if s.kind == 'DeleteStmt' { cgDelete(s)  return }
 
     cgUnported(`statement ${s.kind}`)
 }
@@ -2632,6 +2876,26 @@ void func cgEmitAppendAssign(slot:text, pieces:arr[Node]) {
 void func cgIndexAssign(e:Node, target:Node) {
     Val obj = cgExpr(childOf(target, 'obj'))
     if CG_STUCK { return }
+    if obj.fty == 'map' {
+        if obj.ety == '' {
+            cgUnported('assignment into a map of a non-scalar type')
+            return
+        }
+        // The key, then the value, and only then the header GEPs the
+        // set itself needs -- the original resolves the target's own
+        // parts first, so a key expression's side effects precede the
+        // value's.
+        MapKey k = cgMapKey(childOf(target, 'prop'))
+        if CG_STUCK { return }
+        Val v = cgExpr(childOf(e, 'value'))
+        if CG_STUCK { return }
+        if v.fty != obj.ety {
+            cgUnported(`assigning ${v.fty} into a map of ${obj.ety}`)
+            return
+        }
+        cgMapSet(obj.v, obj.ety, k.v, v.v, k.owned)
+        return
+    }
     if obj.fty != 'arr' {
         cgUnported(`assignment through an index on ${obj.fty}`)
         return
@@ -2716,6 +2980,10 @@ void func cgAssign(e:Node) {
         return
     }
     if fty == 'struct' || fty == 'arr' || fty == 'map' {
+        if cgStorableRefcounted(fty, cgEtyOf(name)) == false {
+            cgUnported(`assignment to a ${fty} of a non-scalar type`)
+            return
+        }
         cgStoreRefcounted(slot, fty, v.v, cgIsOwningRefcountedSource(value))
         return
     }
@@ -2730,6 +2998,21 @@ void func cgAssign(e:Node) {
 // An owning source already holds a fresh +1 that nothing else
 // references, so it is stored directly; anything else (another
 // binding, a field read) is shared and needs its own count.
+//
+// **A container whose elements own something is refused here**, not
+// released with the generic call. `map[text]`'s release is a GENERATED
+// per-type cascade (`@__festina_release_map_1`), not
+// `@festina_release_map`, and the difference is invisible in the IR
+// until the wrong one leaks every value in the table. A global of such
+// a type was harmless while nothing could assign to it -- a global is
+// never released -- and stopped being harmless the moment literals
+// gave it an initializer.
+bool func cgStorableRefcounted(fty:text, ety:text) {
+    if fty == 'struct' { return true }
+    if ety == '' { return false }
+    return ety == 'int' || ety == 'float' || ety == 'bool'
+}
+
 void func cgStoreRefcounted(slot:text, fty:text, v:text, owning:bool) {
     text old = cgTmp()
     cgOut(`  ${old} = load ptr, ptr ${slot}`)
@@ -2762,6 +3045,7 @@ text func cgReleaseFn(fty:text) {
 bool func cgIsOwningRefcountedSource(e:Node) {
     if e == null { return false }
     if e.kind == 'ArrayLit' { return true }
+    if e.kind == 'MapLit' { return true }
     return e.kind == 'Call'
 }
 
@@ -3037,8 +3321,10 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 if ffty == '' { ffty = cgManagedFty(ft) }
                 SF_FTY[key] = ffty
                 if ffty == 'struct' { SF_SNAME[key] = ft.name }
-                if ffty == 'arr' && ft.elem != null {
-                    if ft.elem.kind == 'prim' { SF_ETY[key] = ft.elem.name }
+                if ffty == 'arr' || ffty == 'map' {
+                    if ft.elem != null {
+                        if ft.elem.kind == 'prim' { SF_ETY[key] = ft.elem.name }
+                    }
                 }
                 fi++
             }
@@ -3096,8 +3382,10 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                     G_SLOT[gn] = `@${gn}`
                     G_FTY[gn] = cgManagedFty(gt)
                     if gt.kind == 'struct' { G_SNAME[gn] = gt.name }
-                    if gt.kind == 'arr' && gt.elem != null {
-                        if gt.elem.kind == 'prim' { G_ETY[gn] = gt.elem.name }
+                    if gt.kind == 'arr' || gt.kind == 'map' {
+                        if gt.elem != null {
+                            if gt.elem.kind == 'prim' { G_ETY[gn] = gt.elem.name }
+                        }
                     }
                 }
             }
