@@ -183,7 +183,8 @@ round-by-round design and implementation record predating 0.1 lives in
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
   not. Sixty-one deliberate breakages, one per mechanism, re-run by
-  `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
+  `tests/test_bootstrap_canary.py`: **57 caught as a diff, 4 through
+  the coverage ratchet, 0 not caught**. And "caught" is
   no longer the whole verdict: a canary looks for TWO independent
   witnesses and reports a lone one in its own output, because
   decisions.md #312's seven canaries all fired and all seven fired on

@@ -64,7 +64,9 @@ Over the 113-file repository corpus:
   both** — 1,716 of 1,769 records.
 - **codegen: 38 match, 0 differ, 64 unported, 11 rejected by both** —
   250,007 of 278,447 file-specific IR lines.
-- **canaries: 61 registered, 0 missed.**
+- **canaries: 61 registered — 57 caught as a diff, 4 through the
+  coverage ratchet, 0 missed, and 0 relying on a lone witness that is
+  not a `cases/` file.**
 
 **The bootstrap compiler reproduces its own compilation.** All ten of
 its files — the five passes and the five command-line drivers — emit
@@ -93,8 +95,8 @@ the two implementations agree; it says nothing about whether the corpus
 could tell them apart if they stopped agreeing — and for four
 consecutive slices of the codegen port, the honest answer was that it
 could not. `bootstrap/canary.py` holds sixty-one deliberate breakages,
-one per mechanism, and asks the corpus whether it notices: **0 not
-caught.** A failure
+one per mechanism, and asks the corpus whether it notices: **57 caught
+as a diff, 4 through the coverage ratchet, 0 not caught.** A failure
 there is not a compiler bug — it means a `cases/` file has drifted and
 the mechanism behind it is unmeasured, so the fix is a corpus file
 rather than a code change. See "Canaries" below.
@@ -112,7 +114,10 @@ divergences that even `codegen.f` could not see.
 The check earned its keep on the very next slice: three of
 decisions.md #313's six canaries came back caught-but-with-one-witness,
 and in each case the witness was a driver or a stress file rather than
-a `cases/` file. `cases/drivers.f` is the answer.
+a `cases/` file. `cases/drivers.f` is the answer, and with it the
+whole registry is clean on this measure for the first time — eight
+canaries still have a single witness, and in every one of the eight it
+is the `cases/` file written for the mechanism.
 
 The lexer lexes itself; the parser parses itself; the code generator
 compiles itself; and the whole compiler compiles the whole compiler.
@@ -443,8 +448,11 @@ Four verdicts, and the distinction between the middle two is the point:
   signal: a real disagreement in a real program.
 - **ratchet** — nothing differs, but the coverage NUMBER fell, because
   a file the port used to emit went "unported" instead. Real detection,
-  weaker claim; three canaries land here and each is reported
-  separately rather than counted as a pass.
+  weaker claim; four canaries land here and each is reported
+  separately rather than counted as a pass. Some mechanisms can only
+  land here: leaving `argv`'s registration out does not produce a
+  wrong compiler, it produces one that cannot see the name, and there
+  is no "wrong argv" that still compiles.
 - **broken** — the patched source did not compile, or compiled and
   died. Proves nothing: a canary has to produce a *wrong* compiler, not
   an absent one.
