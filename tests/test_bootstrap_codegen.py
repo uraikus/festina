@@ -353,6 +353,59 @@ class TestTheCoverageNumberIsHonest:
         assert "@festina_release_map(" in body, (
             "no refcounted map local, so the heap half is unmeasured")
 
+    def test_the_owning_element_case_really_has_all_four_mechanisms(self):
+        """`cases/owning_elements.f` is the only evidence that an
+        `arr[text]` is not an `arr[int]` with a different element size.
+
+        Four deliberate breakages -- the generated cascade replaced by
+        the generic release, the element loop skipped for a
+        frame-allocated array, a literal's elements aliased instead of
+        copied, and an element write storing without reclaiming -- were
+        all invisible to the corpus before this file, because not one
+        file that matches holds a container of anything but a scalar. A
+        fifth, appending generated functions at the end rather than
+        lazily, is invisible without two functions needing the same
+        cascade and one not.
+        """
+        dump = irdump.dump_file("bootstrap/cases/owning_elements.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/owning_elements.f no longer compiles, so it measures "
+            "nothing at all: " + dump[0])
+        body = "\n".join(dump)
+        # 1: a generated cascade exists and is actually called.
+        generated = [line for line in dump
+                     if line.startswith("define void @__festina_release_array_")]
+        assert len(generated) == 1, (
+            f"{len(generated)} generated array cascades; the file needs "
+            f"exactly one, shared by every arr[text] in it -- more means "
+            f"the per-element-type cache stopped caching")
+        assert "@festina_release_array(ptr" in body, (
+            "no generic release left, so nothing distinguishes the "
+            "cascade from the release every container would get anyway")
+        # 2: it lands BEFORE the function that asked for it, which only
+        # means something if some function is emitted before it.
+        names = [line.split("(")[0].split()[-1] for line in dump
+                 if line.startswith("define ")]
+        gen_at = next(i for i, n in enumerate(names)
+                      if n.startswith("@__festina_release_array_"))
+        assert gen_at > 0, (
+            "the generated cascade is the first definition in the "
+            "module, so its placement relative to the function that "
+            "triggered it is unmeasured -- the file needs a function "
+            "that does NOT need it emitted first")
+        assert gen_at < len(names) - 2, (
+            "the generated cascade is last, so nothing here shows it "
+            "landing before the body that asked for it")
+        # 3: both storage answers, for a container whose elements own.
+        assert ".storage." in body, "no frame-allocated container local"
+        # 4: the literal's copy and the write's reclaim-then-copy.
+        assert "@festina_text_own(" in body, (
+            "no copied element, so a literal aliasing its source would "
+            "go unnoticed")
+        assert "@free(ptr" in body, (
+            "nothing reclaimed, so an element write that leaked the "
+            "value it replaced would go unnoticed")
+
     def test_the_conversion_case_really_has_all_four_mechanisms(self):
         """`cases/conversions.f` is the only evidence for the method-call
         slice, and that is measured rather than feared.
@@ -405,7 +458,8 @@ class TestTheCoverageNumberIsHonest:
             "the per-method-name rule is measured")
 
     @pytest.mark.parametrize("case", ["indexing.f", "array_literals.f", "maps.f",
-                                      "conversions.f"])
+                                      "conversions.f",
+                                      "owning_elements.f"])
     def test_the_container_cases_really_run(self, compile_and_run, case):
         """The two container case files are PROGRAMS, not only sources
         of IR, and this runs them to prove it.
@@ -516,6 +570,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 3804, (
+        assert reproduced >= 4341, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 3804")
+            f"the port previously emitted at least 4341")

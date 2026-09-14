@@ -6206,3 +6206,30 @@ One of the four, with the case file in place, fires through the coverage RATCHET
 That one is a test rather than a corpus file: the interesting inputs are control bytes, which have no escape spelling in Festina and would be awkward to keep in a checked-in source. The negative control is recorded — restoring the old rule fails four of its five cases.
 
 **Verified.** Codegen 21 match, 0 differ, 76 unported. Lexer 108/108, parser 108/108, semantic 108/108, escape analysis 90 match with 1,599 of 1,652 records. 2,752 passed, 343 skipped; the 24 graphics and 12 leak-stress failures are this container's limits, reproduced identically on the pristine tree. `cases/conversions.f` is valgrind-clean.
+
+
+307. CONTAINERS WHOSE ELEMENTS OWN SOMETHING
+
+`arr[text]`, and `.push()`/`.pop()`/`.shift()`/`.unshift()` to go with it. **4,341 of 253,842 file-specific IR lines, up from 3,804; 22 files match, up from 21.** Two blocker rows disappeared outright — `arr local of text` (18 files) and `method .push()` (17) — and `arr global of a non-scalar type` fell from 15 to 13.
+
+**An `arr[text]` is not an `arr[int]` with a different element size.** Every ownership decision the language makes for a `text` binding it also has to make for each SLOT, and none of that machinery exists in the scalar case. `@festina_release_array` frees the buffer and the header and knows nothing about what the slots hold; a container whose elements own something needs a cascade GENERATED for that element type, one that drops the refcount itself, because the element loop has to run strictly between the refcount check and the free — so the two cannot simply call each other.
+
+**A generated function lands BEFORE the function that asked for it**, and getting that wrong is invisible until a module has three functions in it. The cascade is generated lazily, at the first release site that needs it, which is somewhere inside a body — and the original builds each body in a list of its own and extends the shared one only at the end. So a cascade first needed by the second of three functions is emitted between the first and the second, with temp numbers taken from the middle of the second's. The port streamed straight into its function buffer and had to be restructured to buffer per function before any of this could match.
+
+**A predicate that generates is not a predicate.** `cgStorableRefcounted` — "could a binding of this type be released?" — was first written as `cgReleaseFnFor(...) != ''`, which is correct and is wrong: generating a cascade takes a uid and a run of temp numbers, so merely ASKING the question consumed the names the original hands to whatever comes next. Every temp after the first `arr[text]` global was off by sixteen. The predicate is pure now, and says so.
+
+**A literal COPIES; a write RECLAIMS first.** An array literal writes into fresh malloc'd memory, so every slot is written exactly once and there is no stale value to give back: copy and store. An element write into a built array has to release what the slot already held — and read it BEFORE making the copy, so `xs[i] = xs[i]` cannot free the buffer it is about to copy from.
+
+**Five canaries, zero detected.** The same answer as the last three slices, and the same reason: not one corpus file that matches holds a container of anything but a scalar.
+
+    the generated cascade replaced by the generic release   not detected
+    the element loop skipped for a frame-allocated array    not detected
+    a literal's elements aliased instead of copied          not detected
+    an element write storing without reclaiming             not detected
+    generated functions appended at the end, not lazily     not detected
+
+`cases/owning_elements.f` is the whole evidential basis. It has three functions of which two need the cascade and one does not, precisely so the placement is observable rather than trivially right; with it, all five fire.
+
+**Scope, stated rather than implied.** A `map` of a type that owns something is still refused: a map's entries are opaque to codegen in a way an array's flat buffer is not, so its cascade goes through a generated per-value-type TRAMPOLINE handed to `festina_map_for_each`. That is a different mechanism and it is its own slice. A container of a struct is refused too — the cycle-trial branch a struct element can need is not ported.
+
+**Verified.** Codegen 22 match, 0 differ, 76 unported. Lexer 109/109, parser 109/109, semantic 109/109, escape analysis 91 match with 1,623 of 1,676 records. 2,759 passed, 343 skipped; the 24 graphics and 12 leak-stress failures are this container's limits, reproduced identically on the pristine tree. `cases/owning_elements.f` is valgrind-clean.
