@@ -2092,7 +2092,14 @@ void func cgDelete(s:Node) {
     cgOut(`  ${cap} = load i64, ptr ${capP}`)
     text tombP = cgTmp()
     cgOut(`  ${tombP} = getelementptr %struct._FestinaMap, ptr ${obj.v}, i32 0, i32 3`)
-    cgOut(`  call i8 @festina_map_delete(ptr ${countP}, ptr ${entP}, i64 ${cap}, ptr ${tombP}, ptr ${k.v}, ptr null)`)
+    // A deleted entry's VALUE has to be given back, and the runtime
+    // cannot do it: a map's buckets are opaque to codegen's element
+    // walk and codegen's types are opaque to the runtime, so the two
+    // meet at a generated trampoline, exactly as the release cascade
+    // does. A scalar value owns nothing and passes null.
+    text delFn = 'null'
+    if cgElemOwnsSomething(obj.ety) { delFn = cgMapReleaseTrampoline(obj.ety) }
+    cgOut(`  call i8 @festina_map_delete(ptr ${countP}, ptr ${entP}, i64 ${cap}, ptr ${tombP}, ptr ${k.v}, ptr ${delFn})`)
     if k.owned { cgOut(`  call void @free(ptr ${k.v})`) }
 }
 
@@ -2950,6 +2957,55 @@ Val func cgMethodCall(e:Node, callee:Node) {
         return cgVal(out, 'ptr', 'text')
     }
 
+    // claude.md #186: `m.keys()` answers an arr[text] and `m.values()`
+    // an arr[T], both built by the runtime into a header this call
+    // allocates. The receiver is NOT released, matching forEach's own
+    // precedent: every call site is a plain named map, never a chained
+    // call-result temporary.
+    //
+    // keys needs nothing but the entries and the capacity, because a
+    // key is always text. values needs the element type spelled out as
+    // three constants -- stride, "is refcounted", "is text" -- since
+    // the runtime walks a map's buckets without knowing what is in
+    // them, and only the compiler does.
+    if m == 'keys' || m == 'values' {
+        if args.length != 0 {
+            cgUnported(`.${m}() with arguments`)
+            return none
+        }
+        Val mv = cgExpr(recv)
+        if CG_STUCK { return none }
+        if mv.fty != 'map' {
+            cgUnported(`.${m}() on ${mv.fty}`)
+            return none
+        }
+        if mv.ety == '' || cgElemLty(mv.ety) == '' {
+            cgUnported(`.${m}() on a map of a non-scalar type`)
+            return none
+        }
+        text kEntP = cgTmp()
+        cgOut(`  ${kEntP} = getelementptr %struct._FestinaMap, ptr ${mv.v}, i32 0, i32 1`)
+        text kEnt = cgTmp()
+        cgOut(`  ${kEnt} = load ptr, ptr ${kEntP}`)
+        text kCapP = cgTmp()
+        cgOut(`  ${kCapP} = getelementptr %struct._FestinaMap, ptr ${mv.v}, i32 0, i32 2`)
+        text kCap = cgTmp()
+        cgOut(`  ${kCap} = load i64, ptr ${kCapP}`)
+        text dst = cgFreshHeader('%struct._FestinaArray')
+        if m == 'keys' {
+            cgOut(`  call void @festina_map_keys(ptr ${kEnt}, i64 ${kCap}, ptr ${dst})`)
+            return cgArrVal(dst, 'text')
+        }
+        text vSize = '8'
+        if mv.ety == 'bool' { vSize = '1' }
+        text vRef = '0'
+        if SF_NAMES[mv.ety] != null { vRef = '1' }
+        text vText = '0'
+        if mv.ety == 'text' { vText = '1' }
+        cgOut(`  call void @festina_map_values(ptr ${kEnt}, i64 ${kCap}, i64 ${vSize}, i8 ${vRef}, i8 ${vText}, ptr ${dst})`)
+        return cgArrVal(dst, mv.ety)
+    }
+
     // Everything this slice does not implement is refused BEFORE the
     // receiver is emitted, so a refusal never leaves half an
     // expression behind for the next statement to trip over.
@@ -3090,6 +3146,24 @@ Val func cgCall(e:Node, wantValue:bool) {
         return none
     }
     text name = rawText(callee, 'name')
+    // claude.md #131: `close(code)` ends the program, running a
+    // declared `on exit(code:int)` handler on the way out --
+    // festina_program_exit does both, because the registered handler
+    // is a runtime concern rather than something codegen calls here.
+    // Checked before the user-function table so a program that happens
+    // to declare its own `close` still gets the builtin, which is the
+    // original's own order.
+    if name == 'close' {
+        arr[Node] cargs = listOf(e, 'args')
+        if cargs.length != 1 {
+            cgUnported('close() with other than one argument')
+            return none
+        }
+        Val cv = cgExprExpecting(cargs[0], 'int', '')
+        if CG_STUCK { return none }
+        cgOut(`  call void @festina_program_exit(i64 ${cv.v})`)
+        return cgVal('0', 'void', 'void')
+    }
     if FN_RET[name] == null {
         cgUnported(`call to ${name}`)
         return none
@@ -3196,7 +3270,20 @@ void func cgStmt(s:Node) {
             // value stored over it, exactly as a later `ns = [...]`
             // would do.
             text gname = rawText(s, 'name')
-            if G_SLOT[gname] != null {
+            // Local or global, on exactly the rule the scalar path
+            // above uses: a declaration INSIDE a function is local
+            // even when it shadows a global of the same name. Reading
+            // the global table alone gets that wrong, and silently --
+            // `arr[Tok] toks` inside `tokenize` would resolve to
+            // lexdump.f's own top-level `toks` and never get a slot at
+            // all, while every later read of the name went to the
+            // global. Found by porting the drivers, where a local and
+            // a top-level binding first share a name.
+            bool isGlobalDecl = false
+            if CG_IN_FUNC == false {
+                if G_SLOT[gname] != null { isGlobalDecl = true }
+            }
+            if isGlobalDecl {
                 Node ginit = childOf(s, 'init')
                 if ginit == null { return }
                 if cgStorableRefcounted(managed, cgEtyOf(gname)) == false {
@@ -5423,6 +5510,15 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     cgEmit('')
     cgEmit('@argv.header = global {i64, %struct._FestinaArray} {i64 -1, %struct._FestinaArray zeroinitializer}')
     cgEmit('@argv = global ptr getelementptr({i64, %struct._FestinaArray}, ptr @argv.header, i32 0, i32 1)')
+    // And registered like any other global, because that is exactly
+    // what it is from here on. claude.md #150: the only thing special
+    // about argv is its INITIAL value, which main() stores from the
+    // real argc/argv rather than from a user-written initializer --
+    // every read, copy, index and free of it is an ordinary
+    // `arr[text]` global's.
+    G_SLOT['argv'] = '@argv'
+    G_FTY['argv'] = 'arr'
+    G_ETY['argv'] = 'text'
 
     // Every top-level declaration's storage, in source order.
     int g = 0
@@ -5544,6 +5640,17 @@ void func cgProgram(body:arr[Node], srcPath:text) {
 
     // Then main's own statements.
     CUR = CG_MAIN
+    // main gets a fresh local scope too, and for the same reason every
+    // function does. Without this it inherits whichever function was
+    // emitted LAST -- so a top-level `int i = 0` that shadows nothing
+    // at all would resolve to some unrelated body's `%i.685`, storing
+    // into a slot that is not in scope and leaving the global it just
+    // declared untouched. Invisible until a driver's top level shared
+    // a name with a function local, which is to say until now.
+    map[text] mainSlot = {}
+    map[text] mainFty = {}
+    L_SLOT = mainSlot
+    L_FTY = mainFty
     cgOut('define void @__festina_main() {')
     cgBlockLabel('entry')
     CG_TERM = false

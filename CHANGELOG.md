@@ -97,9 +97,9 @@ round-by-round design and implementation record predating 0.1 lives in
 
 - **`bootstrap/escape.f`** — `festina/escape_analysis.py` ported to
   Festina, the fifth module the codegen port turned out to need and one
-  that was not in its original estimate: **94 of 112 corpus files
+  that was not in its original estimate: **94 of 113 corpus files
   produce an identical record sequence, 0 differ, 7 not yet ported, 11
-  rejected by both** — 1,715 of 1,768 records. It decides whether every
+  rejected by both** — 1,716 of 1,769 records. It decides whether every
   container and struct local lives in the frame or behind a heap
   refcount header, so the codegen port cannot emit one without agreeing
   here first. The ORDER bodies are analyzed in is part of the answer
@@ -111,16 +111,19 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage, **in progress**: **31 of 112 corpus files
-  emit byte-identical LLVM IR, 0 differ, 70 not yet ported, 11 rejected
-  by both** — 125,765 of 276,562 file-specific IR lines. **The code
-  generator compiles itself**: `bootstrap/codegen.f` emits 58,506 of
-  58,506 file-specific lines byte for byte, and so do `lexer.f`
-  (4,552), `parser.f` (13,139), `semantic.f` (20,651) and `escape.f`
-  (22,232) — five of the bootstrap's own ten files, including every
-  compiler pass. The five that remain are the command-line drivers,
-  held back by a short shared list (`argv`, a `close` call, `.keys()`,
-  a `.push` onto a non-scalar array). In are
+  the fourth and last stage: **38 of 113 corpus files emit
+  byte-identical LLVM IR, 0 differ, 64 not yet ported, 11 rejected by
+  both** — 250,007 of 278,447 file-specific IR lines. **The bootstrap
+  compiler reproduces its own compilation**: all ten of its files —
+  `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
+  `escape.f` (22,232), `codegen.f` (59,166) and the five command-line
+  drivers `lexdump.f` (4,793), `astdumpf.f` (13,356), `semdumpf.f`
+  (20,946), `escdumpf.f` (23,988) and `irdumpf.f` (59,567) — emit
+  byte-identical IR, 242,390 file-specific lines in total. **And the
+  fixed point closes**: linking the IR the self-hosted compiler emits
+  for `bootstrap/irdumpf.f` gives a second-generation binary
+  byte-identical to the first, agreeing with it on all ten files and
+  emitting its own source's IR unchanged. In are
   expressions (arithmetic and comparison with int/float mixing,
   `&&`/`||`, unary, the ternary, `/` and `%` with claude.md #57's
   divide-by-zero control flow, template literals, and `+` and `==`/`!=`
@@ -163,19 +166,24 @@ round-by-round design and implementation record predating 0.1 lives in
   what indexing a container the expression owns needs. Not in: structs
   with a non-scalar field, `img`/`regex` and the other non-scalar
   declarations, the remaining methods, and the
-  graphics/audio/HTTP/thread/sqlite/table subsystems.
-  `bootstrap/irdump.py` and `bootstrap/irdiff.py` run the comparison;
-  the oracle is the IR text itself, so it needed no canonical form of
-  its own (decisions.md #289–#312).
+  graphics/audio/HTTP/thread/sqlite/table subsystems — none of which
+  the compiler needs to compile itself. And what a program needs to be
+  a COMMAND: `argv`, `close(code)`, `.keys()`/`.values()`, and the two
+  scope rules a driver is the first program to reach — a managed
+  declaration inside a function is local even when a global shares its
+  name, and `__festina_main` gets a fresh local scope rather than
+  inheriting the last function's. `bootstrap/irdump.py` and
+  `bootstrap/irdiff.py` run the comparison; the oracle is the IR text
+  itself, so it needed no canonical form of its own (decisions.md
+  #289–#313).
 
 - **`bootstrap/canary.py` — the breakages the harness is supposed to
   catch, as a test rather than as prose.** A green differential run says
   the two implementations agree; it says nothing about whether the
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
-  not. Fifty-five deliberate breakages, one per mechanism, re-run by
-  `tests/test_bootstrap_canary.py`: **52 caught as a diff, 3 through
-  the coverage ratchet, 0 not caught**. And "caught" is
+  not. Sixty-one deliberate breakages, one per mechanism, re-run by
+  `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
   no longer the whole verdict: a canary looks for TWO independent
   witnesses and reports a lone one in its own output, because
   decisions.md #312's seven canaries all fired and all seven fired on

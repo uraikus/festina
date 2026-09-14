@@ -670,6 +670,67 @@ CANARIES = [
     }""",
     ),
 
+    # --- decisions.md #313: the drivers, and the fixed point ----------
+    Canary(
+        "argv-is-an-ordinary-global", "#313",
+        "argv is registered like any other arr[text] global, so reads "
+        "of it resolve",
+        """    G_SLOT['argv'] = '@argv'
+    G_FTY['argv'] = 'arr'
+    G_ETY['argv'] = 'text'""",
+        """    G_FTY['argv'] = 'arr'
+    G_ETY['argv'] = 'text'""",
+    ),
+    Canary(
+        "close-exits-through-the-runtime", "#313",
+        "close(code) goes through festina_program_exit, which runs a "
+        "declared exit handler first",
+        """        cgOut(`  call void @festina_program_exit(i64 ${cv.v})`)""",
+        """        cgOut(`  call void @exit(i64 ${cv.v})`)""",
+    ),
+    Canary(
+        "a-local-shadows-a-global-of-the-same-name", "#313",
+        "a managed declaration INSIDE a function is local even when a "
+        "global shares its name",
+        """            bool isGlobalDecl = false
+            if CG_IN_FUNC == false {
+                if G_SLOT[gname] != null { isGlobalDecl = true }
+            }""",
+        """            bool isGlobalDecl = false
+            if G_SLOT[gname] != null { isGlobalDecl = true }""",
+    ),
+    Canary(
+        "main-gets-a-fresh-local-scope", "#313",
+        "__festina_main does not inherit the locals of whichever "
+        "function was emitted last",
+        """    map[text] mainSlot = {}
+    map[text] mainFty = {}
+    L_SLOT = mainSlot
+    L_FTY = mainFty
+""",
+        "",
+    ),
+    Canary(
+        "map-keys-is-not-map-values", "#313",
+        "keys and values are different runtime calls with different "
+        "element answers",
+        """        if m == 'keys' {
+            cgOut(`  call void @festina_map_keys(ptr ${kEnt}, i64 ${kCap}, ptr ${dst})`)
+            return cgArrVal(dst, 'text')
+        }""",
+        """        if m == 'keys' {
+            cgOut(`  call void @festina_map_keys(ptr ${kEnt}, i64 ${kCap}, ptr ${dst})`)
+            return cgArrVal(dst, mv.ety)
+        }""",
+    ),
+    Canary(
+        "map-delete-releases-the-value", "#313",
+        "deleting an entry whose VALUE owns something hands the runtime "
+        "a release trampoline",
+        """    if cgElemOwnsSomething(obj.ety) { delFn = cgMapReleaseTrampoline(obj.ety) }""",
+        """    if false { delFn = cgMapReleaseTrampoline(obj.ety) }""",
+    ),
+
     Canary(
         "generated-fn-placement", "#307",
         "a generated cascade lands BEFORE the function whose body asked for it",

@@ -249,6 +249,17 @@ Native builds on Linux, macOS, and Windows, plus cross-compiling to
 [`tests/CONTRACT.md`](tests/CONTRACT.md) for exactly what's covered
 and how, and [todo.md](todo.md) for what's next.
 
+**Festina compiles Festina.** [`bootstrap/`](bootstrap/README.md) is a
+second implementation of the whole compiler — lexer, parser, semantic
+analysis, escape analysis and LLVM codegen — written in Festina
+itself, and it reproduces its own compilation: all ten of its files
+emit LLVM IR byte-identical to what the Python compiler emits for
+them, and the second-generation binary built from that IR is identical
+to the first. It is checked continuously rather than claimed once:
+five differential harnesses compare the two implementations over every
+`.f` file in the repository on each run, and sixty-one deliberate
+breakages ask whether that corpus could still tell them apart.
+
 ```bash
 python3 -m pytest            # the whole suite
 scripts/leak_stress.sh       # just the sanitizer stress runs

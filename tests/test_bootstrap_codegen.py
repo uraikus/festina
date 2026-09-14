@@ -359,9 +359,14 @@ class TestTheCoverageNumberIsHonest:
         ("bootstrap/semantic.f", 19000),
         ("bootstrap/escape.f", 20000),
         ("bootstrap/codegen.f", 55000),
+        ("bootstrap/lexdump.f", 4000),
+        ("bootstrap/astdumpf.f", 12000),
+        ("bootstrap/semdumpf.f", 19000),
+        ("bootstrap/escdumpf.f", 21000),
+        ("bootstrap/irdumpf.f", 55000),
     ])
     def test_a_bootstrap_file_self_hosts(self, rel, floor):
-        """The port compiling real pieces of itself.
+        """The port compiling real pieces of itself -- now all ten.
 
         Pinned separately from the ratchet because it is a different
         claim: the line count could stay where it is while one of these
@@ -489,6 +494,55 @@ class TestTheCoverageNumberIsHonest:
             "nothing reclaimed, so an element write that leaked the "
             "value it replaced would go unnoticed")
 
+    def test_the_driver_case_really_has_all_six_mechanisms(self):
+        """`cases/drivers.f` carries what a program needs to be a
+        COMMAND, and the two scope bugs only a command reaches.
+
+        The bootstrap's five entry points looked like a list of ten
+        missing constructs for five slices. Two were real -- `argv` and
+        `close` -- and the other eight were consequences of one
+        shadowing bug. Measured rather than described: the shadowing
+        canary's only witness was `bootstrap/lexdump.f` before this
+        file existed, which is exactly the "one witness, and it is not
+        a case file" arrangement the canary harness now reports on.
+        """
+        dump = irdump.dump_file("bootstrap/cases/drivers.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/drivers.f no longer compiles, so it measures nothing "
+            "at all: " + dump[0])
+        body = "\n".join(dump)
+        # 1: argv read, indexed and copied.
+        assert "load ptr, ptr @argv" in body, (
+            "no argv read, so a compiler that could not see the name at "
+            "all would go unnoticed")
+        # 2: close, through the runtime rather than libc.
+        assert "@festina_program_exit(" in body, (
+            "no close(), so nothing distinguishes it from a plain exit")
+        # 3 and 4: the two halves of the shadowing rule. A local named
+        # `rows` must get its own slot even though `@rows` exists, and
+        # a top-level `tally` must be a global even though some
+        # function has a local by that name.
+        assert "@rows = global" in body, "no shadowed global container"
+        assert any(line.strip().startswith("%rows.") and "alloca" in line
+                   for line in dump), (
+            "the local that shadows @rows got no storage, so this file "
+            "is no longer measuring the bug it was written for")
+        assert "@tally = global" in body, (
+            "the top-level `tally` is not a global, so main is still "
+            "inheriting some function's locals -- which is the other "
+            "half of the same bug")
+        # 5: both map projections, with values' three constants.
+        assert "@festina_map_keys(" in body, "no .keys()"
+        assert "@festina_map_values(" in body, "no .values()"
+        # 6: delete, with and without a trampoline.
+        deletes = [line for line in dump if "@festina_map_delete(" in line]
+        assert any("ptr null)" in line for line in deletes), (
+            "no delete on a map of a scalar, so the null trampoline is "
+            "unmeasured")
+        assert any("ptr @__festina_maprelease_" in line for line in deletes), (
+            "no delete on a map whose values own something, so a delete "
+            "that leaked the value it removed would go unnoticed")
+
     def test_the_owning_container_case_really_has_all_six_mechanisms(self):
         """`cases/owning_containers.f` exists because the mechanisms it
         holds were, for one slice, measured by nothing but
@@ -605,7 +659,8 @@ class TestTheCoverageNumberIsHonest:
                                       "owning_elements.f",
                                       "nulls.f",
                                       "blobs_and_scopes.f",
-                                      "owning_containers.f"])
+                                      "owning_containers.f",
+                                      "drivers.f"])
     def test_the_container_cases_really_run(self, compile_and_run, case):
         """The two container case files are PROGRAMS, not only sources
         of IR, and this runs them to prove it.
@@ -716,6 +771,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 125765, (
+        assert reproduced >= 250007, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 125765")
+            f"the port previously emitted at least 250007")

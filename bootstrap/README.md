@@ -1,9 +1,10 @@
 # bootstrap/
 
-Festina's own compiler, written in Festina — the lexer, the parser,
-semantic analysis and escape analysis all complete and all agreeing
-with their originals over the whole corpus, and codegen far enough
-along that it compiles its own source byte for byte.
+Festina's own compiler, written in Festina — every pass complete and
+agreeing with its original over the whole corpus, and the whole thing
+far enough along that it reproduces its own compilation: all ten files
+here emit byte-identical IR, and the second-generation binary built
+from that IR is identical to the first.
 
 Nothing in the shipped compiler depends on this directory. It exists to
 be a demanding real program in the language, and to be checked against
@@ -24,7 +25,7 @@ the Python implementation it mirrors.
 | `semdumpf.f` | entry point: dumps semantic analysis in the canonical form |
 | `semdump.py` | the Python side's canonical semantic-analysis dump |
 | `semdiff.py` | diffs both analyzers over the same corpus |
-| `codegen.f` | `festina/codegen.py`, in progress (imports `semantic.f`) |
+| `codegen.f` | `festina/codegen.py`, ported (imports `semantic.f`) |
 | `irdumpf.f` | entry point: dumps LLVM IR |
 | `irdump.py` | the Python side's IR, which needs no canonical form of its own |
 | `irdiff.py` | diffs both code generators over the same corpus |
@@ -54,62 +55,68 @@ python bootstrap/canary.py                          # can the corpus still TELL?
 python bootstrap/canary.py --list
 ```
 
-Over the 112-file repository corpus:
+Over the 113-file repository corpus:
 
-- **lexer: 112 match, 0 differ.**
-- **parser: 112 match, 0 differ, 0 unported.**
-- **semantic: 112 match, 0 differ, 0 unported.**
+- **lexer: 113 match, 0 differ.**
+- **parser: 113 match, 0 differ, 0 unported.**
+- **semantic: 113 match, 0 differ, 0 unported.**
 - **escape analysis: 94 match, 0 differ, 7 unported, 11 rejected by
-  both** — 1,715 of 1,768 records.
-- **codegen: 31 match, 0 differ, 70 unported, 11 rejected by both** —
-  125,765 of 276,562 file-specific IR lines.
-- **canaries: 55 registered — 52 caught as a diff, 3 through the
-  coverage ratchet, 0 missed.**
+  both** — 1,716 of 1,769 records.
+- **codegen: 38 match, 0 differ, 64 unported, 11 rejected by both** —
+  250,007 of 278,447 file-specific IR lines.
+- **canaries: 61 registered, 0 missed.**
 
-**`bootstrap/codegen.f` compiles itself: 58,506 of 58,506 file-specific
-IR lines, byte for byte.** The code generator is the largest file in
-the corpus by a wide margin — its own dump is more than four times
-`parser.f`'s — and it is the one whose output the whole effort exists
-to compare. Five of the bootstrap's own ten files now self-host:
+**The bootstrap compiler reproduces its own compilation.** All ten of
+its files — the five passes and the five command-line drivers — emit
+byte-identical IR, 242,390 file-specific lines in total:
 
-| file | file-specific IR lines |
-| --- | --- |
-| `lexer.f` | 4,552 |
-| `parser.f` | 13,139 |
-| `semantic.f` | 20,651 |
-| `escape.f` | 22,232 |
-| `codegen.f` | 58,506 |
+| file | file-specific IR lines | | file | file-specific IR lines |
+| --- | --- | --- | --- | --- |
+| `lexer.f` | 4,552 | | `lexdump.f` | 4,793 |
+| `parser.f` | 13,139 | | `astdumpf.f` | 13,356 |
+| `semantic.f` | 20,651 | | `semdumpf.f` | 20,946 |
+| `escape.f` | 22,232 | | `escdumpf.f` | 23,988 |
+| `codegen.f` | 59,166 | | `irdumpf.f` | 59,567 |
 
-The five that remain are the command-line drivers, not compiler
-passes, and they are held back by a short shared list — `argv`, a
-`close` call, `.keys()`, a `.push` onto a non-scalar array. See below
-for why a line count is the number reported rather than a file count,
-and for the caveat that comes with this particular figure.
+**And the fixed point closes.** Linking the IR the self-hosted compiler
+emits for `bootstrap/irdumpf.f` gives a second-generation binary that
+is byte-identical to the first, agrees with it on all ten bootstrap
+files, and emits its own source's IR unchanged. Generation 2 is
+generation 1.
+
+See below for why a line count is the number reported rather than a
+file count, and for the caveat that comes with this particular
+figure.
 
 **A green differential test is not the claim that matters.** It says
 the two implementations agree; it says nothing about whether the corpus
 could tell them apart if they stopped agreeing — and for four
 consecutive slices of the codegen port, the honest answer was that it
-could not. `bootstrap/canary.py` holds fifty-five deliberate breakages,
-one per mechanism, and asks the corpus whether it notices: **52 caught
-as a diff, 3 through the coverage ratchet, 0 not caught.** A failure
+could not. `bootstrap/canary.py` holds sixty-one deliberate breakages,
+one per mechanism, and asks the corpus whether it notices: **0 not
+caught.** A failure
 there is not a compiler bug — it means a `cases/` file has drifted and
 the mechanism behind it is unmeasured, so the fix is a corpus file
 rather than a code change. See "Canaries" below.
 
-**"Caught" is not automatically enough, either.** Seven of this slice's
-canaries fired, and every one of them fired on `bootstrap/codegen.f`
-alone. A mechanism whose only witness is the largest file in the corpus
-is measured in name only: the whole set would have gone silent together
-the moment that file stopped matching for some unrelated reason. Which
-file catches a canary is therefore part of reading the result, not a
-detail — and writing the small, stable witness
-(`cases/owning_containers.f`) immediately found two more divergences
-that even `codegen.f` could not see.
+**"Caught" is not automatically enough, either.** Seven of decisions.md
+#312's canaries fired, and every one of them fired on
+`bootstrap/codegen.f` alone. A mechanism whose only witness is the
+largest file in the corpus is measured in name only: the whole set
+would have gone silent together the moment that file stopped matching
+for some unrelated reason. Which file catches a canary is therefore
+part of reading the result, not a detail — and writing the small,
+stable witness (`cases/owning_containers.f`) immediately found two more
+divergences that even `codegen.f` could not see.
+
+The check earned its keep on the very next slice: three of
+decisions.md #313's six canaries came back caught-but-with-one-witness,
+and in each case the witness was a driver or a stress file rather than
+a `cases/` file. `cases/drivers.f` is the answer.
 
 The lexer lexes itself; the parser parses itself; the code generator
-compiles itself. Lexing and parsing `parser.f`, the largest source in
-the corpus at ~1,200 lines, takes about 60 ms.
+compiles itself; and the whole compiler compiles the whole compiler.
+Lexing and parsing `parser.f`, ~1,200 lines, takes about 60 ms.
 
 ## Why a port, not a rewrite
 
@@ -156,7 +163,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 112-file repository corpus is a strong oracle for ordinary code and
+The 113-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -300,7 +307,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 125,765 of 276,562 file-specific IR lines
+## Codegen: 250,007 of 278,447 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -369,10 +376,10 @@ times and so could not have varied either way.
 
 **The proportion turned over, and then kept going.** Four slices ago it
 was 3,715 of 4,849 — three quarters from `cases/` files written for the
-slices that claimed them. It is now **5,847 of 125,765, under five per
-cent**, because the bootstrap's own five self-hosting files contribute
-119,080 lines between them of programs written to be a compiler rather
-than to be measured.
+slices that claimed them. It is now **6,412 of 250,007, under three per
+cent**, because the bootstrap's own ten files contribute 242,390 lines
+between them of programs written to be a compiler rather than to be
+measured.
 
 That is a ratio to read carefully rather than to be pleased by. A
 corpus dominated by one enormous file measures whatever that file
@@ -381,11 +388,11 @@ mechanism with one witness. The `cases/` files are small precisely so
 that each one's coverage is deliberate; see the canary note above for
 what happened when a slice's mechanisms were left to `codegen.f` alone.
 
-The eleven largest case files are `owning_containers.f` (889),
-`owning_elements.f` (652), `blobs_and_scopes.f` (597),
-`escape_locals.f` (538), `maps.f` (521), `text_building.f` (418),
-`nulls.f` (393), `array_literals.f` (379), `struct_fields.f` (348),
-`indexing.f` (252) and `conversions.f` (252). Non-scalar parameters were the one slice
+The twelve largest case files are `owning_containers.f` (889),
+`owning_elements.f` (652), `blobs_and_scopes.f` (597), `drivers.f`
+(565), `escape_locals.f` (538), `maps.f` (521), `text_building.f`
+(418), `nulls.f` (393), `array_literals.f` (379), `struct_fields.f`
+(348), `indexing.f` (252) and `conversions.f` (252). Non-scalar parameters were the one slice
 so far to bring in pre-existing files instead: `examples/geometry.f`
 and `examples/multifile.f`, the two the blocker table listed as one
 construct away. Struct fields and container globals
@@ -469,25 +476,25 @@ minute when the corpus was small programs; with a 58,000-line
 anywhere still pays a full scan, which is the right way round — those
 are the ones worth knowing about.
 
-### The target is self-hosting
+### The target was self-hosting, and it is reached
 
 The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
-**241,070 of the 276,562 file-specific IR lines**, and they need
-none of the graphics, audio, HTTP, thread, sqlite, regex or table
+**242,390 of the 278,447 file-specific IR lines**, and they need none
+of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
-whole corpus. That is what this port is driving at; whether the
-remaining subsystems are worth porting afterwards is a separate
-question.
+whole corpus.
 
-**Five of the ten are there: every compiler PASS.** `lexer.f`,
-`parser.f`, `semantic.f`, `escape.f` and `codegen.f` all emit
-byte-identical IR for their own sources, 119,080 file-specific lines
-between them. What remains is the five entry points — command-line
-drivers rather than passes — and a short shared list of constructs
-holds all five back at once: `argv`, a `close` call, `.keys()`, and a
-`.push` onto an array of a non-scalar.
+**All ten match**, and the fixed point closes on top of that: the IR
+the self-hosted compiler emits for `bootstrap/irdumpf.f`, linked,
+gives a second-generation binary byte-identical to the first, agreeing
+with it on all ten files and emitting its own source's IR unchanged.
+
+Whether the remaining subsystems — graphics, audio, HTTP, threads,
+sqlite, regex, tables — are worth porting afterwards is a separate
+question, and now a genuinely optional one: the compiler no longer
+needs them to compile itself.
 
 ### What is in
 
@@ -672,21 +679,27 @@ sanitizer for this stage rather than needing it alongside.
 |20|0|a declaration of a non-scalar type (`img`, `regex`, …)|
 |19|0|`EventHandler`|
 |18|0|`ThreadDecl`|
-|15|**1**|`free`|
-|15|0|`close()`|
+|15|**2**|`free`|
 |12|0|`.postMessage()`|
 |10|**2**|`table` declarations|
-|8|0|`argv`|
 |8|0|`sqlite()`|
 |8|0|an `arr[T]` local of a non-scalar element type|
+|7|0|`openPort()`|
+|5|0|a parameter of a non-scalar type|
 
 `blocks` counts every file a construct appears in; `only` counts the
 files where it is the last thing in the way, and so the number that
 would actually become matches.
 
-**The `only` column is four files** — `table` declarations for two,
-`free` for one and `try`/`catch` for one, all features rather than
+**The `only` column is five files** — `table` declarations for two,
+`free` for two and `try`/`catch` for one, all features rather than
 expression-level work.
+
+**Everything left is a SUBSYSTEM**, which is the shape of the
+remainder now: graphics, audio, HTTP, threads, sqlite, tables, and the
+manual-memory escape hatch. None of it is needed to compile the
+compiler, and none of it is the kind of expression-level work the last
+twenty slices were.
 
 **And read that column with care.** It said `bootstrap/lexer.f` was one
 construct away, and lexer.f needed five. `cgFunc` refuses a function

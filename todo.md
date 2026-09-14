@@ -49,13 +49,21 @@ stubs. Nothing open here.
   deliberate part: a blob is a *file*, carrying its own path, so a slice
   of one has no path to carry.
 
-### After the bootstrap port
+### After the bootstrap port — now unblocked
 
-Deliberately queued behind the self-hosting effort. Each of these adds
-a *capability* — new syntax, new runtime surface, or a new type — and
-every one of them would have to be ported to `bootstrap/` a second
-time if it landed while the port is mid-flight. None is blocked on
-anything; they are waiting on a stable target.
+Queued behind the self-hosting effort because each adds a *capability*
+— new syntax, new runtime surface, or a new type — and every one would
+have needed porting to `bootstrap/` a second time if it landed
+mid-flight. **That target is reached** (decisions.md #313), so the
+reason for the queue is gone. Each of these now costs its own
+implementation plus a port of that implementation, which is the
+ordinary price of a language change from here on.
+
+A caution that applies to all five: `bootstrap/` is a second
+implementation of the compiler, and a capability that changes codegen
+has to land in both or the differential test goes red. That is the
+point of the test, not a problem with it — but it does mean these are
+larger than they look.
 
 - **A native file picker.** The platform's own open/save dialog, so a
   program can ask for a path without inventing its own browser. Three
@@ -118,6 +126,20 @@ open:
   exit-time busywork.
 
 ## The bootstrap compiler
+
+The port reached its target: **all ten of the bootstrap's own files
+reproduce their own compilation byte for byte, and the second-
+generation binary built from that IR is identical to the first**
+(decisions.md #313). What remains open is below; none of it stands
+between the compiler and compiling itself.
+
+- **The remaining unported constructs are all SUBSYSTEMS.** Graphics,
+  audio, HTTP, threads, sqlite, tables, and `free`/`delete`'s manual
+  escape hatch — 64 corpus files, and a different kind of work from
+  the twenty slices that came before, which were expression-level
+  mechanisms the compiler itself needed. Worth doing only if the goal
+  becomes "the whole corpus" rather than "the compiler"; that is a
+  decision, not a backlog item.
 
 - **`bootstrap/lexer.f` does not follow Python's `repr()` into
   scientific notation.** The canonical token dump renders a float with
