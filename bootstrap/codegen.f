@@ -109,38 +109,70 @@ void func cgUnported(what:text) {
 // conservative in the one safe direction: a missing construct shows up
 // as "not done yet" rather than as a silently wrong module.
 
+// The C-string form of one BYTE, and the byte count it costs.
+//
+// The rule is per byte, not per character: a printable ASCII byte other
+// than `"` and `\\` goes in literally, and every other byte -- control
+// characters, and every byte of a multi-byte UTF-8 sequence -- goes in
+// as `\\XX` with uppercase hex. Anything narrower than that diverges on
+// the first literal that is not plain ASCII text.
+text func cgCByte(b:int) {
+    if b >= 32 && b < 127 && b != 34 && b != 92 { return b.toChar() }
+    return `\\${cgHexN(b, 2)}`
+}
+
+// A text's bytes, escaped. Festina has no byte-level access to a
+// `text` and no bitwise operators, so each code point is re-encoded to
+// UTF-8 here arithmetically -- the shifts and masks spelled as
+// divisions and remainders by powers of two.
 text func cgCEscape(s:text) {
     text out = ''
     int i = 0
     while i < s.length {
         int c = s.charCodeAt(i)
-        if c == 92 { out = out + '\\5C' }
-        if c == 34 { out = out + '\\22' }
-        if c == 10 { out = out + '\\0A' }
-        if c == 9  { out = out + '\\09' }
-        if c == 13 { out = out + '\\0D' }
-        if c != 92 && c != 34 && c != 10 && c != 9 && c != 13 {
-            out = out + c.toChar()
+        if c < 128 {
+            out = out + cgCByte(c)
+        } else if c < 2048 {
+            out = out + cgCByte(192 + Math.floorDiv(c, 64))
+            out = out + cgCByte(128 + c % 64)
+        } else if c < 65536 {
+            out = out + cgCByte(224 + Math.floorDiv(c, 4096))
+            out = out + cgCByte(128 + Math.floorDiv(c, 64) % 64)
+            out = out + cgCByte(128 + c % 64)
+        } else {
+            out = out + cgCByte(240 + Math.floorDiv(c, 262144))
+            out = out + cgCByte(128 + Math.floorDiv(c, 4096) % 64)
+            out = out + cgCByte(128 + Math.floorDiv(c, 64) % 64)
+            out = out + cgCByte(128 + c % 64)
         }
         i++
     }
     return out
 }
 
-text func cgStringConst(v:text) {
+// The DECLARED length is a byte count, and `text.length` is a code
+// point count -- so a literal with any multi-byte character would get
+// an array too short for its own contents if this used `.length`.
+int func cgUtf8Bytes(s:text) {
+    int n = 0
     int i = 0
-    while i < v.length {
-        if v.charCodeAt(i) > 127 {
-            cgUnported('non-ASCII string literal')
-            return '@.str.0'
-        }
+    while i < s.length {
+        int c = s.charCodeAt(i)
+        if c < 128 { n = n + 1 }
+        else if c < 2048 { n = n + 2 }
+        else if c < 65536 { n = n + 3 }
+        else { n = n + 4 }
         i++
     }
+    return n
+}
+
+text func cgStringConst(v:text) {
     if CG_STR_MAP[v] != null { return CG_STR_MAP[v] }
     text name = `@.str.${CG_STR_N}`
     CG_STR_N++
     CG_STR_MAP[v] = name
-    int bytes = v.length + 1
+    int bytes = cgUtf8Bytes(v) + 1
     CG_STRS.push(`${name} = private unnamed_addr constant [${bytes} x i8] c"${cgCEscape(v)}\\00"`)
     return name
 }
@@ -2169,9 +2201,246 @@ Val func cgLogical(e:Node) {
 // A call to a user-declared function. `wantValue` distinguishes an
 // expression position from a bare statement, because a void call has no
 // result temp to take.
+// ---------------------------------------------------------------------
+// Method calls.
+//
+// A call whose callee is a `Member` -- `x.f()`. Two unrelated things
+// wear that shape: a METHOD on a value, whose receiver is emitted and
+// handed to a runtime function, and a `Math.*` call, whose "receiver"
+// is a namespace that is never emitted at all.
+//
+// The original distinguishes them by spelling: the identifier `Math`,
+// with no check that it is unbound. A local named `Math` would still
+// take the namespace path. Reproduced exactly rather than tidied --
+// this port's job is to agree.
+
+// claude.md #93: float -> float. LLVM has real intrinsics for most of
+// these; the rest come straight from libm, which is on every link line
+// already. Both are emitted identically, so the split is only about
+// which name to use.
+text func cgMathFloatFn(m:text) {
+    if m == 'sqrt' { return 'llvm.sqrt.f64' }
+    if m == 'sin' { return 'llvm.sin.f64' }
+    if m == 'cos' { return 'llvm.cos.f64' }
+    if m == 'exp' { return 'llvm.exp.f64' }
+    if m == 'log' { return 'llvm.log.f64' }
+    if m == 'log2' { return 'llvm.log2.f64' }
+    if m == 'log10' { return 'llvm.log10.f64' }
+    if m == 'abs' { return 'llvm.fabs.f64' }
+    if m == 'tan' { return 'tan' }
+    if m == 'asin' { return 'asin' }
+    if m == 'acos' { return 'acos' }
+    if m == 'atan' { return 'atan' }
+    return ''
+}
+
+text func cgMathFloat2Fn(m:text) {
+    if m == 'pow' { return 'llvm.pow.f64' }
+    if m == 'min' { return 'llvm.minnum.f64' }
+    if m == 'max' { return 'llvm.maxnum.f64' }
+    if m == 'atan2' { return 'atan2' }
+    return ''
+}
+
+text func cgMathIntrinsic(m:text) {
+    if m == 'floor' { return 'llvm.floor.f64' }
+    if m == 'ceil' { return 'llvm.ceil.f64' }
+    if m == 'round' { return 'llvm.round.f64' }
+    if m == 'trunc' { return 'llvm.trunc.f64' }
+    return ''
+}
+
+// claude.md #102: a double to an i64 without the undefined behaviour a
+// bare `fptosi` has. `fptosi` is genuinely undefined for a NaN, an
+// infinity, or anything outside i64's range -- not "some unspecified
+// integer" -- so the three cases are tested for and answered with the
+// int null, the same claim claude.md #57 already makes for division by
+// zero. The conversion itself uses the saturating intrinsic, which is
+// fully defined, so no UB is left anywhere for the optimizer to fold
+// two identical sites differently.
+text func cgFloatToInt(v:text) {
+    text isNan = cgTmp()
+    cgOut(`  ${isNan} = fcmp uno double ${v}, ${v}`)
+    text hi = cgTmp()
+    cgOut(`  ${hi} = fcmp oge double ${v}, 0x43E0000000000000`)
+    text lo = cgTmp()
+    cgOut(`  ${lo} = fcmp olt double ${v}, 0xC3E0000000000000`)
+    text oor = cgTmp()
+    cgOut(`  ${oor} = or i1 ${hi}, ${lo}`)
+    text bad = cgTmp()
+    cgOut(`  ${bad} = or i1 ${isNan}, ${oor}`)
+    text conv = cgTmp()
+    cgOut(`  ${conv} = call i64 @llvm.fptosi.sat.i64.f64(double ${v})`)
+    text out = cgTmp()
+    cgOut(`  ${out} = select i1 ${bad}, i64 -9223372036854775808, i64 ${conv}`)
+    return out
+}
+
+bool func cgIsMathMethod(m:text) {
+    if cgMathFloatFn(m) != '' { return true }
+    if cgMathFloat2Fn(m) != '' { return true }
+    if cgMathIntrinsic(m) != '' { return true }
+    return m == 'random' || m == 'floorDiv'
+}
+
+Val func cgMathCall(e:Node, m:text) {
+    Val none
+    arr[Node] args = listOf(e, 'args')
+    if cgMathFloatFn(m) != '' {
+        Val a = cgExpr(args[0])
+        if CG_STUCK { return none }
+        text out = cgTmp()
+        cgOut(`  ${out} = call double @${cgMathFloatFn(m)}(double ${a.v})`)
+        return cgVal(out, 'double', 'float')
+    }
+    if cgMathFloat2Fn(m) != '' {
+        Val a = cgExpr(args[0])
+        if CG_STUCK { return none }
+        Val b = cgExpr(args[1])
+        if CG_STUCK { return none }
+        text out = cgTmp()
+        cgOut(`  ${out} = call double @${cgMathFloat2Fn(m)}(double ${a.v}, double ${b.v})`)
+        return cgVal(out, 'double', 'float')
+    }
+    if m == 'random' {
+        text out = cgTmp()
+        cgOut(`  ${out} = call double @festina_random()`)
+        return cgVal(out, 'double', 'float')
+    }
+    if cgMathIntrinsic(m) != '' {
+        Val a = cgExpr(args[0])
+        if CG_STUCK { return none }
+        if a.fty != 'float' {
+            cgUnported(`Math.${m}() of ${a.fty}`)
+            return none
+        }
+        text rounded = cgTmp()
+        cgOut(`  ${rounded} = call double @${cgMathIntrinsic(m)}(double ${a.v})`)
+        return cgVal(cgFloatToInt(rounded), 'i64', 'int')
+    }
+    cgUnported(`Math.${m}()`)
+    return none
+}
+
+// A method on a VALUE. The receiver is emitted first and, when it is a
+// text the expression itself allocated, freed once the call has read
+// it -- exactly what `.length` already does for the same reason.
+Val func cgMethodCall(e:Node, callee:Node) {
+    Val none
+    text m = rawText(callee, 'prop')
+    Node recv = childOf(callee, 'obj')
+    arr[Node] args = listOf(e, 'args')
+
+    // claude.md #150: a LITERAL receiver is parsed at compile time, so
+    // `'42'.toInt()` costs the compiled program nothing at all. The
+    // fold and the runtime function must agree exactly; they do here
+    // because `festina_text_to_int` is itself what evaluates this
+    // `.toInt()` while the port is running.
+    if m == 'toInt' && args.length == 0 && recv.kind == 'StringLit' {
+        return cgVal(`${rawText(recv, 'value').toInt()}`, 'i64', 'int')
+    }
+
+    // Everything this slice does not implement is refused BEFORE the
+    // receiver is emitted, so a refusal never leaves half an
+    // expression behind for the next statement to trip over.
+    bool known = false
+    if m == 'toFloat' && args.length == 0 { known = true }
+    if m == 'toInt' && args.length == 0 { known = true }
+    if m == 'trim' && args.length == 0 { known = true }
+    if m == 'toChar' && args.length == 0 { known = true }
+    if m == 'toText' && args.length == 0 { known = true }
+    if m == 'charCodeAt' && args.length == 1 { known = true }
+    if known == false {
+        cgUnported(`method .${m}()`)
+        return none
+    }
+
+    Val r = cgExpr(recv)
+    if CG_STUCK { return none }
+
+    if m == 'toFloat' {
+        if r.fty != 'int' {
+            cgUnported(`.toFloat() on ${r.fty}`)
+            return none
+        }
+        text out = cgTmp()
+        cgOut(`  ${out} = sitofp i64 ${r.v} to double`)
+        return cgVal(out, 'double', 'float')
+    }
+    if m == 'toInt' {
+        if r.fty != 'text' {
+            cgUnported(`.toInt() on ${r.fty}`)
+            return none
+        }
+        text out = cgTmp()
+        cgOut(`  ${out} = call i64 @festina_text_to_int(ptr ${r.v})`)
+        cgFreeTextTemp(recv, r)
+        return cgVal(out, 'i64', 'int')
+    }
+    if m == 'trim' {
+        if r.fty != 'text' {
+            cgUnported(`.trim() on ${r.fty}`)
+            return none
+        }
+        text out = cgTmp()
+        cgOut(`  ${out} = call ptr @festina_text_trim(ptr ${r.v})`)
+        cgFreeTextTemp(recv, r)
+        return cgVal(out, 'ptr', 'text')
+    }
+    if m == 'charCodeAt' {
+        if r.fty != 'text' {
+            cgUnported(`.charCodeAt() on ${r.fty}`)
+            return none
+        }
+        Val idx = cgExpr(args[0])
+        if CG_STUCK { return none }
+        text out = cgTmp()
+        cgOut(`  ${out} = call i64 @festina_text_char_code_at(ptr ${r.v}, i64 ${idx.v})`)
+        cgFreeTextTemp(recv, r)
+        return cgVal(out, 'i64', 'int')
+    }
+    if m == 'toChar' {
+        if r.fty != 'int' {
+            cgUnported(`.toChar() on ${r.fty}`)
+            return none
+        }
+        text out = cgTmp()
+        cgOut(`  ${out} = call ptr @festina_int_to_char(i64 ${r.v})`)
+        return cgVal(out, 'ptr', 'text')
+    }
+    // .toText() is the explicit spelling of exactly what a template
+    // interpolation already does, so it shares cgToText rather than
+    // having a copy that could drift from it.
+    if r.fty != 'int' && r.fty != 'float' && r.fty != 'bool' {
+        cgUnported(`.toText() on ${r.fty}`)
+        return none
+    }
+    return cgToText(r)
+}
+
 Val func cgCall(e:Node, wantValue:bool) {
     Val none
     Node callee = childOf(e, 'callee')
+    if callee != null && callee.kind == 'Member' {
+        if fieldOf(callee, 'computed').raw == 'true' {
+            cgUnported('call through a computed member')
+            return none
+        }
+        Node recv = childOf(callee, 'obj')
+        text prop = rawText(callee, 'prop')
+        if recv != null && recv.kind == 'Identifier' {
+            // The namespace path is taken per METHOD NAME, not per
+            // receiver: `Math.sqrt()` is the namespace even when a
+            // variable called `Math` is in scope, while `Math.toText()`
+            // is that variable's own method, because `toText` is in no
+            // Math table. Both halves are the original's, quirk
+            // included.
+            if rawText(recv, 'name') == 'Math' && cgIsMathMethod(prop) {
+                return cgMathCall(e, prop)
+            }
+        }
+        return cgMethodCall(e, callee)
+    }
     if callee == null || callee.kind != 'Identifier' {
         cgUnported('call through a non-identifier callee')
         return none

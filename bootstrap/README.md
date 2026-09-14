@@ -50,15 +50,15 @@ python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
 ```
 
-Over the 107-file repository corpus:
+Over the 108-file repository corpus:
 
-- **lexer: 107 match, 0 differ.**
-- **parser: 107 match, 0 differ, 0 unported.**
-- **semantic: 107 match, 0 differ, 0 unported.**
-- **escape analysis: 89 match, 0 differ, 7 unported, 11 rejected by
-  both** — 1,579 of 1,632 records.
-- **codegen: 20 match, 0 differ, 76 unported, 11 rejected by both** —
-  3,552 of 245,137 file-specific IR lines. See below for why that is the
+- **lexer: 108 match, 0 differ.**
+- **parser: 108 match, 0 differ, 0 unported.**
+- **semantic: 108 match, 0 differ, 0 unported.**
+- **escape analysis: 90 match, 0 differ, 7 unported, 11 rejected by
+  both** — 1,599 of 1,652 records.
+- **codegen: 21 match, 0 differ, 76 unported, 11 rejected by both** —
+  3,804 of 249,697 file-specific IR lines. See below for why that is the
   number reported rather than a file count, and for the caveat that
   comes with this particular figure.
 
@@ -155,7 +155,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Escape analysis: 1,579 of 1,632 records
+## Escape analysis: 1,599 of 1,652 records
 
 `escape_analysis.py` answers one purely syntactic question per function
 body — which names appear anywhere other than as the immediate base of
@@ -255,7 +255,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 3,552 of 245,137 file-specific IR lines
+## Codegen: 3,804 of 249,697 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -322,13 +322,13 @@ times and so could not have varied either way.
 
 ### And the caveat that comes with the current figure
 
-**2,418 of the 3,552 lines come from six `cases/` files written for
+**2,670 of the 3,804 lines come from seven `cases/` files written for
 the slices that claim them** — `escape_locals.f` (538), `maps.f` (521),
 `text_building.f` (418), `struct_fields.f` (348), `array_literals.f`
-(341) and `indexing.f` (252). Non-scalar parameters were the first
-slice to bring in pre-existing files instead: `examples/geometry.f` and
-`examples/multifile.f`, the two the blocker table listed as one
-construct away. Struct fields and container globals
+(341), `indexing.f` (252) and `conversions.f` (252). Non-scalar
+parameters were the one slice so far to bring in pre-existing files
+instead: `examples/geometry.f` and `examples/multifile.f`, the two the
+blocker table listed as one construct away. Struct fields and container globals
 unlocked zero pre-existing files: none is one construct away, because
 every file with a struct also has a container local, a non-scalar
 parameter or an event handler behind it. Templates and text
@@ -347,7 +347,7 @@ the implementation. But a number that grows because the input grew says
 nothing about the remaining 178,000 lines, and the two facts are worth
 keeping separate when reading the table below.
 
-**The budget is not fixed, either.** It went 175,080 → 245,137 across
+**The budget is not fixed, either.** It went 175,080 → 249,697 across
 one session with `festina/codegen.py` untouched, because
 `bootstrap/codegen.f` is itself a corpus file: every line added to the
 port enlarges the denominator. Self-hosting is a moving goal by
@@ -357,7 +357,7 @@ construction.
 
 The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
-**212,466 of the 245,137 file-specific IR lines**, and they need
+**216,774 of the 249,697 file-specific IR lines**, and they need
 none of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
@@ -379,13 +379,15 @@ template literals; `+` and `==`/`!=` on `text`; `text` parameters;
 struct **locals**, stack or heap by claude.md #74's own answer;
 `arr[T]`/`map[T]` **locals** of a scalar element type, on the same
 decision; struct/`arr[T]`/`map[T]` **parameters**, on the same
-decision again; `.length` on `text` and `arr[T]`; array indexing, read
-and written; `arr[T]` and `map[T]` **literals** in every position with a
+decision again; method calls, with the conversion family
+(`toText`/`toInt`/`toFloat`/`toChar`/`trim`/`charCodeAt`) and all four
+`Math` tables behind them; `.length` on `text` and `arr[T]`; array
+indexing, read and written; `arr[T]` and `map[T]` **literals** in every position with a
 declared type to take their element type from; map reads, writes and
 `delete`; assignment to a refcounted binding; and imports merged before
 either stage runs.
 
-Thirteen pieces are subtler than they look:
+Fifteen pieces are subtler than they look:
 
 - **Alloca hoisting** (claude.md #191) is a post-pass over the finished
   text, exactly as in the original, because it is a property of the
@@ -446,6 +448,19 @@ Thirteen pieces are subtler than they look:
   `.length` frees. An index is emitted **before** the data pointer, and
   on a write the whole slot is computed before the value; neither shows
   in `xs[0] = 1`, which is why `cases/indexing.f` indexes with a call.
+- **A string constant is an array of BYTES with a declared length**,
+  and `text.length` counts CODE POINTS. The escape rule is per byte:
+  printable ASCII other than `"` and `\` goes in literally, everything
+  else as `\XX`. The port got this wrong in a way no corpus file could
+  see — it escaped only backslash, quote and the three whitespace
+  escapes and passed every other byte through, so a literal containing
+  a control character emitted `c"abz\00"`, silently dropping them.
+- **`Math` is a namespace per METHOD NAME, not per receiver.** With a
+  variable called `Math` in scope, `Math.sqrt()` is still the namespace
+  and `Math.toText()` is the variable's own method, because `toText` is
+  in no Math table. That is the shipped compiler's behavior rather than
+  a design anyone argued for; a port that tidied it would disagree with
+  the thing it exists to agree with.
 - **A refcounted PARAMETER takes a reference where a text one takes a
   buffer.** Same rule, different currency: text is copy-on-alias, so an
   escaping text parameter calls `festina_text_own` and an escaping
@@ -475,15 +490,16 @@ sanitizer for this stage rather than needing it alongside.
 
 |blocks|only|construct|
 |---:|---:|---|
-|56|0|a call through a non-identifier callee (method calls)|
 |34|0|a declaration of a non-scalar type (`blob`, `img`, `regex`, …)|
 |24|0|a struct local with a non-scalar field|
 |22|0|an `arr[T]` local of a non-scalar element type|
 |19|0|`EventHandler`|
 |18|0|`ThreadDecl`|
 |18|0|an `arr[text]` local|
+|17|0|`.push()`|
 |16|0|a parameter of a type this port still refuses (`blob`, …)|
 |15|0|`free`|
+|12|0|`.postMessage()`|
 
 `blocks` counts every file a construct appears in; `only` counts the
 files where it is the last thing in the way, and so the number that
@@ -502,6 +518,12 @@ that was fixed, and indexing did not appear at all before.
 
 Read the first column for where the volume is and the second for what
 finishing one thing would buy.
+
+**That table is itself a result.** `a call through a non-identifier
+callee` was one bucket of 56 files and the largest entry here for four
+slices running — and useless as a plan, because "method calls" is not a
+mechanism. Implementing the dispatch split it into one entry per
+method, so the next slice can be chosen rather than guessed.
 
 **Container and struct locals needed a fifth module, and now have
 one.** The stack-versus-heap choice comes from

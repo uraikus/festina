@@ -6178,3 +6178,31 @@ The detected one is the pair of files that just started matching — both take a
 **The blocker table now has no sole-blocked file left that this port could reasonably take next.** The three remaining are two `table` declarations and one `try`/`catch` — all of them features rather than expression-level work. What is left is volume: method calls (56 files), non-scalar declarations (34), structs with a non-scalar field (24).
 
 **Verified.** Codegen 20 match, 0 differ, 76 unported. Lexer 107/107, parser 107/107, semantic 107/107, escape analysis 89 match with 1,579 of 1,632 records. 2,740 passed, 343 skipped; the 24 graphics and 12 leak-stress failures are this container's limits, reproduced identically on the pristine tree. `cases/escape_locals.f` is valgrind-clean with the new parameter shapes in it.
+
+
+306. METHOD CALLS, AND A STRING ENCODER THAT DROPPED BYTES
+
+The method-call dispatch, plus the conversion family and `Math.*` behind it. **3,804 of 249,697 file-specific IR lines, up from 3,552; 21 files match, up from 20.**
+
+**The blocker table is the real result.** `call through a non-identifier callee` was one bucket of 56 files — the largest entry in the table for four slices running, and useless as a plan, because "method calls" is not a mechanism. It is now gone, replaced by one entry per method: `.push()` (17 files), `.postMessage()` (12), and a long tail. The next slice can be chosen instead of guessed.
+
+**A call whose callee is a `Member` wears one shape over two unrelated things** — a method on a value, whose receiver is emitted and handed to a runtime function, and a `Math.*` call, whose "receiver" is a namespace never emitted at all.
+
+**And the namespace is chosen per METHOD NAME, not per receiver.** The original's test is `callee.obj.name == "Math" and callee.prop in MATH_FLOAT_FNS` (and so on per table), with no check that `Math` is unbound. So with `float Math = 1.5` in scope, `Math.sqrt(9.0)` is still the namespace and answers 3, while `Math.toText()` is that variable's own method and answers `1.5` — because `toText` is in no Math table. The first port of this took the namespace path for every `Math.*`, which would have reported `Math.toText()` unported rather than emitting the float's conversion. Reproduced exactly rather than tidied; a port that improved on it would disagree with the thing it exists to agree with.
+
+**`'42'.toInt()` is folded at COMPILE time, and the fold has to be C's `strtoll`** — leading whitespace, an optional sign, digits, trailing garbage ignored, no digits at all giving null, and overflow CLAMPED to i64's ends rather than wrapped. The port needs no replica of that rule: the literal is folded by calling Festina's own `.toInt()`, which IS `festina_text_to_int`, so the compile-time answer and the runtime answer come from the same C function by construction. `cases/conversions.f` pairs all eight shapes against their dynamic twins anyway, because "by construction" is an argument and the pairs are evidence.
+
+**Four canaries, zero detected.** Again zero, for the same reason as maps: not one corpus file that currently matches calls a method at all.
+
+    the `'42'.toInt()` constant fold removed        not detected
+    an owning text receiver never freed            not detected
+    the float-to-int guard replaced by `fptosi`    not detected
+    the `Math` namespace yielding to a binding     not detected
+
+One of the four, with the case file in place, fires through the coverage RATCHET rather than as a diff: shadowing `Math` makes the port report the file UNPORTED, and "unported" is how this harness spells "not implemented yet" rather than "wrong". The line count still falls, which is what catches it. Worth naming, because a canary that only moves the ratchet is weaker evidence than one that produces a diff.
+
+**A latent bug the case file found, which no canary was looking for.** `cases/conversions.f` wanted `'café'.charCodeAt(3)` — the whole point of code-point indexing is a multi-byte character — and the port refused non-ASCII literals outright. Fixing that exposed the real problem underneath: the encoder escaped only backslash, quote and the three whitespace escapes and passed every other byte through untouched, so a literal containing a control character emitted `c"abz\00"` — **silently DROPPING the bytes** rather than failing. The rule is per byte (printable ASCII except `"` and `\` goes in literally, everything else as `\XX`), and the declared length is a BYTE count while `text.length` counts CODE POINTS, so the two had to be separated as well. Festina has no byte access to a `text` and no bitwise operators, so the UTF-8 re-encoding is spelled as divisions and remainders by powers of two.
+
+That one is a test rather than a corpus file: the interesting inputs are control bytes, which have no escape spelling in Festina and would be awkward to keep in a checked-in source. The negative control is recorded — restoring the old rule fails four of its five cases.
+
+**Verified.** Codegen 21 match, 0 differ, 76 unported. Lexer 108/108, parser 108/108, semantic 108/108, escape analysis 90 match with 1,599 of 1,652 records. 2,752 passed, 343 skipped; the 24 graphics and 12 leak-stress failures are this container's limits, reproduced identically on the pristine tree. `cases/conversions.f` is valgrind-clean.

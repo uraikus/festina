@@ -353,7 +353,59 @@ class TestTheCoverageNumberIsHonest:
         assert "@festina_release_map(" in body, (
             "no refcounted map local, so the heap half is unmeasured")
 
-    @pytest.mark.parametrize("case", ["indexing.f", "array_literals.f", "maps.f"])
+    def test_the_conversion_case_really_has_all_four_mechanisms(self):
+        """`cases/conversions.f` is the only evidence for the method-call
+        slice, and that is measured rather than feared.
+
+        With the port broken on purpose four ways -- the `'42'.toInt()`
+        constant fold removed, an owning text receiver never freed, the
+        float-to-int guard replaced by a bare `fptosi`, and the `Math`
+        namespace made conditional on `Math` being unbound -- the whole
+        corpus reported no difference at all. Not one file that
+        currently matches calls a method.
+
+        One of those four fires through the coverage RATCHET rather than
+        as a diff: with `Math` shadowed, the port reports the file
+        unported instead of emitting different IR, and "unported" is how
+        this harness spells "not implemented yet". The line count still
+        falls, which is what catches it.
+        """
+        dump = irdump.dump_file("bootstrap/cases/conversions.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/conversions.f no longer compiles, so it measures "
+            "nothing at all: " + dump[0])
+        body = "\n".join(dump)
+        # 1: the fold. A folded receiver leaves NO call behind, so the
+        # evidence is that some toInt calls exist and some do not --
+        # asserted as a count, since either alone proves nothing.
+        runtime_parses = body.count("@festina_text_to_int(")
+        assert runtime_parses >= 5, (
+            "too few dynamic .toInt() receivers; the file must pair "
+            "each folded literal with a binding, or the fold and the "
+            "runtime are never compared against each other")
+        assert "i64 9223372036854775807" in body, (
+            "no folded overflow, so the half of strtoll's rule that "
+            "CLAMPS rather than wraps is unmeasured")
+        # 2: an owning receiver freed after the call reads it.
+        assert "@festina_text_trim(" in body and "@free(ptr" in body, (
+            "no text-consuming method on an owning receiver, so the "
+            "receiver free is unmeasured")
+        # 3: the float-to-int guard, in full.
+        for frag, why in (("fcmp uno double", "the NaN test"),
+                          ("@llvm.fptosi.sat.i64.f64(", "the saturating conversion"),
+                          ("select i1", "the null answer")):
+            assert frag in body, (
+                f"{why} is missing, so claude.md #102's guard against "
+                f"fptosi's undefined behaviour is unmeasured")
+        # 4: both halves of the Math-name rule, which needs a binding
+        # called Math to be visible at all.
+        assert "@llvm.sqrt.f64(" in body, "no Math namespace call"
+        assert "@festina_str_from_float(" in body, (
+            "no .toText() on the binding called Math, so only half of "
+            "the per-method-name rule is measured")
+
+    @pytest.mark.parametrize("case", ["indexing.f", "array_literals.f", "maps.f",
+                                      "conversions.f"])
     def test_the_container_cases_really_run(self, compile_and_run, case):
         """The two container case files are PROGRAMS, not only sources
         of IR, and this runs them to prove it.
@@ -417,6 +469,44 @@ class TestBootstrapCodegenMatchesPython:
             f"  python:  {detail[1]}\n"
             f"  festina: {detail[2]}")
 
+    @pytest.mark.parametrize("literal,why", [
+        ("caf\u00e9", "a two-byte code point"),
+        ("\u2713 ok", "a three-byte code point"),
+        ("\U0001F389", "a four-byte code point"),
+        ("a\x01b\x0bc\x7fz", "control bytes with no escape spelling"),
+        ("tab\there\nand\\a quote \" too", "the escapes that do have one"),
+    ])
+    def test_a_string_constant_is_encoded_byte_for_byte(
+            self, codegen_binary, tmp_path, literal, why):
+        """A string constant is an array of BYTES with a declared
+        length, and `text.length` counts CODE POINTS -- so anything but
+        plain ASCII needs the two kept apart.
+
+        This is a test rather than a corpus file because the interesting
+        inputs are control bytes, which have no escape spelling in
+        Festina and would be genuinely awkward to keep in a checked-in
+        source file. It is here because the port got this wrong and no
+        corpus file could see it: the old encoder escaped only
+        backslash, quote and the three whitespace escapes, and passed
+        every other byte through untouched -- so `a\x01b` emitted
+        `c"abz\00"`, silently DROPPING the control characters rather
+        than failing. Found by needing a multi-byte literal for
+        `cases/conversions.f`, not by reading the code.
+        """
+        # Spelled as a Festina single-quoted literal, not via repr():
+        # Python's own escaping would emit \xNN and \uNNNN forms the
+        # Festina lexer has no spelling for, so the two sides would
+        # disagree about the SOURCE rather than about its encoding.
+        body = (literal.replace("\\", "\\\\").replace("'", "\\'")
+                       .replace("\n", "\\n").replace("\t", "\\t"))
+        source = tmp_path / "lit.f"
+        source.write_text(f"log('{body}')\n", encoding="utf-8")
+        status, detail = irdiff.compare(codegen_binary, str(source))
+        assert status == "match", (
+            f"{why} is encoded differently by the two implementations:\n"
+            f"  python:  {detail[1] if detail else ''}\n"
+            f"  festina: {detail[2] if detail else ''}")
+
     def test_coverage_does_not_go_backwards(self, codegen_binary):
         """A ratchet, not a target.
 
@@ -426,6 +516,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 3552, (
+        assert reproduced >= 3804, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 3552")
+            f"the port previously emitted at least 3804")

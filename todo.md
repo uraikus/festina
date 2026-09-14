@@ -130,6 +130,15 @@ open:
   (`at`, `esc`, `known`) and exactly what a code generator's locals
   want to be called, so this will keep coming up.
 
+- **`Math` is a namespace per method name, not per receiver.** With a
+  variable called `Math` in scope, `Math.sqrt(9.0)` is still
+  `llvm.sqrt.f64` and answers 3, while `Math.toText()` is that
+  variable's own method. Nothing warns; the binding is simply ignored
+  for any name in a Math table. Both implementations agree on it
+  (decisions.md #306 reproduces it deliberately rather than tidying
+  it), so this is a diagnostics question rather than a correctness one
+  -- a shadowing declaration should say something.
+
 - **One half of claude.md #81 is unmeasured until non-scalar returns
   land.** A refcounted container local with an initializer retains its
   value unless the source already owns a fresh reference, and the only

@@ -97,9 +97,9 @@ round-by-round design and implementation record predating 0.1 lives in
 
 - **`bootstrap/escape.f`** — `festina/escape_analysis.py` ported to
   Festina, the fifth module the codegen port turned out to need and one
-  that was not in its original estimate: **89 of 107 corpus files
+  that was not in its original estimate: **90 of 108 corpus files
   produce an identical record sequence, 0 differ, 7 not yet ported, 11
-  rejected by both** — 1,579 of 1,632 records. It decides whether every
+  rejected by both** — 1,599 of 1,652 records. It decides whether every
   container and struct local lives in the frame or behind a heap
   refcount header, so the codegen port cannot emit one without agreeing
   here first. The ORDER bodies are analyzed in is part of the answer
@@ -111,9 +111,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage, **in progress**: **20 of 107 corpus files
+  the fourth and last stage, **in progress**: **21 of 108 corpus files
   emit byte-identical LLVM IR, 0 differ, 76 not yet ported, 11 rejected
-  by both** — 3,552 of 245,137 file-specific IR lines. In are
+  by both** — 3,804 of 249,697 file-specific IR lines. In are
   expressions (arithmetic and comparison with int/float mixing,
   `&&`/`||`, unary, the ternary, `/` and `%` with claude.md #57's
   divide-by-zero control flow, template literals, and `+` and `==`/`!=`
@@ -133,13 +133,17 @@ round-by-round design and implementation record predating 0.1 lives in
   `delete`, and struct/`arr[T]`/`map[T]` parameters -- each of which
   takes its own reference on the way in only when the body lets it
   escape, the refcounted counterpart of a text parameter's own copy.
-  Not in: structs with a non-scalar field, containers of a non-scalar
-  element type, `blob`/`img`/`regex` and the other non-scalar
-  declarations, non-scalar returns, method calls, and the
+  Method calls too, with the conversion family
+  (`toText`/`toInt`/`toFloat`/`toChar`/`trim`/`charCodeAt` --
+  `'42'.toInt()` folded at compile time, as the original folds it) and
+  all four `Math` tables. Not in: structs with a non-scalar field,
+  containers of a non-scalar element type, `blob`/`img`/`regex` and the
+  other non-scalar declarations, non-scalar returns, the remaining
+  methods (`.push()` first, at 17 files), and the
   graphics/audio/HTTP/thread/sqlite/table subsystems.
   `bootstrap/irdump.py` and `bootstrap/irdiff.py` run the comparison;
   the oracle is the IR text itself, so it needed no canonical form of
-  its own (decisions.md #289–#305).
+  its own (decisions.md #289–#306).
 
 - **Every bootstrap differential harness now runs in CI** — on Linux
   only. They compare two implementations of the lexer, parser, analyzer
