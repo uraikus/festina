@@ -6352,8 +6352,8 @@ That also means the mechanism is **unmeasurable by construction**, and the canar
 
 That ordering is also what keeps the suite affordable. Re-dumping the whole matching corpus for every canary was about a minute when the corpus was small programs; with `codegen.f` in it, it was over an hour. Cheapest-first with an early exit puts the usual case back in the hundreds of milliseconds, and a canary with only one witness anywhere still pays a full scan — which is the right way round, since those are exactly the ones worth knowing about.
 
-**Nine new canaries, all caught**, and every one of them witnessed by `cases/owning_containers.f` rather than by `codegen.f` alone. 55 in total.
+**Nine new canaries, all caught**, and every one of them witnessed by `cases/owning_containers.f` rather than by `codegen.f` alone. **55 in total: 52 caught as a diff, 3 through the coverage ratchet, 0 missed.** Eleven have a single witness, and in every one of those eleven it is the `cases/` file written for the mechanism — the intended arrangement, and now measured rather than assumed.
 
 **And one existing canary went stale, exactly as designed.** `cgOwnsRefcounted` moved the line #311's `field-read-mints-before-release` was aimed at, and the registry's own well-formedness test reported it as STALE rather than letting it go on passing while guarding nothing. Re-aimed at the same mechanism, it fires on two files.
 
-**Verified.** Lexer 112/112, parser 112/112, semantic 112/112, escape analysis 94 match with 1,715 of 1,768 records, codegen 31 match and 0 differ. `cases/owning_containers.f` is valgrind-clean.
+**Verified.** Lexer 112/112, parser 112/112, semantic 112/112, escape analysis 94 match with 1,715 of 1,768 records, codegen 31 match and 0 differ. All 55 canaries caught. `cases/owning_containers.f` is valgrind-clean. Full suite: 2,794 passed, 36 failed — the environment's own baseline (24 graphics tests with no window manager, 12 leak-stress tests whose ASan link cannot resolve `festina_register_tls_hooks`), identical to what the pristine tree produces.

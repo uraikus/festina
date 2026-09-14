@@ -63,7 +63,8 @@ Over the 112-file repository corpus:
   both** — 1,715 of 1,768 records.
 - **codegen: 31 match, 0 differ, 70 unported, 11 rejected by both** —
   125,765 of 276,562 file-specific IR lines.
-- **canaries: 55 registered, 0 missed.**
+- **canaries: 55 registered — 52 caught as a diff, 3 through the
+  coverage ratchet, 0 missed.**
 
 **`bootstrap/codegen.f` compiles itself: 58,506 of 58,506 file-specific
 IR lines, byte for byte.** The code generator is the largest file in
@@ -90,10 +91,11 @@ the two implementations agree; it says nothing about whether the corpus
 could tell them apart if they stopped agreeing — and for four
 consecutive slices of the codegen port, the honest answer was that it
 could not. `bootstrap/canary.py` holds fifty-five deliberate breakages,
-one per mechanism, and asks the corpus whether it notices: **0 not
-caught.** A failure there is not a compiler bug — it means a `cases/`
-file has drifted and the mechanism behind it is unmeasured, so the fix
-is a corpus file rather than a code change. See "Canaries" below.
+one per mechanism, and asks the corpus whether it notices: **52 caught
+as a diff, 3 through the coverage ratchet, 0 not caught.** A failure
+there is not a compiler bug — it means a `cases/` file has drifted and
+the mechanism behind it is unmeasured, so the fix is a corpus file
+rather than a code change. See "Canaries" below.
 
 **"Caught" is not automatically enough, either.** Seven of this slice's
 canaries fired, and every one of them fired on `bootstrap/codegen.f`
@@ -434,7 +436,7 @@ Four verdicts, and the distinction between the middle two is the point:
   signal: a real disagreement in a real program.
 - **ratchet** — nothing differs, but the coverage NUMBER fell, because
   a file the port used to emit went "unported" instead. Real detection,
-  weaker claim; exactly one canary lands here and it is reported
+  weaker claim; three canaries land here and each is reported
   separately rather than counted as a pass.
 - **broken** — the patched source did not compile, or compiled and
   died. Proves nothing: a canary has to produce a *wrong* compiler, not
@@ -455,7 +457,10 @@ saying whether it is the `cases/` file written for the mechanism (the
 intended arrangement) or something that merely happens to exercise it.
 That distinction came from a pass, not a failure: decisions.md #312's
 seven canaries all fired, and all seven fired on `bootstrap/codegen.f`
-alone.
+alone. With the check in place, **eleven of the fifty-five have a
+single witness, and in every one of those eleven it is the `cases/`
+file written for the mechanism** — which is the intended arrangement,
+and now a measured fact rather than an assumption.
 
 Scanning cheapest-first with an early exit is also what keeps the suite
 affordable. Re-dumping the whole matching corpus per canary was about a
