@@ -786,6 +786,12 @@ struct Val {
     // the element type is not recoverable from the value itself and has
     // to travel with it.
     ety:text
+    // Whether a COERCION just minted this value, so it already owns a
+    // reference nothing else holds. Normally the source expression
+    // answers that -- see cgIsOwningRefcountedSource -- and the two
+    // disagree only where a coercion turns a borrowed value into a
+    // fresh one.
+    fresh:bool
 }
 
 Val func cgVal(v:text, lty:text, fty:text) {
@@ -830,6 +836,7 @@ Val func cgStructVal(v:text, sname:text) {
 text func cgLtyOf(fty:text) {
     if fty == 'int' { return 'i64' }
     if fty == 'float' { return 'double' }
+    if fty == 'blob' { return 'ptr' }
     if fty == 'bool' { return 'i8' }
     if fty == 'text' { return 'ptr' }
     // arr[T], map[T] and struct values are all a pointer to their own
@@ -889,6 +896,14 @@ text func cgManagedFty(t:Ty) {
     if t.kind == 'arr' { return 'arr' }
     if t.kind == 'map' { return 'map' }
     if t.kind == 'struct' { return 'struct' }
+    // claude.md #109: a blob carries the ordinary refcount header, so
+    // the only thing the generic release cannot do for it is free the
+    // path and byte buffer hanging off the payload -- exactly the shape
+    // of a per-type cascade, except the runtime writes this one once
+    // instead of codegen generating it per type.
+    if t.kind == 'prim' {
+        if t.name == 'blob' { return 'blob' }
+    }
     return ''
 }
 
@@ -911,6 +926,10 @@ map[text] FN_RET = {}
 // registration site for why a call needs them.
 map[text] FN_PARAMS = {}
 
+// The second half of a refcounted return's release key: a struct's
+// name, or a container's element type.
+map[text] FN_RETKEY = {}
+
 // Struct field layout, keyed '<Struct>.<field>'. codegen.py reads this
 // off `analyzed.structs`; here it is collected while the type
 // definitions are emitted, which is the same information in the same
@@ -930,6 +949,14 @@ map[text] SF_ETY = {}
 // own mechanisms; until they are ported, refusing is the honest
 // answer.
 map[int] SF_PLAIN = {}
+
+// Each struct's field names in declaration order, joined by `|`.
+map[text] SF_NAMES = {}
+
+// Lazily-generated per-struct release cascades, cached by struct name
+// -- registered BEFORE the field walk so a struct that reaches itself
+// gets its own name back instead of generating a second wrapper.
+map[text] CG_STRUCT_REL = {}
 
 bool func cgIsLocal(name:text) {
     return L_SLOT[name] != null
@@ -1033,6 +1060,14 @@ arr[int] CG_FRAME = []
 // is why it was read off the original's output before anything was
 // written.
 arr[text] CG_PARAM_LIVE = []
+
+// The innermost loop's `continue` label, `break` label, and the frame
+// depth to unwind to, joined -- festina/codegen.py's own
+// `_loop_targets`. The depth is recorded BEFORE the body's frame is
+// pushed, and a break frees down to exactly that: an outer local
+// merely USED inside the loop, rather than declared inside it, is not
+// this loop's to free.
+arr[text] CG_LOOPS = []
 
 // The escaping-name set for the body currently being emitted --
 // festina/codegen.py's `_current_escaping_names`. Saved and restored
@@ -1585,7 +1620,7 @@ Val func cgLoadFieldValue(fp:Val) {
 // in.
 Val func cgArrayLit(e:Node, ety:text, header:text) {
     Val none
-    if ety == '' || cgLtyOf(ety) == '' {
+    if ety == '' || cgElemLty(ety) == '' {
         cgUnported('array literal of a non-scalar type')
         return none
     }
@@ -1593,7 +1628,7 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
         cgUnported(`array literal of ${ety}`)
         return none
     }
-    text elemLty = cgLtyOf(ety)
+    text elemLty = cgElemLty(ety)
     arr[Node] elems = listOf(e, 'elements')
 
     arr[text] vals = []
@@ -1602,12 +1637,14 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
     while i < elems.length {
         Val v = cgExprExpecting(elems[i], ety, '')
         if CG_STUCK { return none }
-        if v.fty != ety {
+        if cgValIsElem(v, ety) == false {
             cgUnported(`array literal element of type ${v.fty} in an array of ${ety}`)
             return none
         }
         vals.push(v.v)
-        if cgIsOwningTextSource(elems[i]) { owned.push(1) } else { owned.push(0) }
+        bool isOwning = cgIsOwningTextSource(elems[i])
+        if SF_NAMES[ety] != null { isOwning = cgIsOwningRefcountedSource(elems[i]) }
+        if isOwning { owned.push(1) } else { owned.push(0) }
         i++
     }
 
@@ -1636,11 +1673,14 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
         cgOut(`  ${slot} = getelementptr ${elemLty}, ptr ${data}, i64 ${k}`)
         text v = vals[k]
         // claude.md #83: a text element is COPIED into its slot unless
-        // the expression already owns a buffer nothing else holds. No
-        // release-old here, unlike `xs[i] = v` on a built array: this
-        // buffer is fresh malloc'd memory, so every slot is written
-        // exactly once and there is no stale value to reclaim.
-        if ety == 'text' && owned[k] == 0 {
+        // the expression already owns a buffer nothing else holds, and
+        // a refcounted one takes its own reference on the same terms.
+        // No release-old here, unlike `xs[i] = v` on a built array:
+        // this buffer is fresh malloc'd memory, so every slot is
+        // written exactly once and there is no stale value to reclaim.
+        if SF_NAMES[ety] != null {
+            if owned[k] == 0 { cgOut(`  call void @festina_retain(ptr ${v})`) }
+        } else if ety == 'text' && owned[k] == 0 {
             text o = cgTmp()
             cgOut(`  ${o} = call ptr @festina_text_own(ptr ${v})`)
             v = o
@@ -1690,7 +1730,25 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
         }
         return cgMapLit(e, ety, '')
     }
-    return cgExpr(e)
+    Val v = cgExpr(e)
+    if CG_STUCK { return v }
+    // claude.md #109: a text in a blob position OPENS it. The handle
+    // is fresh -- the count starts at 1 -- so nothing retains it, and
+    // the path text is freed here if the expression allocated it.
+    if fty == 'blob' && v.fty == 'text' {
+        text out = cgTmp()
+        cgOut(`  ${out} = call ptr @festina_blob_open(ptr ${v.v})`)
+        cgFreeTextTemp(e, v)
+        Val opened = cgVal(out, 'ptr', 'blob')
+        // The handle is a fresh +1 however the SOURCE expression
+        // reads: `blob b = 'path'` has a string literal for a node,
+        // which owns nothing, and a value that owns everything. That
+        // is the one place the node and the value disagree, so the
+        // answer travels with the value.
+        opened.fresh = true
+        return opened
+    }
+    return v
 }
 
 // ---------------------------------------------------------------------
@@ -1922,6 +1980,14 @@ Val func cgLengthOf(e:Node, obj:Val) {
         cgFreeTextTemp(childOf(e, 'obj'), obj)
         return cgVal(out, 'i64', 'int')
     }
+    // A blob's length is a runtime call, not a header field: unlike an
+    // array, a blob handle does not carry one.
+    if obj.fty == 'blob' {
+        text out = cgTmp()
+        cgOut(`  ${out} = call i64 @festina_blob_length(ptr ${obj.v})`)
+        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+        return cgVal(out, 'i64', 'int')
+    }
     if obj.fty == 'arr' {
         text lenP = cgTmp()
         cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 0`)
@@ -1967,7 +2033,7 @@ Val func cgIndexRead(e:Node, obj:Val) {
         cgUnported(`array index of type ${idx.fty}`)
         return none
     }
-    text elemLty = cgLtyOf(obj.ety)
+    text elemLty = cgElemLty(obj.ety)
     text dataP = cgTmp()
     cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 1`)
     text dataV = cgTmp()
@@ -1976,6 +2042,7 @@ Val func cgIndexRead(e:Node, obj:Val) {
     cgOut(`  ${slot} = getelementptr ${elemLty}, ptr ${dataV}, i64 ${idx.v}`)
     text out = cgTmp()
     cgOut(`  ${out} = load ${elemLty}, ptr ${slot}`)
+    if SF_NAMES[obj.ety] != null { return cgStructVal(out, obj.ety) }
     return cgVal(out, elemLty, obj.ety)
 }
 
@@ -2445,18 +2512,26 @@ Val func cgMethodCall(e:Node, callee:Node) {
             cgUnported(`.${m}() on an array of ${obj.ety}`)
             return none
         }
-        text elemLty = cgLtyOf(obj.ety)
+        text elemLty = cgElemLty(obj.ety)
         text elemSize = '8'
         if obj.ety == 'bool' { elemSize = '1' }
         if m == 'push' || m == 'unshift' {
             Val v = cgExprExpecting(args[0], obj.ety, '')
             if CG_STUCK { return none }
-            if v.fty != obj.ety {
+            if cgValIsElem(v, obj.ety) == false {
                 cgUnported(`.${m}() of ${v.fty} onto an array of ${obj.ety}`)
                 return none
             }
             text stored = v.v
-            if obj.ety == 'text' && cgIsOwningTextSource(args[0]) == false {
+            // The same rule `xs[i] = v` follows: a text element is
+            // COPIED unless its source already owns a buffer, and a
+            // refcounted one takes its own reference unless the source
+            // already holds a fresh +1 nothing else references.
+            if SF_NAMES[obj.ety] != null {
+                if cgIsOwningRefcountedSource(args[0]) == false {
+                    cgOut(`  call void @festina_retain(ptr ${stored})`)
+                }
+            } else if obj.ety == 'text' && cgIsOwningTextSource(args[0]) == false {
                 text o = cgTmp()
                 cgOut(`  ${o} = call ptr @festina_text_own(ptr ${stored})`)
                 stored = o
@@ -2490,6 +2565,58 @@ Val func cgMethodCall(e:Node, callee:Node) {
         cgOut(`  ${out} = load ${elemLty}, ptr ${slot}`)
         if obj.ety == 'text' { return cgVal(out, 'ptr', 'text') }
         return cgVal(out, elemLty, obj.ety)
+    }
+
+    // claude.md #109/#272: a blob's byte-level readers. The receiver
+    // is a handle that already holds the path, so these are single
+    // runtime calls with no path to thread through.
+    //
+    // **`.slice()` emits its receiver TWICE**, and that is the
+    // original's output rather than a slip here. `slice` is first
+    // claimed by the `ascii` branch, which emits the receiver, finds it
+    // is not an ascii, releases it if it owned one, and falls THROUGH
+    // -- so the blob branch below emits it again from scratch. The
+    // first value is simply unused. Reproducing it matters more than
+    // tidying it: this port's job is to agree.
+    if m == 'byteAt' || m == 'slice' {
+        if m == 'slice' {
+            Val first = cgExpr(recv)
+            if CG_STUCK { return none }
+            if first.fty == 'ascii' {
+                cgUnported('.slice() on ascii')
+                return none
+            }
+            cgReleaseOwnedReceiver(recv, first)
+            cgFreeTextTemp(recv, first)
+        }
+        Val r = cgExpr(recv)
+        if CG_STUCK { return none }
+        if r.fty != 'blob' {
+            cgUnported(`.${m}() on ${r.fty}`)
+            return none
+        }
+        arr[text] avs = []
+        int ai = 0
+        while ai < args.length {
+            Val a = cgExpr(args[ai])
+            if CG_STUCK { return none }
+            avs.push(a.v)
+            ai++
+        }
+        text out = cgTmp()
+        text rty = 'text'
+        if m == 'byteAt' {
+            cgOut(`  ${out} = call i64 @festina_blob_byte_at(ptr ${r.v}, i64 ${avs[0]})`)
+            rty = 'int'
+        } else {
+            cgOut(`  ${out} = call ptr @festina_blob_slice(ptr ${r.v}, i64 ${avs[0]}, i64 ${avs[1]})`)
+        }
+        // byteAt answers a scalar and slice an owned copy -- neither
+        // points into the handle, so the receiver is released exactly
+        // as toText()'s is.
+        cgReleaseOwnedReceiver(recv, r)
+        if rty == 'int' { return cgVal(out, 'i64', 'int') }
+        return cgVal(out, 'ptr', 'text')
     }
 
     // text.split(sep) -> arr[text], and its inverse arr.join(sep).
@@ -2679,8 +2806,12 @@ Val func cgCall(e:Node, wantValue:bool) {
         return cgVal('', 'void', 'void')
     }
     text lty = cgLtyOf(retF)
+    if lty == '' { lty = 'ptr' }
     text t = cgTmp()
     cgOut(`  ${t} = call ${lty} @${name}(${joined})`)
+    if retF == 'struct' { return cgStructVal(t, FN_RETKEY[name]) }
+    if retF == 'arr' { return cgArrVal(t, FN_RETKEY[name]) }
+    if retF == 'map' { return cgMapVal(t, FN_RETKEY[name]) }
     return cgVal(t, lty, retF)
 }
 
@@ -2758,25 +2889,36 @@ void func cgStmt(s:Node) {
                     cgUnported(`initializer of type ${gv.fty} for ${managed}`)
                     return
                 }
-                cgStoreRefcounted(G_SLOT[gname], managed, cgEtyOf(gname),
-                                  gv.v, cgIsOwningRefcountedSource(ginit))
+                bool gOwning = cgIsOwningRefcountedSource(ginit)
+                if gv.fresh { gOwning = true }
+                cgStoreRefcounted(G_SLOT[gname], managed, cgRelKeyOf(gname),
+                                  gv.v, gOwning)
                 return
             }
-            if managed == 'struct' {
-                if SF_PLAIN[dt.name] == null {
-                    cgUnported('struct local with a non-scalar field')
-                    return
-                }
+
+            // A blob DECLARATION needs a way to make one -- reading a
+            // file, or coercing a text path -- which is its own piece
+            // of work. Parameters and the three readers are what this
+            // slice ports, so a declaration is refused outright rather
+            // than half-emitted.
+            if managed == 'blob' {
+                cgUnported('blob declaration')
+                return
             }
             text declEty = ''
-            if managed != 'struct' {
+            if managed == 'struct' { declEty = dt.name }
+            if managed == 'arr' || managed == 'map' {
                 // An `arr[T]`/`map[T]` whose T is itself refcounted
                 // releases every element through a generated per-element
                 // cascade wrapper rather than the plain release. That is
                 // its own mechanism; a scalar element type needs none of
                 // it.
                 Ty et = dt.elem
-                if et == null || et.kind != 'prim' {
+                if et == null { 
+                    cgUnported(`${managed} local of a non-scalar type`)
+                    return
+                }
+                if et.kind != 'prim' && et.kind != 'struct' {
                     cgUnported(`${managed} local of a non-scalar type`)
                     return
                 }
@@ -2846,7 +2988,9 @@ void func cgStmt(s:Node) {
                     cgUnported(`initializer of type ${lv.fty} for ${managed}`)
                     return
                 }
-                if cgIsOwningRefcountedSource(linit) == false {
+                bool lOwning = cgIsOwningRefcountedSource(linit)
+                if lv.fresh { lOwning = true }
+                if lOwning == false {
                     cgOut(`  call void @festina_retain(ptr ${lv.v})`)
                 }
                 cgOut(`  ${slot} = alloca ptr`)
@@ -2857,9 +3001,17 @@ void func cgStmt(s:Node) {
                 cgOut(`  store ${payload} zeroinitializer, ptr ${backing}`)
                 cgOut(`  ${slot} = alloca ptr`)
                 cgOut(`  store ptr ${backing}, ptr ${slot}`)
-                // A struct's frame storage owns nothing else, so it is
-                // not tracked at all. A container's owns its heap data
-                // buffer, which still has to be freed.
+                // A struct's frame storage owns nothing of its OWN --
+                // but its fields can: a text field's buffer is heap
+                // whatever the header's storage is, so it still has to
+                // be reclaimed even though nothing is ever released
+                // here. A container's frame storage owns its heap data
+                // buffer for the same reason.
+                if managed == 'struct' {
+                    if cgStructOwnsAnything(declEty) {
+                        cgTrackLive('struct.stack', slot, declEty)
+                    }
+                }
                 if managed == 'arr' { cgTrackLive('arr.stack', slot, declEty) }
                 if managed == 'map' { cgTrackLive('map.stack', slot, declEty) }
             } else {
@@ -2874,6 +3026,7 @@ void func cgStmt(s:Node) {
             if managed == 'arr' || managed == 'map' {
                 if dt.elem != null {
                     if dt.elem.kind == 'prim' { L_ETY[gname] = dt.elem.name }
+                    if dt.elem.kind == 'struct' { L_ETY[gname] = dt.elem.name }
                 }
             }
             return
@@ -2953,6 +3106,25 @@ void func cgStmt(s:Node) {
     if s.kind == 'IfStmt' { cgIf(s)  return }
     if s.kind == 'Return' { cgReturn(s)  return }
     if s.kind == 'DeleteStmt' { cgDelete(s)  return }
+    if s.kind == 'BreakStmt' || s.kind == 'ContinueStmt' {
+        if CG_LOOPS.length == 0 {
+            // semantic.py rejects this outside a loop, so reaching it
+            // would be a compiler bug rather than bad source.
+            cgUnported(`${s.kind} outside a loop`)
+            return
+        }
+        arr[text] target = CG_LOOPS[CG_LOOPS.length - 1].split('|')
+        // claude.md #74: everything declared since this loop's body
+        // began is freed BEFORE leaving, exactly as reaching the body's
+        // natural end would. Continuing still exits this iteration's
+        // own scopes, even though the loop itself carries on.
+        cgFreeFrom(target[2].toInt())
+        text to = target[0]
+        if s.kind == 'BreakStmt' { to = target[1] }
+        cgOut(`  br label %${to}`)
+        CG_TERM = true
+        return
+    }
 
     cgUnported(`statement ${s.kind}`)
 }
@@ -3018,7 +3190,7 @@ void func cgFreeOne(entry:text) {
     // A heap-backed binding hands back its counted reference. Each
     // container type has its own release, because each knows a
     // different thing about what it owns.
-    if kind == 'struct' || kind == 'arr' || kind == 'map' {
+    if cgIsRefcounted(kind) {
         cgOut(`  call void ${cgReleaseFnFor(kind, parts[2])}(ptr ${t})`)
         return
     }
@@ -3031,6 +3203,13 @@ void func cgFreeOne(entry:text) {
     // original's output, not an oversight of this port's -- the same
     // sequence releases each element first when the element type is
     // refcounted, and the load is hoisted above that branch.
+    // claude.md #78: the storage is in the frame and is never freed,
+    // and there is no refcount to drop -- but every field reference it
+    // holds still has an owner going away.
+    if kind == 'struct.stack' {
+        cgReleaseStructFields(t, parts[2])
+        return
+    }
     if kind == 'arr.stack' {
         text lenP = cgTmp()
         cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${t}, i32 0, i32 0`)
@@ -3046,7 +3225,7 @@ void func cgFreeOne(entry:text) {
         // owns nothing, so for one the load really is unused
         // (decisions.md #301) and only the buffer is freed.
         if cgElemOwnsSomething(parts[2]) {
-            cgReleaseArrayElements(dataV, lenV, cgElemReleaseFn(parts[2]), 'ptr')
+            cgReleaseArrayElements(dataV, lenV, cgElemReleaseFn(parts[2]), cgElemLty(parts[2]))
         }
         cgOut(`  call void @free(ptr ${dataV})`)
         return
@@ -3065,11 +3244,42 @@ void func cgFreeOne(entry:text) {
     }
 }
 
+// Frees every live value from the frame at `downTo` up to the
+// innermost, INNERMOST FRAME FIRST -- and within each frame in
+// declaration order.
+//
+// Both halves are measured rather than reasoned about, and they point
+// opposite ways, which is exactly why guessing gets it wrong. Inside
+// one frame the frees run in declaration order; ACROSS frames the
+// innermost runs first, so an outer text local is freed after an inner
+// struct one declared later than it. The original says the order never
+// affects correctness -- each release is independent -- and that is
+// true and beside the point: this port has to produce the same TEXT,
+// and the two orders renumber every temp from the first divergence on.
 void func cgFreeFrom(downTo:int) {
-    int i = downTo
-    while i < CG_LIVE.length {
-        cgFreeOne(CG_LIVE[i])
-        i++
+    // Frame boundaries at or above downTo, innermost last.
+    arr[int] bounds = []
+    int f = 0
+    while f < CG_FRAME.length {
+        if CG_FRAME[f] > downTo { bounds.push(CG_FRAME[f]) }
+        f++
+    }
+    int hi = CG_LIVE.length
+    int b = bounds.length - 1
+    while b >= 0 {
+        int lo = bounds[b]
+        int i = lo
+        while i < hi {
+            cgFreeOne(CG_LIVE[i])
+            i++
+        }
+        hi = lo
+        b = b - 1
+    }
+    int i2 = downTo
+    while i2 < hi {
+        cgFreeOne(CG_LIVE[i2])
+        i2++
     }
 }
 
@@ -3152,7 +3362,9 @@ void func cgFor(s:Node) {
     cgOut(`  ${t} = icmp ne i8 ${c.v}, 0`)
     cgOut(`  br i1 ${t}, label %${bodyL}, label %${endL}`)
     cgBlockLabel(bodyL)
+    CG_LOOPS.push(`${updateL}|${endL}|${CG_LIVE.length}`)
     cgBlockInto(childOf(s, 'body'))
+    CG_LOOPS.pop()
     if CG_TERM == false { cgOut(`  br label %${updateL}`) }
     cgBlockLabel(updateL)
     cgEvalForEffect(childOf(s, 'update'))
@@ -3398,7 +3610,7 @@ void func cgIndexAssign(e:Node, target:Node) {
         cgUnported(`array index of type ${idx.fty}`)
         return
     }
-    text elemLty = cgLtyOf(obj.ety)
+    text elemLty = cgElemLty(obj.ety)
     text dataP = cgTmp()
     cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 1`)
     text dataV = cgTmp()
@@ -3408,7 +3620,7 @@ void func cgIndexAssign(e:Node, target:Node) {
     Node valueNode = childOf(e, 'value')
     Val v = cgExprExpecting(valueNode, obj.ety, '')
     if CG_STUCK { return }
-    if v.fty != obj.ety {
+    if cgValIsElem(v, obj.ety) == false {
         cgUnported(`assigning ${v.fty} into an array of ${obj.ety}`)
         return
     }
@@ -3444,11 +3656,38 @@ void func cgAssign(e:Node) {
         // context.
         Val fp = cgFieldPtr(target)
         if CG_STUCK { return }
+        if fp.fty == 'text' {
+            // The slot already holds something, so the old buffer is
+            // reclaimed -- and read BEFORE the copy is made, so
+            // `p.name = p.name` cannot free what it is about to copy.
+            // A plain free here, not festina_free_z: the zeroing form
+            // is the SCOPE-EXIT rule (decisions.md #284), and an
+            // overwrite is not a scope exit.
+            // The VALUE first, then the old contents: the original
+            // resolves the target's address, emits the value, and only
+            // then reads what the slot held. Reading the old value
+            // first gives identical behaviour and different temp
+            // numbers from there on -- which is the whole diff.
+            Node fvalue = childOf(e, 'value')
+            Val fv = cgExprExpecting(fvalue, 'text', '')
+            if CG_STUCK { return }
+            text old = cgTmp()
+            cgOut(`  ${old} = load ptr, ptr ${fp.v}`)
+            text stored = fv.v
+            if cgIsOwningTextSource(fvalue) == false {
+                text o = cgTmp()
+                cgOut(`  ${o} = call ptr @festina_text_own(ptr ${stored})`)
+                stored = o
+            }
+            cgOut(`  call void @free(ptr ${old})`)
+            cgOut(`  store ptr ${stored}, ptr ${fp.v}`)
+            return
+        }
         if fp.fty != 'int' && fp.fty != 'float' && fp.fty != 'bool' {
             cgUnported(`assignment to a ${fp.fty} field`)
             return
         }
-        Val fv = cgExpr(childOf(e, 'value'))
+        Val fv = cgExprExpecting(childOf(e, 'value'), fp.fty, '')
         if CG_STUCK { return }
         cgOut(`  store ${fp.lty} ${fv.v}, ptr ${fp.v}`)
         return
@@ -3483,12 +3722,14 @@ void func cgAssign(e:Node) {
         cgStoreText(slot, `${slot}.ap`, v, cgIsOwningTextSource(value))
         return
     }
-    if fty == 'struct' || fty == 'arr' || fty == 'map' {
+    if cgIsRefcounted(fty) {
         if cgStorableRefcounted(fty, cgEtyOf(name)) == false {
             cgUnported(`assignment to a ${fty} of a non-scalar type`)
             return
         }
-        cgStoreRefcounted(slot, fty, cgEtyOf(name), v.v, cgIsOwningRefcountedSource(value))
+        bool owning = cgIsOwningRefcountedSource(value)
+        if v.fresh { owning = true }
+        cgStoreRefcounted(slot, fty, cgRelKeyOf(name), v.v, owning)
         return
     }
     cgOut(`  store ${cgLtyOf(fty)} ${v.v}, ptr ${slot}`)
@@ -3518,7 +3759,7 @@ void func cgAssign(e:Node) {
 // the original hands to whatever comes next. It cost an afternoon's
 // worth of off-by-sixteen temp numbers to notice.
 bool func cgStorableRefcounted(fty:text, ety:text) {
-    if fty == 'struct' { return true }
+    if fty == 'struct' || fty == 'blob' { return true }
     if ety == '' { return false }
     if ety == 'int' || ety == 'float' || ety == 'bool' { return true }
     // A map of a type that owns something needs a per-value-type
@@ -3559,16 +3800,43 @@ void func cgStoreRefcounted(slot:text, fty:text, ety:text, v:text, owning:bool) 
 text func cgReleaseFn(fty:text) {
     if fty == 'arr' { return '@festina_release_array' }
     if fty == 'map' { return '@festina_release_map' }
+    if fty == 'blob' { return '@festina_blob_release' }
     return '@festina_release'
 }
 
 // Whether a container of this element type can use the generic
 // release. A scalar element owns nothing; a `text` one owns a buffer.
+bool func cgIsRefcounted(fty:text) {
+    return fty == 'struct' || fty == 'arr' || fty == 'map' || fty == 'blob'
+}
+
+// Whether a container of this element type can use the generic
+// release. A scalar element owns nothing; a `text` one owns a buffer;
+// a STRUCT one owns a whole reference, whatever its own fields are.
 bool func cgElemOwnsSomething(ety:text) {
-    return ety == 'text'
+    if ety == 'text' { return true }
+    return SF_NAMES[ety] != null
+}
+
+// The LLVM type of one element. Every non-scalar is a pointer to its
+// own storage, so a struct element is a `ptr` whatever its layout.
+// Whether an emitted value is of this element type. A struct value's
+// own `fty` is the tag `struct` while an element type is the struct's
+// NAME, so the two are never directly comparable.
+bool func cgValIsElem(v:Val, ety:text) {
+    if SF_NAMES[ety] != null { return v.fty == 'struct' && v.sname == ety }
+    return v.fty == ety
+}
+
+text func cgElemLty(ety:text) {
+    if SF_NAMES[ety] != null { return 'ptr' }
+    return cgLtyOf(ety)
 }
 
 text func cgReleaseFnFor(fty:text, ety:text) {
+    // `ety` carries the struct NAME for a struct, and the element type
+    // for a container -- one slot, because a value is never both.
+    if fty == 'struct' && cgStructOwnsAnything(ety) { return cgReleaseStructFn(ety) }
     if fty == 'arr' && cgElemOwnsSomething(ety) { return cgReleaseArrayFn(ety) }
     // A map's own cascade needs a per-value-type TRAMPOLINE handed to
     // festina_map_for_each -- a map's entries are opaque to codegen in
@@ -3579,9 +3847,10 @@ text func cgReleaseFnFor(fty:text, ety:text) {
 }
 
 // The release of ONE element, given its type. A `text` is copied on
-// alias and freed outright; a refcounted element would hand back its
-// reference instead, which is the same shape with a different call.
+// alias and freed outright; a struct hands back its reference instead,
+// through its own cascade -- the same shape with a different call.
 text func cgElemReleaseFn(ety:text) {
+    if SF_NAMES[ety] != null { return cgReleaseFnFor('struct', ety) }
     return '@free'
 }
 
@@ -3634,10 +3903,123 @@ void func cgEmitGenerated(lines:arr[text]) {
 // itself rather than calling festina_release_array, because the
 // element loop has to run strictly BETWEEN the refcount check and the
 // free -- the two cannot simply call each other.
+// Whether this struct owns anything of its own -- a struct/arr/map
+// field (refcounted) or a `text` one (an exclusively-owned buffer).
+// Never transitive: a field's own cascade handles its own fields.
+bool func cgStructOwnsAnything(sname:text) {
+    if SF_NAMES[sname] == null { return false }
+    if SF_NAMES[sname] == '' { return false }
+    arr[text] names = SF_NAMES[sname].split('|')
+    int i = 0
+    while i < names.length {
+        text f = SF_FTY[`${sname}.${names[i]}`]
+        if f == 'text' { return true }
+        if cgIsRefcounted(f) { return true }
+        i++
+    }
+    return false
+}
+
+// The field walk both struct cascades share: the generated wrapper for
+// a heap struct about to be freed, and the scope exit of a
+// frame-allocated one whose own storage is never freed but whose
+// fields still hold something. Touches neither the storage nor the
+// header -- the callers need different things done with those.
+void func cgReleaseStructFields(objPtr:text, sname:text) {
+    arr[text] names = SF_NAMES[sname].split('|')
+    int i = 0
+    while i < names.length {
+        text key = `${sname}.${names[i]}`
+        text f = SF_FTY[key]
+        bool managed = cgIsRefcounted(f)
+        if f == 'text' { managed = true }
+        if managed {
+            text fp = cgTmp()
+            cgOut(`  ${fp} = getelementptr %struct.${sname}, ptr ${objPtr}, i32 0, i32 ${SF_IDX[key]}`)
+            text fv = cgTmp()
+            cgOut(`  ${fv} = load ptr, ptr ${fp}`)
+            // decisions.md #284: a text FIELD goes through
+            // festina_free_z rather than plain free, and this is the
+            // site that matters most for `clear` -- a struct holding a
+            // secret holds it in a text field, and wiping only the
+            // struct's own storage would leave it in the heap.
+            text fn = '@festina_free_z'
+            if f != 'text' { fn = cgReleaseFnFor(f, cgFieldEty(key)) }
+            cgOut(`  call void ${fn}(ptr ${fv})`)
+        }
+        i++
+    }
+}
+
+// The second half of a release key: a struct's NAME, or a container's
+// element type. One slot, because a value is never both.
+text func cgFieldEty(key:text) {
+    if SF_SNAME[key] != null { return SF_SNAME[key] }
+    if SF_ETY[key] != null { return SF_ETY[key] }
+    return ''
+}
+
+text func cgRelKeyOf(name:text) {
+    if cgFtyOf(name) == 'struct' { return cgSnameOf(name) }
+    return cgEtyOf(name)
+}
+
+text func cgRelKeyVal(v:Val) {
+    if v.fty == 'struct' { return v.sname }
+    return v.ety
+}
+
+// claude.md #78: the per-struct cascade. Registered in the cache
+// BEFORE the field walk, which is the only thing standing between a
+// self-referential struct and infinite generation -- one that reaches
+// itself finds its own name already there and gets it back. The
+// wrapper may then call ITSELF, which is correct: the recursion it
+// performs is at runtime over the real object graph, bounded by
+// refcounts reaching zero.
+text func cgReleaseStructFn(sname:text) {
+    if CG_STRUCT_REL[sname] != null { return CG_STRUCT_REL[sname] }
+    text name = `@__festina_release_struct_${sname}`
+    CG_STRUCT_REL[sname] = name
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define void ${name}(ptr %payload) {`)
+    cgBlockLabel('entry')
+    text chk = cgTmp()
+    cgOut(`  ${chk} = call i8 @festina_release_check(ptr %payload)`)
+    text cond = cgTmp()
+    cgOut(`  ${cond} = icmp ne i8 ${chk}, 0`)
+    text freeL = cgLabel('relstruct.free')
+    text doneL = cgLabel('relstruct.done')
+    cgOut(`  br i1 ${cond}, label %${freeL}, label %${doneL}`)
+    cgBlockLabel(freeL)
+    cgReleaseStructFields('%payload', sname)
+    text hdr = cgTmp()
+    cgOut(`  ${hdr} = getelementptr i8, ptr %payload, i64 -8`)
+    cgOut(`  call void @festina_free_z(ptr ${hdr})`)
+    cgOut(`  br label %${doneL}`)
+    cgBlockLabel(doneL)
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
 text func cgReleaseArrayFn(ety:text) {
     if CG_ARR_REL[ety] != null { return CG_ARR_REL[ety] }
     text name = `@__festina_release_array_${cgUid()}`
     CG_ARR_REL[ety] = name
+    // The element's own release is resolved BEFORE this body starts,
+    // because resolving it may GENERATE another cascade -- a struct
+    // element's -- and that one's temps come first. Asking for it from
+    // inside the element loop instead numbers the two functions the
+    // other way round.
+    text elemFn = cgElemReleaseFn(ety)
 
     arr[text] saved = CUR
     text savedBlock = CG_BLOCK
@@ -3661,7 +4043,7 @@ text func cgReleaseArrayFn(ety:text) {
     cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr %payload, i32 0, i32 1`)
     text dataV = cgTmp()
     cgOut(`  ${dataV} = load ptr, ptr ${dataP}`)
-    cgReleaseArrayElements(dataV, lenV, cgElemReleaseFn(ety), 'ptr')
+    cgReleaseArrayElements(dataV, lenV, elemFn, cgElemLty(ety))
     cgOut(`  call void @festina_free_z(ptr ${dataV})`)
     text hdr = cgTmp()
     cgOut(`  ${hdr} = getelementptr i8, ptr %payload, i64 -8`)
@@ -3714,9 +4096,9 @@ bool func cgIsOwningTextSource(e:Node) {
 // array has no owner once the length is taken, and nothing else will
 // ever release it.
 void func cgReleaseOwnedReceiver(e:Node, v:Val) {
-    if v.fty != 'struct' && v.fty != 'arr' && v.fty != 'map' { return }
+    if cgIsRefcounted(v.fty) == false { return }
     if cgIsOwningRefcountedSource(e) == false { return }
-    cgOut(`  call void ${cgReleaseFnFor(v.fty, v.ety)}(ptr ${v.v})`)
+    cgOut(`  call void ${cgReleaseFnFor(v.fty, cgRelKeyVal(v))}(ptr ${v.v})`)
 }
 
 void func cgFreeTextTemp(e:Node, v:Val) {
@@ -3761,7 +4143,11 @@ void func cgWhile(s:Node) {
     cgOut(`  ${t} = icmp ne i8 ${c.v}, 0`)
     cgOut(`  br i1 ${t}, label %${bodyL}, label %${endL}`)
     cgBlockLabel(bodyL)
+    // A `while`'s continue goes to the CONDITION; a `for`'s goes to
+    // the update, so the step still runs.
+    CG_LOOPS.push(`${condL}|${endL}|${CG_LIVE.length}`)
     cgBlockInto(childOf(s, 'body'))
+    CG_LOOPS.pop()
     if CG_TERM == false { cgOut(`  br label %${condL}`) }
     cgBlockLabel(endL)
     CG_TERM = false
@@ -3783,7 +4169,18 @@ void func cgReturn(s:Node) {
     // buffer and then freeing it would hand back a dangling pointer.
     // The order here (own, free, ret) is the original's.
     text val = r.v
-    if r.fty == 'text' {
+    // The refcounted counterpart: a struct/container handed back takes
+    // its own reference BEFORE the scope frees run, because a returned
+    // local is no longer excluded from that list. Retain-then-release-
+    // everything nets out to exactly one surviving reference on every
+    // path, which is what makes the exclusion unnecessary -- and it
+    // covers a ternary or field read a name-based exclusion never
+    // could.
+    if cgIsRefcounted(r.fty) {
+        if cgIsOwningRefcountedSource(v) == false {
+            cgOut(`  call void @festina_retain(ptr ${val})`)
+        }
+    } else if r.fty == 'text' {
         if cgIsOwningTextSource(v) == false {
             text o = cgTmp()
             cgOut(`  ${o} = call ptr @festina_text_own(ptr ${val})`)
@@ -3807,6 +4204,7 @@ void func cgFunc(d:Node) {
     text retF = FN_RET[name]
     text retL = 'void'
     if retF != 'void' { retL = cgLtyOf(retF) }
+    if retF != 'void' && retL == '' { retL = 'ptr' }
 
     arr[Node] params = listOf(d, 'params')
     arr[text] sig = []
@@ -3835,7 +4233,10 @@ void func cgFunc(d:Node) {
                 return
             }
             plty = 'ptr'
-            if pf == 'struct' {
+            if pf == 'blob' {
+                // A handle: one ptr, and nothing to say about elements
+                // or fields. Its release is the runtime's own.
+            } else if pf == 'struct' {
                 if SF_PLAIN[pt.name] == null {
                     cgUnported('parameter of a struct with a non-scalar field')
                     return
@@ -3952,7 +4353,7 @@ void func cgFunc(d:Node) {
                 arg = owned
                 CG_PARAM_LIVE.push(`text|${slot}|`)
             }
-        } else if pftys[q] == 'struct' || pftys[q] == 'arr' || pftys[q] == 'map' {
+        } else if cgIsRefcounted(pftys[q]) {
             if escSet[pnames[q]] != null {
                 // The refcounted counterpart of the text copy above.
                 // A text parameter the body lets escape takes its OWN
@@ -3961,7 +4362,7 @@ void func cgFunc(d:Node) {
                 // caller still owns what it passed, so the binding must
                 // not end up sharing the caller's single claim on it.
                 cgOut(`  call void @festina_retain(ptr ${arg})`)
-                CG_PARAM_LIVE.push(`${pftys[q]}|${slot}|${petys[q]}`)
+                CG_PARAM_LIVE.push(`${pftys[q]}|${slot}|${petys[q]}${psnames[q]}`)
             }
         }
         cgOut(`  store ${pltys[q]} ${arg}, ptr ${slot}`)
@@ -4035,6 +4436,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 if ffty == 'arr' || ffty == 'map' {
                     if ft.elem != null {
                         if ft.elem.kind == 'prim' { SF_ETY[key] = ft.elem.name }
+                        if ft.elem.kind == 'struct' { SF_ETY[key] = ft.elem.name }
                     }
                 }
                 fi++
@@ -4048,6 +4450,18 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 pf++
             }
             if plain { SF_PLAIN[sn] = 1 }
+            // The field names in declaration order, joined -- a
+            // release cascade walks them and the per-field tables are
+            // keyed by name, so the order has to be recoverable from
+            // the struct alone.
+            text fnames = ''
+            int fn2 = 0
+            while fn2 < fs.length {
+                if fn2 > 0 { fnames = fnames + '|' }
+                fnames = fnames + rawText(fs[fn2], 'name')
+                fn2++
+            }
+            SF_NAMES[sn] = fnames
             cgEmit(`%struct.${sn} = type { ${row} }`)
         }
         sd++
@@ -4086,6 +4500,16 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 // a global is reachable until the process exits, so
                 // nothing ever releases it.
                 Ty gt = resolveTypeField(d, 'type_expr')
+                // A blob is a HANDLE, not a value with storage of its
+                // own: there is no payload to wrap in a header, only a
+                // pointer that starts null. So it takes the plain form
+                // a scalar global takes, not the {refcount, payload}
+                // one every other refcounted global has.
+                if cgManagedFty(gt) == 'blob' {
+                    cgEmit(`@${gn} = global ptr null`)
+                    G_SLOT[gn] = `@${gn}`
+                    G_FTY[gn] = 'blob'
+                }
                 text payload = cgPayloadFor(gt)
                 if payload != '' {
                     cgEmit(`@${gn}.header = global {i64, ${payload}} {i64 -1, ${payload} zeroinitializer}`)
@@ -4096,6 +4520,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                     if gt.kind == 'arr' || gt.kind == 'map' {
                         if gt.elem != null {
                             if gt.elem.kind == 'prim' { G_ETY[gn] = gt.elem.name }
+                            if gt.elem.kind == 'struct' { G_ETY[gn] = gt.elem.name }
                         }
                     }
                 }
@@ -4112,11 +4537,27 @@ void func cgProgram(body:arr[Node], srcPath:text) {
         if body[fs2].kind == 'FuncDecl' {
             Ty rt = resolveTypeField(body[fs2], 'return_type')
             text rf = 'void'
+            text rkey = ''
             if rt != null {
                 if rt.kind == 'prim' { rf = rt.name }
                 else { rf = '' }
+                // A struct/container return is one `ptr` whatever it
+                // holds, exactly like a parameter -- but the release a
+                // call result eventually gets depends on WHICH, so the
+                // second half of the key travels with it.
+                if rf == '' || cgLtyOf(rf) == '' {
+                    text managedR = cgManagedFty(rt)
+                    if managedR != '' {
+                        rf = managedR
+                        if rt.kind == 'struct' { rkey = rt.name }
+                        else if rt.elem != null { rkey = rt.elem.name }
+                    }
+                }
             }
-            if rf == 'void' || cgLtyOf(rf) != '' {
+            if rf == 'void' || cgLtyOf(rf) != '' || cgIsRefcounted(rf) {
+                FN_RETKEY[rawText(body[fs2], 'name')] = rkey
+            }
+            if rf == 'void' || cgLtyOf(rf) != '' || cgIsRefcounted(rf) {
                 text fname = rawText(body[fs2], 'name')
                 FN_RET[fname] = rf
                 // The parameter types too, joined -- a `null` ARGUMENT

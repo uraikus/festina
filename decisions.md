@@ -6277,3 +6277,30 @@ That one is a test rather than a corpus file: the interesting inputs are control
 **Six canaries, all caught** (two of the twenty-six now via the ratchet). The registry is the harness from #308, so this slice's evidence was written as tests rather than as prose for the first time.
 
 **Verified.** Codegen 23 match, 0 differ, 76 unported. Lexer 110/110, parser 110/110, semantic 110/110, escape analysis 92 match with 1,632 of 1,685 records. 26 canaries: 24 caught, 2 via the ratchet, 0 missed. 2,795 passed, 343 skipped; the 24 graphics and 12 leak-stress failures are this container's limits, reproduced identically on the pristine tree. `cases/nulls.f` and `cases/owning_elements.f` are valgrind-clean.
+
+
+310. THE FIRST SELF-HOSTED FILE
+
+`blob`, `break`/`continue`, per-struct release cascades, arrays of structs, and non-scalar returns. **9,998 of 262,889 file-specific IR lines, up from 4,849 — the number roughly doubled — and 25 files match, up from 23.**
+
+**`bootstrap/lexer.f` emits byte-identical IR: 4,552 of 4,552 lines.** The first of the bootstrap's own ten files to self-host, and the largest single file the port has ever matched — bigger than every `cases/` file put together at the start of this slice.
+
+**"One construct away" was wrong, and the reason is the measurement trap this project has now hit four times.** The last slice reported lexer.f blocked by a single construct. It was blocked by five. `cgFunc` refuses a function whose PARAMETERS it cannot emit and returns immediately, so the body is never walked and none of its constructs are ever counted. The blocker table showed what the port reached, not what the file needs — the same flaw as decisions.md #297, one level up: first-blocker-per-expression became first-blocker-per-function. Porting `blob` parameters did not finish lexer.f; it revealed four more mechanisms that had been hiding behind them.
+
+**Three ORDERING rules, each found only by diffing a 4,552-line file line for line.** All three emit IR that means exactly the same thing, and all three change the text from the first divergence to the end of the module:
+
+1. **Scope exit frees the INNERMOST frame first, and within a frame in declaration order.** The two rules point opposite ways, which is precisely why guessing gets it wrong — an outer `text` local is freed AFTER an inner struct one declared later than it. The original says the order cannot affect correctness, since each release is independent. True, and beside the point for a port that has to produce the same text.
+2. **A text FIELD write emits the value BEFORE reading what the slot held** — the same shape as an array element write, which the port already had right. Getting one of two identical rules backwards is exactly the failure a line-for-line oracle exists to catch.
+3. **An element's own cascade is generated before the array body takes any temps.** Resolving it from inside the element loop instead numbers the two generated functions the other way round.
+
+**`.slice()` emits its receiver TWICE, and the port reproduces that.** The `ascii` branch claims the name first, emits the receiver, finds it is not an ascii, releases it if it owned one, and falls THROUGH — so the blob branch emits it again and the first value is unused. A port that tidied this would disagree with the thing it exists to agree with.
+
+**A `blob` is a HANDLE, not a value with storage.** Its global is a bare null pointer rather than the `{refcount, payload}` header every other refcounted global gets; its destructor is the runtime's own `festina_blob_release`; and its LENGTH is a call, where an array's is a header field.
+
+**Freshness is a property of the VALUE, not only of the expression.** `blob b = 'path'` has a string literal for a source node — which owns nothing — and a value that owns everything, because the coercion just opened a fresh handle. That is the one place the node and the value disagree, so `Val` grew a `fresh` field rather than the store sites growing a special case. A global flag was tried first and rejected as fragile.
+
+**The canary harness earned itself back in one slice.** This change touched the parameter binding, the free walk, the element release and the literal path, and **seven canaries went stale or ambiguous** — reported loudly as `BROKEN` rather than passing silently. One of them (`owned-container-receiver`) had become AMBIGUOUS because the blob `.length` branch added a second identical site; the exactly-once rule caught a canary that would otherwise have started measuring the wrong thing. Without the harness, all seven would have quietly stopped guarding anything.
+
+Eleven new canaries, and four of them were NOT CAUGHT at first — including one that needed a struct reached ONLY through an array, since any struct with a binding of its own generates its cascade first and hides the generation order being measured. `cases/blobs_and_scopes.f` carries all of them.
+
+**Verified.** Codegen 25 match, 0 differ, 75 unported. Lexer 111/111, parser 111/111, semantic 111/111, escape analysis 93 match with 1,660 of 1,713 records. 37 canaries: 35 caught, 2 via the ratchet, 0 missed. `cases/blobs_and_scopes.f`, `cases/owning_elements.f` and `cases/nulls.f` are valgrind-clean.

@@ -166,7 +166,9 @@ CANARIES = [
     Canary(
         "array-init-no-retain", "#303",
         "an aliasing container initializer retains rather than owning",
-        """                if cgIsOwningRefcountedSource(linit) == false {
+        """                bool lOwning = cgIsOwningRefcountedSource(linit)
+                if lv.fresh { lOwning = true }
+                if lOwning == false {
                     cgOut(`  call void @festina_retain(ptr ${lv.v})`)
                 }""",
         "",
@@ -200,22 +202,22 @@ CANARIES = [
         "param-no-retain", "#305",
         "an escaping refcounted parameter takes its own reference",
         """                cgOut(`  call void @festina_retain(ptr ${arg})`)
-                CG_PARAM_LIVE.push(`${pftys[q]}|${slot}|${petys[q]}`)""",
-        """                CG_PARAM_LIVE.push(`${pftys[q]}|${slot}|${petys[q]}`)""",
+                CG_PARAM_LIVE.push(`${pftys[q]}|${slot}|${petys[q]}${psnames[q]}`)""",
+        """                CG_PARAM_LIVE.push(`${pftys[q]}|${slot}|${petys[q]}${psnames[q]}`)""",
     ),
     Canary(
         "param-always-retain", "#305",
         "a parameter the body only READS takes nothing at all",
-        """        } else if pftys[q] == 'struct' || pftys[q] == 'arr' || pftys[q] == 'map' {
+        """        } else if cgIsRefcounted(pftys[q]) {
             if escSet[pnames[q]] != null {""",
-        """        } else if pftys[q] == 'struct' || pftys[q] == 'arr' || pftys[q] == 'map' {
+        """        } else if cgIsRefcounted(pftys[q]) {
             if true {""",
     ),
     Canary(
         "param-generic-release", "#305",
         "an array's release and a map's are not interchangeable",
-        "                CG_PARAM_LIVE.push(`${pftys[q]}|${slot}|${petys[q]}`)",
-        "                CG_PARAM_LIVE.push(`struct|${slot}|${petys[q]}`)",
+        "                CG_PARAM_LIVE.push(`${pftys[q]}|${slot}|${petys[q]}${psnames[q]}`)",
+        "                CG_PARAM_LIVE.push(`struct|${slot}|${petys[q]}${psnames[q]}`)",
     ),
 
     # --- decisions.md #306: method calls -----------------------------
@@ -269,15 +271,15 @@ CANARIES = [
         "cascade-stack-skips-elements", "#307",
         "a frame-allocated array still has its elements' claims to give back",
         """        if cgElemOwnsSomething(parts[2]) {
-            cgReleaseArrayElements(dataV, lenV, cgElemReleaseFn(parts[2]), 'ptr')
+            cgReleaseArrayElements(dataV, lenV, cgElemReleaseFn(parts[2]), cgElemLty(parts[2]))
         }""",
         "",
     ),
     Canary(
         "literal-element-aliased", "#307",
         "a literal COPIES a text element rather than aliasing its source",
-        "        if ety == 'text' && owned[k] == 0 {",
-        "        if false {",
+        "        } else if ety == 'text' && owned[k] == 0 {",
+        "        } else if false {",
     ),
     Canary(
         "element-write-no-reclaim", "#307",
@@ -288,6 +290,119 @@ CANARIES = [
         """    }
     cgOut(`  store ${elemLty} ${stored}, ptr ${slot}`)""",
     ),
+    # --- decisions.md #310: blob, break/continue, struct cascades -----
+    Canary(
+        "blob-generic-release", "#310",
+        "a blob's destructor is the runtime's own, not the generic release",
+        "    if fty == 'blob' { return '@festina_blob_release' }",
+        "",
+    ),
+    Canary(
+        "blob-length-is-a-call", "#310",
+        "a blob carries no length field, unlike an array header",
+        """        cgOut(`  ${out} = call i64 @festina_blob_length(ptr ${obj.v})`)""",
+        """        cgOut(`  ${out} = call i64 @festina_blob_length(ptr ${obj.v})`)
+        cgOut(`  ; canary`)""",
+    ),
+    Canary(
+        "slice-emits-receiver-twice", "#310",
+        "the original emits a .slice() receiver twice and discards the first",
+        """        if m == 'slice' {
+            Val first = cgExpr(recv)""",
+        """        if false {
+            Val first = cgExpr(recv)""",
+    ),
+    Canary(
+        "break-frees-its-scope", "#310",
+        "break and continue free what the iteration declared before leaving",
+        "        cgFreeFrom(target[2].toInt())",
+        "",
+    ),
+    Canary(
+        "continue-target-is-the-update", "#310",
+        "a for-loop's continue goes to the update, so the step still runs",
+        "    CG_LOOPS.push(`${updateL}|${endL}|${CG_LIVE.length}`)",
+        "    CG_LOOPS.push(`${condL}|${endL}|${CG_LIVE.length}`)",
+    ),
+    Canary(
+        "struct-cascade", "#310",
+        "a struct with an owning field needs a generated cascade",
+        "    if fty == 'struct' && cgStructOwnsAnything(ety) { return cgReleaseStructFn(ety) }",
+        "",
+    ),
+    Canary(
+        "stack-struct-keeps-its-fields", "#310",
+        "a frame-allocated struct still owns its fields' buffers",
+        """                if managed == 'struct' {
+                    if cgStructOwnsAnything(declEty) {
+                        cgTrackLive('struct.stack', slot, declEty)
+                    }
+                }""",
+        "",
+    ),
+    Canary(
+        # The first of two ordering rules this slice got wrong, each
+        # found only by diffing a 4,552-line file line for line.
+        "field-write-value-before-old", "#310",
+        "a text field write emits the VALUE before reading what the slot held",
+        [
+            ("""            Node fvalue = childOf(e, 'value')
+            Val fv = cgExprExpecting(fvalue, 'text', '')
+            if CG_STUCK { return }
+            text old = cgTmp()
+            cgOut(`  ${old} = load ptr, ptr ${fp.v}`)""",
+             """            text old = cgTmp()
+            cgOut(`  ${old} = load ptr, ptr ${fp.v}`)
+            Node fvalue = childOf(e, 'value')
+            Val fv = cgExprExpecting(fvalue, 'text', '')
+            if CG_STUCK { return }"""),
+        ],
+    ),
+    Canary(
+        # The second. Within one frame the frees run in DECLARATION
+        # order; across frames the INNERMOST runs first. The two point
+        # opposite ways, which is exactly why guessing gets it wrong.
+        "frees-innermost-frame-first", "#310",
+        "scope exit frees the innermost frame first, outer frames last",
+        [
+            ("""    arr[int] bounds = []
+    int f = 0
+    while f < CG_FRAME.length {
+        if CG_FRAME[f] > downTo { bounds.push(CG_FRAME[f]) }
+        f++
+    }""",
+             """    arr[int] bounds = []
+    int f = 0
+    while f < 0 {
+        if CG_FRAME[f] > downTo { bounds.push(CG_FRAME[f]) }
+        f++
+    }"""),
+        ],
+    ),
+    Canary(
+        "return-retains-before-freeing", "#310",
+        "a returned refcounted value takes its reference before the scope frees",
+        """    if cgIsRefcounted(r.fty) {
+        if cgIsOwningRefcountedSource(v) == false {
+            cgOut(`  call void @festina_retain(ptr ${val})`)
+        }
+    } else if r.fty == 'text' {""",
+        """    if false {
+    } else if r.fty == 'text' {""",
+    ),
+    Canary(
+        "elem-release-resolved-first", "#310",
+        "an element's own cascade is generated before the array body's temps",
+        [
+            ("""    text elemFn = cgElemReleaseFn(ety)
+
+    arr[text] saved = CUR""", """
+    arr[text] saved = CUR"""),
+            ("cgReleaseArrayElements(dataV, lenV, elemFn, cgElemLty(ety))",
+             "cgReleaseArrayElements(dataV, lenV, cgElemReleaseFn(ety), cgElemLty(ety))"),
+        ],
+    ),
+
     # --- decisions.md #309: null, split and join ---------------------
     Canary(
         "null-int-sentinel", "#309",
@@ -326,8 +441,9 @@ CANARIES = [
     Canary(
         "owned-container-receiver", "#309",
         "a container temporary with no binding is released where it is read",
-        "        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)",
-        "",
+        """        cgOut(`  ${out} = load i64, ptr ${lenP}`)
+        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)""",
+        """        cgOut(`  ${out} = load i64, ptr ${lenP}`)""",
     ),
     Canary(
         "join-element-kind", "#309",
