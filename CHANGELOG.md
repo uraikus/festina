@@ -147,7 +147,21 @@ round-by-round design and implementation record predating 0.1 lives in
   graphics/audio/HTTP/thread/sqlite/table subsystems.
   `bootstrap/irdump.py` and `bootstrap/irdiff.py` run the comparison;
   the oracle is the IR text itself, so it needed no canonical form of
-  its own (decisions.md #289–#307).
+  its own (decisions.md #289–#308).
+
+- **`bootstrap/canary.py` — the breakages the harness is supposed to
+  catch, as a test rather than as prose.** A green differential run says
+  the two implementations agree; it says nothing about whether the
+  corpus could tell them apart if they stopped agreeing, and for four
+  consecutive slices of the codegen port the answer was that it could
+  not. Twenty deliberate breakages, one per mechanism, re-run by
+  `tests/test_bootstrap_canary.py`: **19 caught as a diff, 1 caught
+  through the coverage ratchet, 0 not caught**, in about 90 seconds. A
+  failure there is not a compiler bug — it means a `cases/` file has
+  drifted and the mechanism behind it is unmeasured, so the fix is a
+  corpus file rather than a code change. A stale anchor fails rather
+  than passing silently, and the repository is never written to: the
+  patch is applied to a copy of `bootstrap/` (decisions.md #308).
 
 - **Every bootstrap differential harness now runs in CI** — on Linux
   only. They compare two implementations of the lexer, parser, analyzer

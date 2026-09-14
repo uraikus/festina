@@ -8,6 +8,12 @@
 // one file that currently matches uses a map for anything. This file is
 // the only thing standing behind any of it.
 //
+// Those breakages are no longer prose: they live in
+// `bootstrap/canary.py` and are re-run by
+// tests/test_bootstrap_canary.py, which FAILS if this file ever stops
+// making them visible. A drift here is a failing test now, not a
+// silently unmeasured mechanism.
+//
 //   1. **A map literal allocates its header FIRST**, and an array
 //      literal allocates its last. The two look like the same
 //      construct and are built in opposite orders, because a map

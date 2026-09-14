@@ -48,6 +48,9 @@ python bootstrap/semdiff.py                         # analyzer, whole corpus
 python bootstrap/escdiff.py                         # escape analysis, whole corpus
 python bootstrap/irdiff.py                          # codegen, whole corpus
 python bootstrap/difftest.py examples/hello.f       # just these files
+
+python bootstrap/canary.py                          # can the corpus still TELL?
+python bootstrap/canary.py --list
 ```
 
 Over the 109-file repository corpus:
@@ -61,6 +64,17 @@ Over the 109-file repository corpus:
   4,341 of 253,842 file-specific IR lines. See below for why that is the
   number reported rather than a file count, and for the caveat that
   comes with this particular figure.
+
+**A green differential test is not the claim that matters.** It says
+the two implementations agree; it says nothing about whether the corpus
+could tell them apart if they stopped agreeing — and for four
+consecutive slices of the codegen port, the honest answer was that it
+could not. `bootstrap/canary.py` holds twenty deliberate breakages, one
+per mechanism, and asks the corpus whether it notices: **19 caught as a
+diff, 1 caught through the coverage ratchet, 0 not caught.** A failure
+there is not a compiler bug — it means a `cases/` file has drifted and
+the mechanism behind it is unmeasured, so the fix is a corpus file
+rather than a code change. See "Canaries" below.
 
 The lexer lexes itself; the parser parses itself. Lexing and parsing
 `parser.f`, the largest source in the corpus at ~1,200 lines, takes
@@ -353,6 +367,43 @@ one session with `festina/codegen.py` untouched, because
 `bootstrap/codegen.f` is itself a corpus file: every line added to the
 port enlarges the denominator. Self-hosting is a moving goal by
 construction.
+
+### Canaries: can the corpus still tell?
+
+Every slice of this port has ended the same way — break the
+implementation on purpose, one mechanism at a time, and check the
+corpus notices. It usually did not. Array literals: one of four
+detected. Maps: **zero of four**. Method calls: zero of four. Containers
+whose elements own something: zero of five. Every one of those was
+invisible because the corpus contained no program that exercised the
+mechanism, and each was fixed by writing a `cases/` file rather than by
+changing any code.
+
+Those measurements used to live only in commit messages, which meant
+nothing re-ran them: a case file could drift away from the shape it was
+written for and take a whole mechanism back to unmeasured without a
+single test turning red. They are a registry now
+(`bootstrap/canary.py`), driven by `tests/test_bootstrap_canary.py`.
+
+Four verdicts, and the distinction between the middle two is the point:
+
+- **differ** — a matching file now emits different IR. The strong
+  signal: a real disagreement in a real program.
+- **ratchet** — nothing differs, but the coverage NUMBER fell, because
+  a file the port used to emit went "unported" instead. Real detection,
+  weaker claim; exactly one canary lands here and it is reported
+  separately rather than counted as a pass.
+- **broken** — the patched source did not compile, or compiled and
+  died. Proves nothing: a canary has to produce a *wrong* compiler, not
+  an absent one.
+- **undetected** — the failure. The corpus cannot see this mechanism.
+
+Two properties keep it honest. A stale anchor **fails** rather than
+passing silently, because a canary whose target has moved reads as a
+guard while guarding nothing; each substitution must match exactly once.
+And the repository is never written to — the whole of `bootstrap/` is
+copied to a scratch directory and the patch applied there, so an
+interrupted run cannot leave a deliberately broken compiler checked out.
 
 ### The target is self-hosting
 

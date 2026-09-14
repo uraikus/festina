@@ -11,6 +11,12 @@
 // corpus, because not one file that currently matches holds a
 // container of anything but a scalar.
 //
+// Those breakages are no longer prose: they live in
+// `bootstrap/canary.py` and are re-run by
+// tests/test_bootstrap_canary.py, which FAILS if this file ever stops
+// making them visible. A drift here is a failing test now, not a
+// silently unmeasured mechanism.
+//
 //   1. **The generic release is wrong the moment an element owns
 //      something.** `@festina_release_array` frees the buffer and the
 //      header; it knows nothing about what the slots hold. A container

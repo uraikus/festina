@@ -17,6 +17,12 @@
 // Not one file that currently matches calls a method. This file is the
 // entire evidential basis for the slice.
 //
+// Those breakages are no longer prose: they live in
+// `bootstrap/canary.py` and are re-run by
+// tests/test_bootstrap_canary.py, which FAILS if this file ever stops
+// making them visible. A drift here is a failing test now, not a
+// silently unmeasured mechanism.
+//
 //   1. **`'42'.toInt()` is folded at COMPILE time**, and only for a
 //      literal receiver; a dynamic one calls the runtime. The two must
 //      answer identically for the same text, which means the fold has

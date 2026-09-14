@@ -6,6 +6,12 @@
 // separate ways, only ONE of the four showed up anywhere in the corpus.
 // This file exists for the other three.
 //
+// Those breakages are no longer prose: they live in
+// `bootstrap/canary.py` and are re-run by
+// tests/test_bootstrap_canary.py, which FAILS if this file ever stops
+// making them visible. A drift here is a failing test now, not a
+// silently unmeasured mechanism.
+//
 //   1. **Every element is evaluated before the header is allocated.**
 //      An array of constants emits no instructions for its elements at
 //      all, so the ordering cannot be seen in one -- the header could
