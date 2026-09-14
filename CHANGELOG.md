@@ -99,7 +99,7 @@ round-by-round design and implementation record predating 0.1 lives in
   Festina, the fifth module the codegen port turned out to need and one
   that was not in its original estimate: **93 of 111 corpus files
   produce an identical record sequence, 0 differ, 7 not yet ported, 11
-  rejected by both** — 1,660 of 1,713 records. It decides whether every
+  rejected by both** — 1,684 of 1,737 records. It decides whether every
   container and struct local lives in the frame or behind a heap
   refcount header, so the codegen port cannot emit one without agreeing
   here first. The ORDER bodies are analyzed in is part of the answer
@@ -111,11 +111,13 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage, **in progress**: **25 of 111 corpus files
-  emit byte-identical LLVM IR, 0 differ, 75 not yet ported, 11 rejected
-  by both** — 9,998 of 262,889 file-specific IR lines. **`bootstrap/
-  lexer.f` self-hosts**: 4,552 of 4,552 file-specific lines, byte for
-  byte -- the first of the bootstrap's own ten files to do so. In are
+  the fourth and last stage, **in progress**: **26 of 111 corpus files
+  emit byte-identical LLVM IR, 0 differ, 74 not yet ported, 11 rejected
+  by both** — 23,137 of 270,897 file-specific IR lines. **`bootstrap/
+  lexer.f` and `bootstrap/parser.f` self-host**: 4,552 and 13,139
+  file-specific lines, byte for byte -- two of the bootstrap's own ten
+  files, and `parser.f` at ~1,200 source lines is the largest file in
+  the corpus. In are
   expressions (arithmetic and comparison with int/float mixing,
   `&&`/`||`, unary, the ternary, `/` and `%` with claude.md #57's
   divide-by-zero control flow, template literals, and `+` and `==`/`!=`
@@ -145,7 +147,9 @@ round-by-round design and implementation record predating 0.1 lives in
   and an argument takes it from the callee's signature. `blob`
   parameters with `.byteAt()`/`.slice()`/`.length`, `break`/`continue`,
   structs with owning fields (a per-struct release cascade), arrays of
-  structs, and non-scalar returns. And `arr[text]` -- a container whose elements own
+  structs, non-scalar returns, and claude.md #120's cycle collection --
+  a synchronous trial deletion for any type that can reach itself,
+  generated only when one does. And `arr[text]` -- a container whose elements own
   something needs a release cascade generated for that element type,
   since the generic release frees the buffer and header and knows
   nothing about what the slots hold. Not in: structs with a non-scalar
@@ -155,7 +159,7 @@ round-by-round design and implementation record predating 0.1 lives in
   graphics/audio/HTTP/thread/sqlite/table subsystems.
   `bootstrap/irdump.py` and `bootstrap/irdiff.py` run the comparison;
   the oracle is the IR text itself, so it needed no canonical form of
-  its own (decisions.md #289–#310).
+  its own (decisions.md #289–#311).
 
 - **`bootstrap/canary.py` — the breakages the harness is supposed to
   catch, as a test rather than as prose.** A green differential run says
@@ -163,9 +167,9 @@ round-by-round design and implementation record predating 0.1 lives in
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
   not. Twenty deliberate breakages, one per mechanism, re-run by
-  `tests/test_bootstrap_canary.py`: **35 caught as a diff, 2 caught
-  through the coverage ratchet, 0 not caught** (37 in total now), in
-  about 90 seconds. A
+  `tests/test_bootstrap_canary.py`: **44 caught as a diff, 2 caught
+  through the coverage ratchet, 0 not caught** (46 in total now), in
+  about two minutes. A
   failure there is not a compiler bug — it means a `cases/` file has
   drifted and the mechanism behind it is unmeasured, so the fix is a
   corpus file rather than a code change. A stale anchor fails rather

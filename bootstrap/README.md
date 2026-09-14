@@ -59,15 +59,16 @@ Over the 111-file repository corpus:
 - **parser: 111 match, 0 differ, 0 unported.**
 - **semantic: 111 match, 0 differ, 0 unported.**
 - **escape analysis: 93 match, 0 differ, 7 unported, 11 rejected by
-  both** — 1,660 of 1,713 records.
-- **codegen: 25 match, 0 differ, 75 unported, 11 rejected by both** —
-  9,998 of 262,889 file-specific IR lines.
-- **canaries: 35 caught, 2 caught through the ratchet, 0 missed** (of
-  37).
+  both** — 1,684 of 1,737 records.
+- **codegen: 26 match, 0 differ, 74 unported, 11 rejected by both** —
+  23,137 of 270,897 file-specific IR lines.
+- **canaries: 44 caught, 2 caught through the ratchet, 0 missed** (of
+  46).
 
-**`bootstrap/lexer.f` self-hosts** — 4,552 of 4,552 file-specific IR
-lines, byte for byte. The first of the bootstrap's own ten files to do
-so, and the largest single file the port has matched. See below for why that is the
+**`bootstrap/lexer.f` and `bootstrap/parser.f` self-host** — 4,552 and
+13,139 file-specific IR lines, byte for byte. Two of the bootstrap's
+own ten files, and `parser.f` at ~1,200 source lines is the largest
+file in the corpus. See below for why that is the
   number reported rather than a file count, and for the caveat that
   comes with this particular figure.
 
@@ -75,8 +76,8 @@ so, and the largest single file the port has matched. See below for why that is 
 the two implementations agree; it says nothing about whether the corpus
 could tell them apart if they stopped agreeing — and for four
 consecutive slices of the codegen port, the honest answer was that it
-could not. `bootstrap/canary.py` holds thirty-seven deliberate breakages, one
-per mechanism, and asks the corpus whether it notices: **35 caught as a
+could not. `bootstrap/canary.py` holds forty-six deliberate breakages, one
+per mechanism, and asks the corpus whether it notices: **44 caught as a
 diff, 2 caught through the coverage ratchet, 0 not caught.** A failure
 there is not a compiler bug — it means a `cases/` file has drifted and
 the mechanism behind it is unmeasured, so the fix is a corpus file
@@ -175,7 +176,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Escape analysis: 1,660 of 1,713 records
+## Escape analysis: 1,684 of 1,737 records
 
 `escape_analysis.py` answers one purely syntactic question per function
 body — which names appear anywhere other than as the immediate base of
@@ -275,7 +276,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 9,998 of 262,889 file-specific IR lines
+## Codegen: 23,137 of 270,897 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -342,12 +343,12 @@ times and so could not have varied either way.
 
 ### And the caveat that comes with the current figure
 
-**The proportion turned over in one slice.** It was 3,715 of 4,849 —
-three quarters from `cases/` files written for the slices that claimed
-them. It is now **4,312 of 9,998, under half**, because
-`bootstrap/lexer.f` alone contributes 4,552 lines of a program written
-to be a lexer rather than to be measured. That is the first time the
-figure has been carried mostly by real code.
+**The proportion turned over, and then kept going.** Two slices ago it
+was 3,715 of 4,849 — three quarters from `cases/` files written for the
+slices that claimed them. It is now **4,312 of 23,137, under a fifth**,
+because `bootstrap/lexer.f` and `bootstrap/parser.f` contribute 17,691
+lines between them of programs written to be a lexer and a parser
+rather than to be measured.
 
 The ten case files are `owning_elements.f` (652), `blobs_and_scopes.f`
 (597), `escape_locals.f` (538), `maps.f` (521), `text_building.f`
@@ -374,7 +375,7 @@ the implementation. But a number that grows because the input grew says
 nothing about the remaining 178,000 lines, and the two facts are worth
 keeping separate when reading the table below.
 
-**The budget is not fixed, either.** It went 175,080 → 262,889 across
+**The budget is not fixed, either.** It went 175,080 → 270,897 across
 one session with `festina/codegen.py` untouched, because
 `bootstrap/codegen.f` is itself a corpus file: every line added to the
 port enlarges the denominator. Self-hosting is a moving goal by
@@ -421,7 +422,7 @@ interrupted run cannot leave a deliberately broken compiler checked out.
 
 The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
-**228,324 of the 262,889 file-specific IR lines**, and they need
+**236,332 of the 270,897 file-specific IR lines**, and they need
 none of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
@@ -444,7 +445,8 @@ struct **locals**, stack or heap by claude.md #74's own answer;
 `arr[T]`/`map[T]` **locals** of a scalar element type, on the same
 decision; struct/`arr[T]`/`map[T]` **parameters**, on the same
 decision again, `blob` parameters with `.byteAt()`/`.slice()`/
-`.length`, and non-scalar RETURNS; `break` and `continue`; `arr[text]`
+`.length`, and non-scalar RETURNS; cycle collection for a type that
+reaches itself; struct identity against `null`; `break` and `continue`; `arr[text]`
 and `arr[Struct]` on a generated per-element-type release cascade, and
 structs with owning fields on a per-struct one; `.push()`/`.pop()`/`.shift()`/`.unshift()`,
 `.split()` and `.join()`; `null` in every typed position; method
@@ -456,7 +458,7 @@ declared type to take their element type from; map reads, writes and
 `delete`; assignment to a refcounted binding; and imports merged before
 either stage runs.
 
-Twenty pieces are subtler than they look:
+Twenty-two pieces are subtler than they look:
 
 - **Alloca hoisting** (claude.md #191) is a post-pass over the finished
   text, exactly as in the original, because it is a property of the
@@ -517,6 +519,18 @@ Twenty pieces are subtler than they look:
   `.length` frees. An index is emitted **before** the data pointer, and
   on a write the whole slot is computed before the value; neither shows
   in `xs[0] = 1`, which is why `cases/indexing.f` indexes with a call.
+- **A reference CYCLE never reaches zero**, so refcounting alone never
+  frees one. claude.md #120's answer is a synchronous trial deletion —
+  markGray, scan, then black or white — as six generated function kinds
+  over two shapes. It is gated entirely on whether the TYPE can reach
+  itself, so a program with no self-referencing type generates none of
+  it and pays nothing.
+- **A field read through a base the expression OWNS is a borrowed
+  pointer into something about to be freed**, so its own ownership is
+  minted first — a refcounted field retains, a text one copies — and
+  the base is released after. That makes the VALUE own something its
+  own expression does not, which is why `Val` carries a `fresh` flag
+  that several ownership tests consult before asking about the node.
 - **Scope exit frees the INNERMOST frame first, and within a frame in
   declaration order.** The two rules point opposite ways, which is
   exactly why guessing gets it wrong — an outer `text` local is freed
@@ -594,13 +608,13 @@ sanitizer for this stage rather than needing it alongside.
 |20|0|a declaration of a non-scalar type (`img`, `regex`, …)|
 |19|0|`EventHandler`|
 |18|0|`ThreadDecl`|
-|15|0|`close()`|
 |15|0|`free`|
+|15|0|`close()`|
 |14|0|a `blob` declaration|
 |12|0|`.postMessage()`|
-|11|0|a parameter of a struct with a non-scalar field|
-|11|0|assignment to an `arr[T]` field|
+|10|0|`.exists()`|
 |10|**2**|`table` declarations|
+|9|0|a `map[T]` global of a non-scalar value type|
 
 `blocks` counts every file a construct appears in; `only` counts the
 files where it is the last thing in the way, and so the number that

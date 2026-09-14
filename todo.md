@@ -130,6 +130,28 @@ open:
   (`at`, `esc`, `known`) and exactly what a code generator's locals
   want to be called, so this will keep coming up.
 
+- **`struct == struct` emits invalid LLVM and fails to build.** The
+  shipped compiler lowers it to `icmp eq i64 %ptr, %ptr`, which LLVM
+  rejects: `'%t1' defined with type 'ptr' but expected 'i64'`. Two
+  struct values reach the ordinary integer comparison, which never
+  learns they were pointers. Reproduced on a four-line program:
+
+      struct P { x:int }
+      P a
+      P b
+      if a == b { log(1) }
+
+  `festina/codegen.py` calls the construct "unsupported" in a comment
+  -- it would have to mean identity or deep equality, and claude.md
+  picks neither (#54's ambiguity rule) -- but nothing rejects it, so
+  the error surfaces from LLVM rather than from the front end. Either
+  answer is a decision rather than a fix: semantic.py could refuse it
+  with a real message, or codegen could commit to identity and emit
+  `icmp eq ptr`. Comparison against `null` already works and takes a
+  branch of its own. Found while porting -- both implementations agree
+  on the invalid IR, so this is the language's, not the port's
+  (decisions.md #311).
+
 - **`Math` is a namespace per method name, not per receiver.** With a
   variable called `Math` in scope, `Math.sqrt(9.0)` is still
   `llvm.sqrt.f64` and answers 3, while `Math.toText()` is that

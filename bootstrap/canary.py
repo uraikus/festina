@@ -290,6 +290,112 @@ CANARIES = [
         """    }
     cgOut(`  store ${elemLty} ${stored}, ptr ${slot}`)""",
     ),
+    # --- decisions.md #311: cycles, minting, and parser.f -------------
+    Canary(
+        "cycle-trial", "#311",
+        "claude.md #120: a cyclic type's release runs a trial deletion",
+        """    bool cyclic = cgIsCyclic(sname)
+    text aliveL = doneL""",
+        """    bool cyclic = false
+    text aliveL = doneL""",
+    ),
+    Canary(
+        "cycle-white-disposes-acyclic-fields", "#311",
+        "a white sweep disposes exactly the fields the trial did not traverse",
+        """            if cyclic == false {
+                if cgIsRefcounted(f) {""",
+        """            if true {
+                if cgIsRefcounted(f) {""",
+    ),
+    Canary(
+        "field-release-resolved-first", "#311",
+        "a field's release is resolved before the field's own GEP temp",
+        [
+            ("""            text fn = '@festina_free_z'
+            if f != 'text' { fn = cgReleaseFnFor(f, cgFieldEty(key)) }
+            text fp = cgTmp()""",
+             """            text fp = cgTmp()"""),
+            ("""            cgOut(`  ${fv} = load ptr, ptr ${fp}`)
+            cgOut(`  call void ${fn}(ptr ${fv})`)""",
+             """            cgOut(`  ${fv} = load ptr, ptr ${fp}`)
+            text fn = '@festina_free_z'
+            if f != 'text' { fn = cgReleaseFnFor(f, cgFieldEty(key)) }
+            cgOut(`  call void ${fn}(ptr ${fv})`)"""),
+        ],
+    ),
+    Canary(
+        "call-frees-owning-arguments", "#311",
+        "a call borrows its arguments, so an owning one is the caller's to reclaim",
+        """        cgFreeCallArgs(args, argVals)
+        return cgVal('', 'void', 'void')""",
+        """        return cgVal('', 'void', 'void')""",
+    ),
+    Canary(
+        "discarded-result-released", "#311",
+        "a discarded call result is provably this statement's only reference",
+        """        if cgIsRefcounted(r.fty) {
+            if cgIsOwningRefcountedSource(ex) || r.fresh {
+                cgOut(`  call void ${cgReleaseFnFor(r.fty, cgRelKeyVal(r))}(ptr ${r.v})`)
+            }
+        } else {
+            cgFreeTextTemp(ex, r)
+        }""",
+        "",
+    ),
+    Canary(
+        "field-read-mints-before-release", "#311",
+        "claude.md #117: a field read through an owning base is copied out first",
+        """    if cgIsRefcounted(base.fty) && cgIsOwningRefcountedSource(childOf(e, 'obj')) {""",
+        """    if false {""",
+    ),
+    # No canary for "two struct values compare as i64". The
+    # construct cannot appear in a working program: the shipped
+    # compiler emits `icmp eq i64 %ptr, %ptr` for it, which LLVM
+    # rejects outright, so `struct == struct` fails to build. Both
+    # implementations agree on that invalid IR -- it is a compiler
+    # bug rather than a port gap (todo.md) -- and a canary for
+    # something no compiling program can contain could never be
+    # caught by any corpus.
+    Canary(
+        "null-comparison-after-text", "#311",
+        "the text branch claims `text == null` before the pointer branch sees it",
+        """    if l.fty == 'text' || r.fty == 'text' {""",
+        """    if op == '==' || op == '!=' {
+        if rn.kind == 'NullLit' || ln.kind == 'NullLit' {
+            text other2 = r.lty
+            text value2 = r.v
+            if rn.kind == 'NullLit' { other2 = l.lty  value2 = l.v }
+            if other2 == 'ptr' {
+                text cmp2 = cgTmp()
+                text pred2 = 'eq'
+                if op == '!=' { pred2 = 'ne' }
+                cgOut(`  ${cmp2} = icmp ${pred2} ptr ${value2}, null`)
+                text out2 = cgTmp()
+                cgOut(`  ${out2} = zext i1 ${cmp2} to i8`)
+                return cgVal(out2, 'i8', 'bool')
+            }
+        }
+    }
+    if l.fty == 'text' || r.fty == 'text' {""",
+    ),
+    Canary(
+        "refcounted-element-write-retains", "#311",
+        "a refcounted array element write retains, stores, then releases the old",
+        """        cgOut(`  store ${elemLty} ${stored}, ptr ${slot}`)
+        cgOut(`  call void ${cgReleaseFnFor('struct', obj.ety)}(ptr ${old})`)""",
+        """        cgOut(`  store ${elemLty} ${stored}, ptr ${slot}`)""",
+    ),
+    Canary(
+        "refcounted-field-write-defers-release", "#311",
+        "claude.md #120: a refcounted field write stores BEFORE releasing the old",
+        [
+            ("""            cgOut(`  store ptr ${rv.v}, ptr ${fp.v}`)
+            cgOut(`  call void ${cgReleaseFnFor(fp.fty, cgRelKeyVal(fp))}(ptr ${old})`)""",
+             """            cgOut(`  call void ${cgReleaseFnFor(fp.fty, cgRelKeyVal(fp))}(ptr ${old})`)
+            cgOut(`  store ptr ${rv.v}, ptr ${fp.v}`)"""),
+        ],
+    ),
+
     # --- decisions.md #310: blob, break/continue, struct cascades -----
     Canary(
         "blob-generic-release", "#310",

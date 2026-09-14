@@ -353,21 +353,24 @@ class TestTheCoverageNumberIsHonest:
         assert "@festina_release_map(" in body, (
             "no refcounted map local, so the heap half is unmeasured")
 
-    def test_the_lexer_self_hosts(self):
-        """`bootstrap/lexer.f` is the first of the bootstrap's own ten
-        files to emit byte-identical IR -- the port compiling a real
-        piece of itself.
+    @pytest.mark.parametrize("rel,floor", [
+        ("bootstrap/lexer.f", 4000),
+        ("bootstrap/parser.f", 12000),
+    ])
+    def test_a_bootstrap_file_self_hosts(self, rel, floor):
+        """The port compiling real pieces of itself.
 
         Pinned separately from the ratchet because it is a different
-        claim: the line count could stay where it is while this file
+        claim: the line count could stay where it is while one of these
         stopped matching and something else made up the difference.
+        The floor guards against the other direction -- a file that
+        shrank to a stub would "self-host" trivially.
         """
-        dump = irdump.dump_file("bootstrap/lexer.f")
+        dump = irdump.dump_file(rel)
         assert not dump[0].startswith("SEMERR"), dump[0]
-        assert len(dump) > 4000, (
-            f"bootstrap/lexer.f now emits {len(dump)} lines; it was "
-            f"4,935 -- if it shrank this much it is no longer the file "
-            f"this milestone was measured on")
+        assert len(dump) > floor, (
+            f"{rel} now emits {len(dump)} lines, below the {floor} this "
+            f"milestone was measured on -- it is no longer the same file")
 
     def test_the_blob_case_really_has_all_five_mechanisms(self):
         """`cases/blobs_and_scopes.f` carries the ordering rules that
@@ -649,6 +652,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 9998, (
+        assert reproduced >= 23137, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 9998")
+            f"the port previously emitted at least 23137")

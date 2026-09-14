@@ -6304,3 +6304,28 @@ That one is a test rather than a corpus file: the interesting inputs are control
 Eleven new canaries, and four of them were NOT CAUGHT at first — including one that needed a struct reached ONLY through an array, since any struct with a binding of its own generates its cascade first and hides the generation order being measured. `cases/blobs_and_scopes.f` carries all of them.
 
 **Verified.** Codegen 25 match, 0 differ, 75 unported. Lexer 111/111, parser 111/111, semantic 111/111, escape analysis 93 match with 1,660 of 1,713 records. 37 canaries: 35 caught, 2 via the ratchet, 0 missed. `cases/blobs_and_scopes.f`, `cases/owning_elements.f` and `cases/nulls.f` are valgrind-clean.
+
+
+311. THE SECOND SELF-HOSTED FILE, AND A COMPILER BUG FOUND BY LOOKING
+
+Cycle collection, ownership minting, and five smaller mechanisms. **23,137 of 270,897 file-specific IR lines, up from 9,998 — more than double, for the second slice running — and 26 files match.**
+
+**`bootstrap/parser.f` emits byte-identical IR: 13,139 of 13,139 lines.** At ~1,200 source lines it is the largest file in the corpus and nearly three times lexer.f. Two of the bootstrap's own ten files now self-host.
+
+**Cycle collection is the mechanism parser.f needed and lexer.f did not.** `Node` reaches itself through `arr[Field]` → `Field.node`, so its release cannot be a refcount decrement: a cycle never reaches zero. claude.md #120's answer is a synchronous TRIAL DELETION — markGray, scan, then black or white — and it is six generated function kinds (`gray`, `scan`, `black`, `white`, plus the `grayedge`/`blackedge` per-element helpers) across two shapes, struct and container. The whole thing is gated on `_is_cyclic_type`: a program with no self-referencing type generates none of it and its releases run no trial, so it pays nothing at all for the collector existing.
+
+**A type had to become a string.** The port keys a release on `(fty, ety)`, which cannot name `arr[Node]`. Type keys are spelled `arr:T` rather than `arr[T]` for a blunt reason: Festina's `text` has no `.slice()`, so a key has to be decodable by `.split()`.
+
+**Ownership MINTING, which no smaller program reached.** `peek().kind` reads a text field through a base the expression owns and is about to release — the value is a borrowed pointer INTO something being freed. claude.md #117's answer is to mint the field's own ownership first (retain a refcounted field, copy a text one) and release the base after; its cascade then decrements the just-retained value back to exactly one reference. That produced a second place where **the VALUE owns something its own expression does not**, so `Val.fresh` is now consulted by `cgFreeTextTemp`, `cgReleaseOwnedReceiver` and the template's per-piece test, not only by the store sites #310 added it for.
+
+**Three more ownership sites that only a large program reaches:** a call frees an owning ARGUMENT after the call (a callee borrows, and anything it kept took its own reference), a discarded call RESULT is released (it is provably the statement's only reference), and a refcounted array element or struct field write stores BEFORE releasing the old value — claude.md #120 again, so a cycle trial never finds the slot still pointing at the value whose count it just dropped.
+
+**The same resolve-before-the-temp trap, a second time.** #310 found that an array element's cascade must be generated before the array body takes temps. A struct FIELD's release has the identical shape and the port had it the identical way round. Both are now canaries.
+
+**`struct == struct` does not compile, and that is the shipped compiler's.** Writing a case file for struct identity produced IR both implementations agree on and LLVM rejects: `icmp eq i64 %ptr, %ptr` — *"'%t1' defined with type 'ptr' but expected 'i64'"*. Two struct values reach the ordinary integer comparison, which never learns they were pointers. Reproduced on four lines. `festina/codegen.py` calls the construct unsupported in a comment — it would have to mean identity or deep equality, and claude.md picks neither — but nothing REJECTS it, so the error surfaces from LLVM rather than from the front end. Recorded in todo.md rather than fixed: either answer (refuse it in semantic.py, or commit to identity and emit `icmp eq ptr`) is a language decision, not a port fix.
+
+That also means the mechanism is **unmeasurable by construction**, and the canary registry says so instead of carrying a breakage no corpus could ever catch: a construct that cannot appear in a compiling program can never be detected by comparing compiled programs.
+
+**Ten new canaries, all caught. 46 in total: 44 as diffs, 2 through the ratchet, 0 missed.**
+
+**Verified.** Codegen 26 match, 0 differ, 74 unported. Lexer 111/111, parser 111/111, semantic 111/111, escape analysis 93 match with 1,684 of 1,737 records. `cases/blobs_and_scopes.f`, `cases/nulls.f`, `cases/owning_elements.f` and `cases/maps.f` are valgrind-clean.

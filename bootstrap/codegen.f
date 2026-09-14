@@ -958,6 +958,13 @@ map[text] SF_NAMES = {}
 // gets its own name back instead of generating a second wrapper.
 map[text] CG_STRUCT_REL = {}
 
+// The receiver cgFieldPtr last emitted. A field read through a base the
+// expression OWNS is a borrowed pointer INTO something about to be
+// released, so it is copied out first and the base released after --
+// claude.md #117/#119. Set on every cgFieldPtr and read immediately by
+// cgMemberRead, so the window in which it is live is one call wide.
+Val CG_FIELD_BASE
+
 bool func cgIsLocal(name:text) {
     return L_SLOT[name] != null
 }
@@ -1377,6 +1384,54 @@ Val func cgBinOp(e:Node) {
         return none
     }
 
+    // A comparison against `null` is its own branch, and it differs
+    // from the generic one twice over: `icmp ... ptr X, null` rather
+    // than an i64 compare, and the two temps in the opposite order --
+    // the comparison's own first, then the widening. `text == null`
+    // never reaches here, because the text branch above claims it for
+    // festina_str_eq.
+    if op == '==' || op == '!=' {
+        bool rNull = rn.kind == 'NullLit'
+        bool lNull = ln.kind == 'NullLit'
+        if rNull || lNull {
+            text other = r.lty
+            text value = r.v
+            if rNull { other = l.lty  value = l.v }
+            if other == 'ptr' {
+                text cmp = cgTmp()
+                text pred = 'eq'
+                if op == '!=' { pred = 'ne' }
+                cgOut(`  ${cmp} = icmp ${pred} ptr ${value}, null`)
+                text out = cgTmp()
+                cgOut(`  ${out} = zext i1 ${cmp} to i8`)
+                return cgVal(out, 'i8', 'bool')
+            }
+        }
+    }
+
+    // Identity, for a value that IS a reference. The original compares
+    // the two pointers as i64 rather than as ptr -- they go through the
+    // ordinary integer comparison path, which never learns they were
+    // pointers. Same answer, different text.
+    if cgIsRefcounted(l.fty) || cgIsRefcounted(r.fty) {
+        if op != '==' && op != '!=' {
+            cgUnported(`operator ${op} on ${l.fty}`)
+            return none
+        }
+        if cgIsRefcounted(l.fty) == false || cgIsRefcounted(r.fty) == false {
+            cgUnported(`operator ${op} between ${l.fty} and ${r.fty}`)
+            return none
+        }
+        text res = cgTmp()
+        text cmp = cgTmp()
+        text pred = 'eq'
+        if op == '!=' { pred = 'ne' }
+        cgOut(`  ${cmp} = icmp ${pred} i64 ${l.v}, ${r.v}`)
+        cgOut(`  ${res} = zext i1 ${cmp} to i8`)
+        return cgVal(res, 'i8', 'bool')
+    }
+
+
     // int/float mix: whichever side is int gets an sitofp, exactly as
     // though .toFloat() had been written on it (claude.md #143).
     if l.fty == 'int' && r.fty == 'float' {
@@ -1536,6 +1591,11 @@ Val func cgFieldPtr(e:Node) {
     Val r = cgVal(fp, SF_LTY[key], SF_FTY[key])
     if SF_FTY[key] == 'struct' { r.sname = SF_SNAME[key] }
     if SF_ETY[key] != null { r.ety = SF_ETY[key] }
+    // The base travels with the pointer, because a READ through a base
+    // this expression owns has to mint the field's own ownership
+    // before that base is released -- see cgMemberRead. A WRITE uses
+    // the pointer and nothing else.
+    CG_FIELD_BASE = obj
     return r
 }
 
@@ -1959,11 +2019,33 @@ Val func cgMemberRead(e:Node) {
     Val none
     Val fp = cgFieldPtr(e)
     if CG_STUCK { return none }
+    Val base = CG_FIELD_BASE
     if cgLtyOf(fp.fty) == '' {
         cgUnported(`read of a ${fp.fty} field`)
         return none
     }
-    return cgLoadFieldValue(fp)
+    Val out = cgLoadFieldValue(fp)
+    if CG_STUCK { return none }
+    // claude.md #117: the field's value points INTO a base this
+    // expression owns and is about to release, so its own ownership is
+    // minted first -- a refcounted field retains, a text one copies --
+    // and only then is the base released. Its cascade then decrements
+    // the just-retained value back to exactly the one reference this
+    // expression holds. A scalar needs no minting: its loaded value
+    // survives the base by copy.
+    if cgIsRefcounted(base.fty) && cgIsOwningRefcountedSource(childOf(e, 'obj')) {
+        if cgIsRefcounted(out.fty) {
+            cgOut(`  call void @festina_retain(ptr ${out.v})`)
+            out.fresh = true
+        } else if out.fty == 'text' {
+            text owned = cgTmp()
+            cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${out.v})`)
+            out.v = owned
+            out.fresh = true
+        }
+        cgOut(`  call void ${cgReleaseFnFor(base.fty, cgRelKeyVal(base))}(ptr ${base.v})`)
+    }
+    return out
 }
 
 // `.length` on a `text` or an `arr[T]`. Two different mechanisms behind
@@ -2185,7 +2267,13 @@ Val func cgTemplate(e:Node) {
         Val a = cgExpr(exprs[i])
         if CG_STUCK { return none }
         bool pieceOwned = a.fty != 'text'
-        if a.fty == 'text' { pieceOwned = cgIsOwningTextSource(exprs[i]) }
+        if a.fty == 'text' {
+            // The VALUE can own a buffer its own node does not -- a
+            // text field read through an owning base was copied out
+            // (claude.md #117) -- so the value is asked first.
+            pieceOwned = a.fresh
+            if pieceOwned == false { pieceOwned = cgIsOwningTextSource(exprs[i]) }
+        }
         Val piece = cgToText(a)
         if CG_STUCK { return none }
 
@@ -2746,6 +2834,30 @@ Val func cgMethodCall(e:Node, callee:Node) {
     return cgToText(r)
 }
 
+// claude.md #108: a call BORROWS every argument for its duration, so
+// an argument the expression itself allocated is the caller's to
+// reclaim once the call returns. An owning refcounted argument is
+// released and an owning text one is freed -- sound because a callee
+// that KEPT anything took its own reference on the way to wherever it
+// stored it (an escaping parameter retains at binding, a global or
+// field store retains, a returned alias is retained by the return
+// path), so the caller's is provably the last one nothing else will
+// drop.
+void func cgFreeCallArgs(args:arr[Node], vals:arr[Val]) {
+    int i = 0
+    while i < vals.length {
+        Val a = vals[i]
+        if cgIsRefcounted(a.fty) {
+            if cgIsOwningRefcountedSource(args[i]) || a.fresh {
+                cgOut(`  call void ${cgReleaseFnFor(a.fty, cgRelKeyVal(a))}(ptr ${a.v})`)
+            }
+        } else {
+            cgFreeTextTemp(args[i], a)
+        }
+        i++
+    }
+}
+
 Val func cgCall(e:Node, wantValue:bool) {
     Val none
     Node callee = childOf(e, 'callee')
@@ -2785,6 +2897,7 @@ Val func cgCall(e:Node, wantValue:bool) {
         if FN_PARAMS[name] != '' { ptys = FN_PARAMS[name].split('|') }
     }
     arr[text] parts = []
+    arr[Val] argVals = []
     int i = 0
     while i < args.length {
         text want = ''
@@ -2792,6 +2905,7 @@ Val func cgCall(e:Node, wantValue:bool) {
         Val a = cgExprExpecting(args[i], want, '')
         if CG_STUCK { return none }
         parts.push(`${a.lty} ${a.v}`)
+        argVals.push(a)
         i++
     }
     text joined = ''
@@ -2803,12 +2917,14 @@ Val func cgCall(e:Node, wantValue:bool) {
     }
     if retF == 'void' {
         cgOut(`  call void @${name}(${joined})`)
+        cgFreeCallArgs(args, argVals)
         return cgVal('', 'void', 'void')
     }
     text lty = cgLtyOf(retF)
     if lty == '' { lty = 'ptr' }
     text t = cgTmp()
     cgOut(`  ${t} = call ${lty} @${name}(${joined})`)
+    cgFreeCallArgs(args, argVals)
     if retF == 'struct' { return cgStructVal(t, FN_RETKEY[name]) }
     if retF == 'arr' { return cgArrVal(t, FN_RETKEY[name]) }
     if retF == 'map' { return cgMapVal(t, FN_RETKEY[name]) }
@@ -3144,7 +3260,21 @@ void func cgEvalForEffect(ex:Node) {
             cgLog(listOf(ex, 'args'))
             return
         }
-        cgCall(ex, false)
+        Val r = cgCall(ex, false)
+        if CG_STUCK { return }
+        // A discarded result this statement OWNS is provably the
+        // value's only reference -- nothing else can hold a call's
+        // fresh +1 yet -- so releasing it here frees it outright and is
+        // correct rather than merely conservative. Only an owning
+        // source reaches this: a bare identifier or field read as a
+        // statement allocates nothing of its own.
+        if cgIsRefcounted(r.fty) {
+            if cgIsOwningRefcountedSource(ex) || r.fresh {
+                cgOut(`  call void ${cgReleaseFnFor(r.fty, cgRelKeyVal(r))}(ptr ${r.v})`)
+            }
+        } else {
+            cgFreeTextTemp(ex, r)
+        }
         return
     }
     if ex.kind == 'Assign' {
@@ -3625,6 +3755,23 @@ void func cgIndexAssign(e:Node, target:Node) {
         return
     }
     text stored = v.v
+    if SF_NAMES[obj.ety] != null {
+        // A refcounted element: the slot's old value is read, the new
+        // one takes its reference, the store happens, and only THEN is
+        // the old one released -- claude.md #120's store-before-release
+        // again, so a cycle trial never finds the slot still pointing
+        // at the value whose count it just dropped.
+        text old = cgTmp()
+        cgOut(`  ${old} = load ptr, ptr ${slot}`)
+        bool eOwning = cgIsOwningRefcountedSource(valueNode)
+        if v.fresh { eOwning = true }
+        if eOwning == false {
+            cgOut(`  call void @festina_retain(ptr ${stored})`)
+        }
+        cgOut(`  store ${elemLty} ${stored}, ptr ${slot}`)
+        cgOut(`  call void ${cgReleaseFnFor('struct', obj.ety)}(ptr ${old})`)
+        return
+    }
     if obj.ety == 'text' {
         // Unlike a literal's fresh buffer, this slot already holds
         // something, so the old value is reclaimed -- and read BEFORE
@@ -3681,6 +3828,27 @@ void func cgAssign(e:Node) {
             }
             cgOut(`  call void @free(ptr ${old})`)
             cgOut(`  store ptr ${stored}, ptr ${fp.v}`)
+            return
+        }
+        if cgIsRefcounted(fp.fty) {
+            Node rvalue = childOf(e, 'value')
+            Val rv = cgExprExpecting(rvalue, fp.fty, fp.ety)
+            if CG_STUCK { return }
+            text old = cgTmp()
+            cgOut(`  ${old} = load ptr, ptr ${fp.v}`)
+            bool owning = cgIsOwningRefcountedSource(rvalue)
+            if rv.fresh { owning = true }
+            if owning == false {
+                cgOut(`  call void @festina_retain(ptr ${rv.v})`)
+            }
+            // claude.md #120: the release of the overwritten value is
+            // DEFERRED until after the store. A cycle trial run by that
+            // release must never find the field still pointing at the
+            // value whose count it has just dropped -- which is why
+            // this one path stores first, where a plain binding
+            // assignment releases first.
+            cgOut(`  store ptr ${rv.v}, ptr ${fp.v}`)
+            cgOut(`  call void ${cgReleaseFnFor(fp.fty, cgRelKeyVal(fp))}(ptr ${old})`)
             return
         }
         if fp.fty != 'int' && fp.fty != 'float' && fp.fty != 'bool' {
@@ -3934,17 +4102,21 @@ void func cgReleaseStructFields(objPtr:text, sname:text) {
         bool managed = cgIsRefcounted(f)
         if f == 'text' { managed = true }
         if managed {
-            text fp = cgTmp()
-            cgOut(`  ${fp} = getelementptr %struct.${sname}, ptr ${objPtr}, i32 0, i32 ${SF_IDX[key]}`)
-            text fv = cgTmp()
-            cgOut(`  ${fv} = load ptr, ptr ${fp}`)
             // decisions.md #284: a text FIELD goes through
             // festina_free_z rather than plain free, and this is the
             // site that matters most for `clear` -- a struct holding a
             // secret holds it in a text field, and wiping only the
             // struct's own storage would leave it in the heap.
+            //
+            // Resolved BEFORE the field's own GEP temp, because
+            // resolving it may GENERATE another cascade and that one's
+            // temps come first. The same trap the array cascade has.
             text fn = '@festina_free_z'
             if f != 'text' { fn = cgReleaseFnFor(f, cgFieldEty(key)) }
+            text fp = cgTmp()
+            cgOut(`  ${fp} = getelementptr %struct.${sname}, ptr ${objPtr}, i32 0, i32 ${SF_IDX[key]}`)
+            text fv = cgTmp()
+            cgOut(`  ${fv} = load ptr, ptr ${fp}`)
             cgOut(`  call void ${fn}(ptr ${fv})`)
         }
         i++
@@ -3967,6 +4139,404 @@ text func cgRelKeyOf(name:text) {
 text func cgRelKeyVal(v:Val) {
     if v.fty == 'struct' { return v.sname }
     return v.ety
+}
+
+// ---------------------------------------------------------------------
+// claude.md #120: cycle collection.
+//
+// A reference cycle never reaches zero, so refcounting alone never
+// frees one. The answer is a synchronous TRIAL DELETION: when a
+// release leaves a value still referenced, try it as a cycle root --
+// markGray (tentatively remove every edge internal to the subgraph),
+// scan (decide survival from the counts that remain), then black
+// (restore a surviving region) or white (free the garbage).
+//
+// The whole thing is gated on whether the TYPE can reach itself. A
+// program with no self-referencing type generates none of these
+// functions and its releases run no trial, so it pays literally
+// nothing for the collector existing.
+//
+// A type is identified here by a key that describes itself: a struct
+// by its name, a container as `arr[T]`/`map[T]`. That is the same
+// spelling festina/codegen.py uses, and it is what lets a child be
+// handed around as one string instead of a pair.
+
+// Spelled `arr:T` rather than `arr[T]`: Festina's `text` has no
+// `.slice()`, so a key has to be decodable by `.split()`, and a struct
+// name never contains a colon.
+text func cgTypeKey(fty:text, ety:text) {
+    if fty == 'struct' { return ety }
+    if fty == 'arr' { return `arr:${ety}` }
+    if fty == 'map' { return `map:${ety}` }
+    return ''
+}
+
+text func cgKeyFty(key:text) {
+    arr[text] parts = key.split(':')
+    if parts.length == 2 { return parts[0] }
+    return 'struct'
+}
+
+text func cgKeyEty(key:text) {
+    arr[text] parts = key.split(':')
+    if parts.length == 2 { return parts[1] }
+    return key
+}
+
+// The type-graph edges a trial walks: a struct's struct/arr/map fields,
+// a container's element type when it is one of those. Every leaf --
+// text, blob, a scalar -- has no outgoing edge, because none of them
+// holds a reference to another managed value.
+arr[text] func cgManagedChildren(key:text) {
+    arr[text] out = []
+    if cgKeyFty(key) != 'struct' {
+        text e = cgKeyEty(key)
+        if SF_NAMES[e] != null { out.push(e) }
+        return out
+    }
+    if SF_NAMES[key] == null { return out }
+    if SF_NAMES[key] == '' { return out }
+    arr[text] names = SF_NAMES[key].split('|')
+    int i = 0
+    while i < names.length {
+        text fk = `${key}.${names[i]}`
+        text f = SF_FTY[fk]
+        if f == 'struct' || f == 'arr' || f == 'map' {
+            out.push(cgTypeKey(f, cgFieldEty(fk)))
+        }
+        i++
+    }
+    return out
+}
+
+map[int] CG_CYCLIC = {}
+map[text] CG_CYCLE_FNS = {}
+
+// Whether values of this type can sit on a cycle -- whether the type
+// can reach ITSELF through managed edges. Purely a property of the
+// declared type graph, so it is computed once per key and cached.
+bool func cgIsCyclic(key:text) {
+    if key == '' { return false }
+    if CG_CYCLIC[key] != null { return CG_CYCLIC[key] == 1 }
+    map[int] seen = {}
+    arr[text] frontier = cgManagedChildren(key)
+    bool result = false
+    while frontier.length > 0 {
+        text child = frontier.pop()
+        if child == key {
+            result = true
+            frontier = []
+        } else if seen[child] == null {
+            seen[child] = 1
+            arr[text] more = cgManagedChildren(child)
+            int j = 0
+            while j < more.length {
+                frontier.push(more[j])
+                j++
+            }
+        }
+    }
+    if result { CG_CYCLIC[key] = 1 } else { CG_CYCLIC[key] = 0 }
+    return result
+}
+
+// The four traversals, plus the two per-element helpers a container
+// hands to festina_cycle_visit_*. Registered in the cache BEFORE the
+// body is generated, exactly like the release wrappers -- which is the
+// only thing standing between a self-referencing type and infinite
+// generation.
+text func cgCycleFn(op:text, key:text) {
+    text ck = `${op}|${key}`
+    if CG_CYCLE_FNS[ck] != null { return CG_CYCLE_FNS[ck] }
+    text name = `@__festina_cycle_${op}_${cgUid()}`
+    CG_CYCLE_FNS[ck] = name
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    if op == 'grayedge' {
+        cgOut(`define void ${name}(ptr %c) {`)
+        cgBlockLabel('entry')
+        cgOut('  call void @festina_cycle_dec(ptr %c)')
+        cgOut(`  call void ${cgCycleFn('gray', key)}(ptr %c)`)
+        cgOut('  ret void')
+        cgOut('}')
+        cgOut('')
+    } else if op == 'blackedge' {
+        cgOut(`define void ${name}(ptr %c) {`)
+        cgBlockLabel('entry')
+        text recL = cgLabel('cyedge.rec')
+        text doneL = cgLabel('cyedge.done')
+        text nb = cgTmp()
+        text cc = cgTmp()
+        cgOut('  call void @festina_cycle_inc(ptr %c)')
+        cgOut(`  ${nb} = call i8 @festina_cycle_needs_black(ptr %c)`)
+        cgOut(`  ${cc} = icmp ne i8 ${nb}, 0`)
+        cgOut(`  br i1 ${cc}, label %${recL}, label %${doneL}`)
+        cgBlockLabel(recL)
+        cgOut(`  call void ${cgCycleFn('black', key)}(ptr %c)`)
+        cgOut(`  br label %${doneL}`)
+        cgBlockLabel(doneL)
+        cgOut('  ret void')
+        cgOut('}')
+        cgOut('')
+    } else if cgKeyFty(key) == 'struct' {
+        cgCycleStructBody(op, key, name)
+    } else {
+        cgCycleContainerBody(op, key, name)
+    }
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
+// The fields a trial traverses: exactly the cyclic-typed ones.
+// Everything else the struct owns -- text buffers, acyclic containers
+// -- is handled by `white`'s disposal instead, released through the
+// ordinary machinery, because it provably is not part of any cycle and
+// its counts were never touched by the trial.
+arr[text] func cgCycleStructChildren(sname:text) {
+    arr[text] out = []
+    if SF_NAMES[sname] == null { return out }
+    if SF_NAMES[sname] == '' { return out }
+    arr[text] names = SF_NAMES[sname].split('|')
+    int i = 0
+    while i < names.length {
+        text fk = `${sname}.${names[i]}`
+        text f = SF_FTY[fk]
+        if f == 'struct' || f == 'arr' || f == 'map' {
+            text ck = cgTypeKey(f, cgFieldEty(fk))
+            if cgIsCyclic(ck) { out.push(`${SF_IDX[fk]}|${ck}`) }
+        }
+        i++
+    }
+    return out
+}
+
+text func cgCycleLoadField(sname:text, idx:text) {
+    text fp = cgTmp()
+    cgOut(`  ${fp} = getelementptr %struct.${sname}, ptr %p, i32 0, i32 ${idx}`)
+    text fv = cgTmp()
+    cgOut(`  ${fv} = load ptr, ptr ${fp}`)
+    return fv
+}
+
+void func cgCycleStructBody(op:text, sname:text, name:text) {
+    arr[text] children = cgCycleStructChildren(sname)
+    cgOut(`define void ${name}(ptr %p) {`)
+    cgBlockLabel('entry')
+    if op == 'gray' {
+        text go = cgTmp()
+        text cond = cgTmp()
+        text walk = cgLabel('cygray.walk')
+        text done = cgLabel('cygray.done')
+        cgOut(`  ${go} = call i8 @festina_cycle_begin_gray(ptr %p)`)
+        cgOut(`  ${cond} = icmp ne i8 ${go}, 0`)
+        cgOut(`  br i1 ${cond}, label %${walk}, label %${done}`)
+        cgBlockLabel(walk)
+        int i = 0
+        while i < children.length {
+            arr[text] c = children[i].split('|')
+            text fv = cgCycleLoadField(sname, c[0])
+            cgOut(`  call void @festina_cycle_dec(ptr ${fv})`)
+            cgOut(`  call void ${cgCycleFn('gray', c[1])}(ptr ${fv})`)
+            i++
+        }
+        cgOut(`  br label %${done}`)
+        cgBlockLabel(done)
+    } else if op == 'scan' {
+        text r = cgTmp()
+        text is1 = cgTmp()
+        text blackL = cgLabel('cyscan.black')
+        text chk2 = cgLabel('cyscan.chk2')
+        text walk = cgLabel('cyscan.walk')
+        text done = cgLabel('cyscan.done')
+        cgOut(`  ${r} = call i64 @festina_cycle_begin_scan(ptr %p)`)
+        cgOut(`  ${is1} = icmp eq i64 ${r}, 1`)
+        cgOut(`  br i1 ${is1}, label %${blackL}, label %${chk2}`)
+        cgBlockLabel(blackL)
+        cgOut(`  call void ${cgCycleFn('black', sname)}(ptr %p)`)
+        cgOut(`  br label %${done}`)
+        cgBlockLabel(chk2)
+        text is2 = cgTmp()
+        cgOut(`  ${is2} = icmp eq i64 ${r}, 2`)
+        cgOut(`  br i1 ${is2}, label %${walk}, label %${done}`)
+        cgBlockLabel(walk)
+        int i2 = 0
+        while i2 < children.length {
+            arr[text] c = children[i2].split('|')
+            text fv = cgCycleLoadField(sname, c[0])
+            cgOut(`  call void ${cgCycleFn('scan', c[1])}(ptr ${fv})`)
+            i2++
+        }
+        cgOut(`  br label %${done}`)
+        cgBlockLabel(done)
+    } else if op == 'black' {
+        cgOut('  call void @festina_cycle_set_black(ptr %p)')
+        int i3 = 0
+        while i3 < children.length {
+            arr[text] c = children[i3].split('|')
+            text fv = cgCycleLoadField(sname, c[0])
+            cgOut(`  call void @festina_cycle_inc(ptr ${fv})`)
+            text nb = cgTmp()
+            text cc = cgTmp()
+            text rec = cgLabel('cyblack.rec')
+            text nxt = cgLabel('cyblack.next')
+            cgOut(`  ${nb} = call i8 @festina_cycle_needs_black(ptr ${fv})`)
+            cgOut(`  ${cc} = icmp ne i8 ${nb}, 0`)
+            cgOut(`  br i1 ${cc}, label %${rec}, label %${nxt}`)
+            cgBlockLabel(rec)
+            cgOut(`  call void ${cgCycleFn('black', c[1])}(ptr ${fv})`)
+            cgOut(`  br label %${nxt}`)
+            cgBlockLabel(nxt)
+            i3++
+        }
+    } else {
+        text go = cgTmp()
+        text cond = cgTmp()
+        text walk = cgLabel('cywhite.walk')
+        text done = cgLabel('cywhite.done')
+        cgOut(`  ${go} = call i8 @festina_cycle_begin_white(ptr %p)`)
+        cgOut(`  ${cond} = icmp ne i8 ${go}, 0`)
+        cgOut(`  br i1 ${cond}, label %${walk}, label %${done}`)
+        cgBlockLabel(walk)
+        int i4 = 0
+        while i4 < children.length {
+            arr[text] c = children[i4].split('|')
+            text fv = cgCycleLoadField(sname, c[0])
+            cgOut(`  call void ${cgCycleFn('white', c[1])}(ptr ${fv})`)
+            i4++
+        }
+        // Dispose: everything the node owns that the trial did NOT
+        // traverse -- ordinary releases, whose counts the trial never
+        // altered. Cyclic children are NOT released here: markGray
+        // already removed those counts and the white recursion above
+        // frees whichever of them are garbage.
+        arr[text] names = SF_NAMES[sname].split('|')
+        int k = 0
+        while k < names.length {
+            text fk = `${sname}.${names[k]}`
+            text f = SF_FTY[fk]
+            bool cyclic = false
+            if f == 'struct' || f == 'arr' || f == 'map' {
+                if cgIsCyclic(cgTypeKey(f, cgFieldEty(fk))) { cyclic = true }
+            }
+            if cyclic == false {
+                if cgIsRefcounted(f) {
+                    text dfn = cgReleaseFnFor(f, cgFieldEty(fk))
+                    text fv = cgCycleLoadField(sname, `${SF_IDX[fk]}`)
+                    cgOut(`  call void ${dfn}(ptr ${fv})`)
+                } else if f == 'text' {
+                    text fv = cgCycleLoadField(sname, `${SF_IDX[fk]}`)
+                    cgOut(`  call void @festina_free_z(ptr ${fv})`)
+                }
+            }
+            k++
+        }
+        text hdr = cgTmp()
+        cgOut(`  ${hdr} = getelementptr i8, ptr %p, i64 -8`)
+        cgOut(`  call void @free(ptr ${hdr})`)
+        cgOut(`  br label %${done}`)
+        cgBlockLabel(done)
+    }
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+}
+
+// An arr[T]/map[T] with a cyclic T: the same four operations, with the
+// per-element loop delegated to the runtime's visit helper handing
+// each element to the element type's own function -- or to a
+// grayedge/blackedge helper where the edge has count work of its own.
+// Disposal is the runtime's, covering the container's buffers and keys
+// and never its elements.
+void func cgCycleContainerBody(op:text, key:text, name:text) {
+    bool isMap = cgKeyFty(key) == 'map'
+    text elem = cgKeyEty(key)
+    text visit = '@festina_cycle_visit_array'
+    text dispose = '@festina_cycle_dispose_array'
+    if isMap {
+        visit = '@festina_cycle_visit_map'
+        dispose = '@festina_cycle_dispose_map'
+    }
+    cgOut(`define void ${name}(ptr %p) {`)
+    cgBlockLabel('entry')
+    if op == 'gray' {
+        text go = cgTmp()
+        text cond = cgTmp()
+        text walk = cgLabel('cygray.walk')
+        text done = cgLabel('cygray.done')
+        cgOut(`  ${go} = call i8 @festina_cycle_begin_gray(ptr %p)`)
+        cgOut(`  ${cond} = icmp ne i8 ${go}, 0`)
+        cgOut(`  br i1 ${cond}, label %${walk}, label %${done}`)
+        cgBlockLabel(walk)
+        cgOut(`  call void ${visit}(ptr %p, ptr ${cgCycleFn('grayedge', elem)})`)
+        cgOut(`  br label %${done}`)
+        cgBlockLabel(done)
+    } else if op == 'scan' {
+        text r = cgTmp()
+        text is1 = cgTmp()
+        text blackL = cgLabel('cyscan.black')
+        text chk2 = cgLabel('cyscan.chk2')
+        text walk = cgLabel('cyscan.walk')
+        text done = cgLabel('cyscan.done')
+        cgOut(`  ${r} = call i64 @festina_cycle_begin_scan(ptr %p)`)
+        cgOut(`  ${is1} = icmp eq i64 ${r}, 1`)
+        cgOut(`  br i1 ${is1}, label %${blackL}, label %${chk2}`)
+        cgBlockLabel(blackL)
+        cgOut(`  call void ${cgCycleFn('black', key)}(ptr %p)`)
+        cgOut(`  br label %${done}`)
+        cgBlockLabel(chk2)
+        text is2 = cgTmp()
+        cgOut(`  ${is2} = icmp eq i64 ${r}, 2`)
+        cgOut(`  br i1 ${is2}, label %${walk}, label %${done}`)
+        cgBlockLabel(walk)
+        cgOut(`  call void ${visit}(ptr %p, ptr ${cgCycleFn('scan', elem)})`)
+        cgOut(`  br label %${done}`)
+        cgBlockLabel(done)
+    } else if op == 'black' {
+        cgOut('  call void @festina_cycle_set_black(ptr %p)')
+        cgOut(`  call void ${visit}(ptr %p, ptr ${cgCycleFn('blackedge', elem)})`)
+    } else {
+        text go = cgTmp()
+        text cond = cgTmp()
+        text walk = cgLabel('cywhite.walk')
+        text done = cgLabel('cywhite.done')
+        cgOut(`  ${go} = call i8 @festina_cycle_begin_white(ptr %p)`)
+        cgOut(`  ${cond} = icmp ne i8 ${go}, 0`)
+        cgOut(`  br i1 ${cond}, label %${walk}, label %${done}`)
+        cgBlockLabel(walk)
+        cgOut(`  call void ${visit}(ptr %p, ptr ${cgCycleFn('white', elem)})`)
+        cgOut(`  call void ${dispose}(ptr %p)`)
+        cgOut(`  br label %${done}`)
+        cgBlockLabel(done)
+    }
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+}
+
+// The still-referenced branch of a cyclic type's release wrapper: the
+// value survives its own release, so try it as a cycle root. The
+// candidate check keeps the trial off null and immortal values;
+// everything else is at worst wasted work -- an externally-reachable
+// subgraph scans black and comes out exactly as it went in -- never
+// corruption.
+void func cgCycleTrial(key:text, aliveL:text, doneL:text) {
+    cgBlockLabel(aliveL)
+    text cand = cgTmp()
+    text cc = cgTmp()
+    text trial = cgLabel('reltrial.run')
+    cgOut(`  ${cand} = call i8 @festina_cycle_candidate(ptr %payload)`)
+    cgOut(`  ${cc} = icmp ne i8 ${cand}, 0`)
+    cgOut(`  br i1 ${cc}, label %${trial}, label %${doneL}`)
+    cgBlockLabel(trial)
+    cgOut(`  call void ${cgCycleFn('gray', key)}(ptr %payload)`)
+    cgOut(`  call void ${cgCycleFn('scan', key)}(ptr %payload)`)
+    cgOut(`  call void ${cgCycleFn('white', key)}(ptr %payload)`)
+    cgOut(`  br label %${doneL}`)
 }
 
 // claude.md #78: the per-struct cascade. Registered in the cache
@@ -3993,13 +4563,23 @@ text func cgReleaseStructFn(sname:text) {
     cgOut(`  ${cond} = icmp ne i8 ${chk}, 0`)
     text freeL = cgLabel('relstruct.free')
     text doneL = cgLabel('relstruct.done')
-    cgOut(`  br i1 ${cond}, label %${freeL}, label %${doneL}`)
+    // claude.md #120: a type that can sit on a cycle takes a third
+    // branch -- the not-last-reference case runs a trial deletion
+    // instead of doing nothing, because this release may be the last
+    // EXTERNAL reference to a cycle whose internal edges hold every
+    // count above zero. An acyclic type keeps the plain two-way branch
+    // and pays nothing.
+    bool cyclic = cgIsCyclic(sname)
+    text aliveL = doneL
+    if cyclic { aliveL = cgLabel('relstruct.alive') }
+    cgOut(`  br i1 ${cond}, label %${freeL}, label %${aliveL}`)
     cgBlockLabel(freeL)
     cgReleaseStructFields('%payload', sname)
     text hdr = cgTmp()
     cgOut(`  ${hdr} = getelementptr i8, ptr %payload, i64 -8`)
     cgOut(`  call void @festina_free_z(ptr ${hdr})`)
     cgOut(`  br label %${doneL}`)
+    if cyclic { cgCycleTrial(sname, aliveL, doneL) }
     cgBlockLabel(doneL)
     cgOut('  ret void')
     cgOut('}')
@@ -4033,7 +4613,12 @@ text func cgReleaseArrayFn(ety:text) {
     cgOut(`  ${cond} = icmp ne i8 ${chk}, 0`)
     text freeL = cgLabel('relarr.free')
     text doneL = cgLabel('relarr.done')
-    cgOut(`  br i1 ${cond}, label %${freeL}, label %${doneL}`)
+    // The same trial branch the struct wrapper grows, for an arr[T]
+    // whose T sits on a cycle.
+    bool cyclic = cgIsCyclic(cgTypeKey('arr', ety))
+    text aliveL = doneL
+    if cyclic { aliveL = cgLabel('relarr.alive') }
+    cgOut(`  br i1 ${cond}, label %${freeL}, label %${aliveL}`)
     cgBlockLabel(freeL)
     text lenP = cgTmp()
     cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr %payload, i32 0, i32 0`)
@@ -4049,6 +4634,7 @@ text func cgReleaseArrayFn(ety:text) {
     cgOut(`  ${hdr} = getelementptr i8, ptr %payload, i64 -8`)
     cgOut(`  call void @festina_free_z(ptr ${hdr})`)
     cgOut(`  br label %${doneL}`)
+    if cyclic { cgCycleTrial(cgTypeKey('arr', ety), aliveL, doneL) }
     cgBlockLabel(doneL)
     cgOut('  ret void')
     cgOut('}')
@@ -4097,13 +4683,21 @@ bool func cgIsOwningTextSource(e:Node) {
 // ever release it.
 void func cgReleaseOwnedReceiver(e:Node, v:Val) {
     if cgIsRefcounted(v.fty) == false { return }
-    if cgIsOwningRefcountedSource(e) == false { return }
+    if v.fresh == false {
+        if cgIsOwningRefcountedSource(e) == false { return }
+    }
     cgOut(`  call void ${cgReleaseFnFor(v.fty, cgRelKeyVal(v))}(ptr ${v.v})`)
 }
 
 void func cgFreeTextTemp(e:Node, v:Val) {
     if v.fty != 'text' { return }
-    if cgIsOwningTextSource(e) == false { return }
+    // The VALUE can own a buffer its own expression does not: a text
+    // field read through an owning base was copied out (claude.md
+    // #117), so the node reads as a plain member access and the value
+    // holds a fresh buffer.
+    if v.fresh == false {
+        if cgIsOwningTextSource(e) == false { return }
+    }
     cgOut(`  call void @free(ptr ${v.v})`)
 }
 
@@ -4237,22 +4831,22 @@ void func cgFunc(d:Node) {
                 // A handle: one ptr, and nothing to say about elements
                 // or fields. Its release is the runtime's own.
             } else if pf == 'struct' {
-                if SF_PLAIN[pt.name] == null {
-                    cgUnported('parameter of a struct with a non-scalar field')
-                    return
-                }
                 psname = pt.name
             } else {
                 Ty pe = pt.elem
-                if pe == null || pe.kind != 'prim' {
+                if pe == null { 
                     cgUnported(`${pf} parameter of a non-scalar type`)
                     return
                 }
-                if pe.name != 'int' && pe.name != 'float' && pe.name != 'bool' {
-                    cgUnported(`${pf} parameter of ${pe.name}`)
+                if pe.kind != 'prim' && pe.kind != 'struct' {
+                    cgUnported(`${pf} parameter of a non-scalar type`)
                     return
                 }
                 pety = pe.name
+                if cgStorableRefcounted(pf, pety) == false {
+                    cgUnported(`${pf} parameter of ${pe.name}`)
+                    return
+                }
             }
         }
         sig.push(`${plty} %arg.${pn}`)
