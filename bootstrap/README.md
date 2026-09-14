@@ -53,15 +53,17 @@ python bootstrap/canary.py                          # can the corpus still TELL?
 python bootstrap/canary.py --list
 ```
 
-Over the 109-file repository corpus:
+Over the 110-file repository corpus:
 
-- **lexer: 109 match, 0 differ.**
-- **parser: 109 match, 0 differ, 0 unported.**
-- **semantic: 109 match, 0 differ, 0 unported.**
-- **escape analysis: 91 match, 0 differ, 7 unported, 11 rejected by
-  both** — 1,623 of 1,676 records.
-- **codegen: 22 match, 0 differ, 76 unported, 11 rejected by both** —
-  4,341 of 253,842 file-specific IR lines. See below for why that is the
+- **lexer: 110 match, 0 differ.**
+- **parser: 110 match, 0 differ, 0 unported.**
+- **semantic: 110 match, 0 differ, 0 unported.**
+- **escape analysis: 92 match, 0 differ, 7 unported, 11 rejected by
+  both** — 1,632 of 1,685 records.
+- **codegen: 23 match, 0 differ, 76 unported, 11 rejected by both** —
+  4,849 of 256,416 file-specific IR lines.
+- **canaries: 24 caught, 2 caught through the ratchet, 0 missed** (of
+  26). See below for why that is the
   number reported rather than a file count, and for the caveat that
   comes with this particular figure.
 
@@ -69,9 +71,9 @@ Over the 109-file repository corpus:
 the two implementations agree; it says nothing about whether the corpus
 could tell them apart if they stopped agreeing — and for four
 consecutive slices of the codegen port, the honest answer was that it
-could not. `bootstrap/canary.py` holds twenty deliberate breakages, one
-per mechanism, and asks the corpus whether it notices: **19 caught as a
-diff, 1 caught through the coverage ratchet, 0 not caught.** A failure
+could not. `bootstrap/canary.py` holds twenty-six deliberate breakages, one
+per mechanism, and asks the corpus whether it notices: **24 caught as a
+diff, 2 caught through the coverage ratchet, 0 not caught.** A failure
 there is not a compiler bug — it means a `cases/` file has drifted and
 the mechanism behind it is unmeasured, so the fix is a corpus file
 rather than a code change. See "Canaries" below.
@@ -169,7 +171,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Escape analysis: 1,623 of 1,676 records
+## Escape analysis: 1,632 of 1,685 records
 
 `escape_analysis.py` answers one purely syntactic question per function
 body — which names appear anywhere other than as the immediate base of
@@ -269,7 +271,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 4,341 of 253,842 file-specific IR lines
+## Codegen: 4,849 of 256,416 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -336,11 +338,11 @@ times and so could not have varied either way.
 
 ### And the caveat that comes with the current figure
 
-**3,207 of the 4,341 lines come from eight `cases/` files written for
-the slices that claim them** — `escape_locals.f` (538),
-`owning_elements.f` (537), `maps.f` (521), `text_building.f` (418),
-`struct_fields.f` (348), `array_literals.f` (341), `conversions.f`
-(252) and `indexing.f` (252). Non-scalar parameters were the one slice
+**3,715 of the 4,849 lines come from nine `cases/` files written for
+the slices that claim them** — `owning_elements.f` (652),
+`escape_locals.f` (538), `maps.f` (521), `text_building.f` (418),
+`nulls.f` (393), `struct_fields.f` (348), `array_literals.f` (341),
+`indexing.f` (252) and `conversions.f` (252). Non-scalar parameters were the one slice
 so far to bring in pre-existing files instead: `examples/geometry.f`
 and `examples/multifile.f`, the two the blocker table listed as one
 construct away. Struct fields and container globals
@@ -362,7 +364,7 @@ the implementation. But a number that grows because the input grew says
 nothing about the remaining 178,000 lines, and the two facts are worth
 keeping separate when reading the table below.
 
-**The budget is not fixed, either.** It went 175,080 → 253,842 across
+**The budget is not fixed, either.** It went 175,080 → 256,416 across
 one session with `festina/codegen.py` untouched, because
 `bootstrap/codegen.f` is itself a corpus file: every line added to the
 port enlarges the denominator. Self-hosting is a moving goal by
@@ -409,7 +411,7 @@ interrupted run cannot leave a deliberately broken compiler checked out.
 
 The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
-**220,382 of the 253,842 file-specific IR lines**, and they need
+**222,448 of the 256,416 file-specific IR lines**, and they need
 none of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
@@ -432,7 +434,8 @@ struct **locals**, stack or heap by claude.md #74's own answer;
 `arr[T]`/`map[T]` **locals** of a scalar element type, on the same
 decision; struct/`arr[T]`/`map[T]` **parameters**, on the same
 decision again, and `arr[text]` on a generated per-element-type
-release cascade; `.push()`/`.pop()`/`.shift()`/`.unshift()`; method
+release cascade; `.push()`/`.pop()`/`.shift()`/`.unshift()`,
+`.split()` and `.join()`; `null` in every typed position; method
 calls, with the conversion family
 (`toText`/`toInt`/`toFloat`/`toChar`/`trim`/`charCodeAt`) and all four
 `Math` tables behind them; `.length` on `text` and `arr[T]`; array
@@ -441,7 +444,7 @@ declared type to take their element type from; map reads, writes and
 `delete`; assignment to a refcounted binding; and imports merged before
 either stage runs.
 
-Seventeen pieces are subtler than they look:
+Eighteen pieces are subtler than they look:
 
 - **Alloca hoisting** (claude.md #191) is a post-pass over the finished
   text, exactly as in the original, because it is a property of the
@@ -502,6 +505,13 @@ Seventeen pieces are subtler than they look:
   `.length` frees. An index is emitted **before** the data pointer, and
   on a write the whole slot is computed before the value; neither shows
   in `xs[0] = 1`, which is why `cases/indexing.f` indexes with a call.
+- **`null` has no type of its own and no single bit pattern.** An
+  `int` null is i64's minimum, a `float` null is a NaN, a `bool` null
+  is 2, everything else is the LLVM null pointer — so it can only be
+  emitted where a type is already known, and a comparison takes that
+  type from its OTHER side, which reverses the order the two operands
+  are evaluated in. A NaN is not equal to itself, so a `float` null
+  cannot be tested for with `==` even though it prints as `nan`.
 - **The generic release is wrong the moment an element owns
   something.** `@festina_release_array` frees the buffer and the header
   and knows nothing about what the slots hold, so a container of a type
@@ -560,20 +570,22 @@ sanitizer for this stage rather than needing it alongside.
 |22|0|an `arr[T]` local of a non-scalar element type|
 |19|0|`EventHandler`|
 |18|0|`ThreadDecl`|
-|16|0|a parameter of a type this port still refuses (`blob`, …)|
+|16|**1**|a parameter of a type this port still refuses (`blob`, …)|
 |15|0|`free`|
 |13|0|an `arr[T]` global of a non-scalar element type|
-|13|0|`null` as an expression|
 |12|0|`.postMessage()`|
+|12|0|indexing an array of a non-scalar element type|
 
 `blocks` counts every file a construct appears in; `only` counts the
 files where it is the last thing in the way, and so the number that
 would actually become matches.
 
-**The `only` column is three files, total** — `table` declarations for
-two and `try`/`catch` for the third, both of them features rather than
-expression-level work. Non-scalar parameters took the other two, and
-nothing else in this corpus is one construct from matching. Nothing else in this
+**The `only` column is four files, and one of them is the one that
+matters**: `bootstrap/lexer.f`, the smallest of the bootstrap's own ten
+files, is blocked by a single construct — the `blob` parameter its
+`tokenize(src:blob, …)` signature needs. The other three are `table`
+declarations for two and `try`/`catch` for one, both features rather
+than expression-level work. Nothing else in this
 corpus is one construct from matching, and the earlier tables that
 implied otherwise were measuring wrong: the walk stopped at the first
 reason inside an expression, so `examples/ascii_scan.f` claimed a

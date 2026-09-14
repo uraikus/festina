@@ -907,6 +907,10 @@ map[text] L_SLOT = {}
 map[text] L_FTY = {}
 map[text] FN_RET = {}
 
+// Each function's parameter types, joined by `|` -- see the
+// registration site for why a call needs them.
+map[text] FN_PARAMS = {}
+
 // Struct field layout, keyed '<Struct>.<field>'. codegen.py reads this
 // off `analyzed.structs`; here it is collected while the type
 // definitions are emitted, which is the same information in the same
@@ -1222,6 +1226,15 @@ Val func cgExpr(e:Node) {
         return cgVal(cgStringConst(rawText(e, 'value')), 'ptr', 'text')
     }
 
+    // A `null` with no declared type in reach. `null` is only valid IR
+    // for a pointer type, which covers every Festina type that can get
+    // here at all -- int/float/bool always have a context, because
+    // their nulls are ordinary constants and there is nowhere to put
+    // one without knowing which. See cgExprExpecting for that half.
+    if e.kind == 'NullLit' {
+        return cgVal('null', 'ptr', 'null')
+    }
+
     if e.kind == 'Identifier' {
         text name = rawText(e, 'name')
         text slot = cgSlotOf(name)
@@ -1253,10 +1266,37 @@ Val func cgExpr(e:Node) {
 
 Val func cgBinOp(e:Node) {
     Val none
-    Val l = cgExpr(childOf(e, 'left'))
-    if CG_STUCK { return none }
-    Val r = cgExpr(childOf(e, 'right'))
-    if CG_STUCK { return none }
+    Node ln = childOf(e, 'left')
+    Node rn = childOf(e, 'right')
+    Val l
+    Val r
+
+    // `x == null` takes its type from the OTHER side, which means the
+    // other side has to be emitted first -- and for `null == x` that
+    // reverses the order the two operands are evaluated in. Observable
+    // whenever the non-null side has effects of its own, so it is the
+    // original's order rather than left-to-right by default.
+    //
+    // `null == null` has no context on either side and stays
+    // unresolved, exactly as in the original: an exceedingly rare
+    // expression with no obvious meaning, left alone under claude.md
+    // #54's ambiguity rule rather than guessed at.
+    if rn.kind == 'NullLit' && ln.kind != 'NullLit' {
+        l = cgExpr(ln)
+        if CG_STUCK { return none }
+        r = cgExprExpecting(rn, l.fty, '')
+        if CG_STUCK { return none }
+    } else if ln.kind == 'NullLit' && rn.kind != 'NullLit' {
+        r = cgExpr(rn)
+        if CG_STUCK { return none }
+        l = cgExprExpecting(ln, r.fty, '')
+        if CG_STUCK { return none }
+    } else {
+        l = cgExpr(ln)
+        if CG_STUCK { return none }
+        r = cgExpr(rn)
+        if CG_STUCK { return none }
+    }
     text op = rawText(e, 'op')
 
     // `text` has its own branch, ahead of everything numeric: `==`/`!=`
@@ -1560,7 +1600,7 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
     arr[int] owned = []
     int i = 0
     while i < elems.length {
-        Val v = cgExpr(elems[i])
+        Val v = cgExprExpecting(elems[i], ety, '')
         if CG_STUCK { return none }
         if v.fty != ety {
             cgUnported(`array literal element of type ${v.fty} in an array of ${ety}`)
@@ -1622,6 +1662,18 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
 // routing every typed position through one function is what keeps the
 // two from drifting.
 Val func cgExprExpecting(e:Node, fty:text, ety:text) {
+    // `null` has no type of its own, so it can only be emitted where
+    // one is already known. Each Festina type spells its own null
+    // differently -- i64's minimum, a NaN, 2 for a bool, the LLVM null
+    // pointer for everything else -- and cgNullValue is the single
+    // place that decides which.
+    if e.kind == 'NullLit' {
+        // No type in reach either (an argument to a function whose
+        // signature this port has not registered, say): the untyped
+        // `null` pointer, which is what the original answers too.
+        if cgLtyOf(fty) == '' { return cgExpr(e) }
+        return cgVal(cgNullValue(fty), cgLtyOf(fty), fty)
+    }
     if e.kind == 'ArrayLit' {
         if fty != 'arr' {
             Val none
@@ -1782,7 +1834,7 @@ Val func cgMapLit(e:Node, vty:text, header:text) {
     while i < entries.length {
         MapKey k = cgMapKey(childOf(entries[i], 'a'))
         if CG_STUCK { return none }
-        Val v = cgExpr(childOf(entries[i], 'b'))
+        Val v = cgExprExpecting(childOf(entries[i], 'b'), vty, '')
         if CG_STUCK { return none }
         if v.fty != vty {
             cgUnported(`map literal value of type ${v.fty} in a map of ${vty}`)
@@ -1875,6 +1927,7 @@ Val func cgLengthOf(e:Node, obj:Val) {
         cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 0`)
         text out = cgTmp()
         cgOut(`  ${out} = load i64, ptr ${lenP}`)
+        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
         return cgVal(out, 'i64', 'int')
     }
     cgUnported(`.length on ${obj.fty}`)
@@ -2396,7 +2449,7 @@ Val func cgMethodCall(e:Node, callee:Node) {
         text elemSize = '8'
         if obj.ety == 'bool' { elemSize = '1' }
         if m == 'push' || m == 'unshift' {
-            Val v = cgExpr(args[0])
+            Val v = cgExprExpecting(args[0], obj.ety, '')
             if CG_STUCK { return none }
             if v.fty != obj.ety {
                 cgUnported(`.${m}() of ${v.fty} onto an array of ${obj.ety}`)
@@ -2437,6 +2490,55 @@ Val func cgMethodCall(e:Node, callee:Node) {
         cgOut(`  ${out} = load ${elemLty}, ptr ${slot}`)
         if obj.ety == 'text' { return cgVal(out, 'ptr', 'text') }
         return cgVal(out, elemLty, obj.ety)
+    }
+
+    // text.split(sep) -> arr[text], and its inverse arr.join(sep).
+    // Both free the SEPARATOR when the expression allocated it, and
+    // split frees its receiver too -- an array receiver is a binding
+    // rather than a temporary, so join has nothing to free there.
+    if m == 'split' && args.length == 1 {
+        Val r = cgExpr(recv)
+        if CG_STUCK { return none }
+        if r.fty != 'text' {
+            cgUnported(`.split() on ${r.fty}`)
+            return none
+        }
+        Val sep = cgExpr(args[0])
+        if CG_STUCK { return none }
+        if sep.fty != 'text' {
+            // A regex separator goes to festina_regex_split instead,
+            // which is a different call and a different temporary to
+            // reclaim; `regex` is not ported at all yet.
+            cgUnported(`.split() by ${sep.fty}`)
+            return none
+        }
+        text out = cgTmp()
+        cgOut(`  ${out} = call ptr @festina_text_split(ptr ${r.v}, ptr ${sep.v})`)
+        cgFreeTextTemp(recv, r)
+        cgFreeTextTemp(args[0], sep)
+        return cgArrVal(out, 'text')
+    }
+    if m == 'join' && args.length == 1 {
+        Val r = cgExpr(recv)
+        if CG_STUCK { return none }
+        if r.fty != 'arr' {
+            cgUnported(`.join() on ${r.fty}`)
+            return none
+        }
+        if r.ety == '' {
+            cgUnported('.join() on an array of a non-scalar type')
+            return none
+        }
+        Val sep = cgExpr(args[0])
+        if CG_STUCK { return none }
+        text out = cgTmp()
+        // claude.md #116: one runtime function, with the element KIND
+        // riding along as a constant -- only the compiler knows an
+        // arr[T]'s T, the same reason the JSON renderers are generated
+        // per type.
+        cgOut(`  ${out} = call ptr @festina_arr_join(ptr ${r.v}, ptr ${sep.v}, ptr ${cgStringConst(r.ety)})`)
+        cgFreeTextTemp(args[0], sep)
+        return cgVal(out, 'ptr', 'text')
     }
 
     // Everything this slice does not implement is refused BEFORE the
@@ -2551,10 +2653,16 @@ Val func cgCall(e:Node, wantValue:bool) {
     }
     text retF = FN_RET[name]
     arr[Node] args = listOf(e, 'args')
+    arr[text] ptys = []
+    if FN_PARAMS[name] != null {
+        if FN_PARAMS[name] != '' { ptys = FN_PARAMS[name].split('|') }
+    }
     arr[text] parts = []
     int i = 0
     while i < args.length {
-        Val a = cgExpr(args[i])
+        text want = ''
+        if i < ptys.length { want = ptys[i] }
+        Val a = cgExprExpecting(args[i], want, '')
         if CG_STUCK { return none }
         parts.push(`${a.lty} ${a.v}`)
         i++
@@ -2805,7 +2913,7 @@ void func cgStmt(s:Node) {
         }
         Node init = childOf(s, 'init')
         if init == null { return }
-        Val v = cgExpr(init)
+        Val v = cgExprExpecting(init, fty, '')
         if CG_STUCK { return }
         if v.fty != fty && cgNumericPair(v.fty, fty) == false {
             cgUnported(`initializer of type ${v.fty} for ${fty}`)
@@ -3267,7 +3375,7 @@ void func cgIndexAssign(e:Node, target:Node) {
         // value's.
         MapKey k = cgMapKey(childOf(target, 'prop'))
         if CG_STUCK { return }
-        Val v = cgExpr(childOf(e, 'value'))
+        Val v = cgExprExpecting(childOf(e, 'value'), obj.ety, '')
         if CG_STUCK { return }
         if v.fty != obj.ety {
             cgUnported(`assigning ${v.fty} into a map of ${obj.ety}`)
@@ -3298,7 +3406,7 @@ void func cgIndexAssign(e:Node, target:Node) {
     text slot = cgTmp()
     cgOut(`  ${slot} = getelementptr ${elemLty}, ptr ${dataV}, i64 ${idx.v}`)
     Node valueNode = childOf(e, 'value')
-    Val v = cgExpr(valueNode)
+    Val v = cgExprExpecting(valueNode, obj.ety, '')
     if CG_STUCK { return }
     if v.fty != obj.ety {
         cgUnported(`assigning ${v.fty} into an array of ${obj.ety}`)
@@ -3600,6 +3708,17 @@ bool func cgIsOwningTextSource(e:Node) {
 // A text value that was produced fresh by an expression and is not
 // owned by any binding has to be freed once it has been used, or every
 // such call leaks. Only a call reaches this today.
+// The refcounted counterpart of cgFreeTextTemp: a receiver the
+// expression itself owns and is now finished with. `xs.length` on a
+// BINDING reads and leaves it alone; on `s.split(sep).length` the
+// array has no owner once the length is taken, and nothing else will
+// ever release it.
+void func cgReleaseOwnedReceiver(e:Node, v:Val) {
+    if v.fty != 'struct' && v.fty != 'arr' && v.fty != 'map' { return }
+    if cgIsOwningRefcountedSource(e) == false { return }
+    cgOut(`  call void ${cgReleaseFnFor(v.fty, v.ety)}(ptr ${v.v})`)
+}
+
 void func cgFreeTextTemp(e:Node, v:Val) {
     if v.fty != 'text' { return }
     if cgIsOwningTextSource(e) == false { return }
@@ -3998,7 +4117,23 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 else { rf = '' }
             }
             if rf == 'void' || cgLtyOf(rf) != '' {
-                FN_RET[rawText(body[fs2], 'name')] = rf
+                text fname = rawText(body[fs2], 'name')
+                FN_RET[fname] = rf
+                // The parameter types too, joined -- a `null` ARGUMENT
+                // has no type of its own and takes the parameter's, so
+                // a call site needs the signature and not just the
+                // return. An entry is '' for a parameter whose type
+                // this port does not spell, which falls back to the
+                // untyped null exactly as the original does.
+                arr[Node] ps = listOf(body[fs2], 'params')
+                text joined = ''
+                int pi = 0
+                while pi < ps.length {
+                    if pi > 0 { joined = joined + '|' }
+                    joined = joined + cgDeclFty(ps[pi])
+                    pi++
+                }
+                FN_PARAMS[fname] = joined
             }
         }
         fs2++

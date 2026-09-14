@@ -126,6 +126,37 @@ int func removes() {
     return xs.length + gone.length + also.length
 }
 
+// `split` MAKES an arr[text] and `join` consumes one, which is where a
+// container temporary with no binding at all first becomes reachable.
+//
+// `parts.length` on a binding reads it and leaves it alone.
+// `s.split(sep).length` has no owner once the length is taken, and
+// nothing else will ever release it -- so the length read is also the
+// release, the container counterpart of the free a text receiver gets.
+// Both spellings are here, and so is an owning SEPARATOR, which each
+// of them frees.
+text raw = 'a b c'
+
+text func dash() {
+    return `-${1}`
+}
+
+int func splitting() {
+    arr[text] parts = raw.split(' ')
+    arr[text] byOwned = raw.split(dash())
+    // The temporary with no binding: released where its length is read.
+    int loose = raw.split(' ').length
+    return parts.length + byOwned.length + loose
+}
+
+text func joining() {
+    arr[text] parts = raw.split(' ')
+    arr[int] ns = [1, 2]
+    // One runtime function whatever the element type is, with the KIND
+    // riding along as a constant, so an array of each is worth having.
+    return `${parts.join(',')}/${ns.join(';')}/${parts.join(dash())}`
+}
+
 // An empty pop answers this element type's own NULL, which for an int
 // is NOT zero -- zero is a perfectly ordinary element.
 int func emptyPop() {
@@ -143,5 +174,7 @@ log(words[1])
 log(pushes())
 log(removes())
 log(emptyPop())
+log(splitting())
+log(joining())
 log(numbers.length)
 log(sink.length)

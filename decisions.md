@@ -6256,3 +6256,24 @@ That one is a test rather than a corpus file: the interesting inputs are control
 **Not marked slow, not deselected.** Ninety seconds on a nine-minute suite is a fair price for the only thing keeping a case file honest, and a canary suite nobody runs is exactly the commit-message prose it replaced.
 
 **Verified.** 2,782 passed, 343 skipped; the 24 graphics and 12 leak-stress failures are this container's limits, reproduced identically on the pristine tree. Codegen unchanged at 22 match, 4,341 lines — this slice adds no compiler behaviour, only evidence.
+
+
+309. NULL, SPLIT AND JOIN -- AND lexer.f ONE CONSTRUCT AWAY
+
+`null` in every typed position, `text.split()`, `arr.join()`, and the release a container temporary needs. **4,849 of 256,416 file-specific IR lines, up from 4,341; 23 files match, up from 22.**
+
+**`bootstrap/lexer.f` is now blocked by exactly one construct** — a `blob` parameter, which its `tokenize(src:blob, from:int, to:int)` signature needs. Everything else in the smallest of the bootstrap's own ten files is ported. That is the first time any of them has been within one mechanism of matching.
+
+**`null` is the one expression with no type of its own**, and there is no single bit pattern to emit: an `int` null is i64's minimum, a `float` null is a NaN, a `bool` null is 2 (a value no real bool can hold) and everything else is the LLVM null pointer. So the whole mechanism is about finding the type, and the positions that supply one are more numerous than they look — a declaration, an assignment, an array element, a map value, an element write, a push, and an ARGUMENT, whose type comes from the callee's signature rather than from anything at the call site. The port had no parameter-type table at all; it carried only return types, and a call had never needed more.
+
+**A comparison takes its type from the other side, which reverses the evaluation order.** `x == null` emits x and resolves the null against x's type; `null == x` has to do the same thing, which means emitting the RIGHT operand first. That order is not an independent choice — a null cannot be emitted before the side it takes its type from, because there is nothing to emit yet — which is why its canary is necessarily a ratchet canary rather than a diff one. Said so in the registry rather than left to look like a weaker result.
+
+**`null == null` stays unresolved**, exactly as in the original: no context on either side, left alone under claude.md #54's ambiguity rule rather than guessed at.
+
+**A NaN is not equal to itself, so a float null cannot be tested for.** `log(f)` prints `nan` while `f == null` is false even when `f` IS the null. That follows from the choice of representation and both implementations agree on it, which is all the case file claims — but the line is in `cases/nulls.f` with a comment saying it deliberately does not fire, because a reader tidying away a "dead" branch would remove the only place the asymmetry is visible.
+
+**A container temporary with no binding first becomes reachable here.** `parts.length` on a binding reads it and leaves it alone; `s.split(sep).length` has no owner once the length is taken and nothing else will ever release it — so the length read is also the release. That is the container counterpart of the free a text receiver already gets, and it did not exist in the port because until `split` there was no way to produce an unbound container at all.
+
+**Six canaries, all caught** (two of the twenty-six now via the ratchet). The registry is the harness from #308, so this slice's evidence was written as tests rather than as prose for the first time.
+
+**Verified.** Codegen 23 match, 0 differ, 76 unported. Lexer 110/110, parser 110/110, semantic 110/110, escape analysis 92 match with 1,632 of 1,685 records. 26 canaries: 24 caught, 2 via the ratchet, 0 missed. 2,795 passed, 343 skipped; the 24 graphics and 12 leak-stress failures are this container's limits, reproduced identically on the pristine tree. `cases/nulls.f` and `cases/owning_elements.f` are valgrind-clean.

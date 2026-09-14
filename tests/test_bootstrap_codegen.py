@@ -353,6 +353,34 @@ class TestTheCoverageNumberIsHonest:
         assert "@festina_release_map(" in body, (
             "no refcounted map local, so the heap half is unmeasured")
 
+    def test_the_null_case_really_has_every_spelling(self):
+        """`cases/nulls.f` exists because `null` is the one expression
+        with no type of its own, and each type spells its null
+        differently -- so a file that only ever nulls an `int` would
+        measure one quarter of the mechanism.
+
+        The canaries behind it live in `bootstrap/canary.py`; this is
+        the cheap content check that runs everywhere.
+        """
+        dump = irdump.dump_file("bootstrap/cases/nulls.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/nulls.f no longer compiles, so it measures nothing "
+            "at all: " + dump[0])
+        body = "\n".join(dump)
+        for frag, why in (("i64 -9223372036854775808", "the int null"),
+                          ("double 0x7FF8000000000000", "the float null (a NaN)"),
+                          ("i8 2", "the bool null"),
+                          ("ptr null", "the pointer null")):
+            assert frag in body, (
+                f"{why} never appears, so that quarter of the mechanism "
+                f"is unmeasured")
+        # The signature-driven argument, which is the only position
+        # whose type comes from somewhere other than the expression.
+        assert "@takesScalars(i64 -9223372036854775808" in body, (
+            "no call passing null to a typed parameter, so the "
+            "parameter-type table the port carries for exactly this is "
+            "unmeasured")
+
     def test_the_owning_element_case_really_has_all_four_mechanisms(self):
         """`cases/owning_elements.f` is the only evidence that an
         `arr[text]` is not an `arr[int]` with a different element size.
@@ -459,7 +487,8 @@ class TestTheCoverageNumberIsHonest:
 
     @pytest.mark.parametrize("case", ["indexing.f", "array_literals.f", "maps.f",
                                       "conversions.f",
-                                      "owning_elements.f"])
+                                      "owning_elements.f",
+                                      "nulls.f"])
     def test_the_container_cases_really_run(self, compile_and_run, case):
         """The two container case files are PROGRAMS, not only sources
         of IR, and this runs them to prove it.
@@ -570,6 +599,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 4341, (
+        assert reproduced >= 4849, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 4341")
+            f"the port previously emitted at least 4849")

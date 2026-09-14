@@ -288,6 +288,54 @@ CANARIES = [
         """    }
     cgOut(`  store ${elemLty} ${stored}, ptr ${slot}`)""",
     ),
+    # --- decisions.md #309: null, split and join ---------------------
+    Canary(
+        "null-int-sentinel", "#309",
+        "each Festina type spells its own null, and they are unrelated",
+        "    if fty == 'int' { return '-9223372036854775808' }",
+        "    if fty == 'int' { return '0' }",
+    ),
+    Canary(
+        # Necessarily a ratchet canary rather than a diff one, and the
+        # reason is worth stating: the ORDER here is a consequence of
+        # the type resolution rather than an independent choice. A null
+        # cannot be emitted before the side it takes its type from,
+        # because there is nothing to emit yet -- so there is no "wrong
+        # order" that still compiles, only a missing mechanism. The
+        # coverage number is what catches it.
+        "null-comparison-typed-from-the-other-side", "#309",
+        "a comparison against null resolves it from the other operand's type",
+        """    if rn.kind == 'NullLit' && ln.kind != 'NullLit' {""",
+        """    if false {""",
+    ),
+    Canary(
+        "null-argument-signature", "#309",
+        "a null ARGUMENT takes the parameter's type, not the call site's",
+        """        text want = ''
+        if i < ptys.length { want = ptys[i] }""",
+        """        text want = ''""",
+    ),
+    Canary(
+        "split-receiver-not-freed", "#309",
+        "split frees the receiver AND the separator it allocated",
+        """        cgFreeTextTemp(recv, r)
+        cgFreeTextTemp(args[0], sep)
+        return cgArrVal(out, 'text')""",
+        """        return cgArrVal(out, 'text')""",
+    ),
+    Canary(
+        "owned-container-receiver", "#309",
+        "a container temporary with no binding is released where it is read",
+        "        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)",
+        "",
+    ),
+    Canary(
+        "join-element-kind", "#309",
+        "join carries the element KIND, which only the compiler knows",
+        "ptr ${cgStringConst(r.ety)})`)",
+        "ptr ${cgStringConst('int')})`)",
+    ),
+
     Canary(
         "generated-fn-placement", "#307",
         "a generated cascade lands BEFORE the function whose body asked for it",
