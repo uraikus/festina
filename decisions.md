@@ -6157,3 +6157,24 @@ Not three of four this time — four of four. The reason is blunter than last sl
 **The target got closer and the remaining list got shorter.** `bootstrap/lexer.f` — the smallest of the bootstrap's own ten files — was blocked by five mechanisms; map literals and map indexing were two of them. Three remain: `arr[text]` locals, non-scalar parameters, and method calls.
 
 **Verified.** Codegen 18 match, 0 differ, 78 unported. Lexer 107/107, parser 107/107, semantic 107/107, escape analysis 89 match with 1,575 of 1,628 records. 2,738 passed, 345 skipped; the 24 graphics and 12 leak-stress failures are this container's limits, reproduced identically on the pristine tree. `cases/maps.f` is valgrind-clean — **and the canary fires**: disabling the rendered-key free makes valgrind report `10 bytes in 4 blocks are definitely lost`, so the clean run is evidence rather than an absence of evidence.
+
+
+305. NON-SCALAR PARAMETERS, AND THE HALF THE CORPUS CANNOT SEE
+
+A struct/`arr[T]`/`map[T]` parameter, on the same claude.md #74 decision its local counterpart already gets. **3,552 of 245,137 file-specific IR lines, up from 3,234; 20 files match, up from 18.** This is the first slice whose new matches are PRE-EXISTING corpus files rather than case files it wrote: `examples/geometry.f` and `examples/multifile.f` were the two the blocker table listed as one construct away, and they are now in.
+
+**The signature needs nothing.** Whatever it holds, a non-scalar parameter is one `ptr` in the definition and one `ptr` at the call site, so neither the caller nor the declaration changed. The whole mechanism is the BINDING: an alloca, and whether anything is taken on the way in.
+
+**Text copies a buffer; a refcounted parameter takes a reference.** That is the same rule with different currency. `text` is copy-on-alias (claude.md #83), so an escaping text parameter calls `festina_text_own`; a struct/container parameter calls `festina_retain` instead. The reason is identical in both: the CALLER still owns what it passed and will free it, so the binding must not end up sharing the caller's single claim. A parameter the body only reads takes nothing at all, and the answer is per NAME rather than per function.
+
+**Three canaries; the corpus saw only one.**
+
+    an escaping refcounted parameter never retains        not detected
+    EVERY refcounted parameter retains, escaping or not   DETECTED (2 files)
+    a container parameter released as a struct            not detected
+
+The detected one is the pair of files that just started matching — both take a struct parameter that is only ever field-accessed, so the "takes nothing" half was covered the moment they came in and the "takes a reference" half was covered by nothing at all. `cases/escape_locals.f` grew the escaping shapes, and an `arr[T]` and a `map[T]` parameter together rather than one of them, because their releases are not interchangeable and a file with one cannot distinguish a correct release from the generic one. With those, all three fire.
+
+**The blocker table now has no sole-blocked file left that this port could reasonably take next.** The three remaining are two `table` declarations and one `try`/`catch` — all of them features rather than expression-level work. What is left is volume: method calls (56 files), non-scalar declarations (34), structs with a non-scalar field (24).
+
+**Verified.** Codegen 20 match, 0 differ, 76 unported. Lexer 107/107, parser 107/107, semantic 107/107, escape analysis 89 match with 1,579 of 1,632 records. 2,740 passed, 343 skipped; the 24 graphics and 12 leak-stress failures are this container's limits, reproduced identically on the pristine tree. `cases/escape_locals.f` is valgrind-clean with the new parameter shapes in it.

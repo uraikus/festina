@@ -126,6 +126,55 @@ void func heapContainers() {
     sharedRates = qs
 }
 
+// A refcounted PARAMETER gets the same per-name decision a text one
+// does, with one difference: text is copy-on-alias, so an escaping text
+// parameter takes its own BUFFER, while an escaping struct/arr/map
+// parameter takes its own REFERENCE. Either way the caller still owns
+// what it passed, so the binding must not share the caller's single
+// claim on it -- and a parameter the body only reads takes nothing at
+// all.
+//
+// Measured: with the retain deleted, and again with it applied to every
+// refcounted parameter rather than only escaping ones, the whole corpus
+// saw only the second. Nothing that matches has an escaping non-scalar
+// parameter, so these functions are the only evidence for the half that
+// retains.
+P heldStruct
+arr[int] heldNums
+map[int] heldCounts
+
+// `kept` escapes into a global; `borrowed` is only ever read through.
+// Same function, same type, different answers.
+int func takesStructs(kept:P, borrowed:P) {
+    heldStruct = kept
+    return borrowed.x + borrowed.y
+}
+
+// Both escape, and their releases are NOT interchangeable: an array's
+// knows to reclaim its data buffer and a map's its entry table, so a
+// file with only one of them cannot tell a correct release from the
+// generic one.
+int func takesContainers(xs:arr[int], m:map[int]) {
+    heldNums = xs
+    heldCounts = m
+    return xs.length
+}
+
+// The same, leaving through a `return` rather than falling off the end,
+// and with a body local of its own so the free ORDER is pinned at that
+// exit too: the local first, the parameter second.
+int func takesAndReturnsContainer(xs:arr[int]) {
+    arr[int] mine = [1, 2]
+    heldNums = xs
+    return mine.length
+}
+
+// A borrowed container, so the "takes nothing at all" half is not left
+// to the struct case alone.
+int func onlyReads(xs:arr[int], m:map[int]) {
+    return xs.length + m['a']
+}
+
 log(stackOnly())
 log(twoStackLocals())
 escapesToAGlobal()
@@ -137,3 +186,16 @@ log(takesAndReturns('d'))
 stackContainers()
 heapContainers()
 log(sink)
+
+P argP
+argP.x = 5
+argP.y = 6
+arr[int] argNums = [1, 2, 3]
+map[int] argCounts = {'a': 4}
+log(takesStructs(argP, argP))
+log(takesContainers(argNums, argCounts))
+log(takesAndReturnsContainer(argNums))
+log(onlyReads(argNums, argCounts))
+log(heldStruct.x)
+log(heldNums.length)
+log(heldCounts['a'])

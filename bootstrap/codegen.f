@@ -3166,17 +3166,54 @@ void func cgFunc(d:Node) {
     arr[text] sig = []
     arr[text] pnames = []
     arr[text] pftys = []
+    arr[text] pltys = []
+    arr[text] psnames = []
+    arr[text] petys = []
     int i = 0
     while i < params.length {
-        text pf = cgDeclFty(params[i])
-        if pf == '' {
-            cgUnported('parameter of a non-scalar type')
-            return
-        }
         text pn = rawText(params[i], 'name')
-        sig.push(`${cgLtyOf(pf)} %arg.${pn}`)
+        text pf = cgDeclFty(params[i])
+        text psname = ''
+        text pety = ''
+        text plty = cgLtyOf(pf)
+        if pf == '' {
+            // A struct/arr[T]/map[T] parameter: one `ptr` in the
+            // signature whatever it holds, so the caller's side needs
+            // nothing special. What it needs is the same restrictions a
+            // LOCAL of that type has, because the binding is released
+            // by the same machinery.
+            Ty pt = resolveTypeField(params[i], 'type_expr')
+            pf = cgManagedFty(pt)
+            if pf == '' {
+                cgUnported('parameter of a non-scalar type')
+                return
+            }
+            plty = 'ptr'
+            if pf == 'struct' {
+                if SF_PLAIN[pt.name] == null {
+                    cgUnported('parameter of a struct with a non-scalar field')
+                    return
+                }
+                psname = pt.name
+            } else {
+                Ty pe = pt.elem
+                if pe == null || pe.kind != 'prim' {
+                    cgUnported(`${pf} parameter of a non-scalar type`)
+                    return
+                }
+                if pe.name != 'int' && pe.name != 'float' && pe.name != 'bool' {
+                    cgUnported(`${pf} parameter of ${pe.name}`)
+                    return
+                }
+                pety = pe.name
+            }
+        }
+        sig.push(`${plty} %arg.${pn}`)
         pnames.push(pn)
         pftys.push(pf)
+        pltys.push(plty)
+        psnames.push(psname)
+        petys.push(pety)
         i++
     }
     text joined = ''
@@ -3218,13 +3255,15 @@ void func cgFunc(d:Node) {
     int p = 0
     while p < pnames.length {
         text slot = `%${pnames[p]}.${cgUid()}`
-        cgOut(`  ${slot} = alloca ${cgLtyOf(pftys[p])}`)
+        cgOut(`  ${slot} = alloca ${pltys[p]}`)
         if pftys[p] == 'text' {
             cgOut(`  ${slot}.ap = alloca ptr`)
             cgOut(`  ${slot}.aplen = alloca i64`)
         }
         L_SLOT[pnames[p]] = slot
         L_FTY[pnames[p]] = pftys[p]
+        if psnames[p] != '' { L_SNAME[pnames[p]] = psnames[p] }
+        if petys[p] != '' { L_ETY[pnames[p]] = petys[p] }
         p++
     }
 
@@ -3257,8 +3296,19 @@ void func cgFunc(d:Node) {
                 arg = owned
                 CG_PARAM_LIVE.push(`text|${slot}`)
             }
+        } else if pftys[q] == 'struct' || pftys[q] == 'arr' || pftys[q] == 'map' {
+            if escSet[pnames[q]] != null {
+                // The refcounted counterpart of the text copy above.
+                // A text parameter the body lets escape takes its OWN
+                // buffer, because text is copy-on-alias; a refcounted
+                // one takes its own reference instead. Either way the
+                // caller still owns what it passed, so the binding must
+                // not end up sharing the caller's single claim on it.
+                cgOut(`  call void @festina_retain(ptr ${arg})`)
+                CG_PARAM_LIVE.push(`${pftys[q]}|${slot}`)
+            }
         }
-        cgOut(`  store ${cgLtyOf(pftys[q])} ${arg}, ptr ${slot}`)
+        cgOut(`  store ${pltys[q]} ${arg}, ptr ${slot}`)
         q++
     }
     // Through cgBlockInto, not a loop of its own: the helper resets

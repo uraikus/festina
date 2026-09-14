@@ -238,6 +238,17 @@ class TestTheCoverageNumberIsHonest:
             "no frame-allocated map local -- a stack container still "
             "owns a heap buffer, which is the one way its stack answer "
             "differs from a struct's")
+        # claude.md #74 applied per PARAMETER, for a refcounted type.
+        # Measured: with the retain deleted, the whole corpus saw no
+        # difference -- nothing else that matches has an escaping
+        # non-scalar parameter. These two assertions are the evidence.
+        assert "@festina_retain(ptr %arg." in body, (
+            "no escaping refcounted parameter takes its own reference, "
+            "so the half of the per-parameter decision that retains is "
+            "unmeasured")
+        assert "@festina_release_map(ptr" in body, (
+            "no released map, so an array's release and a map's -- "
+            "which are not interchangeable -- are not distinguished")
         assert any(line.startswith("  store ptr %arg.") for line in dump), (
             "every text parameter is copied, so nothing here shows a "
             "borrowed one")
@@ -415,6 +426,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 3234, (
+        assert reproduced >= 3552, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 3234")
+            f"the port previously emitted at least 3552")
