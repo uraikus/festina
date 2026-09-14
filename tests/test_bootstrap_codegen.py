@@ -356,6 +356,9 @@ class TestTheCoverageNumberIsHonest:
     @pytest.mark.parametrize("rel,floor", [
         ("bootstrap/lexer.f", 4000),
         ("bootstrap/parser.f", 12000),
+        ("bootstrap/semantic.f", 19000),
+        ("bootstrap/escape.f", 20000),
+        ("bootstrap/codegen.f", 55000),
     ])
     def test_a_bootstrap_file_self_hosts(self, rel, floor):
         """The port compiling real pieces of itself.
@@ -486,6 +489,66 @@ class TestTheCoverageNumberIsHonest:
             "nothing reclaimed, so an element write that leaked the "
             "value it replaced would go unnoticed")
 
+    def test_the_owning_container_case_really_has_all_six_mechanisms(self):
+        """`cases/owning_containers.f` exists because the mechanisms it
+        holds were, for one slice, measured by nothing but
+        `bootstrap/codegen.f` itself.
+
+        Every canary for them fired -- and every one of them fired on
+        that single 58,000-line file, so the whole set would have gone
+        silent together the moment it stopped matching for any
+        unrelated reason. Two further breakages were invisible even to
+        it: a field read off a minted computed index, and a
+        frame-allocated map's values. Both were found by writing this
+        file, not by reading the code.
+        """
+        dump = irdump.dump_file("bootstrap/cases/owning_containers.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/owning_containers.f no longer compiles, so it "
+            "measures nothing at all: " + dump[0])
+        body = "\n".join(dump)
+        # 1: an element minted out of a container the expression owns --
+        # a copy for text, a retain for a refcounted one -- and the
+        # container released after.
+        assert "@festina_text_own(" in body, (
+            "no text element minted, so an index off an owning "
+            "container handing back a borrowed pointer into freed "
+            "storage would go unnoticed")
+        assert "@festina_retain(" in body, (
+            "no refcounted element minted, so only half of claude.md "
+            "#119 is measured")
+        # 2 and 3: a map[text] write, which copies or not depending on
+        # the value's own source, and frees what the key held before.
+        assert "@festina_map_set(" in body, "no map write at all"
+        assert "@festina_str_concat(" in body, (
+            "no concatenation stored into a map, so the text owning "
+            "predicate is never asked a question the refcounted one "
+            "answers differently")
+        # 4: the release trampoline, for both value shapes, and the
+        # inline for_each a frame-allocated map gets.
+        trampolines = [line for line in dump
+                       if line.startswith("define void @__festina_maprelease_")]
+        assert len(trampolines) >= 2, (
+            f"{len(trampolines)} map release trampolines; the file "
+            f"needs one per value type -- text and a struct -- or the "
+            f"difference between freeing and releasing is unmeasured")
+        assert "@festina_map_for_each(" in body, (
+            "no map value walk, so a map whose values leaked would go "
+            "unnoticed")
+        assert "@festina_map_free_entries(" in body, (
+            "no frame-allocated map, so the inline walk that runs "
+            "before the entries buffer is freed is unmeasured")
+        # 5: floorDiv's adjustment branch, which only differs from sdiv
+        # on a negative operand.
+        assert "srem i64" in body, (
+            "no floorDiv remainder, so nothing distinguishes flooring "
+            "from truncation")
+        # 6: the exactly-representable literal that only parses once
+        # trailing fraction zeros are stripped.
+        assert "0x4330000000000000" in body, (
+            "no 2^52 float literal, so a parse whose window is decided "
+            "by SPELLING rather than value would go unnoticed")
+
     def test_the_conversion_case_really_has_all_four_mechanisms(self):
         """`cases/conversions.f` is the only evidence for the method-call
         slice, and that is measured rather than feared.
@@ -541,7 +604,8 @@ class TestTheCoverageNumberIsHonest:
                                       "conversions.f",
                                       "owning_elements.f",
                                       "nulls.f",
-                                      "blobs_and_scopes.f"])
+                                      "blobs_and_scopes.f",
+                                      "owning_containers.f"])
     def test_the_container_cases_really_run(self, compile_and_run, case):
         """The two container case files are PROGRAMS, not only sources
         of IR, and this runs them to prove it.
@@ -652,6 +716,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 23137, (
+        assert reproduced >= 125765, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 23137")
+            f"the port previously emitted at least 125765")

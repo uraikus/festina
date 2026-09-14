@@ -74,10 +74,20 @@ class TestTheRegistryIsWellFormed:
 class TestTheCorpusCanStillSeeEachMechanism:
     """The differential test itself, run backwards.
 
-    Deliberately NOT marked slow and deselected by default. Ninety
-    seconds on a six-minute suite is a fair price for the only thing
-    that keeps a case file honest, and a canary suite nobody runs is
-    exactly the prose-in-a-commit-message this replaced.
+    Deliberately NOT marked slow and deselected by default. It is the
+    only thing that keeps a case file honest, and a canary suite nobody
+    runs is exactly the prose-in-a-commit-message this replaced.
+
+    Keeping that affordable is a live concern rather than a settled
+    one. The corpus is now dominated by the bootstrap's own compiler
+    -- `bootstrap/codegen.f` alone is 58,000 IR lines -- so re-dumping
+    all of it for every canary would have taken this from about a
+    minute to well over an hour. `canary.run_one` scans cheapest-first
+    and stops once it has `WITNESSES_WANTED` differing files, which
+    puts the usual case (a mechanism a `cases/` file was written for)
+    back in the hundreds of milliseconds. A canary with only ONE
+    witness anywhere still costs a full scan, which is the right way
+    round: those are the ones worth knowing about.
     """
 
     @pytest.fixture(scope="module")

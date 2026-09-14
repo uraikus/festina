@@ -49,9 +49,11 @@
 //      error LLVM will not catch, since both are i64-shaped in the
 //      call.
 //
-// Scalar value types only. A `map[text]` releases its values through a
-// GENERATED per-type cascade rather than the plain release, which is
-// its own mechanism and its own file when it lands.
+// Scalar value types only, deliberately. A `map[text]` or a
+// `map[Struct]` releases its values through a GENERATED per-value-type
+// trampoline rather than the plain release, and asks a different
+// ownership question on every write -- a whole mechanism of its own,
+// measured by `cases/owning_containers.f`.
 
 map[int] counts = {}
 map[float] rates = {'base': 1.5}

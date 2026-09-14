@@ -97,9 +97,9 @@ round-by-round design and implementation record predating 0.1 lives in
 
 - **`bootstrap/escape.f`** — `festina/escape_analysis.py` ported to
   Festina, the fifth module the codegen port turned out to need and one
-  that was not in its original estimate: **93 of 111 corpus files
+  that was not in its original estimate: **94 of 112 corpus files
   produce an identical record sequence, 0 differ, 7 not yet ported, 11
-  rejected by both** — 1,684 of 1,737 records. It decides whether every
+  rejected by both** — 1,715 of 1,768 records. It decides whether every
   container and struct local lives in the frame or behind a heap
   refcount header, so the codegen port cannot emit one without agreeing
   here first. The ORDER bodies are analyzed in is part of the answer
@@ -111,13 +111,16 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage, **in progress**: **26 of 111 corpus files
-  emit byte-identical LLVM IR, 0 differ, 74 not yet ported, 11 rejected
-  by both** — 23,137 of 270,897 file-specific IR lines. **`bootstrap/
-  lexer.f` and `bootstrap/parser.f` self-host**: 4,552 and 13,139
-  file-specific lines, byte for byte -- two of the bootstrap's own ten
-  files, and `parser.f` at ~1,200 source lines is the largest file in
-  the corpus. In are
+  the fourth and last stage, **in progress**: **31 of 112 corpus files
+  emit byte-identical LLVM IR, 0 differ, 70 not yet ported, 11 rejected
+  by both** — 125,765 of 276,562 file-specific IR lines. **The code
+  generator compiles itself**: `bootstrap/codegen.f` emits 58,506 of
+  58,506 file-specific lines byte for byte, and so do `lexer.f`
+  (4,552), `parser.f` (13,139), `semantic.f` (20,651) and `escape.f`
+  (22,232) — five of the bootstrap's own ten files, including every
+  compiler pass. The five that remain are the command-line drivers,
+  held back by a short shared list (`argv`, a `close` call, `.keys()`,
+  a `.push` onto a non-scalar array). In are
   expressions (arithmetic and comparison with int/float mixing,
   `&&`/`||`, unary, the ternary, `/` and `%` with claude.md #57's
   divide-by-zero control flow, template literals, and `+` and `==`/`!=`
@@ -152,24 +155,31 @@ round-by-round design and implementation record predating 0.1 lives in
   generated only when one does. And `arr[text]` -- a container whose elements own
   something needs a release cascade generated for that element type,
   since the generic release frees the buffer and header and knows
-  nothing about what the slots hold. Not in: structs with a non-scalar
-  field, maps of a type that owns something, containers of a struct,
-  `blob`/`img`/`regex` and the other non-scalar declarations,
-  non-scalar returns, the remaining methods, and the
+  nothing about what the slots hold. And `blob` locals and their file
+  methods, `map[text]` and `map[Struct]` — whose values are released
+  through a generated per-value-type trampoline, since a map's entries
+  are opaque to codegen in a way an array's flat buffer is not — and
+  claude.md #119's ownership minting for a computed index, which is
+  what indexing a container the expression owns needs. Not in: structs
+  with a non-scalar field, `img`/`regex` and the other non-scalar
+  declarations, the remaining methods, and the
   graphics/audio/HTTP/thread/sqlite/table subsystems.
   `bootstrap/irdump.py` and `bootstrap/irdiff.py` run the comparison;
   the oracle is the IR text itself, so it needed no canonical form of
-  its own (decisions.md #289–#311).
+  its own (decisions.md #289–#312).
 
 - **`bootstrap/canary.py` — the breakages the harness is supposed to
   catch, as a test rather than as prose.** A green differential run says
   the two implementations agree; it says nothing about whether the
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
-  not. Twenty deliberate breakages, one per mechanism, re-run by
-  `tests/test_bootstrap_canary.py`: **44 caught as a diff, 2 caught
-  through the coverage ratchet, 0 not caught** (46 in total now), in
-  about two minutes. A
+  not. Fifty-five deliberate breakages, one per mechanism, re-run by
+  `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
+  no longer the whole verdict: a canary looks for TWO independent
+  witnesses and reports a lone one in its own output, because
+  decisions.md #312's seven canaries all fired and all seven fired on
+  `bootstrap/codegen.f` alone — a mechanism whose only witness is the
+  largest file in the corpus is measured in name only. A
   failure there is not a compiler bug — it means a `cases/` file has
   drifted and the mechanism behind it is unmeasured, so the fix is a
   corpus file rather than a code change. A stale anchor fails rather

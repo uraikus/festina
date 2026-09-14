@@ -36,13 +36,14 @@
 //      function, so the difference is per DECLARATION rather than per
 //      function.
 //
-// One half of mechanism 3 is deliberately NOT here: a refcounted
-// with-initializer local retains its value unless the source already
-// owns a fresh reference, and the only owning source that is not a
-// literal is a call returning a container. Those do not compile in the
-// port yet, so a file containing one would be classified unported and
-// measure none of the three mechanisms above. It belongs here the day
-// non-scalar returns land, not before.
+//   4. **A refcounted with-initializer local RETAINS -- unless the
+//      source already owns a fresh reference.** The only owning source
+//      that is not a literal is a call returning a container, so this
+//      half could not be written at all until non-scalar returns
+//      landed. `alias` and `owned` sit side by side below: same
+//      declaration shape, same heap header, and opposite answers,
+//      because the only thing separating them is whether anyone else
+//      will ever give the reference back.
 //
 // The header a literal builds into is the only part of it that can
 // live in the frame. Its data buffer is always heap -- which is why a
@@ -80,10 +81,23 @@ int func strategies() {
     // An empty literal in a local, which stack-allocates like any
     // other literal while its buffer stays a malloc(0) on the heap.
     arr[int] empty = []
+    // The other half of the retain decision, and the one that needed
+    // non-scalar returns before it could be written at all: a call
+    // result is not a literal, so the header is heap -- but unlike
+    // `alias` it already holds a reference nobody else will give
+    // back, so the binding takes it AS IT STANDS rather than
+    // retaining. The two sit side by side because the only thing that
+    // separates them is whether the source already owns one.
+    arr[int] owned = fresh()
 
     counted = leaks
     return bare.length + literal.length + leaks.length
-         + alias.length + empty.length
+         + alias.length + empty.length + owned.length
+}
+
+arr[int] func fresh() {
+    arr[int] made = [7, 8]
+    return made
 }
 
 // An escaping local from a literal, on its own, so the heap answer is

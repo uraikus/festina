@@ -49,6 +49,37 @@ stubs. Nothing open here.
   deliberate part: a blob is a *file*, carrying its own path, so a slice
   of one has no path to carry.
 
+### After the bootstrap port
+
+Deliberately queued behind the self-hosting effort. Each of these adds
+a *capability* — new syntax, new runtime surface, or a new type — and
+every one of them would have to be ported to `bootstrap/` a second
+time if it landed while the port is mid-flight. None is blocked on
+anything; they are waiting on a stable target.
+
+- **A native file picker.** The platform's own open/save dialog, so a
+  program can ask for a path without inventing its own browser. Three
+  backends (GTK/portal, Cocoa, Win32) behind one call, on the same
+  opt-in-per-platform footing the graphics backends already use.
+- **A `ContextMenu` API.** Right-click menus on a windowed program:
+  items, separators, submenus, and a handler per item. Pairs with the
+  existing mouse handlers rather than replacing them.
+- **Clipboard.** Read and write the system clipboard, text first.
+  Deliberately smaller than the other two: no format negotiation until
+  something needs it.
+- **A `vid` type, alongside `img` and `aud`.** Same shape as the media
+  types that exist — a value that owns decoded frames, with the codec
+  dependency compiled in *only when the type appears in the program*,
+  exactly as `img`/`aud` already gate theirs. That conditional-linking
+  property is the point: a program with no `vid` in it must not grow a
+  video decoder.
+- **Research a `gguf` type, for talking to a model directly.** The
+  open questions are what the value actually owns (a memory-mapped
+  file? a loaded context?), what the call surface is, and whether the
+  dependency can be gated the way `vid`'s would be. Research first —
+  this is the only one of the five whose *design* is unsettled, not
+  just its implementation.
+
 ## Memory model
 
 Automatic reclamation is escape analysis plus reference counting.
@@ -160,16 +191,6 @@ open:
   (decisions.md #306 reproduces it deliberately rather than tidying
   it), so this is a diagnostics question rather than a correctness one
   -- a shadowing declaration should say something.
-
-- **One half of claude.md #81 is unmeasured until non-scalar returns
-  land.** A refcounted container local with an initializer retains its
-  value unless the source already owns a fresh reference, and the only
-  owning source that is not a literal is a call returning a container.
-  The port refuses those, so a case file containing one would be
-  classified unported and would measure nothing else either.
-  `cases/array_literals.f` says so in its own header; the line to add
-  is `arr[int] owned = fresh()`, next to the `alias` declaration that
-  covers the retaining half today (decisions.md #303).
 
 ## Deliberate behavior (documented, not planned work)
 

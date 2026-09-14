@@ -47,6 +47,17 @@ only two of them mean anything here:
 than an optimisation: coverage counts only matching files, so a
 canary's entire effect is determined by that set. A file that was
 already unported cannot become more so.
+
+**"Caught" is not the whole answer; WHICH file caught it matters too.**
+decisions.md #312 is why: seven canaries fired, all seven fired on
+`bootstrap/codegen.f` and on nothing else, and the honest reading of
+that pass is a failure -- a mechanism whose only witness is the largest
+file in the corpus goes unmeasured the day that file stops matching for
+some unrelated reason, and the whole set would have gone silent
+together. So a canary looks for two independent witnesses
+(WITNESSES_WANTED), scans the corpus cheapest-first, and reports a lone
+witness in its own output rather than letting it read as an ordinary
+pass.
 """
 import os
 import shutil
@@ -60,6 +71,23 @@ from bootstrap import irdiff, irdump                         # noqa: E402
 from bootstrap.difftest import REPO_ROOT, corpus             # noqa: E402
 
 CODEGEN_F = os.path.join(REPO_ROOT, "bootstrap", "codegen.f")
+
+# How many differing files a canary looks for before it stops scanning.
+#
+# One would be enough to call the mechanism "caught", and for most of
+# this registry's life that is what the count was. It is not enough, and
+# decisions.md #312 is why: seven canaries fired, all seven fired on
+# `bootstrap/codegen.f` and on nothing else, and the honest reading of
+# that pass is a failure. A mechanism whose only witness is the largest
+# file in the corpus is measured in name only -- the whole set goes
+# silent together the day that file stops matching for some unrelated
+# reason. So the bar is TWO independent programs, and a canary that
+# finds only one after scanning everything says so in its own output.
+#
+# Two rather than three because the cost is real: every extra file is
+# another compilation of the patched compiler's output, and the corpus
+# is now dominated by files of tens of thousands of IR lines.
+WITNESSES_WANTED = 2
 
 
 class Canary:
@@ -345,7 +373,7 @@ CANARIES = [
     Canary(
         "field-read-mints-before-release", "#311",
         "claude.md #117: a field read through an owning base is copied out first",
-        """    if cgIsRefcounted(base.fty) && cgIsOwningRefcountedSource(childOf(e, 'obj')) {""",
+        """    if cgIsRefcounted(base.fty) && cgOwnsRefcounted(childOf(e, 'obj'), base) {""",
         """    if false {""",
     ),
     # No canary for "two struct values compare as i64". The
@@ -558,6 +586,90 @@ CANARIES = [
         "ptr ${cgStringConst('int')})`)",
     ),
 
+    # --- decisions.md #312: the port compiles itself ------------------
+    Canary(
+        "computed-index-mints-before-release", "#312",
+        "an element read through an OWNING container is copied before "
+        "the container is released",
+        """    } else if out.fty == 'text' {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${out.v})`)
+        out.v = owned
+        out.fresh = true
+    }
+    cgOut(`  call void ${cgReleaseFnFor(obj.fty, cgRelKeyVal(obj))}(ptr ${obj.v})`)""",
+        """    }
+    cgOut(`  call void ${cgReleaseFnFor(obj.fty, cgRelKeyVal(obj))}(ptr ${obj.v})`)""",
+    ),
+    Canary(
+        "computed-index-releases-the-container", "#312",
+        "a computed index off an owning receiver releases the container "
+        "it indexed",
+        """    if cgIsRefcounted(obj.fty) == false { return out }
+    if cgIsOwningRefcountedSource(childOf(e, 'obj')) == false { return out }""",
+        """    if cgIsRefcounted(obj.fty) == false { return out }
+    if true { return out }""",
+    ),
+    Canary(
+        "map-text-value-asks-the-text-question", "#312",
+        "a TEXT map value uses the text owning predicate, not the "
+        "refcounted one",
+        """bool func cgMapValOwns(vty:text, e:Node, v:Val) {
+    if vty == 'text' { return cgOwnsText(e, v) }""",
+        """bool func cgMapValOwns(vty:text, e:Node, v:Val) {""",
+    ),
+    Canary(
+        "map-text-frees-the-old-buffer", "#312",
+        "overwriting a text map entry frees what the key mapped to before",
+        """            cgOut(`  call void @free(ptr ${old})`)
+        } else {""",
+        """        } else {""",
+    ),
+    Canary(
+        "map-release-trampoline-element-fn", "#312",
+        "a map's release trampoline frees a text value rather than "
+        "releasing it as though it had a header",
+        """    text releaseFn = cgElemReleaseFn(vty)""",
+        """    text releaseFn = cgReleaseFnFor('struct', vty)""",
+    ),
+    Canary(
+        "minted-base-field-release", "#312",
+        "a field read off a MINTED computed index releases the base it "
+        "was handed",
+        """    if cgIsRefcounted(base.fty) && cgOwnsRefcounted(childOf(e, 'obj'), base) {""",
+        """    if cgIsRefcounted(base.fty) && cgIsOwningRefcountedSource(childOf(e, 'obj')) {""",
+    ),
+    Canary(
+        "map-stack-values-released", "#312",
+        "a FRAME-allocated map still releases its values before freeing "
+        "the entries buffer",
+        """        if cgElemOwnsSomething(parts[2]) {
+            text tramp = cgMapReleaseTrampoline(parts[2])
+            cgOut(`  call void @festina_map_for_each(ptr ${entV}, i64 ${nV}, ptr ${tramp})`)
+        }""",
+        "",
+    ),
+    Canary(
+        "floordiv-floors", "#312",
+        "Math.floorDiv rounds toward negative infinity, not toward zero",
+        """        text adjust = cgTmp()
+        cgOut(`  ${adjust} = and i1 ${rNonzero}, ${differ}`)""",
+        """        text adjust = cgTmp()
+        cgOut(`  ${adjust} = and i1 ${rNonzero}, false`)""",
+    ),
+    Canary(
+        "float-literal-trailing-zeros", "#312",
+        "a float literal's window is decided by its VALUE, not its "
+        "spelling",
+        """    while frac.length > 0 {
+        if frac.charCodeAt(frac.length - 1) != 48 { break }
+        frac = cgDropLast(frac)
+    }""",
+        """    while false {
+        frac = cgDropLast(frac)
+    }""",
+    ),
+
     Canary(
         "generated-fn-placement", "#307",
         "a generated cascade lands BEFORE the function whose body asked for it",
@@ -601,9 +713,20 @@ class Baseline:
     """
 
     def __init__(self, paths, expected, lines):
-        self.paths = paths
+        # Cheapest FIRST, because a canary stops as soon as it has
+        # enough witnesses (see WITNESSES_WANTED). The corpus is no
+        # longer a flat set of small programs: `bootstrap/codegen.f`
+        # alone is 58,000 IR lines, and re-dumping it for every one of
+        # fifty-five canaries turned the suite from about a minute into
+        # well over an hour. Sorting by expected size means the usual
+        # case -- a mechanism a `cases/` file was written for -- is
+        # answered in a few hundred milliseconds, and the whole corpus
+        # is still scanned whenever the answer is not found early.
+        self.paths = sorted(paths, key=lambda p: len(expected[p]))
         self.expected = expected      # {path: the Python side's own dump}
         self.lines = lines
+        self.total_lines = {p: max(0, len(expected[p]) - irdiff.SHARED_PREAMBLE_LINES)
+                            for p in paths}
 
 
 def baseline(binary=None, paths=None):
@@ -682,7 +805,17 @@ def run_one(canary, base):
             return "broken", error
         differed = []
         lines = 0
-        for path in base.paths:
+        scanned_all = True
+        for n, path in enumerate(base.paths):
+            # Enough witnesses: this mechanism is visible, and visible
+            # in more than one program, which is the part that matters
+            # (see WITNESSES_WANTED). Everything after this point in
+            # the corpus is strictly more expensive to dump than
+            # everything before it, so stopping here is where the
+            # saving is.
+            if len(differed) >= WITNESSES_WANTED:
+                scanned_all = False
+                break
             try:
                 got = irdiff.festina_dump(binary, path)
             except RuntimeError as exc:
@@ -707,7 +840,10 @@ def run_one(canary, base):
                     differed.append((rel, (i, a, b)))
                     break
         if differed:
-            return "differ", differed
+            return "differ", (differed, scanned_all)
+        # Only reachable on a full scan: the loop cannot exit early
+        # without having found a difference, so `lines` is a real total
+        # here rather than a partial one.
         if lines < base.lines:
             return "ratchet", f"{base.lines} -> {lines} lines reproduced"
         return "undetected", None
@@ -743,12 +879,31 @@ def main(argv):
                 "undetected": "NOT CAUGHT", "broken": "BROKEN"}[verdict]
         print(f"{c.name:30s} {c.slice:6s} {mark}")
         if verdict == "differ":
-            for rel, d in detail[:2]:
+            files, scanned_all = detail
+            for rel, d in files[:2]:
                 print(f"    {rel}: line {d[0] + 1}")
                 print(f"      python:  {d[1]}")
                 print(f"      festina: {d[2]}")
-            if len(detail) > 2:
-                print(f"    ... and {len(detail) - 2} more file(s)")
+            if scanned_all and len(files) == 1:
+                # The distinction this whole ordering exists to keep
+                # visible. One witness after a FULL scan is a real
+                # finding: the mechanism hangs on a single file and
+                # goes unmeasured the day that file stops matching for
+                # any unrelated reason. WHICH file decides how much it
+                # matters -- a purpose-written `cases/` file is the
+                # intended arrangement, and anything else is an
+                # accident waiting to be noticed.
+                only = files[0][0]
+                if only.startswith("bootstrap/cases/"):
+                    print(f"    one witness, and it is the case file "
+                          f"written for it -- by design")
+                else:
+                    print(f"    ONE WITNESS, and it is not a case file: "
+                          f"{only}. {c.mechanism} goes unmeasured the day "
+                          f"that file stops matching for any reason at "
+                          f"all -- write a `cases/` file for it")
+            elif len(files) > 2:
+                print(f"    ... and {len(files) - 2} more file(s)")
         elif verdict == "ratchet":
             print(f"    {detail}")
         elif verdict == "broken":

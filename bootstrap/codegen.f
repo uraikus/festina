@@ -606,6 +606,19 @@ text func cgHexN(value:int, digits:int) {
 // a real strtod is what a literal like 0.30000000000000004 needs.
 bool CG_NUM_OK = true
 
+// Festina's `text` has no `.slice()`, so dropping the last character
+// is a rebuild. Only ever called on a digit string, so a code-point
+// walk is a byte walk here.
+text func cgDropLast(s:text) {
+    text out = ''
+    int i = 0
+    while i < s.length - 1 {
+        out = out + s.charCodeAt(i).toChar()
+        i++
+    }
+    return out
+}
+
 float func cgParseFloat(s:text) {
     CG_NUM_OK = true
     arr[text] parts = s.split('.')
@@ -614,9 +627,22 @@ float func cgParseFloat(s:text) {
         return parts[0].toInt().toFloat()
     }
     if parts.length != 2 { CG_NUM_OK = false  return 0.0 }
-    int k = parts[1].length
+    // Trailing zeros in the FRACTION are stripped first, and that is
+    // exact rather than approximate: dropping one divides both the
+    // digit integer and the power of ten by the same 10, so the
+    // quotient is unchanged. Without it the window is decided by the
+    // SPELLING rather than the value, and `4503599627370496.0` -- 2^52,
+    // exactly representable -- is refused for a zero that carries no
+    // information. That literal is in this port's own source, so the
+    // difference is between self-hosting and not.
+    text frac = parts[1]
+    while frac.length > 0 {
+        if frac.charCodeAt(frac.length - 1) != 48 { break }
+        frac = cgDropLast(frac)
+    }
+    int k = frac.length
     if k > 22 { CG_NUM_OK = false  return 0.0 }
-    text digits = parts[0] + parts[1]
+    text digits = parts[0] + frac
     if digits.length > 18 { CG_NUM_OK = false  return 0.0 }
     int d = digits.toInt()
     if d >= 9007199254740992 { CG_NUM_OK = false  return 0.0 }
@@ -1044,6 +1070,12 @@ void func cgBlockLabel(l:text) {
 // than into __festina_main's top level. A declaration's storage and
 // its lifetime both depend on this.
 bool CG_IN_FUNC = false
+
+// The function currently being emitted, and its return type. A
+// `return null` takes its type from the signature rather than from
+// anything at the return site, which is the only thing these are for.
+text CG_FUNC_NAME = ''
+text CG_FUNC_RET = ''
 
 // Values needing a free when their scope ends, and where each scope
 // began. festina/codegen.py keeps the same thing as a frame stack and
@@ -1702,7 +1734,7 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
             return none
         }
         vals.push(v.v)
-        bool isOwning = cgIsOwningTextSource(elems[i])
+        bool isOwning = cgOwnsText(elems[i], v)
         if SF_NAMES[ety] != null { isOwning = cgIsOwningRefcountedSource(elems[i]) }
         if isOwning { owned.push(1) } else { owned.push(0) }
         i++
@@ -1876,7 +1908,7 @@ MapKey func cgMapKey(e:Node) {
     if CG_STUCK { return k }
     if v.fty == 'text' {
         k.v = v.v
-        k.owned = cgIsOwningTextSource(e)
+        k.owned = cgOwnsText(e, v)
         return k
     }
     Val r = cgToText(v)
@@ -1890,7 +1922,7 @@ MapKey func cgMapKey(e:Node) {
 // storage. No `count`: festina_map_get scans buckets by capacity, not
 // a dense range, so a read never needed it.
 Val func cgMapGet(objV:text, vty:text, keyV:text) {
-    text vlty = cgLtyOf(vty)
+    text vlty = cgElemLty(vty)
     text entP = cgTmp()
     cgOut(`  ${entP} = getelementptr %struct._FestinaMap, ptr ${objV}, i32 0, i32 1`)
     text ent = cgTmp()
@@ -1901,7 +1933,9 @@ Val func cgMapGet(objV:text, vty:text, keyV:text) {
     cgOut(`  ${cap} = load i64, ptr ${capP}`)
     text raw = cgTmp()
     cgOut(`  ${raw} = call i64 @festina_map_get(ptr ${ent}, i64 ${cap}, ptr ${keyV}, i64 ${cgMapMissing(vlty)})`)
-    return cgVal(cgMapFromI64(raw, vlty), vlty, vty)
+    text out = cgMapFromI64(raw, vlty)
+    if SF_NAMES[vty] != null { return cgStructVal(out, vty) }
+    return cgVal(out, vlty, vty)
 }
 
 // `m[k] = v`, and every entry of a map literal, which is the same
@@ -1914,8 +1948,8 @@ Val func cgMapGet(objV:text, vty:text, keyV:text) {
 // and release whatever the key mapped to before -- there is no fixed
 // address to load an old value from, so it takes a festina_map_get of
 // its own first -- and that is its own piece of work.
-void func cgMapSet(mapPtr:text, vty:text, keyV:text, valV:text, keyOwned:bool) {
-    text vlty = cgLtyOf(vty)
+void func cgMapSet(mapPtr:text, vty:text, keyV:text, valV:text, keyOwned:bool, valOwning:bool) {
+    text vlty = cgElemLty(vty)
     text countP = cgTmp()
     cgOut(`  ${countP} = getelementptr %struct._FestinaMap, ptr ${mapPtr}, i32 0, i32 0`)
     text entP = cgTmp()
@@ -1924,8 +1958,55 @@ void func cgMapSet(mapPtr:text, vty:text, keyV:text, valV:text, keyOwned:bool) {
     cgOut(`  ${capP} = getelementptr %struct._FestinaMap, ptr ${mapPtr}, i32 0, i32 2`)
     text tombP = cgTmp()
     cgOut(`  ${tombP} = getelementptr %struct._FestinaMap, ptr ${mapPtr}, i32 0, i32 3`)
-    text raw = cgMapToI64(valV, vlty)
+    // claude.md #80: a refcounted value has to give back whatever the
+    // key mapped to before. There is no fixed address to load an old
+    // value from -- a key may or may not be present and
+    // festina_map_set does not say which -- so festina_map_get with a
+    // null default finds it, which is safe unconditionally: 0 can
+    // never be a real heap pointer, so it only ever means "nothing to
+    // release".
+    text oldPtr = ''
+    text oldFn = ''
+    text stored = valV
+    if cgElemOwnsSomething(vty) {
+        text ent = cgTmp()
+        cgOut(`  ${ent} = load ptr, ptr ${entP}`)
+        text cap = cgTmp()
+        cgOut(`  ${cap} = load i64, ptr ${capP}`)
+        text oldRaw = cgTmp()
+        cgOut(`  ${oldRaw} = call i64 @festina_map_get(ptr ${ent}, i64 ${cap}, ptr ${keyV}, i64 0)`)
+        text old = cgTmp()
+        cgOut(`  ${old} = inttoptr i64 ${oldRaw} to ptr`)
+        if vty == 'text' {
+            // claude.md #83: text is copied rather than retained, and
+            // the old buffer is freed BEFORE the set rather than after
+            // -- there is no cycle trial behind a free, so nothing
+            // needs the entry to be updated first.
+            if valOwning == false {
+                text o = cgTmp()
+                cgOut(`  ${o} = call ptr @festina_text_own(ptr ${stored})`)
+                stored = o
+            }
+            cgOut(`  call void @free(ptr ${old})`)
+        } else {
+            if valOwning == false {
+                cgOut(`  call void @festina_retain(ptr ${stored})`)
+            }
+            // Resolved HERE, before the value's own reinterpretation
+            // takes a temp -- generating the value type's cascade is
+            // what this call may do, and those temps come first.
+            oldPtr = old
+            oldFn = cgReleaseFnFor('struct', vty)
+        }
+    }
+    text raw = cgMapToI64(stored, vlty)
     cgOut(`  call void @festina_map_set(ptr ${countP}, ptr ${entP}, ptr ${capP}, ptr ${tombP}, ptr ${keyV}, i64 ${raw})`)
+    // claude.md #120: DEFERRED until after the set. A cycle trial run
+    // by that release must never find the entry still pointing at the
+    // value whose count it has just dropped.
+    if oldPtr != '' {
+        cgOut(`  call void ${oldFn}(ptr ${oldPtr})`)
+    }
     // claude.md #97: festina_map_set strdups the key, so a key the
     // caller allocated has no owner left once this returns. Freed here
     // rather than at each call site so the literal path and the
@@ -1938,7 +2019,7 @@ void func cgMapSet(mapPtr:text, vty:text, keyV:text, valV:text, keyOwned:bool) {
 // order, so a repeated key ends up last-one-wins with no dedup pass.
 Val func cgMapLit(e:Node, vty:text, header:text) {
     Val none
-    if vty == '' || cgLtyOf(vty) == '' {
+    if vty == '' || cgElemLty(vty) == '' {
         cgUnported('map literal of a non-scalar type')
         return none
     }
@@ -1954,11 +2035,11 @@ Val func cgMapLit(e:Node, vty:text, header:text) {
         if CG_STUCK { return none }
         Val v = cgExprExpecting(childOf(entries[i], 'b'), vty, '')
         if CG_STUCK { return none }
-        if v.fty != vty {
+        if cgValIsElem(v, vty) == false {
             cgUnported(`map literal value of type ${v.fty} in a map of ${vty}`)
             return none
         }
-        cgMapSet(into, vty, k.v, v.v, k.owned)
+        cgMapSet(into, vty, k.v, v.v, k.owned, cgMapValOwns(vty, childOf(entries[i], 'b'), v))
         i++
     }
     return cgMapVal(into, vty)
@@ -2033,7 +2114,7 @@ Val func cgMemberRead(e:Node) {
     // the just-retained value back to exactly the one reference this
     // expression holds. A scalar needs no minting: its loaded value
     // survives the base by copy.
-    if cgIsRefcounted(base.fty) && cgIsOwningRefcountedSource(childOf(e, 'obj')) {
+    if cgIsRefcounted(base.fty) && cgOwnsRefcounted(childOf(e, 'obj'), base) {
         if cgIsRefcounted(out.fty) {
             cgOut(`  call void @festina_retain(ptr ${out.v})`)
             out.fresh = true
@@ -2082,6 +2163,35 @@ Val func cgLengthOf(e:Node, obj:Val) {
     return none
 }
 
+// claude.md #119: the COMPUTED half of #117's chain ownership.
+// `getRows()[0]`, `line.split(' ')[0]` -- a computed member whose
+// receiver this expression owns has the same dilemma a field read
+// does: releasing the container before the element escapes would free
+// the element too, and not releasing it at all leaks the whole
+// container, because nothing else will ever own it. The answer is the
+// same one instruction: mint the element's own ownership FIRST --
+// retain a refcounted one, copy a text one -- and only then release
+// the container, whose element cascade decrements the just-retained
+// value back to exactly the one reference this expression holds.
+//
+// A scalar element needs no minting: its loaded value survives the
+// container by copy, so the container is simply released.
+Val func cgMintAndReleaseComputed(e:Node, out:Val, obj:Val) {
+    if cgIsRefcounted(obj.fty) == false { return out }
+    if cgIsOwningRefcountedSource(childOf(e, 'obj')) == false { return out }
+    if cgIsRefcounted(out.fty) {
+        cgOut(`  call void @festina_retain(ptr ${out.v})`)
+        out.fresh = true
+    } else if out.fty == 'text' {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${out.v})`)
+        out.v = owned
+        out.fresh = true
+    }
+    cgOut(`  call void ${cgReleaseFnFor(obj.fty, cgRelKeyVal(obj))}(ptr ${obj.v})`)
+    return out
+}
+
 // `xs[i]` on an array: the object, then the INDEX, then the data
 // pointer. That order is the original's and it is observable -- an
 // index expression with side effects of its own runs before the data
@@ -2099,7 +2209,7 @@ Val func cgIndexRead(e:Node, obj:Val) {
         // A key this expression rendered or allocated has no owner once
         // the lookup is done -- festina_map_get only reads it.
         if k.owned { cgOut(`  call void @free(ptr ${k.v})`) }
-        return r
+        return cgMintAndReleaseComputed(e, r, obj)
     }
     if obj.fty != 'arr' {
         cgUnported(`indexing a ${obj.fty}`)
@@ -2124,8 +2234,10 @@ Val func cgIndexRead(e:Node, obj:Val) {
     cgOut(`  ${slot} = getelementptr ${elemLty}, ptr ${dataV}, i64 ${idx.v}`)
     text out = cgTmp()
     cgOut(`  ${out} = load ${elemLty}, ptr ${slot}`)
-    if SF_NAMES[obj.ety] != null { return cgStructVal(out, obj.ety) }
-    return cgVal(out, elemLty, obj.ety)
+    if SF_NAMES[obj.ety] != null {
+        return cgMintAndReleaseComputed(e, cgStructVal(out, obj.ety), obj)
+    }
+    return cgMintAndReleaseComputed(e, cgVal(out, elemLty, obj.ety), obj)
 }
 
 // Every member access, computed or not, dispatched on the receiver's
@@ -2272,7 +2384,7 @@ Val func cgTemplate(e:Node) {
             // text field read through an owning base was copied out
             // (claude.md #117) -- so the value is asked first.
             pieceOwned = a.fresh
-            if pieceOwned == false { pieceOwned = cgIsOwningTextSource(exprs[i]) }
+            if pieceOwned == false { pieceOwned = cgOwnsText(exprs[i], a) }
         }
         Val piece = cgToText(a)
         if CG_STUCK { return none }
@@ -2542,6 +2654,52 @@ Val func cgMathCall(e:Node, m:text) {
         cgOut(`  ${out} = call double @${cgMathFloat2Fn(m)}(double ${a.v}, double ${b.v})`)
         return cgVal(out, 'double', 'float')
     }
+    // claude.md #188: Math.floorDiv(a, b) -- floor rather than
+    // truncation, so a negative quotient rounds away from zero. It
+    // shares claude.md #57's by-zero convention (null, through real
+    // control flow) rather than inventing a second one: sdiv and srem
+    // by zero are undefined at the hardware level, so a `select` alone
+    // would not do.
+    if m == 'floorDiv' {
+        Val a = cgExpr(args[0])
+        if CG_STUCK { return none }
+        Val b = cgExpr(args[1])
+        if CG_STUCK { return none }
+        text isZero = cgTmp()
+        cgOut(`  ${isZero} = icmp eq i64 ${b.v}, 0`)
+        text zeroL = cgLabel('floordivzero')
+        text nonzeroL = cgLabel('floordivnonzero')
+        text endL = cgLabel('floordivend')
+        cgOut(`  br i1 ${isZero}, label %${zeroL}, label %${nonzeroL}`)
+        cgBlockLabel(zeroL)
+        text zeroPred = CG_BLOCK
+        cgOut(`  br label %${endL}`)
+        cgBlockLabel(nonzeroL)
+        text q = cgTmp()
+        cgOut(`  ${q} = sdiv i64 ${a.v}, ${b.v}`)
+        text r2 = cgTmp()
+        cgOut(`  ${r2} = srem i64 ${a.v}, ${b.v}`)
+        text rNonzero = cgTmp()
+        cgOut(`  ${rNonzero} = icmp ne i64 ${r2}, 0`)
+        text rNeg = cgTmp()
+        cgOut(`  ${rNeg} = icmp slt i64 ${r2}, 0`)
+        text bNeg = cgTmp()
+        cgOut(`  ${bNeg} = icmp slt i64 ${b.v}, 0`)
+        text differ = cgTmp()
+        cgOut(`  ${differ} = xor i1 ${rNeg}, ${bNeg}`)
+        text adjust = cgTmp()
+        cgOut(`  ${adjust} = and i1 ${rNonzero}, ${differ}`)
+        text lower = cgTmp()
+        cgOut(`  ${lower} = sub i64 ${q}, 1`)
+        text picked = cgTmp()
+        cgOut(`  ${picked} = select i1 ${adjust}, i64 ${lower}, i64 ${q}`)
+        text nonzeroPred = CG_BLOCK
+        cgOut(`  br label %${endL}`)
+        cgBlockLabel(endL)
+        text out = cgTmp()
+        cgOut(`  ${out} = phi i64 [ -9223372036854775808, %${zeroPred} ], [ ${picked}, %${nonzeroPred} ]`)
+        return cgVal(out, 'i64', 'int')
+    }
     if m == 'random' {
         text out = cgTmp()
         cgOut(`  ${out} = call double @festina_random()`)
@@ -2619,7 +2777,7 @@ Val func cgMethodCall(e:Node, callee:Node) {
                 if cgIsOwningRefcountedSource(args[0]) == false {
                     cgOut(`  call void @festina_retain(ptr ${stored})`)
                 }
-            } else if obj.ety == 'text' && cgIsOwningTextSource(args[0]) == false {
+            } else if obj.ety == 'text' && cgOwnsText(args[0], v) == false {
                 text o = cgTmp()
                 cgOut(`  ${o} = call ptr @festina_text_own(ptr ${stored})`)
                 stored = o
@@ -2666,6 +2824,42 @@ Val func cgMethodCall(e:Node, callee:Node) {
     // -- so the blob branch below emits it again from scratch. The
     // first value is simply unused. Reproducing it matters more than
     // tidying it: this port's job is to agree.
+    // claude.md #109: a blob's path-shaped methods, all of one shape --
+    // the receiver is a handle that already holds the path, so none of
+    // them threads one through. `toText` belongs to this family too
+    // but is not here: the conversion family claims the NAME first,
+    // emits the receiver, finds a blob matches none of its cases and
+    // falls through -- so a blob's toText emits its receiver twice,
+    // exactly as `.slice()` does. Reproduced rather than tidied.
+    if m == 'write' || m == 'append' || m == 'exists' || m == 'delete' {
+        Val r = cgExpr(recv)
+        if CG_STUCK { return none }
+        if r.fty != 'blob' {
+            cgUnported(`.${m}() on ${r.fty}`)
+            return none
+        }
+        text fn = 'festina_blob_exists'
+        text retIr = 'i8'
+        text retF = 'bool'
+        if m == 'write' { fn = 'festina_blob_write' }
+        else if m == 'append' { fn = 'festina_blob_append' }
+        else if m == 'delete' { fn = 'festina_blob_delete' }
+        text out = cgTmp()
+        if args.length > 0 {
+            Val a = cgExpr(args[0])
+            if CG_STUCK { return none }
+            cgOut(`  ${out} = call ${retIr} @${fn}(ptr ${r.v}, ptr ${a.v})`)
+            cgFreeTextTemp(args[0], a)
+        } else {
+            cgOut(`  ${out} = call ${retIr} @${fn}(ptr ${r.v})`)
+        }
+        // toText hands back an owned copy and the rest return scalars,
+        // so nothing here points into the handle.
+        cgReleaseOwnedReceiver(recv, r)
+        if retF == 'text' { return cgVal(out, 'ptr', 'text') }
+        return cgVal(out, 'i8', 'bool')
+    }
+
     if m == 'byteAt' || m == 'slice' {
         if m == 'slice' {
             Val first = cgExpr(recv)
@@ -2827,6 +3021,16 @@ Val func cgMethodCall(e:Node, callee:Node) {
     // .toText() is the explicit spelling of exactly what a template
     // interpolation already does, so it shares cgToText rather than
     // having a copy that could drift from it.
+    if r.fty == 'blob' {
+        // The fall-through the original takes, receiver and all: this
+        // second emission is the one the call actually uses.
+        Val again = cgExpr(recv)
+        if CG_STUCK { return none }
+        text bt = cgTmp()
+        cgOut(`  ${bt} = call ptr @festina_blob_to_text(ptr ${again.v})`)
+        cgReleaseOwnedReceiver(recv, again)
+        return cgVal(bt, 'ptr', 'text')
+    }
     if r.fty != 'int' && r.fty != 'float' && r.fty != 'bool' {
         cgUnported(`.toText() on ${r.fty}`)
         return none
@@ -3012,13 +3216,33 @@ void func cgStmt(s:Node) {
                 return
             }
 
-            // A blob DECLARATION needs a way to make one -- reading a
-            // file, or coercing a text path -- which is its own piece
-            // of work. Parameters and the three readers are what this
-            // slice ports, so a declaration is refused outright rather
-            // than half-emitted.
+            // A blob is a HANDLE, so its local is one `alloca ptr` and
+            // nothing else -- no frame storage to zero, no header to
+            // calloc, and no stack-versus-heap decision to make: there
+            // is no payload that could live in the frame.
             if managed == 'blob' {
-                cgUnported('blob declaration')
+                Node binit = childOf(s, 'init')
+                if binit == null {
+                    cgUnported('blob declaration with no initializer')
+                    return
+                }
+                Val bv = cgExprExpecting(binit, 'blob', '')
+                if CG_STUCK { return }
+                if bv.fty != 'blob' {
+                    cgUnported(`initializer of type ${bv.fty} for blob`)
+                    return
+                }
+                text bslot = `%${gname}.${cgUid()}`
+                cgOut(`  ${bslot} = alloca ptr`)
+                bool bOwning = cgIsOwningRefcountedSource(binit)
+                if bv.fresh { bOwning = true }
+                if bOwning == false {
+                    cgOut(`  call void @festina_retain(ptr ${bv.v})`)
+                }
+                cgOut(`  store ptr ${bv.v}, ptr ${bslot}`)
+                cgTrackLive('blob', bslot, '')
+                L_SLOT[gname] = bslot
+                L_FTY[gname] = 'blob'
                 return
             }
             text declEty = ''
@@ -3196,7 +3420,7 @@ void func cgStmt(s:Node) {
             // why it goes the long way round.
             if freshLocal {
                 text owned = v.v
-                if cgIsOwningTextSource(init) == false {
+                if cgOwnsText(init, v) == false {
                     text o = cgTmp()
                     cgOut(`  ${o} = call ptr @festina_text_own(ptr ${owned})`)
                     owned = o
@@ -3205,7 +3429,7 @@ void func cgStmt(s:Node) {
                 return
             }
             cgStoreText(cgSlotOf(name), `${cgSlotOf(name)}.ap`, v,
-                        cgIsOwningTextSource(init))
+                        cgOwnsText(init, v))
             return
         }
         cgOut(`  store ${lty} ${v.v}, ptr ${cgSlotOf(name)}`)
@@ -3369,6 +3593,16 @@ void func cgFreeOne(entry:text) {
         cgOut(`  ${nP} = getelementptr %struct._FestinaMap, ptr ${t}, i32 0, i32 2`)
         text nV = cgTmp()
         cgOut(`  ${nV} = load i64, ptr ${nP}`)
+        // The header is in the frame, but the VALUES are not, and a
+        // map's entries layout is opaque to codegen the way an array's
+        // flat buffer is not -- there is nothing to walk. So the same
+        // for_each-and-trampoline the generated cascade uses runs
+        // inline here, before the entries buffer is freed. A scalar
+        // value owns nothing and needs none of it.
+        if cgElemOwnsSomething(parts[2]) {
+            text tramp = cgMapReleaseTrampoline(parts[2])
+            cgOut(`  call void @festina_map_for_each(ptr ${entV}, i64 ${nV}, ptr ${tramp})`)
+        }
         cgOut(`  call void @festina_map_free_entries(ptr ${entV}, i64 ${nV})`)
         return
     }
@@ -3681,7 +3915,7 @@ void func cgEmitAppendAssign(slot:text, pieces:arr[Node]) {
             Val a = cgExpr(pieces[i])
             if CG_STUCK { return }
             owned = a.fty != 'text'
-            if a.fty == 'text' { owned = cgIsOwningTextSource(pieces[i]) }
+            if a.fty == 'text' { owned = cgOwnsText(pieces[i], a) }
             Val p = cgToText(a)
             if CG_STUCK { return }
             pieceVal = p.v
@@ -3717,13 +3951,14 @@ void func cgIndexAssign(e:Node, target:Node) {
         // value's.
         MapKey k = cgMapKey(childOf(target, 'prop'))
         if CG_STUCK { return }
-        Val v = cgExprExpecting(childOf(e, 'value'), obj.ety, '')
+        Node mvalue = childOf(e, 'value')
+        Val v = cgExprExpecting(mvalue, obj.ety, '')
         if CG_STUCK { return }
-        if v.fty != obj.ety {
+        if cgValIsElem(v, obj.ety) == false {
             cgUnported(`assigning ${v.fty} into a map of ${obj.ety}`)
             return
         }
-        cgMapSet(obj.v, obj.ety, k.v, v.v, k.owned)
+        cgMapSet(obj.v, obj.ety, k.v, v.v, k.owned, cgMapValOwns(obj.ety, mvalue, v))
         return
     }
     if obj.fty != 'arr' {
@@ -3779,7 +4014,7 @@ void func cgIndexAssign(e:Node, target:Node) {
         // buffer it is about to copy from.
         text old = cgTmp()
         cgOut(`  ${old} = load ptr, ptr ${slot}`)
-        if cgIsOwningTextSource(valueNode) == false {
+        if cgOwnsText(valueNode, v) == false {
             text o = cgTmp()
             cgOut(`  ${o} = call ptr @festina_text_own(ptr ${stored})`)
             stored = o
@@ -3821,7 +4056,7 @@ void func cgAssign(e:Node) {
             text old = cgTmp()
             cgOut(`  ${old} = load ptr, ptr ${fp.v}`)
             text stored = fv.v
-            if cgIsOwningTextSource(fvalue) == false {
+            if cgOwnsText(fvalue, fv) == false {
                 text o = cgTmp()
                 cgOut(`  ${o} = call ptr @festina_text_own(ptr ${stored})`)
                 stored = o
@@ -3887,7 +4122,7 @@ void func cgAssign(e:Node) {
     Val v = cgExprExpecting(value, fty, cgEtyOf(name))
     if CG_STUCK { return }
     if fty == 'text' {
-        cgStoreText(slot, `${slot}.ap`, v, cgIsOwningTextSource(value))
+        cgStoreText(slot, `${slot}.ap`, v, cgOwnsText(value, v))
         return
     }
     if cgIsRefcounted(fty) {
@@ -3930,10 +4165,7 @@ bool func cgStorableRefcounted(fty:text, ety:text) {
     if fty == 'struct' || fty == 'blob' { return true }
     if ety == '' { return false }
     if ety == 'int' || ety == 'float' || ety == 'bool' { return true }
-    // A map of a type that owns something needs a per-value-type
-    // trampoline handed to festina_map_for_each, which is its own
-    // piece of work; an array of one needs only the flat cascade.
-    return fty == 'arr' && cgElemOwnsSomething(ety)
+    return cgElemOwnsSomething(ety)
 }
 
 void func cgStoreRefcounted(slot:text, fty:text, ety:text, v:text, owning:bool) {
@@ -4006,11 +4238,7 @@ text func cgReleaseFnFor(fty:text, ety:text) {
     // for a container -- one slot, because a value is never both.
     if fty == 'struct' && cgStructOwnsAnything(ety) { return cgReleaseStructFn(ety) }
     if fty == 'arr' && cgElemOwnsSomething(ety) { return cgReleaseArrayFn(ety) }
-    // A map's own cascade needs a per-value-type TRAMPOLINE handed to
-    // festina_map_for_each -- a map's entries are opaque to codegen in
-    // a way an array's flat buffer is not -- which is its own piece of
-    // work. Refused here rather than released with the generic call.
-    if fty == 'map' && cgElemOwnsSomething(ety) { return '' }
+    if fty == 'map' && cgElemOwnsSomething(ety) { return cgReleaseMapFn(ety) }
     return cgReleaseFn(fty)
 }
 
@@ -4590,6 +4818,90 @@ text func cgReleaseStructFn(sname:text) {
     return name
 }
 
+// claude.md #80: the map counterpart of the array cascade, and it
+// needs one more piece. A map's ENTRIES are opaque to codegen in a way
+// an array's flat buffer is not -- the entry layout lives in the
+// runtime -- so the per-value release cannot be a loop emitted here.
+// It goes through festina_map_for_each instead, which takes a callback
+// of a fixed shape, so a small TRAMPOLINE is generated to discard the
+// key and reinterpret the raw i64 value.
+//
+// The trampoline is never cached the way the wrappers are: it is
+// needed exactly once, at the one site that generates it.
+text func cgMapReleaseTrampoline(vty:text) {
+    text name = `@__festina_maprelease_${cgUid()}`
+    // Resolved before the body's temps, because resolving it may
+    // generate the value type's own cascade -- whose temps come first.
+    // A text value is freed rather than released, exactly as an array
+    // element of the same type is.
+    text releaseFn = cgElemReleaseFn(vty)
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define void ${name}(i64 %raw, ptr %key) {`)
+    cgBlockLabel('entry')
+    text p = cgTmp()
+    cgOut(`  ${p} = inttoptr i64 %raw to ptr`)
+    cgOut(`  call void ${releaseFn}(ptr ${p})`)
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
+text func cgReleaseMapFn(vty:text) {
+    if CG_MAP_REL[vty] != null { return CG_MAP_REL[vty] }
+    text name = `@__festina_release_map_${cgUid()}`
+    CG_MAP_REL[vty] = name
+    text tramp = cgMapReleaseTrampoline(vty)
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define void ${name}(ptr %payload) {`)
+    cgBlockLabel('entry')
+    text chk = cgTmp()
+    cgOut(`  ${chk} = call i8 @festina_release_check(ptr %payload)`)
+    text cond = cgTmp()
+    cgOut(`  ${cond} = icmp ne i8 ${chk}, 0`)
+    text freeL = cgLabel('relmap.free')
+    text doneL = cgLabel('relmap.done')
+    bool cyclic = cgIsCyclic(cgTypeKey('map', vty))
+    text aliveL = doneL
+    if cyclic { aliveL = cgLabel('relmap.alive') }
+    cgOut(`  br i1 ${cond}, label %${freeL}, label %${aliveL}`)
+    cgBlockLabel(freeL)
+    text entP = cgTmp()
+    cgOut(`  ${entP} = getelementptr %struct._FestinaMap, ptr %payload, i32 0, i32 1`)
+    text ent = cgTmp()
+    cgOut(`  ${ent} = load ptr, ptr ${entP}`)
+    text capP = cgTmp()
+    cgOut(`  ${capP} = getelementptr %struct._FestinaMap, ptr %payload, i32 0, i32 2`)
+    text cap = cgTmp()
+    cgOut(`  ${cap} = load i64, ptr ${capP}`)
+    cgOut(`  call void @festina_map_for_each(ptr ${ent}, i64 ${cap}, ptr ${tramp})`)
+    cgOut(`  call void @festina_map_free_entries(ptr ${ent}, i64 ${cap})`)
+    text hdr = cgTmp()
+    cgOut(`  ${hdr} = getelementptr i8, ptr %payload, i64 -8`)
+    cgOut(`  call void @festina_free_z(ptr ${hdr})`)
+    cgOut(`  br label %${doneL}`)
+    if cyclic { cgCycleTrial(cgTypeKey('map', vty), aliveL, doneL) }
+    cgBlockLabel(doneL)
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
 text func cgReleaseArrayFn(ety:text) {
     if CG_ARR_REL[ety] != null { return CG_ARR_REL[ety] }
     text name = `@__festina_release_array_${cgUid()}`
@@ -4652,6 +4964,40 @@ bool func cgIsOwningRefcountedSource(e:Node) {
     return e.kind == 'Call'
 }
 
+// Whether a text VALUE owns its buffer. The expression usually
+// answers, but not always: a text field read through an owning base is
+// copied out (claude.md #117), so the node reads as a plain member
+// access while the value holds a fresh buffer. Ask the value first.
+bool func cgOwnsText(e:Node, v:Val) {
+    if v.fresh { return true }
+    return cgIsOwningTextSource(e)
+}
+
+// Whether a value about to be stored into a map entry already owns
+// what it points at. The two entry families ask DIFFERENT questions: a
+// refcounted entry wants to know whether a retain is owed, a `text`
+// one whether a copy is -- and the predicates disagree, because a
+// concatenation is an owning text source (claude.md #97: every `+` in
+// a text context mallocs) while it is no kind of refcounted source at
+// all. Asking the refcounted question about a text value copies a
+// buffer that was already exclusively owned and drops the original,
+// which is exactly the shape that leaked here before this existed.
+bool func cgMapValOwns(vty:text, e:Node, v:Val) {
+    if vty == 'text' { return cgOwnsText(e, v) }
+    return cgOwnsRefcounted(e, v)
+}
+
+// The refcounted counterpart of cgOwnsText, and the same lesson a
+// third time: the VALUE can own a reference its own expression does
+// not. `makeRows()[0]` is a plain member access as a NODE, while the
+// value it produced holds the +1 claude.md #119 minted for it -- so a
+// `.n` off it has a reference to give back that no amount of looking
+// at the syntax would reveal. Ask the value first.
+bool func cgOwnsRefcounted(e:Node, v:Val) {
+    if v.fresh { return true }
+    return cgIsOwningRefcountedSource(e)
+}
+
 bool func cgIsOwningTextSource(e:Node) {
     if e == null { return false }
     // A call's result is a buffer nothing else holds, so storing it
@@ -4683,9 +5029,7 @@ bool func cgIsOwningTextSource(e:Node) {
 // ever release it.
 void func cgReleaseOwnedReceiver(e:Node, v:Val) {
     if cgIsRefcounted(v.fty) == false { return }
-    if v.fresh == false {
-        if cgIsOwningRefcountedSource(e) == false { return }
-    }
+    if cgOwnsRefcounted(e, v) == false { return }
     cgOut(`  call void ${cgReleaseFnFor(v.fty, cgRelKeyVal(v))}(ptr ${v.v})`)
 }
 
@@ -4756,7 +5100,14 @@ void func cgReturn(s:Node) {
         CG_TERM = true
         return
     }
-    Val r = cgExpr(v)
+    // Through cgExprExpecting, not cgExpr: `return null` has no type
+    // of its own and takes the FUNCTION's. Without that it stays the
+    // untyped null pointer and the refcounted branch below never
+    // fires -- which shows up as a missing `festina_retain(ptr null)`,
+    // a runtime no-op that is nonetheless in the original's IR.
+    text retKey = ''
+    if FN_RETKEY[CG_FUNC_NAME] != null { retKey = FN_RETKEY[CG_FUNC_NAME] }
+    Val r = cgExprExpecting(v, CG_FUNC_RET, retKey)
     if CG_STUCK { return }
     // Returning text hands the caller ownership, so the value is
     // copied BEFORE the locals are freed -- returning a local's own
@@ -4775,7 +5126,7 @@ void func cgReturn(s:Node) {
             cgOut(`  call void @festina_retain(ptr ${val})`)
         }
     } else if r.fty == 'text' {
-        if cgIsOwningTextSource(v) == false {
+        if cgOwnsText(v, r) == false {
             text o = cgTmp()
             cgOut(`  ${o} = call ptr @festina_text_own(ptr ${val})`)
             val = o
@@ -4896,6 +5247,10 @@ void func cgFunc(d:Node) {
     arr[text] body = []
     CUR = body
     CG_IN_FUNC = true
+    text savedFn = CG_FUNC_NAME
+    text savedRet = CG_FUNC_RET
+    CG_FUNC_NAME = name
+    CG_FUNC_RET = retF
     cgOut(`define ${retL} @${name}(${joined}) {`)
     cgBlockLabel(cgLabel('entry'))
 
@@ -4981,6 +5336,8 @@ void func cgFunc(d:Node) {
         b++
     }
     CG_IN_FUNC = false
+    CG_FUNC_NAME = savedFn
+    CG_FUNC_RET = savedRet
     CG_ESC = savedEsc
 
     // claude.md #74 stage 2: registered AFTER the body, so a LATER
