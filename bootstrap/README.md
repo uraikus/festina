@@ -63,7 +63,7 @@ Over the 122-file repository corpus:
 - **escape analysis: 103 match, 0 differ, 7 unported, 11 rejected by
   both** — 1,944 of 1,997 records.
 - **codegen: 85 match, 0 differ, 26 unported, 11 rejected by both** —
-  344,865 of 358,351 file-specific IR lines.
+  345,342 of 358,828 file-specific IR lines.
 - **canaries: 135 registered, 0 missed.**
 
 **The bootstrap compiler reproduces its own compilation.** All ten of

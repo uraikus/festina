@@ -531,6 +531,16 @@ if scan == null { fail('expected ascii input') }
 text back = scan.toText()        // always works, always a copy
 ```
 
+`toInt()` works directly on an `ascii`, reading its bytes in place —
+the same "leading whitespace and sign, then digits, `null` if there are
+none" parse `text.toInt()` performs, with no conversion in between:
+
+```festina
+ascii n = '  -17 items'
+log(n.toInt())                   // -17
+log('abc'.toAscii().toInt() == null)   // true
+```
+
 ### Cost
 
 `.length`, `s[i]` and `charCodeAt(i)` are O(1). Indexing allocates
@@ -1119,6 +1129,18 @@ What "the same value" means depends on the element type:
 - `struct`, `arr`, `map` — **by identity**. Two separately-declared
   structs with identical fields are two different values; only the one
   actually in the array is found.
+
+`==` and `!=` on two values of a reference type mean the same thing —
+identity, not field-by-field equality:
+
+```festina
+struct P { x:int }
+P a
+P c
+P alias = a
+log(a == c)        // false -- two separate values
+log(a == alias)    // true  -- one value, two names
+```
 
 Elements are owned the same way any other binding owns them: pushing a
 `text` copies it, so the array and the variable don't share a buffer.

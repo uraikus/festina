@@ -14,6 +14,16 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Changed
 
+- **`==`/`!=` between two values of a reference type now means
+  identity.** §8.9.1 previously said equality between two structs was
+  "not defined", which the implementation took as licence to accept the
+  program and then fail to build it. Identity is what a reference type
+  makes natural, what the emitted code was already reaching for, and
+  what `indexOf` was already specified to use for structs, arrays and
+  maps — so the two operators now agree rather than disagreeing about
+  the same question. `text` and `ascii` remain the content-comparing
+  exceptions.
+
 - **The language specification now lives in
   [specification.md](specification.md),** organized by topic in the
   manner of the ECMAScript standard — scope and conformance, lexical
@@ -113,7 +123,7 @@ round-by-round design and implementation record predating 0.1 lives in
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
   the fourth and last stage: **85 of 122 corpus files emit
   byte-identical LLVM IR, 0 differ, 26 not yet ported, 11 rejected by
-  both** — 344,865 of 358,351 file-specific IR lines. **The bootstrap
+  both** — 345,342 of 358,828 file-specific IR lines. **The bootstrap
   compiler reproduces its own compilation**: all ten of its files —
   `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
   `escape.f` (22,232), `codegen.f` (94,459) and the five command-line
@@ -269,6 +279,32 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **`ascii b = a` freed the buffer while `a` was still using it.** An
+  `ascii` local was scheduled for release at scope exit but never
+  claimed a reference at its declaration, so an alias dropped one it
+  had never taken. The specification already said `ascii` is reference
+  counted and that `ascii b = a` shares one buffer; the implementation
+  disagreed, and did so silently — such a program prints correct
+  answers and exits 0, and only a sanitizer sees it, as an invalid read
+  **and** an invalid write of size 8 in `festina_ascii_release`. Six
+  shapes reproduced it: a local aliasing a local, a parameter, an array
+  element, a struct field, a map entry, and a parameter stored into a
+  map. `tests/stress/ascii_churn.f` now covers all six — it ran clean
+  through the whole bug, because every value in it was freshly
+  allocated and dropped, never aliased. Reported by
+  [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser).
+- **`==` on two struct references produced invalid LLVM.** Every
+  non-float comparison was spelled `i64`, so two `ptr` operands reached
+  the backend as `icmp eq i64` and the build died there, naming neither
+  the expression nor the source line. `==`/`!=` between two values of
+  any reference type now compares identity — see **Changed** below,
+  since the specification previously left it undefined.
+- **`ascii.toInt()` was accepted by the analyzer and refused by
+  codegen**, with `cannot access field 'toInt' on ascii`, so
+  `a.toText().toInt()` was the only route — an allocation and a UTF-8
+  walk to reach a parse that could already read those bytes. An `ascii`
+  payload is a NUL-terminated byte buffer, so it now uses the same
+  runtime parse `text.toInt()` does.
 - **`\n`, `\t` and `\r` in a regex matched the letter, not the byte.**
   A regex literal can't span lines — a raw newline between the two
   slashes is a parse error — so `\n` is the only spelling a newline has

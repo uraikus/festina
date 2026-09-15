@@ -5120,11 +5120,35 @@ class CodeGen:
             # tracking branch below, were never actually widened to
             # match when EnumType (and, earlier, HttpType/SocketType/
             # UrlType) joined `_is_refcounted`.
-            if type_ == BLOB or type_ == REGEX or isinstance(
+            if type_ == BLOB or type_ == REGEX or type_ == ASCII or isinstance(
                     type_, (types_mod.ImageType, types_mod.AudioType,
                             types_mod.HttpType, types_mod.SocketType,
                             types_mod.UrlType, types_mod.EnumType,
                             types_mod.TableType)):
+                # claude.md #256 (fixed): `ascii` takes this branch too,
+                # and its absence from it was a real use-after-free
+                # rather than a design choice. _emit_block's matching
+                # tracking branch below ALREADY listed ASCII -- every
+                # ascii local was scheduled for release at scope exit --
+                # while this branch, the one that claims the reference
+                # being released, never mentioned it. So `ascii b = a`
+                # dropped a reference it never took: the buffer was
+                # freed while `a` still pointed at it, and the program
+                # went on to print correct answers and exit 0. Six
+                # shapes reproduce it -- a local aliasing a local, a
+                # parameter, an array element, a struct field, a map
+                # entry, and a parameter stored into a map -- and
+                # valgrind reports an invalid read AND an invalid write
+                # of size 8 in festina_ascii_release for each.
+                #
+                # The freshness test above is what keeps this correct in
+                # the other direction: a slice/concat/from_text result
+                # is born at 1 and must NOT be retained again, and an
+                # immortal literal's own negative sentinel makes
+                # festina_retain a no-op whichever way it is classified.
+                # That tracking branch's own comment already asserted
+                # "an aliasing bind retains" as though this were so.
+                #
                 # claude.md #265: a table row takes this branch too, on
                 # exactly blob's terms. `People p = rows[0]` aliases a
                 # row the array still owns, so it needs its own +1 --
@@ -11417,7 +11441,26 @@ class CodeGen:
             if use_float:
                 lines.append(f"  {cmp_out} = fcmp {fcmp[expr.op]} double {left_val}, {right_val}")
             else:
-                ty = "i64" if left_type != BOOL else "i8"
+                # uraikus/archtelos-browser's finding 20: a REFERENCE
+                # type compares as the pointer it is. This used to spell
+                # every non-float comparison `i64`, so `a == c` on two
+                # struct values emitted `icmp eq i64` against two `ptr`
+                # operands -- invalid LLVM, caught only by the backend,
+                # naming neither the expression nor the source line
+                # (`'%t7' defined with type 'ptr' but expected 'i64'`).
+                # Comparing the references is what a reference type
+                # makes natural and what the emitted code was reaching
+                # for anyway; text and ascii never arrive here (each has
+                # its own content-comparison branch above), and `x ==
+                # null` is likewise already handled, so what reaches
+                # this line pointer-shaped is exactly an identity
+                # comparison between two values of the same reference
+                # type.
+                ty = "i64"
+                if left_type == BOOL:
+                    ty = "i8"
+                elif left_type is not None and _llvm_type(left_type) == "ptr":
+                    ty = "ptr"
                 lines.append(f"  {cmp_out} = icmp {icmp[expr.op]} {ty} {left_val}, {right_val}")
             lines.append(f"  {out} = zext i1 {cmp_out} to i8")
             return out, BOOL
@@ -12409,6 +12452,29 @@ class CodeGen:
                     out = self.tmp()
                     lines.append(f"  {out} = call i64 @festina_text_to_int(ptr {val})")
                     self._free_text_temp(callee.obj, val, vtype, lines)
+                    return out, INT
+                if vtype == ASCII:
+                    # uraikus/archtelos-browser's finding 15: the
+                    # analyzer accepted `ascii.toInt()` (see its own
+                    # `_is_ascii_type` check on this same method) and
+                    # this stage had no branch for it, so the call died
+                    # here with "cannot access field 'toInt' on ascii"
+                    # and `a.toText().toInt()` was the workaround --
+                    # an allocation and a UTF-8 walk to reach a parse
+                    # that could already read these bytes.
+                    #
+                    # festina_text_to_int reads a plain NUL-terminated
+                    # char*, and an ascii payload is exactly that (see
+                    # its own layout comment in festina_runtime.c: "the
+                    # bytes, always NUL-terminated at [length]"), so the
+                    # SAME runtime call serves both receivers. Only the
+                    # receiver's release differs: ascii is refcounted,
+                    # so it goes through _release_owned_receiver rather
+                    # than text's unconditional free -- the identical
+                    # split charCodeAt's own two branches already make.
+                    out = self.tmp()
+                    lines.append(f"  {out} = call i64 @festina_text_to_int(ptr {val})")
+                    self._release_owned_receiver(callee.obj, val, vtype, lines)
                     return out, INT
             # claude.md #272: text.trim() -> text. Hands back a fresh
             # owned copy, so the receiver is released the same way every

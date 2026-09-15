@@ -812,8 +812,15 @@ User other = {'id': 2, 'name': 'Brad'}   // active keeps its zero value
 
 A struct value is a reference: `User b = a` makes `b` and `a` name the
 same instance, and a struct passed to a function is the caller's
-instance. Equality with `==`/`!=` between two structs is not defined;
-`x == null` is. `indexOf` compares structs by identity. [#97, #102]
+instance. Equality with `==`/`!=` between two structs compares
+IDENTITY — whether the two operands name the same instance — never
+field contents; `x == null` is the same operator against the null
+reference. The same rule applies to every other reference type
+(`arr[T]`, `map[T]`, `enum`, table rows and the handle types), which is
+what makes `==` agree with `indexOf`, already specified as comparing
+structs, arrays and maps by identity (§13.3). `text` and `ascii` are
+the two exceptions, each comparing by CONTENT (§8.4, §8.5). [#97,
+#102, #326]
 
 #### 8.9.2 Zero values and auto-vivification
 
@@ -2058,7 +2065,10 @@ A user declaration may not reuse any of these names (§6.7).
 | `.callback(fn)` | `blob`/`img`/`aud` | background load (§12.5) |
 
 **`ascii`**: `.length`, `s[i]`, `.charCodeAt(i)`, `.slice(start, end)`,
-`.toText()`, `+`, `==`. [#256]
+`.toText()`, `.toInt()`, `+`, `==`. `.toInt()` reads the value's own
+bytes in place and performs the identical parse `text.toInt()` does
+(leading whitespace, optional sign, digits, trailing garbage ignored;
+`null` if no digits). [#256, #326]
 
 **`arr[T]`, `amor arr[T]`** [#96, #116, #130, #184]
 

@@ -1219,11 +1219,11 @@ CANARIES = [
         r"""    CG_EXTRA.push(`${name} = private unnamed_addr constant ${ty} {i64 ${bytes - 1}, i64 1, [${bytes} x i8] c"${cgCEscape(v)}\\00"}`)""",
     ),
     Canary(
-        "ascii-declaration-does-not-retain", "#320",
-        "an ascii local binds like a scalar -- no retain at the "
-        "declaration -- while still being released at scope exit",
-        """                if managed == 'ascii' { bOwning = true }""",
-        "",
+        "ascii-alias-takes-its-own-reference", "#326",
+        "an ascii local aliasing another binding claims a reference of its own",
+        """                bool bOwning = cgIsOwningRefcountedSource(binit)
+                if bv.fresh { bOwning = true }""",
+        """                bool bOwning = true""",
     ),
 
     Canary(

@@ -2301,7 +2301,12 @@ Val func cgBinOp(e:Node) {
         text cmp = cgTmp()
         text pred = 'eq'
         if op == '!=' { pred = 'ne' }
-        cgOut(`  ${cmp} = icmp ${pred} i64 ${l.v}, ${r.v}`)
+        // A reference compares as the POINTER it is. This used to
+        // spell the comparison `i64`, faithfully reproducing the
+        // original's own `icmp eq i64` against two `ptr` operands --
+        // invalid LLVM that only the backend caught, naming neither the
+        // expression nor the line.
+        cgOut(`  ${cmp} = icmp ${pred} ptr ${l.v}, ${r.v}`)
         cgOut(`  ${res} = zext i1 ${cmp} to i8`)
         return cgVal(res, 'i8', 'bool')
     }
@@ -2426,6 +2431,10 @@ Val func cgBinOp(e:Node) {
         text ty = 'i64'
         if useFloat { ty = 'double' }
         if useFloat == false && l.fty == 'bool' { ty = 'i8' }
+        // The same pointer rule as the identity branch above, for a
+        // pointer-shaped type that is not reference counted and so
+        // never reaches it.
+        if useFloat == false && l.fty != 'bool' && cgLtyOf(l.fty) == 'ptr' { ty = 'ptr' }
         cgOut(`  ${cmpOut} = ${cmpName} ${pred} ${ty} ${l.v}, ${r.v}`)
         cgOut(`  ${out} = zext i1 ${cmpOut} to i8`)
         return cgVal(out, 'i8', 'bool')
@@ -4982,6 +4991,19 @@ Val func cgMethodCall(e:Node, callee:Node) {
         return cgVal(out, 'double', 'float')
     }
     if m == 'toInt' {
+        // An ascii payload is a plain NUL-terminated byte buffer, so
+        // the SAME runtime call serves both receivers; only the
+        // release differs, ascii being refcounted where text is freed
+        // outright. The analyzer always accepted this receiver and this
+        // stage had no branch for it, which made `a.toText().toInt()`
+        // the workaround -- an allocation and a UTF-8 walk to reach a
+        // parse that could already read these bytes.
+        if r.fty == 'ascii' {
+            text aout = cgTmp()
+            cgOut(`  ${aout} = call i64 @festina_text_to_int(ptr ${r.v})`)
+            cgReleaseOwnedReceiver(recv, r)
+            return cgVal(aout, 'i64', 'int')
+        }
         if r.fty != 'text' {
             cgUnported(`.toInt() on ${r.fty}`)
             return none
@@ -6080,14 +6102,16 @@ void func cgStmt(s:Node) {
                 cgOut(`  ${bslot} = alloca ptr`)
                 bool bOwning = cgIsOwningRefcountedSource(binit)
                 if bv.fresh { bOwning = true }
-                // claude.md #256: an ascii DECLARATION never retains,
-                // and that asymmetry is the original's rather than a
-                // slip here. `ascii` is listed among the types a scope
-                // exit releases but NOT among the ones the declaration
-                // branch claims a reference for, so its local is bound
-                // exactly like a scalar -- alloca, store, nothing else
-                // -- while still being released on the way out.
-                if managed == 'ascii' { bOwning = true }
+                // This used to force `bOwning` true for `ascii`, on the
+                // reading that the original's own asymmetry -- released
+                // at scope exit, never retained at the declaration --
+                // was deliberate. It was a use-after-free: `ascii b = a`
+                // dropped a reference it had never taken, freeing the
+                // buffer while `a` still pointed at it. The port
+                // reproduced it faithfully, which is exactly what a
+                // port is for, and the note is kept here rather than
+                // deleted because "the original does this" is not on
+                // its own a reason, and this is the case that proved it.
                 if bOwning == false {
                     cgOut(`  call void @festina_retain(ptr ${bv.v})`)
                 }

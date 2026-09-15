@@ -605,6 +605,36 @@ class TestStructs:
     """claude.md #27: structs are native in-memory objects with typed,
     assignable fields."""
 
+    def test_two_struct_references_compare_by_identity(self, compile_and_run):
+        """uraikus/archtelos-browser's finding 20.
+
+        Structs are references, and `a == c` on two of them used to
+        emit `icmp eq i64` against two `ptr` operands -- invalid LLVM,
+        caught only by the backend, naming neither the expression nor
+        the source line (`'%t7' defined with type 'ptr' but expected
+        'i64'`). Comparing the references is what a reference type
+        makes natural and what the emitted code was reaching for; the
+        same fix covers every other pointer-shaped reference type,
+        which is why arr[T] is checked here too.
+        """
+        source = """
+        struct P { x:int }
+        P a
+        P c
+        P alias = a
+        arr[int] xs = [1]
+        arr[int] ys = [1]
+        arr[int] zs = xs
+        log(a == c)
+        log(a == alias)
+        log(a != c)
+        log(xs == ys)
+        log(xs == zs)
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0
+        assert result.stdout.split() == ["false", "true", "true", "false", "true"]
+
     def test_struct_field_assignment_and_read(self, compile_and_run):
         source = """
         struct Point {
@@ -16671,6 +16701,111 @@ class TestAscii:
         result = compile_and_run("ascii s = 'hello'\nlog(s.length)")
         assert result.returncode == 0
         assert result.stdout == "5\n"
+
+    def test_aliasing_an_ascii_local_takes_its_own_reference(self, compile_and_run):
+        """uraikus/archtelos-browser's finding 2: a real use-after-free.
+
+        `ascii b = a` was released at scope exit without ever being
+        retained at the declaration, so the buffer was freed while `a`
+        still pointed at it. The program printed correct answers and
+        exited 0 -- it is only visible under a sanitizer, or when the
+        freed bytes happen to be reused -- which is why the shape is
+        asserted here as well as in the stress suite: reading the
+        ORIGINAL after the alias has gone out of scope is what has to
+        keep working.
+        """
+        result = compile_and_run(
+            "ascii base = 'hello world'\n"
+            "ascii func viaAlias(s:ascii) {\n"
+            "    ascii inner = s\n"
+            "    return inner\n"
+            "}\n"
+            "void func drop() {\n"
+            "    ascii owned = base.slice(0, 5)\n"
+            "    ascii alias = owned\n"
+            "    log(alias.length)\n"
+            "}\n"
+            "drop()\n"
+            "log(viaAlias(base.slice(0, 4)).length)\n"
+            "log(base.length)")
+        assert result.returncode == 0
+        assert result.stdout == "5\n4\n11\n"
+
+    def test_aliasing_out_of_a_container_leaves_the_container_intact(
+            self, compile_and_run):
+        """The same bug through an array element, a struct field and a
+        map entry -- the container still owns the value after the local
+        that aliased it has been released.
+
+        The alias is taken in a HELPER, so it dies at that function's
+        exit rather than at the end of the one holding the container,
+        and a churn loop in between reuses whatever the buggy release
+        freed. Without both, this shape is silent: the freed bytes are
+        usually still intact when they are read back, which is exactly
+        why the bug survived a release. The stress suite under valgrind
+        is the other half of catching it.
+        """
+        result = compile_and_run(
+            "struct Holder { value:ascii }\n"
+            "ascii base = 'abcdefghij'\n"
+            "int func peek(one:ascii) {\n"
+            "    ascii held = one\n"
+            "    return held.length\n"
+            "}\n"
+            "void func fromContainers() {\n"
+            "    arr[ascii] xs = [base.slice(0, 3), base.slice(3, 6)]\n"
+            "    Holder h\n"
+            "    h.value = base.slice(0, 4)\n"
+            "    map[ascii] m = {}\n"
+            "    m['k'] = base.slice(0, 5)\n"
+            "    log(peek(xs[0]) + peek(h.value) + peek(m['k']))\n"
+            "    int i = 0\n"
+            "    while i < 64 {\n"
+            "        ascii junk = base.slice(0, 9)\n"
+            "        i = i + junk.length - 8\n"
+            "    }\n"
+            "    log(xs[0].length + h.value.length + m['k'].length)\n"
+            "}\n"
+            "fromContainers()")
+        assert result.returncode == 0
+        assert result.stdout == "12\n12\n"
+
+    def test_to_int_reads_the_bytes_directly(self, compile_and_run):
+        """uraikus/archtelos-browser's finding 15: the analyzer accepted
+        `ascii.toInt()` and codegen had no branch for it, so the call
+        died with "cannot access field 'toInt' on ascii" and
+        `a.toText().toInt()` was the workaround -- an allocation and a
+        UTF-8 walk to reach a parse that could already read these bytes.
+        """
+        result = compile_and_run(
+            "ascii a = '42'\n"
+            "ascii b = '  -17xyz'\n"
+            "ascii base = 'zz123zz'\n"
+            "ascii nope = 'abc'\n"
+            "log(a.toInt())\n"
+            "log(b.toInt())\n"
+            "log(base.slice(2, 5).toInt())\n"
+            "log(nope.toInt() == null)")
+        assert result.returncode == 0
+        assert result.stdout == "42\n-17\n123\ntrue\n"
+
+    def test_aliasing_an_immortal_ascii_is_still_a_no_op(self, compile_and_run):
+        """A literal and a global are immortal -- negative refcount
+        sentinel -- so the retain the fix now emits for an alias of one
+        has to stay a no-op, and the release that follows it likewise."""
+        result = compile_and_run(
+            "ascii g = 'global value'\n"
+            "void func aliasImmortals() {\n"
+            "    ascii lit = 'literal'\n"
+            "    ascii a = lit\n"
+            "    ascii b = g\n"
+            "    log(a.length + b.length)\n"
+            "}\n"
+            "aliasImmortals()\n"
+            "aliasImmortals()\n"
+            "log(g.length)")
+        assert result.returncode == 0
+        assert result.stdout == "19\n19\n12\n"
 
     def test_empty_ascii_has_zero_length(self, compile_and_run):
         result = compile_and_run("ascii s = ''\nlog(s.length)")
