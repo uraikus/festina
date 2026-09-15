@@ -111,9 +111,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage: **73 of 120 corpus files emit
-  byte-identical LLVM IR, 0 differ, 36 not yet ported, 11 rejected by
-  both** — 318,939 of 336,247 file-specific IR lines. **The bootstrap
+  the fourth and last stage: **76 of 120 corpus files emit
+  byte-identical LLVM IR, 0 differ, 33 not yet ported, 11 rejected by
+  both** — 324,882 of 340,441 file-specific IR lines. **The bootstrap
   compiler reproduces its own compilation**: all ten of its files —
   `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
   `escape.f` (22,232), `codegen.f` (59,166) and the five command-line
@@ -193,7 +193,11 @@ round-by-round design and implementation record predating 0.1 lives in
   ported as data, and the two media handles taking `blob`'s own shape,
   which between them unblocked the free-function `drawImage`, the
   packed-colour `fillStyle`, `saveCanvas()`'s snapshot form and
-  `getPixelColor`. And what a program needs to be
+  `getPixelColor`. And the graphics EVENT path — `on mouseDown`/
+  `keyDown`/`resize`/`close` and the rest compiling to real void
+  functions registered in declaration order, `render`, the `font` type
+  and `changeFont`, `clientWidth`/`clientHeight`, `const` declarations,
+  and `img.clip()`. And what a program needs to be
   a COMMAND: `argv`, `close(code)`, `.keys()`/`.values()`, and the two
   scope rules a driver is the first program to reach — a managed
   declaration inside a function is local even when a global shares its

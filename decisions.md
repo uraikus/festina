@@ -6581,3 +6581,25 @@ A small slice, and a line worth drawing carefully. **300,464 of 319,458 file-spe
 **The blocker table's "only" column earned its keep again.** `call to drawImage` stood at one file alone before this slice and converted exactly that one. It is the second time the two-column reading -- what a construct BLOCKS versus what it alone holds back -- picked the work correctly.
 
 **Verified.** Lexer 120/120, parser 120/120, semantic 120/120, codegen 73 match and 0 differ.
+
+322. THE GRAPHICS EVENT PATH, AND A PREDICATE THAT ONLY KNEW STRUCTS
+
+**324,882 of 340,441 file-specific IR lines, up from 318,939 -- 95.4% -- and 76 files match, 0 differ**, up from 73. All ten bootstrap files still self-host.
+
+**`on NAME(...)` is an ordinary function body under a different symbol**, so it goes through `cgFunc` rather than a second copy of the parameter-binding loop -- via a symbol and return override that `cgFunc` consumes once and clears. That loop's uid ordering is OBSERVABLE, and two copies of it would drift the day one was touched and the other was not. Restructuring `cgFunc` was the alternative and was not worth the risk to 73 matching files for this.
+
+**Registration order is DECLARATION order**, which is not cosmetic: the prologue emits one line per handler by walking the list, so a set would produce a different prologue from the original's.
+
+**`render` and the two fullscreen calls come off the bench** now that main can enter an event loop. They sit in the same table as every other canvas operation and are separated by what they DO -- presenting rather than painting -- not by their shape. `clientWidth`/`clientHeight` read the runtime's CURRENT size rather than folding a constant, since `on resize` can change it after startup, and deliberately open no window: the canvas has a size whether or not it is on screen.
+
+**A `font` is the one pointer-shaped type never retained or released.** Its record lives in read-only data and nothing allocates it. Identical literals share a constant keyed on the RESOLVED parts rather than on source text, which is why `'bold 13px arial'` and `'arial bold 13px'` collapse together -- the same reason order does not matter in the shorthand at all.
+
+**`const` needed code DELETED, not added.** It is a semantic rule and nothing else: it forbids reassignment and freeing, both already enforced by the time anything reaches codegen, which never consults the flag. The port was refusing a construct that emits exactly what the same declaration without it emits.
+
+**An array literal's retain only knew about STRUCTS**, and that is the real finding of this slice. The element store gated its retain on `SF_NAMES[ety]` -- a lookup answering "is this a declared struct name". Every handle element (img/aud/blob/regex/ascii) and every table ROW silently skipped it, so an `arr[img]` built from two aliased bindings shared a single reference with them and whichever was released first left the other dangling. The same class as #318's `cgMapGet` and its map-set release: a predicate written when structs were the only refcounted element type, never widened as the others arrived. Adding `img` is simply what finally produced a corpus file that could SEE it.
+
+**And widening it alone was wrong in the other direction.** `arr[blob] fs = ['path.txt']` has a string literal for a NODE, which owns nothing, and a value the coercion just minted, which owns everything -- `Val.fresh`'s own rule, that freshness belongs to the value rather than only to the expression. The node alone was a complete answer for exactly as long as structs were the only refcounted element type here, because a struct element is never produced by a coercion. The corpus reported that immediately: three differing files, self-hosting among them, coverage down to 69%.
+
+**Both halves were caught by the full corpus and neither by the file under change.** That is now three separate times in this stretch -- the self-hosting break of #321, the premature release in the img drawImage path, and this pair. The habit that matters is not "test the thing you changed" but "measure everything before committing", and the cost of skipping it is not a failing test on the file you were looking at: it is a silent regression two files away.
+
+**Verified.** Lexer 120/120, parser 120/120, semantic 120/120, codegen 76 match and 0 differ.
