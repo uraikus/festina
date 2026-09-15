@@ -919,6 +919,11 @@ text func cgLtyOf(fty:text) {
     // is REFCOUNTED -- the pointer handed around is the payload, with
     // a {length, refcount} header sitting 16 bytes before it.
     if fty == 'ascii' { return 'ptr' }
+    // claude.md #118: img and aud are handles carrying the same
+    // refcount header a blob does -- one pointer, no payload codegen
+    // lays out.
+    if fty == 'img' { return 'ptr' }
+    if fty == 'aud' { return 'ptr' }
     return ''
 }
 
@@ -1093,6 +1098,8 @@ text func cgManagedFty(t:Ty) {
         if t.name == 'blob' { return 'blob' }
         if t.name == 'regex' { return 'regex' }
         if t.name == 'ascii' { return 'ascii' }
+        if t.name == 'img' { return 'img' }
+        if t.name == 'aud' { return 'aud' }
     }
     return ''
 }
@@ -1297,6 +1304,11 @@ bool CG_USES_SQLITE = false
 // narrower one below is what opens a window.
 bool CG_USES_GRAPHICS_CODE = false
 
+// claude.md #101: whether any audio value exists, which is what
+// registers the audio decoder in main's prologue -- the same
+// only-pay-for-what-you-use gate the image one has.
+bool CG_USES_AUDIO = false
+
 // claude.md #91: every CSS colour name this language understands, and
 // the hex its components come from. Kept as DATA rather than derived,
 // because it is data -- the same 148 names the original resolves
@@ -1445,6 +1457,25 @@ text func cgLowerAscii(v:text) {
         i++
     }
     return out
+}
+
+// claude.md #134/#234: the img-method counterparts of the canvas
+// operations, each retargeted at the RECEIVER image's own surface
+// rather than the shared canvas. Spelled '<arity>:<fn>:<ltys>' and
+// joined by ';', because several of them take more than one argument
+// count and the function differs per count.
+map[text] CG_IMAGE_OPS = {
+    'translate': '2:festina_image_translate:i64,i64',
+    'rotate': '1:festina_image_rotate:double',
+    'scale': '2:festina_image_scale:double,double',
+    'resetTransform': '0:festina_image_reset_transform:',
+    'saveState': '0:festina_image_save_state:',
+    'restoreState': '0:festina_image_restore_state:',
+    'clear': '0:festina_image_clear:',
+    'clearRect': '4:festina_image_clear_rect:i64,i64,i64,i64',
+    'clearCircle': '3:festina_image_clear_circle:i64,i64,i64',
+    'clearPixel': '2:festina_image_clear_pixel:i64,i64',
+    'drawImage': '3:festina_image_draw_image:ptr,i64,i64;5:festina_image_draw_image_scaled:ptr,i64,i64,i64,i64'
 }
 
 // claude.md #94/#180: the canvas operations that are a name, a runtime
@@ -2462,6 +2493,30 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
         // answer travels with the value.
         opened.fresh = true
         return opened
+    }
+    // claude.md #118: a text in an img position LOADS it, exactly as a
+    // text in a blob position opens one -- and the handle is fresh for
+    // the same reason, so nothing retains it and the path is freed
+    // here if this expression allocated it. Loading needs no window:
+    // decoding a PNG is Cairo's own in-memory decoder, which is why
+    // this sets the CODE flag and not the one that opens a canvas.
+    if fty == 'img' && v.fty == 'text' {
+        CG_USES_GRAPHICS_CODE = true
+        text iout = cgTmp()
+        cgOut(`  ${iout} = call ptr @festina_load_image(ptr ${v.v})`)
+        cgFreeTextTemp(e, v)
+        Val loaded = cgVal(iout, 'ptr', 'img')
+        loaded.fresh = true
+        return loaded
+    }
+    if fty == 'aud' && v.fty == 'text' {
+        CG_USES_AUDIO = true
+        text aout3 = cgTmp()
+        cgOut(`  ${aout3} = call ptr @festina_load_audio(ptr ${v.v})`)
+        cgFreeTextTemp(e, v)
+        Val loadedA = cgVal(aout3, 'ptr', 'aud')
+        loadedA.fresh = true
+        return loadedA
     }
     // claude.md #256: a text in an ascii position. A LITERAL is folded
     // into .rodata with its own inline header and needs no call at
@@ -3765,6 +3820,130 @@ Val func cgMathCall(e:Node, m:text) {
 // A method on a VALUE. The receiver is emitted first and, when it is a
 // text the expression itself allocated, freed once the call has read
 // it -- exactly what `.length` already does for the same reason.
+// One drawing or transform call against an image's own surface. Split
+// out of cgMethodCall because the receiver is already emitted by the
+// time this runs -- the same four drawing names are canvas builtins
+// when called bare, and only the receiver's type tells the two apart.
+//
+// Every form is picked purely by ARGUMENT COUNT, exactly as the
+// canvas-level ones are: a trailing `color` overrides the current fill
+// for this call alone, and semantic analysis has already confirmed
+// that exactly one form matches.
+Val func cgImageMethod(e:Node, m:text, args:arr[Node], recv:Node, obj:Val) {
+    Val none
+    CG_USES_GRAPHICS_CODE = true
+    if m == 'drawRect' || m == 'drawPixel' || m == 'drawCircle' {
+        int plain = 4
+        if m == 'drawCircle' { plain = 3 }
+        if m == 'drawPixel' { plain = 2 }
+        // cgSnakeOf already turns `drawRect` into `draw_rect`, so the
+        // prefix stops at `festina_image_` -- spelling it
+        // `festina_image_draw_` gives `festina_image_draw_draw_rect`.
+        text fn = `festina_image_${cgSnakeOf(m)}`
+        int extra = args.length - plain
+        if extra == 1 { fn = fn + '_color' }
+        else if extra == 2 { fn = fn + '_colors' }
+        else if extra != 0 {
+            cgUnported(`.${m}() with ${args.length} arguments`)
+            return none
+        }
+        text joined = ''
+        int i = 0
+        while i < args.length {
+            text want = 'int'
+            // The trailing arguments past the plain form are colours,
+            // which are i64-shaped too but resolve from a literal.
+            if i >= plain { want = 'color' }
+            Val av = cgExprExpecting(args[i], want, '')
+            if CG_STUCK { return none }
+            joined = joined + `, i64 ${av.v}`
+            i++
+        }
+        cgOut(`  call void @${fn}(ptr ${obj.v}${joined})`)
+        cgReleaseOwnedReceiver(recv, obj)
+        return cgVal('0', 'void', 'void')
+    }
+    if m == 'drawText' {
+        if args.length != 3 {
+            cgUnported(`.drawText() with ${args.length} arguments`)
+            return none
+        }
+        Val tv = cgExprExpecting(args[0], 'text', '')
+        if CG_STUCK { return none }
+        Val xv = cgExprExpecting(args[1], 'int', '')
+        if CG_STUCK { return none }
+        Val yv = cgExprExpecting(args[2], 'int', '')
+        if CG_STUCK { return none }
+        cgOut(`  call void @festina_image_draw_text(ptr ${obj.v}, ptr ${tv.v}, i64 ${xv.v}, i64 ${yv.v})`)
+        cgFreeTextTemp(args[0], tv)
+        cgReleaseOwnedReceiver(recv, obj)
+        return cgVal('0', 'void', 'void')
+    }
+    // The table-driven ones. Each entry lists every arity it accepts,
+    // because several of these name a different runtime function per
+    // argument count rather than one function with optional trailing
+    // arguments.
+    arr[text] forms = CG_IMAGE_OPS[m].split(';')
+    Node srcNode = null
+    Val srcVal
+    int fi = 0
+    while fi < forms.length {
+        arr[text] spec = forms[fi].split(':')
+        if spec[0].toInt() == args.length {
+            arr[text] ltys = []
+            if spec[2] != '' { ltys = spec[2].split(',') }
+            text joined2 = ''
+            int q = 0
+            while q < args.length {
+                text want2 = 'int'
+                if ltys[q] == 'double' { want2 = 'float' }
+                if ltys[q] == 'ptr' { want2 = 'img' }
+                Val av2 = cgExprExpecting(args[q], want2, '')
+                if CG_STUCK { return none }
+                joined2 = joined2 + `, ${ltys[q]} ${av2.v}`
+                if ltys[q] == 'ptr' {
+                    // Parked, not released here: an owning SOURCE is
+                    // done with once PAINTED, and releasing it inside
+                    // the argument loop would emit the free before the
+                    // call that reads it.
+                    srcNode = args[q]
+                    srcVal = av2
+                }
+                q++
+            }
+            cgOut(`  call void @${spec[1]}(ptr ${obj.v}${joined2})`)
+            if srcNode != null {
+                // An owning source -- a blankImage() result passed
+                // straight in -- gets the same release an owning
+                // receiver does, and in the same place.
+                cgReleaseOwnedReceiver(srcNode, srcVal)
+            }
+            cgReleaseOwnedReceiver(recv, obj)
+            return cgVal('0', 'void', 'void')
+        }
+        fi++
+    }
+    cgUnported(`.${m}() with ${args.length} arguments`)
+    return none
+}
+
+// drawRect -> draw_rect. Only the three drawing names go through this,
+// so a single capital is all it ever has to find.
+text func cgSnakeOf(m:text) {
+    text out = ''
+    int i = 0
+    while i < m.length {
+        int code = m.charCodeAt(i)
+        if code >= 65 && code <= 90 {
+            out = out + '_' + (code + 32).toChar()
+        } else {
+            out = out + code.toChar()
+        }
+        i++
+    }
+    return out
+}
+
 Val func cgMethodCall(e:Node, callee:Node) {
     Val none
     text m = rawText(callee, 'prop')
@@ -3776,6 +3955,18 @@ Val func cgMethodCall(e:Node, callee:Node) {
     // fold and the runtime function must agree exactly; they do here
     // because `festina_text_to_int` is itself what evaluates this
     // `.toInt()` while the port is running.
+    // claude.md #134/#234: a drawing or transform METHOD on an img.
+    // The receiver decides: the same four names are canvas builtins
+    // when called bare, so this only claims them once the receiver has
+    // been emitted and turns out to be an image.
+    if CG_IMAGE_OPS[m] != null || m == 'drawRect' || m == 'drawPixel'
+            || m == 'drawCircle' || m == 'drawText' {
+        Val imgRecv = cgExpr(recv)
+        if CG_STUCK { return none }
+        if imgRecv.fty == 'img' { return cgImageMethod(e, m, args, recv, imgRecv) }
+        cgUnported(`.${m}() on ${imgRecv.fty}`)
+        return none
+    }
     if m == 'toInt' && args.length == 0 && recv.kind == 'StringLit' {
         return cgVal(`${rawText(recv, 'value').toInt()}`, 'i64', 'int')
     }
@@ -4877,6 +5068,43 @@ Val func cgCall(e:Node, wantValue:bool) {
         cgFreeTextTemp(vargs[0], pv)
         return cgVal(sout, 'i8', 'bool')
     }
+    // claude.md #188: blankImage(w, h) -> img. Shares loadImage's own
+    // reasoning for setting only the CODE flag: creating a Cairo
+    // surface needs no X server, unlike drawing onto a window.
+    if name == 'blankImage' {
+        arr[Node] bargs = listOf(e, 'args')
+        if bargs.length != 2 {
+            cgUnported(`blankImage() with ${bargs.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        Val bw = cgExprExpecting(bargs[0], 'int', '')
+        if CG_STUCK { return none }
+        Val bh = cgExprExpecting(bargs[1], 'int', '')
+        if CG_STUCK { return none }
+        text bout = cgTmp()
+        cgOut(`  ${bout} = call ptr @festina_blank_image(i64 ${bw.v}, i64 ${bh.v})`)
+        Val bres = cgVal(bout, 'ptr', 'img')
+        bres.fresh = true
+        return bres
+    }
+    if name == 'loadImage' {
+        arr[Node] largs = listOf(e, 'args')
+        if largs.length != 1 {
+            cgUnported(`loadImage() with ${largs.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        Val lp = cgExprExpecting(largs[0], 'text', '')
+        if CG_STUCK { return none }
+        text lout = cgTmp()
+        cgOut(`  ${lout} = call ptr @festina_load_image(ptr ${lp.v})`)
+        // Cairo reads the PNG inline and keeps no pointer.
+        cgFreeTextTemp(largs[0], lp)
+        Val lres = cgVal(lout, 'ptr', 'img')
+        lres.fresh = true
+        return lres
+    }
     if name == 'now' && listOf(e, 'args').length == 0 {
         text nout = cgTmp()
         cgOut(`  ${nout} = call i64 @festina_now_ms()`)
@@ -5187,7 +5415,7 @@ void func cgStmt(s:Node) {
             // is a ROW, whose storage the runtime laid out and whose
             // local is therefore one pointer to it and nothing more.
             if managed == 'blob' || managed == 'regex' || managed == 'table'
-                    || managed == 'ascii' {
+                    || managed == 'ascii' || managed == 'img' || managed == 'aud' {
                 Node binit = childOf(s, 'init')
                 if binit == null {
                     cgUnported(`${managed} declaration with no initializer`)
@@ -6482,7 +6710,7 @@ bool func cgStorableRefcounted(fty:text, ety:text) {
     // A handle or a row: one pointer, and nothing to say about
     // elements, so there is no element type for the question below to
     // be about.
-    if fty == 'ascii' || fty == 'table' { return true }
+    if fty == 'ascii' || fty == 'table' || fty == 'img' || fty == 'aud' { return true }
     if ety == '' { return false }
     if ety == 'int' || ety == 'float' || ety == 'bool' { return true }
     return cgElemOwnsSomething(ety)
@@ -6544,6 +6772,11 @@ text func cgReleaseFn(fty:text) {
     // {length, refcount} header -- never at the payload the rest of
     // the program sees.
     if fty == 'ascii' { return '@festina_ascii_release' }
+    // claude.md #118: destruction has real work to do for both -- an
+    // img owns a Cairo surface, its bytes and its path; an aud stops
+    // every channel still playing the clip before freeing its PCM.
+    if fty == 'img' { return '@festina_image_free' }
+    if fty == 'aud' { return '@festina_audio_free' }
     return '@festina_release'
 }
 
@@ -6552,6 +6785,7 @@ text func cgReleaseFn(fty:text) {
 bool func cgIsRefcounted(fty:text) {
     if fty == 'regex' { return true }
     if fty == 'ascii' { return true }
+    if fty == 'img' || fty == 'aud' { return true }
     // claude.md #265: a row is reference counted, so a row an array
     // gave out survives the array it came from.
     if fty == 'table' { return true }
@@ -8444,7 +8678,8 @@ void func cgFunc(d:Node) {
                 return
             }
             plty = 'ptr'
-            if pf == 'blob' {
+            if pf == 'blob' || pf == 'regex' || pf == 'ascii'
+                    || pf == 'img' || pf == 'aud' {
                 // A handle: one ptr, and nothing to say about elements
                 // or fields. Its release is the runtime's own.
             } else if pf == 'struct' {
@@ -8853,7 +9088,8 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 // a scalar global takes, not the {refcount, payload}
                 // one every other refcounted global has.
                 text handleG = cgManagedFty(gt)
-                if handleG == 'blob' || handleG == 'regex' || handleG == 'ascii' {
+                if handleG == 'blob' || handleG == 'regex' || handleG == 'ascii'
+                        || handleG == 'img' || handleG == 'aud' {
                     cgEmit(`@${gn} = global ptr null`)
                     G_SLOT[gn] = `@${gn}`
                     G_FTY[gn] = handleG
@@ -9004,6 +9240,11 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // anything could decode an img column -- and before any thread is
     // spawned, so no thread's own on_load can race this store. Only for
     // a program that already links the feature, so the symbol exists.
+    // The audio decoder goes FIRST, which is the original's order
+    // rather than an alphabetical accident.
+    if CG_USES_AUDIO {
+        cgOut('  call void @festina_set_audio_decoder(ptr @festina_audio_from_bytes)')
+    }
     if CG_USES_GRAPHICS_CODE {
         cgOut('  call void @festina_set_image_decoder(ptr @festina_image_from_bytes)')
     }
