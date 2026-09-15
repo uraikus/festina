@@ -6515,3 +6515,25 @@ The fifth slice of the subsystems. **296,596 of 315,722 file-specific IR lines, 
 **Seven new canaries. 103 in total.**
 
 **Verified.** Lexer 118/118, parser 118/118, semantic 118/118, codegen 65 match and 0 differ. Nine canaries re-run for this slice -- the seven new ones and the two this slice moved the anchors of: 7 caught as diffs with two independent witnesses each, 2 through the ratchet, 0 missed, 0 broken. `cases/rows_and_handles.f` is valgrind-clean. Full suite: 2,861 passed, 36 failed -- the environment's own baseline (24 graphics tests with no window manager, 12 leak-stress tests whose ASan link cannot resolve `festina_register_tls_hooks`), unchanged from the pristine tree.
+
+319. DRAWING THAT OPENS NO WINDOW
+
+A small slice, and a line worth drawing carefully. **300,464 of 319,458 file-specific IR lines, up from 296,596 -- 94.1% -- and 66 files match, 0 differ.** All ten bootstrap files still self-host.
+
+**A canvas operation is a NAME, a runtime function and a fixed argument list, and nothing else.** Twenty-five of them, ported as one table rather than twenty-five branches, because there is genuinely nothing else to say about any of them individually. The argument LLVM types travel WITH the function name rather than being assumed: `rotate`, `scale` and `fillAlpha` take doubles and sit in the same table as the twenty-odd integer ones, and a port that read the types off the wrong half of the entry would still emit every call -- with the arguments mistyped.
+
+**What makes the family worth a table is the line it is drawn along: painting is not presenting.** Every operation here paints the OFFSCREEN canvas and opens nothing, which is what lets a program draw a whole frame and save it as a PNG on a machine with no display at all. The style setters go one step further -- they record state and draw nothing, so a program that sets a fill colour it never draws with should not have a window opened on it either.
+
+**`render()`, `enterFullscreen()` and `exitFullscreen()` are deliberately ABSENT from the table.** They are the three that need a real GUI, and needing one changes main's own shape -- a window opened before `__festina_main`, an event loop entered after it returns. A port that emitted the call without that change would be silently wrong rather than merely incomplete, which is the worse of the two failures and the one this project's whole harness exists to make impossible.
+
+**A computed path is the caller's to free.** Cairo reads a PNG path inline and copies the glyphs it draws; neither `festina_save_canvas` nor `festina_draw_text` keeps the pointer it was handed. Measured with a computed path rather than a literal, for the reason #316 already had to learn once: a literal is never freed anyway, so it measures nothing.
+
+**The case file for this slice cannot be RUN in this environment, and that is a real gap rather than a technicality.** Linking a graphics program needs libjpeg, which this sandbox does not have, so `cases/canvas_ops.f` is measured through the IR harness alone -- no execution, no valgrind. What carries the claim instead is `benchmarks/canvas/draw_shapes.f`, a real corpus program that now reproduces byte-identical IR, and the canaries that fire on it.
+
+**The gradients are in the table and out of the case file.** Their colour arguments are `color`-typed, which this port has no type for yet; writing one into the case file would have made the whole file unported and taken every other mechanism in it down too.
+
+**A canary that makes the port REFUSE is worth re-aiming when a wrong compiler is available.** The argument-type canary's first spelling read the types off the wrong half of the table entry, which made the argument count and the LLVM type both wrong at once -- so the port's own check refused the call and the verdict was ratchet-only. Dropping that check in the same breath, and assuming `i64` for every argument, leaves the call EMITTED and merely mistyped: a genuinely wrong compiler, and a differing line in a real program. Not every mechanism has such a spelling -- #318's ownership predicates do not, and are ratchet-only for a structural reason -- but this one did, and the stronger claim was available for the cost of a second edit.
+
+**Three new canaries. 106 in total.**
+
+**Verified.** Lexer 118/118, parser 118/118, semantic 118/118, codegen 67 match and 0 differ (66 corpus files plus this slice's own case file). Three canaries run: all caught, 0 missed, 0 broken -- the argument-type one as a ratchet in its first spelling and, after the re-aim above, as a differing line.

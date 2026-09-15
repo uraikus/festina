@@ -1131,12 +1131,19 @@ CANARIES = [
         "canvas-op-argument-types-travel-with-the-name", "#319",
         "a canvas operation's argument LLVM types come from its own "
         "table entry, not from an assumption that everything is i64",
-        # rotate takes a double. Reading the types off the wrong half
-        # of the entry makes every one of them an i64, which is a
-        # wrong compiler rather than an absent one: the call is still
-        # emitted, with the argument mistyped.
-        """        if spec[1] != '' { argLtys = spec[1].split(',') }""",
-        """        if spec[1] != '' { argLtys = spec[0].split(',') }""",
+        [
+            # rotate, scale and fillAlpha take doubles. Assuming i64 for
+            # every argument has to leave the call EMITTED and merely
+            # mistyped, or it proves nothing about the corpus -- so the
+            # port's own type check is dropped in the same breath.
+            # Reading the types off the wrong half of the table entry
+            # was the first spelling and made the port REFUSE instead,
+            # which is a ratchet detection and a weaker claim.
+            ("""            if cv.lty != argLtys[cq] {""",
+             """            if false {"""),
+            ("""            cjoined = cjoined + `${argLtys[cq]} ${cv.v}`""",
+             """            cjoined = cjoined + `i64 ${cv.v}`"""),
+        ],
     ),
     Canary(
         "drawing-opens-no-window", "#319",

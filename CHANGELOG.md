@@ -111,9 +111,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage: **65 of 118 corpus files emit
-  byte-identical LLVM IR, 0 differ, 42 not yet ported, 11 rejected by
-  both** — 296,596 of 315,722 file-specific IR lines. **The bootstrap
+  the fourth and last stage: **66 of 118 corpus files emit
+  byte-identical LLVM IR, 0 differ, 41 not yet ported, 11 rejected by
+  both** — 300,464 of 319,458 file-specific IR lines. **The bootstrap
   compiler reproduces its own compilation**: all ten of its files —
   `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
   `escape.f` (22,232), `codegen.f` (59,166) and the five command-line
@@ -178,7 +178,13 @@ round-by-round design and implementation record predating 0.1 lives in
   they hang off. Plus `DatabaseURL` and `environment.NAME`, and
   refcounted HANDLE elements — an `arr[blob]` needs the same
   per-element cascade an `arr[Struct]` does, which the predicate
-  deciding it had never said. And what a program needs to be
+  deciding it had never said. And the CANVAS operations that paint the
+  offscreen surface — drawing, clearing, paths, transforms, the style
+  setters and text metrics — every one of which opens no window, which
+  is what lets a program draw a frame and save it as a PNG with no
+  display present. `render()` and the two fullscreen calls are
+  deliberately not among them: they are the three that need a real GUI,
+  and needing one changes main's own shape. And what a program needs to be
   a COMMAND: `argv`, `close(code)`, `.keys()`/`.values()`, and the two
   scope rules a driver is the first program to reach — a managed
   declaration inside a function is local even when a global shares its
@@ -197,7 +203,7 @@ round-by-round design and implementation record predating 0.1 lives in
   the two implementations agree; it says nothing about whether the
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
-  not. A hundred and three deliberate breakages, one per mechanism,
+  not. A hundred and six deliberate breakages, one per mechanism,
   re-run by `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
   no longer the whole verdict: a canary looks for TWO independent
   witnesses and reports a lone one in its own output, because
