@@ -871,8 +871,8 @@ CANARIES = [
         "timers-need-a-loop-to-fire-in", "#315",
         "a program that schedules a callback gets a blocking loop for "
         "it to fire in",
-        """    else if CG_USES_TIMERS || CG_USES_THREADS { cgOut('  call void @festina_run_timer_loop()') }""",
-        """    else if CG_USES_THREADS { cgOut('  call void @festina_run_timer_loop()') }""",
+        """    else if CG_USES_TIMERS || CG_USES_ASYNC_IO || CG_USES_THREADS { cgOut('  call void @festina_run_timer_loop()') }""",
+        """    else if CG_USES_ASYNC_IO || CG_USES_THREADS { cgOut('  call void @festina_run_timer_loop()') }""",
     ),
     Canary(
         "clearing-alone-schedules-nothing", "#315",
@@ -1330,7 +1330,83 @@ CANARIES = [
         """        if cgIsRefcounted(ev.fty) && cgIsOwningRefcountedSource(eargs[0]) {""",
         """        if cgIsRefcounted(ev.fty) && false {""",
     ),
+
+    # --- decisions.md #324: reply and callback ------------------------
+    Canary(
+        "reply-carries-its-own-release", "#324",
+        "a reply records how to free its payload, for when there is nothing to dispatch to",
+        """    cgOut(`  call void @festina_thread_reply(ptr ${selfH}, ptr ${dest.v}, ptr ${box}, ptr ${cgThreadReleaseFn(desc)})`)""",
+        """    cgOut(`  call void @festina_thread_reply(ptr ${selfH}, ptr ${dest.v}, ptr ${box}, ptr @festina_noop_release)`)""",
+    ),
+    Canary(
+        "reply-names-where-it-came-from", "#324",
+        "a reply made inside a thread names THAT thread as its sender, not main",
+        """    text selfH = cgTmp()
+    if CG_THREAD_HANDLE != '' {
+        cgOut(`  ${selfH} = load ptr, ptr ${CG_THREAD_HANDLE}`)
+    } else {
+        cgOut(`  ${selfH} = call ptr @festina_thread_get_main_handle()`)
+    }
+    // claude.md #218: the release function travels WITH the reply,""",
+        """    text selfH = cgTmp()
+    cgOut(`  ${selfH} = call ptr @festina_thread_get_main_handle()`)
+    // claude.md #218: the release function travels WITH the reply,""",
+    ),
+    Canary(
+        "callback-is-registered-before-the-send", "#324",
+        "a pending callback is registered before the message that will answer it is posted",
+        [
+            ("""    cgOut(`  call void @festina_thread_register_callback(ptr ${selfH}, i64 ${txn}, ptr ${tramp}, ptr ${fn.v}, i8 ${onMain})`)
+    if bare {
+        CG_USES_ASYNC_IO = true
+        cgBarePostMessageTxn(pmArgs, txn)
+    } else {
+        cgNamedPostMessageTxn(tname, handle, pmArgs, txn)
+    }""",
+             """    if bare {
+        CG_USES_ASYNC_IO = true
+        cgBarePostMessageTxn(pmArgs, txn)
+    } else {
+        cgNamedPostMessageTxn(tname, handle, pmArgs, txn)
+    }
+    cgOut(`  call void @festina_thread_register_callback(ptr ${selfH}, i64 ${txn}, ptr ${tramp}, ptr ${fn.v}, i8 ${onMain})`)"""),
+        ],
+    ),
+    Canary(
+        "callback-on-a-bare-send-fires-on-main", "#324",
+        "only the bare send asks for its reply to be dispatched on main's own thread",
+        """    text onMain = '0'
+    if bare { onMain = '1' }""",
+        """    text onMain = '0'""",
+    ),
+    Canary(
+        "reply-trampoline-frees-the-payload", "#324",
+        "a reply payload is freed by the trampoline, since nothing else ever frees one",
+        """    cgOut(`  call void ${cgThreadReleaseFn(desc)}(ptr %payload)`)""",
+        "",
+    ),
+    Canary(
+        "a-bare-send-needs-the-async-io-hooks", "#324",
+        "a program using the bare callback form registers the async-io hooks",
+        """    if bare {
+        CG_USES_ASYNC_IO = true""",
+        """    if bare {""",
+    ),
+    Canary(
+        "the-send-carries-its-transaction-id", "#324",
+        "a callback's transaction id travels with the message it will answer",
+        """    cgOut(`  call void @festina_thread_post_outbound(ptr ${handle}, ptr ${box}, i64 ${txn})`)""",
+        """    cgOut(`  call void @festina_thread_post_outbound(ptr ${handle}, ptr ${box}, i64 0)`)""",
+    ),
+    Canary(
+        "colour-equality-is-one-integer-compare", "#324",
+        "two colours compare as the packed integers they are",
+        """        if l.fty == 'color' { lOk = true }
+        if r.fty == 'color' { rOk = true }""",
+        "",
+    ),
 ]
+
 BY_NAME = {c.name: c for c in CANARIES}
 
 

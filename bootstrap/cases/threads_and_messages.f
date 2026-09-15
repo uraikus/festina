@@ -48,14 +48,58 @@
 int total = 0
 float scale = 0.5
 int seen = 0
+int echoSeen = 0
+int bareSeen = 0
+
+// Three counters rather than one, because the three things being
+// counted arrive on different paths: an ordinary message to main, a
+// reply to a named send, and a reply to a bare one. Finishing is
+// checked from all three, since which of them lands last is a race.
+void func maybeFinish() {
+    if seen == 6 && echoSeen == 2 && bareSeen == 6 {
+        log(total)
+        log(scale)
+        log(echoSeen)
+        log(bareSeen)
+        close(0)
+    }
+}
+
+void func onEcho(r:int) {
+    echoSeen = echoSeen + 1
+    maybeFinish()
+}
+
+void func onBare(r:int) {
+    bareSeen = bareSeen + 1
+    maybeFinish()
+}
 
 on message(worker:thread, msg:int) {
     total = total + msg
     seen = seen + 1
-    if seen == 6 {
-        log(total)
-        log(scale)
-        close(0)
+    // claude.md #217: main answers whoever is being handled right now
+    // -- a separate dispatch path from on_message, matched by
+    // transaction id rather than by queue order.
+    worker.reply(msg + 1)
+    // claude.md #218: and a SECOND answer to the same message, every
+    // time. The first consumed the only pending slot, so this one has
+    // nothing to dispatch to and must be RELEASED rather than leaked
+    // -- which is exactly why the release function travels with the
+    // reply rather than being looked up on arrival. Once main replies
+    // at all, every bare send in the program has to chain a callback,
+    // so this is the only shape left that can witness the drop.
+    worker.reply(msg + 2)
+    maybeFinish()
+}
+
+// A thread that replies to a NAMED send, so the two directions of the
+// mechanism are both here: main registers the callback and the thread
+// answers, against the bare form below where a thread registers and
+// MAIN answers.
+thread echoer {
+    on message(worker:thread, msg:int) {
+        worker.reply(msg * 10)
     }
 }
 
@@ -65,7 +109,11 @@ on message(worker:thread, msg:int) {
 // used, exactly like any other declaration.
 thread speaker {
     on message(worker:thread, msg:text) {
-        postMessage(msg.length)
+        // claude.md #222: the bare form registers its callback on THIS
+        // thread's own handle and asks for the eventual reply to fire
+        // on main's OS thread rather than on this one -- which is what
+        // makes it need the async-io hooks registered at all.
+        postMessage(msg.length).callback(onBare)
     }
 }
 
@@ -79,11 +127,11 @@ thread adder {
         // float one is read here rather than left unused, so a wrong
         // store into it is visible and not merely emitted.
         log(scale)
-        postMessage(total)
+        postMessage(total).callback(onBare)
     }
     on message(worker:thread, msg:int) {
         int scaled = msg * 2
-        postMessage(scaled + total)
+        postMessage(scaled + total).callback(onBare)
         // A send to a DIFFERENT thread from inside this one: the
         // sender is this thread's handle, not main's.
         speaker.postMessage('tick')
@@ -102,3 +150,5 @@ while i < 2 {
     i = i + 1
 }
 speaker.postMessage('hello')
+echoer.postMessage(7).callback(onEcho)
+echoer.postMessage(8).callback(onEcho)

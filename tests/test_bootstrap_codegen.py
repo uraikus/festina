@@ -928,6 +928,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 335929, (
+        assert reproduced >= 340577, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 335929")
+            f"the port previously emitted at least 340577")

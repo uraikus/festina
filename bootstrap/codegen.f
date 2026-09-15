@@ -1389,6 +1389,33 @@ text CG_MAIN_MSG_IN = ''
 // The handle global of the thread whose body is being emitted right
 // now, or '' outside any -- what a bare `postMessage(x)` posts from.
 text CG_THREAD_HANDLE = ''
+// And its NAME, which is what a `t.reply(x)` inside that body needs:
+// the reply type is the target's, and the target of a reply made while
+// handling a message is whoever is handling it.
+text CG_THREAD_NAME = ''
+
+// claude.md #217: each target's REPLY type, keyed by thread name, plus
+// main's own -- descriptors in the same '<fty>|<key>' spelling an
+// inbound payload uses.
+//
+// The original INFERS these in semantic analysis, from the first
+// `.reply(x)` in each receiving context, and hands codegen the answer.
+// This port has no access to that inference, so it reads the same fact
+// off the other end of the same rule: a send to a target that replies
+// must chain `.callback(fn)`, and `fn`'s own declared parameter is
+// exactly the type that reply carries. Scanning for the callbacks is
+// therefore equivalent, and needs nothing the port does not already
+// have -- see cgDiscoverReplyTypes.
+map[text] CG_TH_REPLY = {}
+text CG_MAIN_REPLY = ''
+// The reply trampolines generated so far, keyed by the descriptor they
+// unbox -- one per target TYPE, not per send site, since every site
+// aiming at the same target shares that target's single reply type.
+map[text] CG_REPLY_TRAMP = {}
+// claude.md #222: a bare send's own reply is marshaled onto main
+// through the async-io worker pool, so a program using that form needs
+// those hooks registered even if it touches no other async io at all.
+bool CG_USES_ASYNC_IO = false
 
 // What cgFunc should emit right after the entry label, before it binds
 // a single parameter: '' for an ordinary body, or one of the four
@@ -2302,6 +2329,14 @@ Val func cgBinOp(e:Node) {
     if isEquality {
         if l.fty == 'bool' { lOk = true }
         if r.fty == 'bool' { rOk = true }
+        // claude.md #91: a colour is a PACKED integer, so comparing two
+        // of them is one integer compare -- which is most of the reason
+        // it is packed. `c == null` arrives here too, its null already
+        // resolved to colour's own -1 sentinel by the typed emission
+        // above. Equality only: ordering two colours has no meaning
+        // this language picks, so it stays refused by name.
+        if l.fty == 'color' { lOk = true }
+        if r.fty == 'color' { rOk = true }
     }
     if lOk == false {
         cgUnported(`operator ${op} on ${l.fty}`)
@@ -5174,6 +5209,25 @@ Val func cgCall(e:Node, wantValue:bool) {
         }
         Node recv = childOf(callee, 'obj')
         text prop = rawText(callee, 'prop')
+        // claude.md #217: both halves of the reply mechanism are
+        // checked BEFORE a thread's own name namespace, and that
+        // ordering is the original's rather than a preference: an
+        // `on message` parameter is conventionally called `worker`,
+        // and nothing stops a thread being called that too -- in
+        // which case `worker.reply(x)` reaching the namespace branch
+        // first would compile as a completely different method.
+        if prop == 'reply' {
+            cgThreadReply(recv, listOf(e, 'args'))
+            if CG_STUCK { return none }
+            return cgVal('0', 'void', 'void')
+        }
+        if prop == 'callback' && recv != null && recv.kind == 'Call' {
+            if cgIsPostMessageCallee(childOf(recv, 'callee')) {
+                cgPostMessageCallback(e, callee)
+                if CG_STUCK { return none }
+                return cgVal('0', 'void', 'void')
+            }
+        }
         // claude.md #195: a declared thread's own name is a closed
         // namespace, so this is checked ahead of everything else in
         // this branch -- semantic analysis has already proved the
@@ -9359,6 +9413,14 @@ text func cgThreadSendArg(args:arr[Node], desc:text, out:arr[Val]) {
 // sets the queued item's sender field from the handle it is called
 // with, so there is no separate sender argument here.
 void func cgBarePostMessage(args:arr[Node]) {
+    cgBarePostMessageTxn(args, '0')
+}
+
+// The same send, carrying a real transaction id -- `.callback(fn)`
+// wraps this exact call and needs the id it just registered to travel
+// with the message. Factored out rather than duplicated so both forms
+// share one implementation, which is the original's own arrangement.
+void func cgBarePostMessageTxn(args:arr[Node], txn:text) {
     if CG_MAIN_MSG_IN == '' {
         cgUnported('postMessage() with no top-level on message')
         return
@@ -9380,7 +9442,7 @@ void func cgBarePostMessage(args:arr[Node]) {
     text handle = cgTmp()
     cgOut(`  ${handle} = load ptr, ptr ${CG_THREAD_HANDLE}`)
     text box = cgThreadBox(v.v, CG_MAIN_MSG_IN)
-    cgOut(`  call void @festina_thread_post_outbound(ptr ${handle}, ptr ${box}, i64 0)`)
+    cgOut(`  call void @festina_thread_post_outbound(ptr ${handle}, ptr ${box}, i64 ${txn})`)
     cgThreadPostCleanup(args[0], v, CG_MAIN_MSG_IN)
 }
 
@@ -9396,6 +9458,19 @@ void func cgNamedPostMessage(tname:text, args:arr[Node]) {
     }
     text handle = cgTmp()
     cgOut(`  ${handle} = load ptr, ptr @__festina_thread_${tname}_handle`)
+    cgNamedPostMessageTxn(tname, handle, args, '0')
+}
+
+// The send half alone, given a handle the caller has already resolved
+// and a transaction id -- `.callback(fn)` resolves the handle itself,
+// before registering, so the two cannot simply share the whole of
+// cgNamedPostMessage.
+void func cgNamedPostMessageTxn(tname:text, handle:text, args:arr[Node], txn:text) {
+    text desc = CG_TH_IN[tname]
+    if desc == '' {
+        cgUnported(`postMessage() to ${tname}, which declares no on message`)
+        return
+    }
     arr[Val] got = []
     text box = cgThreadSendArg(args, desc, got)
     if CG_STUCK { return }
@@ -9405,8 +9480,240 @@ void func cgNamedPostMessage(tname:text, args:arr[Node]) {
     } else {
         cgOut(`  ${sender} = call ptr @festina_thread_get_main_handle()`)
     }
-    cgOut(`  call void @festina_thread_post(ptr ${handle}, ptr ${sender}, ptr ${box}, i64 0)`)
+    cgOut(`  call void @festina_thread_post(ptr ${handle}, ptr ${sender}, ptr ${box}, i64 ${txn})`)
     cgThreadPostCleanup(args[0], got[0], desc)
+}
+
+// A descriptor built from an fty this port already spells, for the one
+// place a reply type is read off a function's parameter list rather
+// than off a resolved type node.
+text func cgThreadDescOfFty(fty:text) {
+    if fty == 'int' || fty == 'float' || fty == 'bool' || fty == 'text' {
+        return `${fty}|`
+    }
+    return ''
+}
+
+// Is this callee the `postMessage` half of a send -- bare, or named?
+bool func cgIsPostMessageCallee(c:Node) {
+    if c == null { return false }
+    if c.kind == 'Identifier' { return rawText(c, 'name') == 'postMessage' }
+    if c.kind != 'Member' { return false }
+    if fieldOf(c, 'computed').raw == 'true' { return false }
+    return rawText(c, 'prop') == 'postMessage'
+}
+
+// claude.md #217: every `....postMessage(x).callback(fn)` in the
+// program, walked once before any body is emitted, recording the type
+// each target replies with. See CG_TH_REPLY's own comment for why the
+// callback side is what this reads rather than the `.reply()` side.
+//
+// A generic walk over every node's fields rather than a per-statement
+// case list, so a send nested somewhere this port has not thought about
+// is still found.
+void func cgDiscoverReplyTypes(n:Node) {
+    if n == null { return }
+    if n.kind == 'Call' {
+        Node cb = childOf(n, 'callee')
+        if cb != null && cb.kind == 'Member' && fieldOf(cb, 'computed').raw != 'true' {
+            if rawText(cb, 'prop') == 'callback' {
+                Node inner = childOf(cb, 'obj')
+                if inner != null && inner.kind == 'Call' {
+                    if cgIsPostMessageCallee(childOf(inner, 'callee')) {
+                        arr[Node] cargs = listOf(n, 'args')
+                        if cargs.length == 1 && cargs[0].kind == 'Identifier' {
+                            text fn = rawText(cargs[0], 'name')
+                            if FN_PARAMS[fn] != null {
+                                text desc = cgThreadDescOfFty(FN_PARAMS[fn].split('|')[0])
+                                Node pmc = childOf(inner, 'callee')
+                                if pmc.kind == 'Identifier' {
+                                    CG_MAIN_REPLY = desc
+                                } else {
+                                    Node recv = childOf(pmc, 'obj')
+                                    if recv != null && recv.kind == 'Identifier' {
+                                        CG_TH_REPLY[rawText(recv, 'name')] = desc
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    int i = 0
+    while i < n.fields.length {
+        Field f = n.fields[i]
+        if f.tag == 'node' {
+            cgDiscoverReplyTypes(f.node)
+        } else if f.tag == 'list' {
+            int j = 0
+            while j < f.list.length {
+                cgDiscoverReplyTypes(f.list[j])
+                j++
+            }
+        }
+        i++
+    }
+}
+
+// The bridge between festina_thread_reply's fixed C dispatch shape -- a
+// REPLY-kind message looked up by txn id -- and the user's own
+// `.callback(fn)`, whose LLVM signature depends on the target's reply
+// type. Unbox the payload exactly as an on_message adapter does, call
+// `fn` with it, then release the box: nothing else ever frees a REPLY
+// payload, unlike an ordinary message's, which the runtime balances
+// itself after on_message returns.
+text func cgReplyTrampoline(desc:text) {
+    if CG_REPLY_TRAMP[desc] != null { return CG_REPLY_TRAMP[desc] }
+    text name = `@__festina_replytrampoline_${cgUid()}`
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] tr = []
+    CUR = tr
+    cgOut(`define void ${name}(ptr %payload, ptr %user_fn) {`)
+    // A literal `entry:` rather than cgBlockLabel's numbered one: the
+    // original writes this trampoline's own prologue by hand, and a
+    // label taken from the shared counter here would renumber every
+    // block after it.
+    cgOut('entry:')
+    cgThreadUnboxInto('%payload', desc, '%val')
+    cgOut(`  call void %user_fn(${cgLtyOf(cgDescFty(desc))} %val)`)
+    cgOut(`  call void ${cgThreadReleaseFn(desc)}(ptr %payload)`)
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(tr)
+    CG_REPLY_TRAMP[desc] = name
+    return name
+}
+
+// claude.md #217: `t.reply(response)` -- the answer to the message
+// currently being handled. `self_handle` names where the reply is
+// coming FROM (the runtime needs it only to route a reply-to-main
+// through the calling thread's own outbound queue); the receiver names
+// where it is going. It does not touch on_message at all: a reply is a
+// separate dispatch path with its own kind of queued message.
+void func cgThreadReply(recv:Node, args:arr[Node]) {
+    text desc = CG_MAIN_REPLY
+    if CG_THREAD_NAME != '' { desc = CG_TH_REPLY[CG_THREAD_NAME] }
+    if desc == null { desc = '' }
+    if desc == '' {
+        cgUnported('.reply() with no callback anywhere to name its type')
+        return
+    }
+    if args.length != 1 {
+        cgUnported(`.reply() with ${args.length} arguments`)
+        return
+    }
+    Val dest = cgExpr(recv)
+    if CG_STUCK { return }
+    if dest.fty != 'thread' {
+        cgUnported(`.reply() on ${dest.fty}`)
+        return
+    }
+    text rfty = cgDescFty(desc)
+    Val v = cgExpr(args[0])
+    if CG_STUCK { return }
+    if v.fty != rfty {
+        cgUnported(`.reply() of ${v.fty} where ${rfty} is declared`)
+        return
+    }
+    text box = cgThreadBox(v.v, desc)
+    text selfH = cgTmp()
+    if CG_THREAD_HANDLE != '' {
+        cgOut(`  ${selfH} = load ptr, ptr ${CG_THREAD_HANDLE}`)
+    } else {
+        cgOut(`  ${selfH} = call ptr @festina_thread_get_main_handle()`)
+    }
+    // claude.md #218: the release function travels WITH the reply,
+    // because the receiving side cannot name the sender's own reply
+    // type -- and this payload may well have nothing to dispatch to
+    // (replied twice for one message, or still queued when its target
+    // is killed), in which case that is the only thing that can free
+    // it.
+    cgOut(`  call void @festina_thread_reply(ptr ${selfH}, ptr ${dest.v}, ptr ${box}, ptr ${cgThreadReleaseFn(desc)})`)
+    cgThreadPostCleanup(args[0], v, desc)
+}
+
+// claude.md #217/#222: `....postMessage(x).callback(fn)` -- one unit,
+// not a send followed by a method call on its result. `fn` is
+// registered on the SENDING handle's own pending list under a freshly
+// minted txn id, and only then is the send emitted, carrying that id
+// instead of the default 0; the dispatch loop on the receiving end
+// makes it that thread's ambient "currently replying to" state while
+// on_message runs, which is what a `t.reply(...)` made during that
+// dispatch satisfies.
+//
+// Registration and send are emitted TOGETHER, never registration
+// first: a send that does not happen would leave a pending callback
+// that can never fire sitting on the sender's list forever.
+void func cgPostMessageCallback(e:Node, callee:Node) {
+    Node inner = childOf(callee, 'obj')
+    Node pmc = childOf(inner, 'callee')
+    arr[Node] pmArgs = listOf(inner, 'args')
+    arr[Node] cbArgs = listOf(e, 'args')
+    if cbArgs.length != 1 || cbArgs[0].kind != 'Identifier' {
+        cgUnported('.callback() with something other than a declared function')
+        return
+    }
+    bool bare = pmc.kind == 'Identifier'
+    text tname = ''
+    if bare == false {
+        Node recv = childOf(pmc, 'obj')
+        if recv == null || recv.kind != 'Identifier' {
+            cgUnported('.callback() on a send through an unnamed receiver')
+            return
+        }
+        tname = rawText(recv, 'name')
+        if CG_TH_IN[tname] == null {
+            cgUnported('.callback() on a send to something other than a declared thread')
+            return
+        }
+    }
+    text desc = CG_MAIN_REPLY
+    if bare == false {
+        desc = CG_TH_REPLY[tname]
+        if desc == null { desc = '' }
+    }
+    if desc == '' {
+        cgUnported('.callback() whose target has no reply type')
+        return
+    }
+    // Generated BEFORE the target handle is resolved, which is the
+    // original's order and observable: the trampoline takes a uid from
+    // the same counter every alloca slot does.
+    text tramp = cgReplyTrampoline(desc)
+    text handle = ''
+    if bare == false {
+        handle = cgTmp()
+        cgOut(`  ${handle} = load ptr, ptr @__festina_thread_${tname}_handle`)
+    }
+    Val fn = cgExpr(cbArgs[0])
+    if CG_STUCK { return }
+    text txn = cgTmp()
+    cgOut(`  ${txn} = call i64 @festina_thread_alloc_txn_id()`)
+    text selfH = cgTmp()
+    if CG_THREAD_HANDLE != '' {
+        cgOut(`  ${selfH} = load ptr, ptr ${CG_THREAD_HANDLE}`)
+    } else {
+        cgOut(`  ${selfH} = call ptr @festina_thread_get_main_handle()`)
+    }
+    // claude.md #222: the last argument is `dispatch_on_main`, known
+    // from this call site's own shape alone -- the bare form always
+    // targets main, so its reply has to be marshaled onto main's OS
+    // thread rather than firing on whichever thread made the send.
+    text onMain = '0'
+    if bare { onMain = '1' }
+    cgOut(`  call void @festina_thread_register_callback(ptr ${selfH}, i64 ${txn}, ptr ${tramp}, ptr ${fn.v}, i8 ${onMain})`)
+    if bare {
+        CG_USES_ASYNC_IO = true
+        cgBarePostMessageTxn(pmArgs, txn)
+    } else {
+        cgNamedPostMessageTxn(tname, handle, pmArgs, txn)
+    }
 }
 
 // The `on message` parameter type a thread declares, as a descriptor --
@@ -9550,10 +9857,12 @@ void func cgAdapterPrologue(kind:text, pnames:arr[text]) {
         // original's placement: a bare postMessage(x) inside one of
         // them has no thread to send from.
         CG_THREAD_HANDLE = `@__festina_thread_${rawText(d, 'name')}_handle`
+        CG_THREAD_NAME = rawText(d, 'name')
         return
     }
     if kind == 'exit' {
         CG_THREAD_HANDLE = `@__festina_thread_${rawText(d, 'name')}_handle`
+        CG_THREAD_NAME = rawText(d, 'name')
         return
     }
     // Both `on message` shapes, thread-side and main-side. `%sender` is
@@ -9564,8 +9873,13 @@ void func cgAdapterPrologue(kind:text, pnames:arr[text]) {
     if CG_FN_PRE_NAME != '' { desc = CG_TH_IN[CG_FN_PRE_NAME] }
     cgOut(`  %arg.${pnames[0]} = getelementptr i8, ptr %sender, i64 0`)
     cgThreadUnboxInto('%payload', desc, `%arg.${pnames[1]}`)
-    if kind == 'message' {
+    // Only a THREAD's own on_message gets a thread context. Main's is
+    // the same shape and the same unboxing, but it runs on main's own
+    // OS thread: a bare postMessage(x) is illegal from inside it, and
+    // a `t.reply(x)` there answers as main rather than as a worker.
+    if kind == 'message' && CG_FN_PRE_NAME != '' {
         CG_THREAD_HANDLE = `@__festina_thread_${CG_FN_PRE_NAME}_handle`
+        CG_THREAD_NAME = CG_FN_PRE_NAME
     }
 }
 
@@ -9662,6 +9976,7 @@ void func cgThreadDecl(d:Node) {
         cgThreadLoadStub(d)
     }
     CG_THREAD_HANDLE = ''
+    CG_THREAD_NAME = ''
 
     if onMessage != null {
         CG_FN_SYMBOL = `@__festina_thread_${tname}_on_message`
@@ -9672,6 +9987,7 @@ void func cgThreadDecl(d:Node) {
         CG_FN_SIG = 'ptr %sender, ptr %payload'
         cgFunc(onMessage)
         CG_THREAD_HANDLE = ''
+        CG_THREAD_NAME = ''
     } else {
         cgThreadStubAdapter(`@__festina_thread_${tname}_on_message`,
                             'ptr %sender, ptr %payload')
@@ -9685,6 +10001,7 @@ void func cgThreadDecl(d:Node) {
         CG_FN_PRE_DECL = d
         cgFunc(onExit)
         CG_THREAD_HANDLE = ''
+        CG_THREAD_NAME = ''
     } else {
         cgThreadStubAdapter(`@__festina_thread_${tname}_on_exit`, 'i64 %arg.code')
     }
@@ -10325,6 +10642,16 @@ void func cgProgram(body:arr[Node], srcPath:text) {
         mm0++
     }
 
+    // claude.md #217: and every target's REPLY type, from the callback
+    // side. Also before any body, and for the same reason: a
+    // `t.reply(x)` can appear above the `.callback(fn)` that names its
+    // type, and often does.
+    int rt = 0
+    while rt < body.length {
+        cgDiscoverReplyTypes(body[rt])
+        rt++
+    }
+
     // Bodies next, into their own buffer, so the shared counters reach
     // them before main.
     int fb = 0
@@ -10441,6 +10768,14 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // a program that already links the feature, so the symbol exists.
     // The audio decoder goes FIRST, which is the original's order
     // rather than an alphabetical accident.
+    // claude.md #222: a bare send's own reply is marshaled onto main
+    // through the async-io worker pool, so the hooks have to be
+    // registered even for a program that touches no other async io --
+    // without them the dispatch falls back to an inline, same-thread
+    // call, which is the whole thing that form exists to avoid.
+    if CG_USES_ASYNC_IO {
+        cgOut('  call void @festina_register_async_io_hooks()')
+    }
     if CG_USES_AUDIO {
         cgOut('  call void @festina_set_audio_decoder(ptr @festina_audio_from_bytes)')
     }
@@ -10512,7 +10847,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // messages, which the timer loop checks once per iteration whatever
     // it was entered for.
     if CG_USES_WINDOW { cgOut('  call void @festina_run_event_loop()') }
-    else if CG_USES_TIMERS || CG_USES_THREADS { cgOut('  call void @festina_run_timer_loop()') }
+    else if CG_USES_TIMERS || CG_USES_ASYNC_IO || CG_USES_THREADS { cgOut('  call void @festina_run_timer_loop()') }
     // The last thing main does, and only when there is a database to
     // close: for a program that never opens one this call would be the
     // single live reference into the runtime's SQLite code, which on

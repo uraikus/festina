@@ -6631,3 +6631,27 @@ A small slice, and a line worth drawing carefully. **300,464 of 319,458 file-spe
 **Ten canaries. 121 in total.**
 
 **Verified.** Lexer 121/121, parser 121/121, semantic 121/121, escape analysis 103 match and 0 differ (1,944 of 1,997 records), codegen 79 match and 0 differ. Ten canaries run: all ten caught as real diffs, 0 through the ratchet, 0 missed, 0 broken.
+
+324. THE REPLY MECHANISM, AND A TYPE INFERRED FROM THE OTHER END
+
+**340,577 of 354,765 file-specific IR lines, up from 335,929 -- 96.0% -- and 82 files match, 0 differ**, up from 79. All ten bootstrap files still self-host, now 312,976 file-specific lines between them.
+
+**A reply is not a message.** `t.reply(x)` answers whoever is being handled right now, through a dispatch path of its own matched by TRANSACTION ID rather than by queue order, and it never touches on_message at all. `....postMessage(x).callback(fn)` is the other half and is one unit rather than a send followed by a method call on its result: `fn` is registered on the SENDING handle under a freshly minted txn id, and only then is the send emitted carrying that id instead of the default 0.
+
+**Registration and send are emitted together, never registration first.** A send that does not happen would leave a pending callback that can never fire sitting on the sender's own list forever -- which is #218's finding, inherited here rather than rediscovered, and now a canary that swaps the two lines.
+
+**The reply TYPE is read off the callback rather than the reply.** The original infers it during semantic analysis, from the first `.reply(x)` in each receiving context, and hands codegen the answer. This port has no access to that inference and could not reproduce it without carrying the analyzer's own scope stack into codegen. What it does instead is read the same fact off the other end of the same rule: a send to a target that replies MUST chain `.callback(fn)`, and `fn`'s own declared parameter is exactly the type that reply carries. One generic walk over the whole program before any body is emitted collects them all. That is a different derivation reaching the same answer, and the corpus is what says the answer is the same one.
+
+**`.reply` and `.callback` are checked BEFORE a thread's own name namespace**, and that ordering is the original's rather than a preference. An `on message` parameter is conventionally called `worker`, nothing stops a thread being called that too, and `tests/stress/thread_reply_callback_churn.f` has both -- so `worker.reply(x)` reaching the namespace branch first would compile as a completely different method. It would also have been silent: that branch's fallthrough case is `isAlive`.
+
+**Main's own `on message` was quietly given a thread context, and nothing could see it until now.** The adapter prologue set `CG_THREAD_HANDLE` for every `message` kind, including main's, producing `@__festina_thread__handle` -- a global that does not exist. It compiled and matched for a whole slice because nothing inside main's handler read it: a bare `postMessage(x)` is illegal there. `.reply()` reads it, and the first run named the bug outright.
+
+**`==`/`!=` on `color` came along for a third file.** A colour is a packed integer, so comparing two is one integer compare -- most of the reason it is packed -- and `c == null` arrives at the same place with its null already resolved to colour's own -1 sentinel. Ordering two colours stays refused by name: this language picks no meaning for it.
+
+**Ten canaries would have been nine.** `colour-equality-is-one-integer-compare` is caught by the RATCHET rather than as a diff, and that is inherent rather than a weak canary: removing support makes the file unported, which is how this harness spells "not implemented yet". The registry names that verdict separately for exactly this reason. The other eight are real diffs with two witnesses each.
+
+**A note on the valgrind reading, because it changed shape.** `cases/threads_and_messages.f` now reports four `possibly lost` blocks where it previously reported none. All four are glibc's own per-thread TLS (`_dl_allocate_tls` under `pthread_create`) for the async-io worker pool `festina_async_io_run` spawns and the process never joins; `definitely lost` and `indirectly lost` are both 0. The binary measured is one the SHIPPED compiler built, so this is the runtime's own arrangement rather than anything the port does -- the case file is simply the first in the corpus to use the bare callback form, which is what brings that pool into existence.
+
+**Eight new canaries. 129 in total.**
+
+**Verified.** Lexer 121/121, parser 121/121, semantic 121/121, codegen 82 match and 0 differ. Nine canaries run for this slice plus the one it made stale again: 8 caught as diffs, 1 through the ratchet, 0 missed, 0 broken; all 129 anchors resolve.
