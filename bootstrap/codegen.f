@@ -1275,6 +1275,51 @@ bool CG_USES_TIMERS = false
 // dropped by the linker.
 bool CG_USES_SQLITE = false
 
+// claude.md #95: whether any graphics CODE was emitted -- drawing,
+// measuring, loading -- as opposed to anything needing a real window.
+// The distinction is the whole point of that entry: painting the
+// offscreen canvas and saving it needs no X server at all, so a
+// headless program should not have a window opened on it. This flag
+// registers the image decoder in main's prologue; the separate,
+// narrower one below is what opens a window.
+bool CG_USES_GRAPHICS_CODE = false
+
+// claude.md #94/#180: the canvas operations that are a name, a runtime
+// function and a fixed argument list -- nothing else. Spelled
+// '<fn>|<lty>,<lty>,...', with an empty tail for the no-argument ones,
+// because a map of two parallel lists would let the two drift.
+//
+// render(), enterFullscreen() and exitFullscreen() are deliberately
+// ABSENT: they are the three here that need a real GUI, which changes
+// main's own shape, and a port that emitted the call without that
+// change would be silently wrong rather than merely incomplete.
+map[text] CG_CANVAS_OPS = {
+    'clearCanvas': 'festina_clear_canvas|',
+    'clearRect': 'festina_clear_rect|i64,i64,i64,i64',
+    'clearCircle': 'festina_clear_circle|i64,i64,i64',
+    'clearPixel': 'festina_clear_pixel|i64,i64',
+    'setClientWidth': 'festina_set_client_width|i64',
+    'setClientHeight': 'festina_set_client_height|i64',
+    'beginPath': 'festina_begin_path|',
+    'moveTo': 'festina_move_to|i64,i64',
+    'lineTo': 'festina_line_to|i64,i64',
+    'curveTo': 'festina_curve_to|i64,i64,i64,i64,i64,i64',
+    'closePath': 'festina_close_path|',
+    'fillPath': 'festina_fill_path|',
+    'strokePath': 'festina_stroke_path|',
+    'translate': 'festina_translate|i64,i64',
+    'rotate': 'festina_rotate|double',
+    'scale': 'festina_scale|double,double',
+    'resetTransform': 'festina_reset_transform|',
+    'saveState': 'festina_save_state|',
+    'restoreState': 'festina_restore_state|',
+    'fillAlpha': 'festina_set_alpha|double',
+    'fillLinearGradient': 'festina_fill_linear_gradient|i64,i64,i64,i64,i64,i64',
+    'fillRadialGradient': 'festina_fill_radial_gradient|i64,i64,i64,i64,i64',
+    'showCursor': 'festina_show_cursor|',
+    'hideCursor': 'festina_hide_cursor|'
+}
+
 // claude.md #29-31: every declared `table`, in declaration order, and
 // its columns -- names and SQL types, each '|'-joined, neither of
 // which an identifier can contain. Recorded at declaration and spent
@@ -4209,6 +4254,168 @@ Val func cgCall(e:Node, wantValue:bool) {
     // runtime functions keeps a pointer past the call -- the file
     // helpers read or write and close, strftime copies into its own
     // buffer.
+    // claude.md #94: a canvas operation is a name, a runtime function
+    // and a fixed argument list. Every one of them paints or configures
+    // the OFFSCREEN canvas, which needs no window -- see the table's
+    // own comment for the three that do and are therefore not in it.
+    if CG_CANVAS_OPS[name] != null {
+        arr[text] spec = CG_CANVAS_OPS[name].split('|')
+        arr[text] argLtys = []
+        if spec[1] != '' { argLtys = spec[1].split(',') }
+        arr[Node] cargs2 = listOf(e, 'args')
+        if cargs2.length != argLtys.length {
+            cgUnported(`${name}() with ${cargs2.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        text cjoined = ''
+        int cq = 0
+        while cq < cargs2.length {
+            text want = 'int'
+            if argLtys[cq] == 'double' { want = 'float' }
+            Val cv = cgExprExpecting(cargs2[cq], want, '')
+            if CG_STUCK { return none }
+            if cv.lty != argLtys[cq] {
+                cgUnported(`${name}() argument of type ${cv.fty}`)
+                return none
+            }
+            if cq > 0 { cjoined = cjoined + ', ' }
+            cjoined = cjoined + `${argLtys[cq]} ${cv.v}`
+            cq++
+        }
+        cgOut(`  call void @${spec[0]}(${cjoined})`)
+        return cgVal('0', 'void', 'void')
+    }
+    // claude.md #89: the style setters record state and draw nothing,
+    // so they open no window either. One argument is an already-packed
+    // `color`; three are raw channels, for a colour chosen at runtime.
+    if name == 'fillStyle' || name == 'borderColor' {
+        arr[Node] sargs = listOf(e, 'args')
+        if sargs.length != 3 {
+            cgUnported(`${name}() with ${sargs.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        text sfn = 'festina_set_fill_rgb'
+        if name == 'borderColor' { sfn = 'festina_set_border_rgb' }
+        arr[text] schan = []
+        int sq = 0
+        while sq < 3 {
+            Val sv = cgExprExpecting(sargs[sq], 'int', '')
+            if CG_STUCK { return none }
+            if sv.fty != 'int' {
+                cgUnported(`${name}() channel of type ${sv.fty}`)
+                return none
+            }
+            schan.push(sv.v)
+            sq++
+        }
+        cgOut(`  call void @${sfn}(i64 ${schan[0]}, i64 ${schan[1]}, i64 ${schan[2]})`)
+        return cgVal('0', 'void', 'void')
+    }
+    // claude.md #95: drawing paints the OFFSCREEN canvas too. Each of
+    // these has more than one form, picked purely by argument count --
+    // a trailing `color` overrides the current fillStyle for this call
+    // alone -- and semantic analysis has already confirmed exactly one
+    // form matches, so the count is a safe discriminator here.
+    if name == 'drawRect' || name == 'drawCircle' || name == 'drawPixel' {
+        arr[Node] dargs = listOf(e, 'args')
+        int plain = 4
+        if name == 'drawCircle' { plain = 3 }
+        if name == 'drawPixel' { plain = 2 }
+        if dargs.length != plain {
+            // A colour override is a `color` value, which this port
+            // does not have a type for yet.
+            cgUnported(`${name}() with ${dargs.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        text dfn = 'festina_draw_rect'
+        if name == 'drawCircle' { dfn = 'festina_draw_circle' }
+        if name == 'drawPixel' { dfn = 'festina_draw_pixel' }
+        text djoined = ''
+        int dq = 0
+        while dq < dargs.length {
+            Val dv = cgExprExpecting(dargs[dq], 'int', '')
+            if CG_STUCK { return none }
+            if dv.fty != 'int' {
+                cgUnported(`${name}() argument of type ${dv.fty}`)
+                return none
+            }
+            if dq > 0 { djoined = djoined + ', ' }
+            djoined = djoined + `i64 ${dv.v}`
+            dq++
+        }
+        cgOut(`  call void @${dfn}(${djoined})`)
+        return cgVal('0', 'void', 'void')
+    }
+    if name == 'drawText' {
+        arr[Node] targs2 = listOf(e, 'args')
+        if targs2.length != 3 {
+            cgUnported(`drawText() with ${targs2.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        Val tv = cgExprExpecting(targs2[0], 'text', '')
+        if CG_STUCK { return none }
+        Val txv = cgExprExpecting(targs2[1], 'int', '')
+        if CG_STUCK { return none }
+        Val tyv = cgExprExpecting(targs2[2], 'int', '')
+        if CG_STUCK { return none }
+        cgOut(`  call void @festina_draw_text(ptr ${tv.v}, i64 ${txv.v}, i64 ${tyv.v})`)
+        // Cairo copies the glyphs it draws and keeps no pointer.
+        cgFreeTextTemp(targs2[0], tv)
+        return cgVal('0', 'void', 'void')
+    }
+    if name == 'measureTextWidth' || name == 'measureTextHeight' {
+        arr[Node] margs2 = listOf(e, 'args')
+        if margs2.length != 1 {
+            cgUnported(`${name}() with ${margs2.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        Val mv = cgExprExpecting(margs2[0], 'text', '')
+        if CG_STUCK { return none }
+        text mfn = 'festina_measure_text_width'
+        if name == 'measureTextHeight' { mfn = 'festina_measure_text_height' }
+        text mout = cgTmp()
+        cgOut(`  ${mout} = call i64 @${mfn}(ptr ${mv.v})`)
+        cgFreeTextTemp(margs2[0], mv)
+        return cgVal(mout, 'i64', 'int')
+    }
+    if name == 'lineWidth' {
+        arr[Node] wargs = listOf(e, 'args')
+        if wargs.length != 1 {
+            cgUnported(`lineWidth() with ${wargs.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        Val wv = cgExprExpecting(wargs[0], 'int', '')
+        if CG_STUCK { return none }
+        cgOut(`  call void @festina_set_line_width(i64 ${wv.v})`)
+        return cgVal('0', 'void', 'void')
+    }
+    // claude.md #95/#135: writes the OFFSCREEN canvas, so it needs no
+    // window -- this is the headless case the render() split exists
+    // for. The no-argument form answers a fresh img SNAPSHOT instead of
+    // writing a file, which is a different return TYPE and so a
+    // different port.
+    if name == 'saveCanvas' {
+        arr[Node] vargs = listOf(e, 'args')
+        if vargs.length != 1 {
+            cgUnported(`saveCanvas() with ${vargs.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        Val pv = cgExprExpecting(vargs[0], 'text', '')
+        if CG_STUCK { return none }
+        text sout = cgTmp()
+        cgOut(`  ${sout} = call i8 @festina_save_canvas(ptr ${pv.v})`)
+        // Cairo reads the path inline and keeps no pointer, so a
+        // temporary is the caller's to free.
+        cgFreeTextTemp(vargs[0], pv)
+        return cgVal(sout, 'i8', 'bool')
+    }
     if name == 'now' && listOf(e, 'args').length == 0 {
         text nout = cgTmp()
         cgOut(`  ${nout} = call i64 @festina_now_ms()`)
@@ -8185,6 +8392,13 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // the loop polls festina_shutdown_requested() once per iteration,
     // which is what makes installing one meaningful here.
     if CG_USES_TIMERS { cgOut('  call void @festina_install_shutdown_handler()') }
+    // claude.md #101/#199: the image decoder is registered here, before
+    // anything could decode an img column -- and before any thread is
+    // spawned, so no thread's own on_load can race this store. Only for
+    // a program that already links the feature, so the symbol exists.
+    if CG_USES_GRAPHICS_CODE {
+        cgOut('  call void @festina_set_image_decoder(ptr @festina_image_from_bytes)')
+    }
     // claude.md #29-31: the database is opened and every declared table
     // synced HERE, in main's own prologue, before __festina_main runs a
     // single statement -- so a top-level query in the program's very

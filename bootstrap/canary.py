@@ -1128,6 +1128,35 @@ CANARIES = [
     ),
 
     Canary(
+        "canvas-op-argument-types-travel-with-the-name", "#319",
+        "a canvas operation's argument LLVM types come from its own "
+        "table entry, not from an assumption that everything is i64",
+        # rotate takes a double. Reading the types off the wrong half
+        # of the entry makes every one of them an i64, which is a
+        # wrong compiler rather than an absent one: the call is still
+        # emitted, with the argument mistyped.
+        """        if spec[1] != '' { argLtys = spec[1].split(',') }""",
+        """        if spec[1] != '' { argLtys = spec[0].split(',') }""",
+    ),
+    Canary(
+        "drawing-opens-no-window", "#319",
+        "painting the offscreen canvas registers the image decoder but "
+        "never opens a window",
+        """    if CG_USES_GRAPHICS_CODE {
+        cgOut('  call void @festina_set_image_decoder(ptr @festina_image_from_bytes)')
+    }""",
+        "",
+    ),
+    Canary(
+        "canvas-path-arguments-are-freed", "#319",
+        "Cairo reads a PNG path inline and keeps no pointer, so a "
+        "computed one is the caller's to free",
+        """        cgFreeTextTemp(vargs[0], pv)
+        return cgVal(sout, 'i8', 'bool')""",
+        """        return cgVal(sout, 'i8', 'bool')""",
+    ),
+
+    Canary(
         "generated-fn-placement", "#307",
         "a generated cascade lands BEFORE the function whose body asked for it",
         [
