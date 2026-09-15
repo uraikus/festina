@@ -6489,3 +6489,29 @@ The fourth slice of the subsystems, and two real bugs found by a user rather tha
 **Three new canaries. 96 in total.**
 
 **Verified.** Lexer 116/116, parser 116/116, semantic 116/116, codegen 58 match and 0 differ. `cases/tables_and_names.f` is valgrind-clean.
+
+318. ROWS, HANDLES, AND A PATH CHOSEN BEFORE ANYTHING RUNS
+
+The fifth slice of the subsystems. **296,596 of 315,722 file-specific IR lines, up from 289,968 -- 93.9% -- and 65 files match, 0 differ**, up from 58. All ten bootstrap files still self-host.
+
+**A ROW is the first value in this port whose storage the RUNTIME laid out.** Not a struct with a different name: a flat block of 8-byte cells, no LLVM type of its own, and its refcount header one i64 BEFORE the offsets every column is measured from. Nothing generic can be pointed at one -- the ordinary release reads the eight bytes before a payload and would find a column -- so the release is generated per table: each text column freed by the identical rule the runtime used when BUILDING the row, read off the same declared column types, and then the allocation from its BASE.
+
+**A row is reference counted, so a row an array gave out survives the array.** `free`ing the array while a binding still holds one of its rows is the case that proves it, and it is in the corpus rather than hypothetical. That is also what makes the per-table wrapper safe to reach from an ordinary ownership site and not only from a container tearing its elements down.
+
+**The runtime's row-pointer buffer already IS an arr[T] data pointer.** One 8-byte pointer per row is exactly the layout an array of pointer-shaped elements expects, so the collecting query builds a fresh header around the buffer as it stands. Nothing is repacked, and the result is fresh in the strongest sense -- nothing else references it yet, the same way an array literal's own header is.
+
+**Only the DECLARED type of the destination can tell the two `sqlite()` forms apart**, which is why the collecting one is reached from the expected-type path beside the array and map literals rather than from the call dispatch. The expression's own shape says nothing: the same call text is an exec in one position and a collect in another.
+
+**A HANDLE element owns a whole reference**, exactly as a struct element does -- retained on store, released through its own destructor, never plain `free`. Three lines, and the predicate that decided it had listed containers and structs and stopped there: an `arr[blob]` that escaped, was reassigned or was returned leaked one open file handle per element for as long as it lived. The same three lines cover `arr[regex]`.
+
+**Two latent bugs, both found by the harness rather than by reading.** `cgMapGet` special-cased a struct and fell through for everything else, so a row read out of a map came back with an fty of `People` -- a type nothing downstream knows -- instead of a row. And the map-set old-value release was hardcoded to the struct dispatch, which is right for a struct and silently generic for everything else: `map[arr[T]]` and `map[blob]` would have dropped an inner array's elements and a blob's buffer on the floor, and no corpus file had ever exercised either.
+
+**`DatabaseURL` is lifted out of the body and spent in main's prologue.** It runs ahead of `festina_db_open`, and so ahead of every ordinary global's own initializer -- which is exactly why it may read the environment and may not read another global, a consequence of WHERE it runs rather than a rule about what it may contain. `environment.NAME` is intercepted before its object is emitted at all, because `environment` is not a value: there is nothing to load, and evaluating it reports an unknown name.
+
+**A canary anchor is not a comment about the code, it is a claim on it.** Two existing canaries went stale on this slice -- one because a handle case landed between a check and the line under it, one because the column globals moved into a helper -- and the registry's own anchor check, which costs milliseconds, caught both before the expensive scan ever ran. Both were re-aimed at the mechanism rather than deleted, and the second one's breakage is now a genuine reordering instead of a moved declaration.
+
+**One of the seven is caught only by the RATCHET, and that is the honest verdict rather than a rounding of it.** Breaking the predicate that decides whether a handle element owns anything does not make the port emit something wrong -- it makes the port REFUSE the declaration, so the file goes unported and the coverage number falls instead of a line differing. Real detection, and a weaker claim than a differing line in a real program: "unported" is how this harness spells "not implemented yet", so a regression of that shape is caught by the coverage ratchet and not by the per-file comparison. The companion canary on the same mechanism -- the destructor a handle element gets -- does produce a wrong compiler, and fires with two independent witnesses.
+
+**Seven new canaries. 103 in total.**
+
+**Verified.** Lexer 118/118, parser 118/118, semantic 118/118, codegen 65 match and 0 differ. `cases/rows_and_handles.f` is valgrind-clean.

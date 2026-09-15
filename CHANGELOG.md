@@ -111,9 +111,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage: **56 of 116 corpus files emit
-  byte-identical LLVM IR, 0 differ, 49 not yet ported, 11 rejected by
-  both** — 287,128 of 308,018 file-specific IR lines. **The bootstrap
+  the fourth and last stage: **65 of 118 corpus files emit
+  byte-identical LLVM IR, 0 differ, 42 not yet ported, 11 rejected by
+  both** — 296,596 of 315,722 file-specific IR lines. **The bootstrap
   compiler reproduces its own compilation**: all ten of its files —
   `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
   `escape.f` (22,232), `codegen.f` (59,166) and the five command-line
@@ -166,8 +166,19 @@ round-by-round design and implementation record predating 0.1 lives in
   what indexing a container the expression owns needs. Not in: structs
   with a non-scalar field, `img`/`regex` and the other non-scalar
   declarations, the remaining methods, and the
-  graphics/audio/HTTP/thread/sqlite/table subsystems — none of which
-  the compiler needs to compile itself. And what a program needs to be
+  graphics/audio/HTTP/thread subsystems — none of which the compiler
+  needs to compile itself. The DATABASE subsystem is in: a `table` is
+  the first declaration that reaches the program at run time rather
+  than at type-check time, producing nothing where it stands and a
+  schema sync in main's own prologue; `sqlite()` runs a statement or
+  collects its rows, decided by the declared type of wherever the
+  result flows; and a sqlite ROW is the first value whose storage the
+  runtime laid out rather than codegen, so its release is generated per
+  table and frees each of its own text columns before the allocation
+  they hang off. Plus `DatabaseURL` and `environment.NAME`, and
+  refcounted HANDLE elements — an `arr[blob]` needs the same
+  per-element cascade an `arr[Struct]` does, which the predicate
+  deciding it had never said. And what a program needs to be
   a COMMAND: `argv`, `close(code)`, `.keys()`/`.values()`, and the two
   scope rules a driver is the first program to reach — a managed
   declaration inside a function is local even when a global shares its
@@ -186,8 +197,8 @@ round-by-round design and implementation record predating 0.1 lives in
   the two implementations agree; it says nothing about whether the
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
-  not. Ninety-three deliberate breakages, one per mechanism, re-run by
-  `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
+  not. A hundred and three deliberate breakages, one per mechanism,
+  re-run by `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
   no longer the whole verdict: a canary looks for TWO independent
   witnesses and reports a lone one in its own output, because
   decisions.md #312's seven canaries all fired and all seven fired on
