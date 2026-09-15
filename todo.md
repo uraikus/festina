@@ -133,13 +133,13 @@ generation binary built from that IR is identical to the first**
 (decisions.md #313). What remains open is below; none of it stands
 between the compiler and compiling itself.
 
-- **The remaining unported constructs are all SUBSYSTEMS.** Graphics,
-  audio, HTTP, threads, sqlite, tables, and `free`/`delete`'s manual
-  escape hatch — 64 corpus files, and a different kind of work from
-  the twenty slices that came before, which were expression-level
-  mechanisms the compiler itself needed. Worth doing only if the goal
-  becomes "the whole corpus" rather than "the compiler"; that is a
-  decision, not a backlog item.
+- **What remains unported is the SUBSYSTEMS**, and they are being
+  worked through: graphics, audio, HTTP, threads, sqlite, tables,
+  regex, timers and the JSON conversions — 59 corpus files. The
+  language-level work is done (the manual escape hatch, first-class
+  function values, and `try`/`catch`/`throw` landed in decisions.md
+  #314), so what is left is genuinely per-subsystem rather than
+  per-mechanism.
 
 - **`bootstrap/lexer.f` does not follow Python's `repr()` into
   scientific notation.** The canonical token dump renders a float with

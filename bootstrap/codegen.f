@@ -839,6 +839,19 @@ Val func cgArrVal(v:text, ety:text) {
     return r
 }
 
+// claude.md #141: a first-class function value. The `ety` slot carries
+// the encoded SIGNATURE, for the same reason a container's carries its
+// element type -- an indirect call has to spell every argument's LLVM
+// type and the pointer itself says nothing about them.
+Val func cgFuncVal(v:text, sig:text) {
+    Val r
+    r.v = v
+    r.lty = 'ptr'
+    r.fty = 'func'
+    r.ety = sig
+    return r
+}
+
 // The same for a map: its value type is no more recoverable from the
 // header than an array's element type is.
 Val func cgMapVal(v:text, ety:text) {
@@ -871,7 +884,122 @@ text func cgLtyOf(fty:text) {
     if fty == 'arr' { return 'ptr' }
     if fty == 'map' { return 'ptr' }
     if fty == 'struct' { return 'ptr' }
+    // claude.md #141: a first-class function value is a bare LLVM
+    // function pointer. It is never allocated and never freed -- a
+    // declared function is immortal for the process's lifetime -- so
+    // it rides every generic SCALAR-shaped path (declaration, struct
+    // field, array element, map value, argument passing) unchanged,
+    // with no refcount, no tracking and no release.
+    if fty == 'func' { return 'ptr' }
     return ''
+}
+
+// A function type flattened to text, because the port keys everything
+// on strings and a `func[int,int]:int` has to survive in the one
+// element-type slot a binding gets. Each parameter is `fty:key` -- the
+// key carrying a struct's name or a container's element type, empty
+// for a scalar -- parameters joined by `;`, and the return type after
+// a `|`. A void return is spelled `void:`.
+//
+// Parseable with `.split()` alone, which is the constraint: Festina's
+// `text` has no `.slice()`, so an encoding that needed index
+// arithmetic to decode would need a character walk instead.
+text func cgTyKeyOf(t:Ty) {
+    if t == null { return '' }
+    if t.kind == 'struct' { return t.name }
+    if t.kind == 'arr' || t.kind == 'map' {
+        if t.elem == null { return '' }
+        if t.elem.kind == 'prim' { return t.elem.name }
+        if t.elem.kind == 'struct' { return t.elem.name }
+        return ''
+    }
+    return ''
+}
+
+text func cgFtyOfTy(t:Ty) {
+    if t == null { return 'void' }
+    if t.kind == 'prim' {
+        if t.name == 'int' || t.name == 'float' || t.name == 'bool'
+                || t.name == 'text' || t.name == 'blob' { return t.name }
+        return ''
+    }
+    if t.kind == 'arr' { return 'arr' }
+    if t.kind == 'map' { return 'map' }
+    if t.kind == 'struct' { return 'struct' }
+    if t.kind == 'func' { return 'func' }
+    return ''
+}
+
+text func cgFuncSig(t:Ty) {
+    if t == null { return '' }
+    if t.kind != 'func' { return '' }
+    text out = ''
+    int i = 0
+    while i < t.params.length {
+        text pf = cgFtyOfTy(t.params[i])
+        if pf == '' || pf == 'void' { return '' }
+        if i > 0 { out = out + ';' }
+        out = out + `${pf}:${cgTyKeyOf(t.params[i])}`
+        i++
+    }
+    text rf = cgFtyOfTy(t.elem)
+    if rf == '' { return '' }
+    return `${out}|${rf}:${cgTyKeyOf(t.elem)}`
+}
+
+// The same encoding built from a DECLARATION's own parameter list, so
+// a bare reference to a function's name produces a value
+// indistinguishable from one that arrived through a `func[...]`
+// binding. Kept in a table of its own rather than widened out of
+// FN_PARAMS, which a direct call reads and which deliberately spells
+// a non-scalar parameter as '' (see its own comment).
+text func cgSigOfDeclNode(d:Node) {
+    arr[Node] ps = listOf(d, 'params')
+    text out = ''
+    int i = 0
+    while i < ps.length {
+        Ty pt = resolveTypeField(ps[i], 'type_expr')
+        text pf = cgFtyOfTy(pt)
+        if pf == '' || pf == 'void' { return '' }
+        if i > 0 { out = out + ';' }
+        out = out + `${pf}:${cgTyKeyOf(pt)}`
+        i++
+    }
+    text rf = 'void'
+    text rkey = ''
+    Ty rt = resolveTypeField(d, 'return_type')
+    if rt != null {
+        rf = cgFtyOfTy(rt)
+        if rf == '' || rf == 'void' { return '' }
+        rkey = cgTyKeyOf(rt)
+    }
+    return `${out}|${rf}:${rkey}`
+}
+
+// One parameter or the return of an encoded signature, as (fty, key).
+text func cgSigFty(part:text) {
+    arr[text] bits = part.split(':')
+    return bits[0]
+}
+
+text func cgSigKey(part:text) {
+    arr[text] bits = part.split(':')
+    if bits.length < 2 { return '' }
+    return bits[1]
+}
+
+arr[text] func cgSigParams(sig:text) {
+    arr[text] halves = sig.split('|')
+    arr[text] none = []
+    if halves.length != 2 { return none }
+    if halves[0] == '' { return none }
+    return halves[0].split(';')
+}
+
+text func cgSigRet(sig:text) {
+    arr[text] halves = sig.split('|')
+    if halves.length != 2 { return '' }
+    return halves[1]
 }
 
 // The LLVM payload type sitting behind a managed value's pointer, or
@@ -956,6 +1084,10 @@ map[text] FN_PARAMS = {}
 // name, or a container's element type.
 map[text] FN_RETKEY = {}
 
+// Each function's whole signature, encoded by cgSigOfDeclNode, so the
+// name can be read as a first-class value (claude.md #141).
+map[text] FN_SIG = {}
+
 // Struct field layout, keyed '<Struct>.<field>'. codegen.py reads this
 // off `analyzed.structs`; here it is collected while the type
 // definitions are emitted, which is the same information in the same
@@ -1008,6 +1140,9 @@ map[text] G_ETY = {}
 // element type so one is generated per type and not per site.
 map[text] CG_ARR_REL = {}
 map[text] CG_MAP_REL = {}
+
+// Comparator trampolines, cached per element type (claude.md #184).
+map[text] CG_SORT_TRAMP = {}
 map[text] L_SNAME = {}
 map[text] L_ETY = {}
 
@@ -1071,6 +1206,18 @@ void func cgBlockLabel(l:text) {
 // its lifetime both depend on this.
 bool CG_IN_FUNC = false
 
+// claude.md #236: whether the program contains a `try` ANYWHERE. It is
+// a whole-program property rather than a per-function one, because a
+// throw unwinds through frames that know nothing about it -- every
+// tracked binding in the program has to be registered as it is bound,
+// or the throw walks past it. A program with none of them pays
+// literally nothing: the IR is unchanged.
+bool CG_HAS_TRY = false
+
+// Set only while a THROW emits its own scope walk, so a try-frame
+// marker in the range is left alone. See cgFreeOne.
+bool CG_SKIP_TRY_POP = false
+
 // The function currently being emitted, and its return type. A
 // `return null` takes its type from the signature rather than from
 // anything at the return site, which is the only thing these are for.
@@ -1122,10 +1269,16 @@ bool func cgEscapes(name:text) {
 }
 
 void func cgFreeParams() {
+    int popped = 0
     int i = 0
     while i < CG_PARAM_LIVE.length {
-        cgFreeOne(CG_PARAM_LIVE[i])
+        if cgFreeOne(CG_PARAM_LIVE[i]) { popped++ }
         i++
+    }
+    if popped > 0 {
+        if CG_HAS_TRY {
+            cgOut(`  call void @festina_cleanup_pop_n(i64 ${popped})`)
+        }
     }
 }
 
@@ -1313,6 +1466,21 @@ Val func cgExpr(e:Node) {
         text name = rawText(e, 'name')
         text slot = cgSlotOf(name)
         text fty = cgFtyOf(name)
+        // claude.md #141: a bare reference to a FUNCTION's own name,
+        // not immediately called. The global symbol IS the value --
+        // LLVM already treats a function symbol as a plain `ptr`
+        // constant, so there is no address-of step and nothing to
+        // load, unlike a variable's own storage. Checked only when no
+        // binding shadows the name, which is the original's order.
+        if slot == '' {
+            if FN_SIG[name] != null {
+                if FN_SIG[name] != '' {
+                    Val fv = cgVal(`@${name}`, 'ptr', 'func')
+                    fv.ety = FN_SIG[name]
+                    return fv
+                }
+            }
+        }
         if slot == '' || cgLtyOf(fty) == '' {
             cgUnported(`read of ${name}`)
             return none
@@ -1323,6 +1491,7 @@ Val func cgExpr(e:Node) {
         if fty == 'struct' { return cgStructVal(t, cgSnameOf(name)) }
         if fty == 'arr' { return cgArrVal(t, cgEtyOf(name)) }
         if fty == 'map' { return cgMapVal(t, cgEtyOf(name)) }
+        if fty == 'func' { return cgFuncVal(t, cgEtyOf(name)) }
         return cgVal(t, lty, fty)
     }
 
@@ -2055,6 +2224,181 @@ Val func cgMapLit(e:Node, vty:text, header:text) {
 //
 // The last argument is a per-value-type release trampoline, needed only
 // when the values themselves own something. A scalar map passes null.
+// claude.md #111: `free name` releases whatever the binding holds and
+// then NULLS the binding. The null store is half the design rather
+// than tidying: every release in this runtime is null-safe, so the
+// automatic scope-exit release that may later visit this same binding
+// finds null and does nothing. Manual and automatic reclamation
+// coexist with no bookkeeping between them, `free x` twice is a no-op
+// rather than a double free, and use-after-free THROUGH THIS BINDING
+// is impossible -- reading x afterwards reads null, the ordinary
+// absent value.
+//
+// A refcounted binding is DECREMENTED, not forcibly freed: an aliased
+// value survives until its other references drop. A text buffer is
+// exclusively owned (claude.md #83) and so is freed outright. A scalar
+// has nothing to release and `free` degenerates to `x = null` -- which
+// is why the null store is emitted for every type and the release for
+// only some.
+//
+// decisions.md #283/#284: `clear` is the same statement with
+// `zeroing`, and the intent cannot ride on this call site, because a
+// release runs a cascade this site does not walk. It travels as
+// runtime state set around the whole cascade instead, and every free
+// inside consults it -- so a value still referenced elsewhere is
+// neither freed nor zeroed, the flag being read only at a free that
+// actually happens.
+void func cgFree(s:Node) {
+    text name = rawText(s, 'name')
+    text slot = cgSlotOf(name)
+    if slot == '' {
+        cgUnported(`free of ${name}`)
+        return
+    }
+    text fty = cgFtyOf(name)
+    text lty = cgLtyOf(fty)
+    if lty == '' {
+        cgUnported(`free of a ${fty}`)
+        return
+    }
+    bool zeroing = fieldOf(s, 'zeroing').raw == 'true'
+    if lty == 'ptr' {
+        text old = cgTmp()
+        cgOut(`  ${old} = load ptr, ptr ${slot}`)
+        if cgIsRefcounted(fty) {
+            // Resolved before the calls are emitted, because resolving
+            // may GENERATE the cascade and its temps come first.
+            text relFn = cgReleaseFnFor(fty, cgRelKeyOf(name))
+            if zeroing { cgOut('  call void @festina_begin_clearing()') }
+            cgOut(`  call void ${relFn}(ptr ${old})`)
+            if zeroing { cgOut('  call void @festina_end_clearing()') }
+        } else if fty == 'text' {
+            if zeroing {
+                cgOut(`  call void @festina_clear_text(ptr ${old})`)
+            } else {
+                cgOut(`  call void @free(ptr ${old})`)
+            }
+        }
+        cgOut(`  store ptr null, ptr ${slot}`)
+        return
+    }
+    cgOut(`  store ${lty} ${cgNullValue(fty)}, ptr ${slot}`)
+}
+
+// claude.md #157/#235: `try { A } catch (name:text) { B }`.
+//
+// The setjmp call is emitted RIGHT HERE, into the enclosing function's
+// own IR, rather than behind a runtime helper -- setjmp only captures
+// a valid jump target while its OWN calling frame is still live, and a
+// helper that calls it and returns has already invalidated that frame
+// by the time a later throw tries to jump back into it. Emitting it
+// here makes the "calling function" the one containing the try, which
+// by construction cannot have returned yet.
+//
+// libc's setjmp rather than the llvm.eh.sjlj intrinsics: those have no
+// lowering at all on wasm32 or AArch64 and a broken one on x86_64
+// Windows. Structurally this is a plain two-way branch, exactly like an
+// `if` -- 0 is the first, normal arrival and runs A; nonzero means a
+// throw's longjmp landed straight back here and runs B.
+//
+// A's frame gets one extra entry, a try-frame MARKER, in a wrapper
+// frame of its own, so that any exit from A -- fallthrough, return,
+// break, continue, however deeply nested -- pops the runtime's catch
+// frame through the same walk that frees every other local.
+void func cgTry(s:Node) {
+    text bufp = cgTmp()
+    cgOut(`  ${bufp} = alloca [1024 x i8], align 16`)
+    text rc = cgTmp()
+    cgOut(`  ${rc} = call i32 @_setjmp(ptr ${bufp}, ptr null)`)
+    text isCatch = cgTmp()
+    cgOut(`  ${isCatch} = icmp ne i32 ${rc}, 0`)
+    text tryL = cgLabel('try.body')
+    text catchL = cgLabel('try.catch')
+    text endL = cgLabel('try.end')
+    cgOut(`  br i1 ${isCatch}, label %${catchL}, label %${tryL}`)
+
+    cgBlockLabel(tryL)
+    CG_TERM = false
+    cgOut(`  call void @festina_try_push(ptr ${bufp})`)
+    cgPushFrame()
+    cgTrackTryFrame()
+    cgBlockInto(childOf(s, 'try_body'))
+    cgPopFrame()
+    bool tryTerm = CG_TERM
+    if tryTerm == false { cgOut(`  br label %${endL}`) }
+
+    cgBlockLabel(catchL)
+    CG_TERM = false
+    // festina_try_error hands over an OWNED text value -- the runtime's
+    // own copy, made when the throw happened -- bound as an ordinary
+    // local, so its scope-exit cleanup is the same generic text-local
+    // handling every other text local gets rather than anything
+    // special-cased for this one.
+    text errVal = cgTmp()
+    cgOut(`  ${errVal} = call ptr @festina_try_error()`)
+    text errSlot = cgTmp()
+    cgOut(`  ${errSlot} = alloca ptr`)
+    cgOut(`  store ptr ${errVal}, ptr ${errSlot}`)
+    text cvar = rawText(s, 'catch_var')
+    text savedSlot = ''
+    text savedFty = ''
+    if L_SLOT[cvar] != null { savedSlot = L_SLOT[cvar] }
+    if L_FTY[cvar] != null { savedFty = L_FTY[cvar] }
+    L_SLOT[cvar] = errSlot
+    L_FTY[cvar] = 'text'
+    cgPushFrame()
+    cgTrackLive('text', errSlot, '')
+    cgBlockInto(childOf(s, 'catch_body'))
+    cgPopFrame()
+    if savedSlot != '' { L_SLOT[cvar] = savedSlot } else { L_SLOT[cvar] = null }
+    if savedFty != '' { L_FTY[cvar] = savedFty } else { L_FTY[cvar] = null }
+    bool catchTerm = CG_TERM
+    if catchTerm == false { cgOut(`  br label %${endL}`) }
+
+    if tryTerm && catchTerm {
+        CG_TERM = true
+        return
+    }
+    cgBlockLabel(endL)
+    CG_TERM = false
+}
+
+// claude.md #157/#236: `throw expr`. The message is coerced to text
+// exactly as `fail()` coerces its own, and -- unlike fail -- an
+// ALIASED text needs an owning copy first, because festina_throw is
+// handed a pointer the unwinding is about to release.
+//
+// With a `try` anywhere in the program, no scope walk is emitted here
+// at all: every tracked binding is already on the runtime's cleanup
+// stack, and festina_throw releases exactly the entries above the
+// catching frame -- this function's locals since the try, and every
+// intermediate frame's, which no generated code here could reach. The
+// two designs must not be combined; freeing here as well would be a
+// double free.
+void func cgThrow(s:Node) {
+    Node ex = childOf(s, 'expr')
+    Val v = cgExpr(ex)
+    if CG_STUCK { return }
+    Val t = cgToText(v)
+    if CG_STUCK { return }
+    text val = t.v
+    if v.fty == 'text' {
+        if cgOwnsText(ex, v) == false {
+            text owned = cgTmp()
+            cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${val})`)
+            val = owned
+        }
+    }
+    if CG_HAS_TRY == false {
+        // A throw with nothing to unwind to is fail(), and the old
+        // walk stays purely so the IR is unchanged there.
+        CG_SKIP_TRY_POP = true
+        cgFreeFrom(0)
+        CG_SKIP_TRY_POP = false
+    }
+    cgOut(`  call void @festina_throw(ptr ${val})`)
+}
+
 void func cgDelete(s:Node) {
     Node target = childOf(s, 'target')
     if target == null || target.kind != 'Member' {
@@ -2957,6 +3301,83 @@ Val func cgMethodCall(e:Node, callee:Node) {
         return cgVal(out, 'ptr', 'text')
     }
 
+    // claude.md #184: `.sort(cmp)` -- an in-place, stable sort whose
+    // comparator is a first-class function value. Nothing here is
+    // retained, copied or released: a function value is already a bare
+    // pointer (claude.md #141) rather than a heap value, and the sort
+    // itself only repositions each element's raw slot within the same
+    // buffer. The runtime's comparator ABI takes two `void*` slots and
+    // an opaque userdata, so a generated trampoline decodes the slots
+    // into this element type and calls through -- and `userdata` IS
+    // the callback pointer, not a payload to read one out of, because
+    // festina_array_sort hands back unchanged whatever it was given.
+    if m == 'sort' {
+        if args.length != 1 {
+            cgUnported('.sort() with other than one argument')
+            return none
+        }
+        Val sobj = cgExpr(recv)
+        if CG_STUCK { return none }
+        if sobj.fty != 'arr' {
+            cgUnported(`.sort() on ${sobj.fty}`)
+            return none
+        }
+        if cgStorableRefcounted('arr', sobj.ety) == false {
+            cgUnported(`.sort() on an array of ${sobj.ety}`)
+            return none
+        }
+        Val cmp = cgExpr(args[0])
+        if CG_STUCK { return none }
+        if cmp.fty != 'func' {
+            cgUnported(`.sort() with a comparator of type ${cmp.fty}`)
+            return none
+        }
+        text tramp = cgSortTrampoline(sobj.ety)
+        text ssize = '8'
+        if sobj.ety == 'bool' { ssize = '1' }
+        cgOut(`  call void @festina_array_sort(ptr ${sobj.v}, i64 ${ssize}, ptr ${tramp}, ptr ${cmp.v})`)
+        return cgVal('0', 'void', 'void')
+    }
+
+    // claude.md #72: `m.forEach(fn)` visits every live entry as
+    // (value, key). The runtime walks buckets it understands and knows
+    // nothing about T, so a generated trampoline reinterprets the raw
+    // i64 into this map's value type and calls the callback. Semantic
+    // analysis has already established the argument is a declared
+    // function of the right shape, so its own symbol is the callback.
+    if m == 'forEach' {
+        if args.length != 1 {
+            cgUnported('.forEach() with other than one argument')
+            return none
+        }
+        Val fobj = cgExpr(recv)
+        if CG_STUCK { return none }
+        if fobj.fty != 'map' {
+            cgUnported(`.forEach() on ${fobj.fty}`)
+            return none
+        }
+        if fobj.ety == '' || cgElemLty(fobj.ety) == '' {
+            cgUnported('.forEach() on a map of a non-scalar type')
+            return none
+        }
+        if args[0].kind != 'Identifier' {
+            cgUnported('.forEach() with a non-identifier callback')
+            return none
+        }
+        text cbName = `@${rawText(args[0], 'name')}`
+        text ftramp = cgMapForEachTrampoline(fobj.ety, cbName)
+        text fEntP = cgTmp()
+        cgOut(`  ${fEntP} = getelementptr %struct._FestinaMap, ptr ${fobj.v}, i32 0, i32 1`)
+        text fEnt = cgTmp()
+        cgOut(`  ${fEnt} = load ptr, ptr ${fEntP}`)
+        text fCapP = cgTmp()
+        cgOut(`  ${fCapP} = getelementptr %struct._FestinaMap, ptr ${fobj.v}, i32 0, i32 2`)
+        text fCap = cgTmp()
+        cgOut(`  ${fCap} = load i64, ptr ${fCapP}`)
+        cgOut(`  call void @festina_map_for_each(ptr ${fEnt}, i64 ${fCap}, ptr ${ftramp})`)
+        return cgVal('0', 'void', 'void')
+    }
+
     // claude.md #186: `m.keys()` answers an arr[text] and `m.values()`
     // an arr[T], both built by the runtime into a header this call
     // allocates. The receiver is NOT released, matching forEach's own
@@ -3118,6 +3539,60 @@ void func cgFreeCallArgs(args:arr[Node], vals:arr[Val]) {
     }
 }
 
+// claude.md #141: calling through a function VALUE. The pointer is
+// loaded from the binding, every argument is emitted against the
+// signature's own parameter type, and the call spells each argument's
+// LLVM type explicitly -- an indirect callee carries none of that
+// itself.
+Val func cgIndirectCall(e:Node, name:text) {
+    Val none
+    text sig = cgEtyOf(name)
+    if sig == '' {
+        cgUnported(`call through ${name}`)
+        return none
+    }
+    arr[text] ptys = cgSigParams(sig)
+    arr[Node] args = listOf(e, 'args')
+    if args.length != ptys.length {
+        cgUnported(`call through ${name} with ${args.length} arguments`)
+        return none
+    }
+    text fnPtr = cgTmp()
+    cgOut(`  ${fnPtr} = load ptr, ptr ${cgSlotOf(name)}`)
+    arr[text] parts = []
+    arr[Val] argVals = []
+    int i = 0
+    while i < args.length {
+        text pf = cgSigFty(ptys[i])
+        Val a = cgExprExpecting(args[i], pf, cgSigKey(ptys[i]))
+        if CG_STUCK { return none }
+        parts.push(`${cgLtyOf(pf)} ${a.v}`)
+        argVals.push(a)
+        i++
+    }
+    text joined = ''
+    int j = 0
+    while j < parts.length {
+        if j > 0 { joined = joined + ', ' }
+        joined = joined + parts[j]
+        j++
+    }
+    text rf = cgSigFty(cgSigRet(sig))
+    if rf == 'void' {
+        cgOut(`  call void ${fnPtr}(${joined})`)
+        cgFreeCallArgs(args, argVals)
+        return cgVal('', 'void', 'void')
+    }
+    text out = cgTmp()
+    cgOut(`  ${out} = call ${cgLtyOf(rf)} ${fnPtr}(${joined})`)
+    cgFreeCallArgs(args, argVals)
+    text rkey = cgSigKey(cgSigRet(sig))
+    if rf == 'struct' { return cgStructVal(out, rkey) }
+    if rf == 'arr' { return cgArrVal(out, rkey) }
+    if rf == 'map' { return cgMapVal(out, rkey) }
+    return cgVal(out, cgLtyOf(rf), rf)
+}
+
 Val func cgCall(e:Node, wantValue:bool) {
     Val none
     Node callee = childOf(e, 'callee')
@@ -3163,6 +3638,16 @@ Val func cgCall(e:Node, wantValue:bool) {
         if CG_STUCK { return none }
         cgOut(`  call void @festina_program_exit(i64 ${cv.v})`)
         return cgVal('0', 'void', 'void')
+    }
+    // claude.md #141: an INDIRECT call, through a `func[...]`-typed
+    // binding rather than a declared function's own name. Checked
+    // BEFORE the function table below, mirroring the original's
+    // dispatch order, so a local that shadows a real global function
+    // of the same name resolves to ITS OWN signature rather than
+    // silently falling through to a direct call against the global it
+    // shadows.
+    if cgFtyOf(name) == 'func' {
+        if cgSlotOf(name) != '' { return cgIndirectCall(e, name) }
     }
     if FN_RET[name] == null {
         cgUnported(`call to ${name}`)
@@ -3485,14 +3970,24 @@ void func cgStmt(s:Node) {
                 cgOut(`  ${slot}.aplen = alloca i64`)
                 cgOut(`  store ptr null, ptr ${slot}.ap`)
                 cgOut(`  store i64 0, ptr ${slot}.aplen`)
-                cgTrackLive('text', slot, '')
+                cgTrackLiveLate('text', slot, '')
             }
             L_SLOT[name] = slot
             L_FTY[name] = fty
+            // A func binding's signature rides in the element-type
+            // slot, the same place a container's element type does.
+            if fty == 'func' { L_ETY[name] = cgFuncSig(resolveTypeField(s, 'type_expr')) }
             freshLocal = true
         }
         Node init = childOf(s, 'init')
-        if init == null { return }
+        if init == null {
+            // No initializer: the declaration IS the whole statement,
+            // so this is already "after the store" (there is none).
+            if fty == 'text' {
+                if freshLocal { cgCleanupPush('text', cgSlotOf(name), '') }
+            }
+            return
+        }
         Val v = cgExprExpecting(init, fty, '')
         if CG_STUCK { return }
         if v.fty != fty && cgNumericPair(v.fty, fty) == false {
@@ -3513,6 +4008,7 @@ void func cgStmt(s:Node) {
                     owned = o
                 }
                 cgOut(`  store ptr ${owned}, ptr ${cgSlotOf(name)}`)
+                cgCleanupPush('text', cgSlotOf(name), '')
                 return
             }
             cgStoreText(cgSlotOf(name), `${cgSlotOf(name)}.ap`, v,
@@ -3533,6 +4029,9 @@ void func cgStmt(s:Node) {
     if s.kind == 'IfStmt' { cgIf(s)  return }
     if s.kind == 'Return' { cgReturn(s)  return }
     if s.kind == 'DeleteStmt' { cgDelete(s)  return }
+    if s.kind == 'FreeStmt' { cgFree(s)  return }
+    if s.kind == 'TryStmt' { cgTry(s)  return }
+    if s.kind == 'ThrowStmt' { cgThrow(s)  return }
     if s.kind == 'BreakStmt' || s.kind == 'ContinueStmt' {
         if CG_LOOPS.length == 0 {
             // semantic.py rejects this outside a loop, so reaching it
@@ -3614,14 +4113,107 @@ void func cgPushFrame() {
 // something needs a generated cascade rather than the generic call,
 // and by scope-exit time the binding's own name is long gone.
 void func cgTrackLive(kind:text, slot:text, ety:text) {
+    cgTrackLiveLate(kind, slot, ety)
+    cgCleanupPush(kind, slot, ety)
+}
+
+// The two halves, separately, for the one binding whose push is not
+// emitted where its tracking is recorded. A text LOCAL's push comes
+// after the initializer's own store, because the original tracks a
+// local only once its whole declaration statement has been emitted --
+// while a PARAMETER's comes before, its binding store being the last
+// thing that happens. The difference is visible and neither order is
+// derivable from the other, so both are spelled out.
+void func cgTrackLiveLate(kind:text, slot:text, ety:text) {
     CG_LIVE.push(`${kind}|${slot}|${ety}`)
 }
 
-void func cgFreeOne(entry:text) {
+void func cgCleanupPush(kind:text, slot:text, ety:text) {
+    // claude.md #236: when the program has a `try` to reach, every
+    // binding is ALSO registered on the runtime's per-thread cleanup
+    // stack as it is bound, paired with a generated function that
+    // releases it THROUGH ITS SLOT. festina_throw then releases every
+    // entry pushed since the catching frame -- this function's locals
+    // since the try, and every intermediate frame's on the call chain,
+    // which no generated code here could ever reach.
+    //
+    // The push happens after the slot holds its value, and the unwind
+    // function reads the SLOT at throw time rather than the value at
+    // binding time -- so a local reassigned before the throw releases
+    // what it holds then, and one nulled by `free` releases nothing.
+    //
+    // A program with no `try` pays nothing: a throw there is fail(),
+    // and the IR is unchanged.
+    if CG_HAS_TRY {
+        cgOut(`  call void @festina_cleanup_push(ptr ${slot}, ptr ${cgUnwindFn(kind, ety)})`)
+    }
+}
+
+// claude.md #157: not a local at all -- a marker in the live list that
+// pops the runtime's own catch-frame stack. Every exit from a try body
+// (normal fallthrough, return, break, continue) reaches it through the
+// same scope-exit walk every local does, which is what makes
+// festina_try_pop need exactly one emission site.
+void func cgTrackTryFrame() {
+    CG_LIVE.push('try.frame||')
+}
+
+// The release of ONE live entry, through a slot -- shared by the
+// ordinary scope-exit walk and by the per-kind unwind functions
+// festina_throw calls from the runtime, so the two can never disagree
+// about what releasing a binding means.
+map[text] CG_UNWIND = {}
+
+text func cgUnwindFn(kind:text, ety:text) {
+    text key = `${kind}|${ety}`
+    if CG_UNWIND[key] != null { return CG_UNWIND[key] }
+    text name = `@__festina_unwind_${cgUid()}`
+    CG_UNWIND[key] = name
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define void ${name}(ptr %slot) {`)
+    cgBlockLabel('entry')
+    cgReleaseTracked(kind, '%slot', ety)
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
+// Returns whether this entry was a real local -- a try-frame marker is
+// not one, and the count of REAL releases is what the matching
+// cleanup-stack pop is sized from.
+bool func cgFreeOne(entry:text) {
     arr[text] parts = entry.split('|')
-    text kind = parts[0]
+    if parts[0] == 'try.frame' {
+        // claude.md #157: a throw must never pop the very catch frame
+        // it may be about to unwind INTO -- festina_throw looks up and
+        // pops exactly the frame it jumps to, at runtime. Popping it
+        // here first, in code that always runs, would make a
+        // perfectly-caught throw read as uncaught.
+        if CG_SKIP_TRY_POP == false { cgOut('  call void @festina_try_pop()') }
+        return false
+    }
+    cgReleaseTracked(parts[0], parts[1], parts[2])
+    return true
+}
+
+// The release of ONE tracked binding, given its kind, its slot and the
+// element/struct key that travels with it. Split out of cgFreeOne so a
+// generated unwind function can run the IDENTICAL release through the
+// same slot -- if the two ever disagreed about what releasing a
+// binding means, a throw would free something differently from the way
+// an ordinary scope exit does.
+void func cgReleaseTracked(kind:text, slot:text, ety:text) {
+    arr[text] parts = [kind, slot, ety]
     text t = cgTmp()
-    cgOut(`  ${t} = load ptr, ptr ${parts[1]}`)
+    cgOut(`  ${t} = load ptr, ptr ${slot}`)
 
     // claude.md #83: text is copied on alias and freed outright.
     if kind == 'text' {
@@ -3715,13 +4307,14 @@ void func cgFreeFrom(downTo:int) {
         if CG_FRAME[f] > downTo { bounds.push(CG_FRAME[f]) }
         f++
     }
+    int popped = 0
     int hi = CG_LIVE.length
     int b = bounds.length - 1
     while b >= 0 {
         int lo = bounds[b]
         int i = lo
         while i < hi {
-            cgFreeOne(CG_LIVE[i])
+            if cgFreeOne(CG_LIVE[i]) { popped++ }
             i++
         }
         hi = lo
@@ -3729,8 +4322,17 @@ void func cgFreeFrom(downTo:int) {
     }
     int i2 = downTo
     while i2 < hi {
-        cgFreeOne(CG_LIVE[i2])
+        if cgFreeOne(CG_LIVE[i2]) { popped++ }
         i2++
+    }
+    // claude.md #236: these locals' own cleanup-stack entries go with
+    // them. One count-based call for the whole walk: entries are pushed
+    // in binding order and this walk releases frames newest-first, so
+    // what it released is always the top of the runtime's stack.
+    if popped > 0 {
+        if CG_HAS_TRY {
+            cgOut(`  call void @festina_cleanup_pop_n(i64 ${popped})`)
+        }
     }
 }
 
@@ -3833,6 +4435,14 @@ bool func cgNumericPair(a:text, b:text) {
 text func cgDeclFty(d:Node) {
     Ty t = resolveTypeField(d, 'type_expr')
     if t == null { return '' }
+    // claude.md #141: a `func[...]` binding is scalar-shaped -- one
+    // immortal pointer, never retained, tracked or released -- so it
+    // belongs here with the primitives rather than with the managed
+    // types, whatever its arity.
+    if t.kind == 'func' {
+        if cgFuncSig(t) == '' { return '' }
+        return 'func'
+    }
     if t.kind != 'prim' { return '' }
     if t.name == 'int' { return 'int' }
     if t.name == 'float' { return 'float' }
@@ -4915,6 +5525,66 @@ text func cgReleaseStructFn(sname:text) {
 //
 // The trampoline is never cached the way the wrappers are: it is
 // needed exactly once, at the one site that generates it.
+// claude.md #184: the bridge between festina_array_sort's comparator
+// ABI -- `int(*)(const void*, const void*, void*)`, given a real
+// userdata slot from the start so this never needs a global -- and a
+// Festina `func[T,T]:int`. Cached per element type, because decoding
+// the two raw slots needs THIS type's own LLVM type and the indirect
+// call's argument types have to match the comparator exactly.
+text func cgSortTrampoline(ety:text) {
+    if CG_SORT_TRAMP[ety] != null { return CG_SORT_TRAMP[ety] }
+    text name = `@__festina_sortcmp_${cgUid()}`
+    CG_SORT_TRAMP[ety] = name
+    text elemLty = cgElemLty(ety)
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define i32 ${name}(ptr %a, ptr %b, ptr %userdata) {`)
+    cgBlockLabel('entry')
+    text av = cgTmp()
+    cgOut(`  ${av} = load ${elemLty}, ptr %a`)
+    text bv = cgTmp()
+    cgOut(`  ${bv} = load ${elemLty}, ptr %b`)
+    text r = cgTmp()
+    cgOut(`  ${r} = call i64 %userdata(${elemLty} ${av}, ${elemLty} ${bv})`)
+    text r32 = cgTmp()
+    cgOut(`  ${r32} = trunc i64 ${r} to i32`)
+    cgOut(`  ret i32 ${r32}`)
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
+// The same bridge for `map.forEach`: the runtime hands back a raw i64
+// and the key, and only the compiler knows what the i64 means. Never
+// cached -- the callback is part of the body, so two forEach calls
+// with different callbacks need two trampolines.
+text func cgMapForEachTrampoline(vty:text, cbName:text) {
+    text name = `@__festina_maptrampoline_${cgUid()}`
+    text vlty = cgElemLty(vty)
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define void ${name}(i64 %raw, ptr %key) {`)
+    cgBlockLabel('entry')
+    text v = cgMapFromI64('%raw', vlty)
+    cgOut(`  call void ${cbName}(${vlty} ${v}, ptr %key)`)
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
 text func cgMapReleaseTrampoline(vty:text) {
     text name = `@__festina_maprelease_${cgUid()}`
     // Resolved before the body's temps, because resolving it may
@@ -5388,6 +6058,10 @@ void func cgFunc(d:Node) {
                 cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${arg})`)
                 arg = owned
                 CG_PARAM_LIVE.push(`text|${slot}|`)
+                // Before the binding store, not after: a parameter's
+                // store IS the last thing its binding does, and the
+                // original registers it here. claude.md #236.
+                cgCleanupPush('text', slot, '')
             }
         } else if cgIsRefcounted(pftys[q]) {
             if escSet[pnames[q]] != null {
@@ -5399,6 +6073,7 @@ void func cgFunc(d:Node) {
                 // not end up sharing the caller's single claim on it.
                 cgOut(`  call void @festina_retain(ptr ${arg})`)
                 CG_PARAM_LIVE.push(`${pftys[q]}|${slot}|${petys[q]}${psnames[q]}`)
+                cgCleanupPush(pftys[q], slot, `${petys[q]}${psnames[q]}`)
             }
         }
         cgOut(`  store ${pltys[q]} ${arg}, ptr ${slot}`)
@@ -5437,7 +6112,43 @@ void func cgFunc(d:Node) {
 // ---------------------------------------------------------------------
 // The module.
 
+// claude.md #236: does this subtree contain a `try` anywhere -- inside
+// any function, handler, thread body or nested block? A generic walk
+// over every node's own fields, rather than a per-statement case list,
+// so a shape this port has not thought about cannot be missed.
+//
+// Only `try` counts, not `throw`: with no try anywhere a throw is
+// fail(), there is nothing to unwind to, and the cleanup stack would
+// be pure cost.
+bool func cgContainsTry(n:Node) {
+    if n == null { return false }
+    if n.kind == 'TryStmt' { return true }
+    int i = 0
+    while i < n.fields.length {
+        Field f = n.fields[i]
+        if f.tag == 'node' {
+            if cgContainsTry(f.node) { return true }
+        } else if f.tag == 'list' {
+            int j = 0
+            while j < f.list.length {
+                if cgContainsTry(f.list[j]) { return true }
+                j++
+            }
+        }
+        i++
+    }
+    return false
+}
+
 void func cgProgram(body:arr[Node], srcPath:text) {
+    // Decided once, up front, for the whole program: every function
+    // body emitted below needs to know it, and the first one emitted
+    // may well come before the try itself.
+    int tq = 0
+    while tq < body.length {
+        if cgContainsTry(body[tq]) { CG_HAS_TRY = true }
+        tq++
+    }
     cgEmit('; ModuleID = "festina"')
     cgEmit(`; generated from ${srcPath} -- claude.md #47`)
     int i = 0
@@ -5539,6 +6250,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 }
                 G_SLOT[gn] = `@${gn}`
                 G_FTY[gn] = gf
+                if gf == 'func' { G_ETY[gn] = cgFuncSig(resolveTypeField(d, 'type_expr')) }
             } else {
                 // A managed global's storage is its payload wrapped in
                 // a {refcount, payload} header, with the visible
@@ -5622,6 +6334,13 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                     pi++
                 }
                 FN_PARAMS[fname] = joined
+                // claude.md #141: and the whole signature, encoded, so
+                // a bare reference to this name can become a
+                // first-class VALUE with a callable type. Separate
+                // from FN_PARAMS because that one deliberately spells
+                // a non-scalar parameter as '' and a call through a
+                // value cannot.
+                FN_SIG[fname] = cgSigOfDeclNode(body[fs2])
             }
         }
         fs2++
@@ -5651,6 +6370,18 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     map[text] mainFty = {}
     L_SLOT = mainSlot
     L_FTY = mainFty
+    // claude.md #74 over main's own body, for the same reason every
+    // function gets it. What this reaches is a local declared inside a
+    // NESTED block at the top level -- `text row = a + b` in a
+    // top-level `while` -- which is an ordinary alloca and, without an
+    // escaping-name set, gets the wrong storage answer. Top-level
+    // declarations themselves are globals and are unaffected; the
+    // analysis input is the same whole-body statement list a function
+    // gets.
+    CG_ESC = findEscapingNames(body)
+    if ESC_UNKNOWN {
+        cgUnported(`escape analysis: expression ${ESC_UNKNOWN_KIND}`)
+    }
     cgOut('define void @__festina_main() {')
     cgBlockLabel('entry')
     CG_TERM = false

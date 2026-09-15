@@ -55,22 +55,20 @@ python bootstrap/canary.py                          # can the corpus still TELL?
 python bootstrap/canary.py --list
 ```
 
-Over the 113-file repository corpus:
+Over the 114-file repository corpus:
 
-- **lexer: 113 match, 0 differ.**
-- **parser: 113 match, 0 differ, 0 unported.**
-- **semantic: 113 match, 0 differ, 0 unported.**
-- **escape analysis: 94 match, 0 differ, 7 unported, 11 rejected by
-  both** — 1,716 of 1,769 records.
-- **codegen: 38 match, 0 differ, 64 unported, 11 rejected by both** —
-  250,007 of 278,447 file-specific IR lines.
-- **canaries: 61 registered — 57 caught as a diff, 4 through the
-  coverage ratchet, 0 missed, and 0 relying on a lone witness that is
-  not a `cases/` file.**
+- **lexer: 114 match, 0 differ.**
+- **parser: 114 match, 0 differ, 0 unported.**
+- **semantic: 114 match, 0 differ, 0 unported.**
+- **escape analysis: 96 match, 0 differ, 7 unported, 11 rejected by
+  both** — 1,778 of 1,831 records.
+- **codegen: 44 match, 0 differ, 59 unported, 11 rejected by both** —
+  262,764 of 289,230 file-specific IR lines.
+- **canaries: 71 registered, 0 missed.**
 
 **The bootstrap compiler reproduces its own compilation.** All ten of
 its files — the five passes and the five command-line drivers — emit
-byte-identical IR, 242,390 file-specific lines in total:
+byte-identical IR, 252,156 file-specific lines in total:
 
 | file | file-specific IR lines | | file | file-specific IR lines |
 | --- | --- | --- | --- | --- |
@@ -78,7 +76,7 @@ byte-identical IR, 242,390 file-specific lines in total:
 | `parser.f` | 13,139 | | `astdumpf.f` | 13,356 |
 | `semantic.f` | 20,651 | | `semdumpf.f` | 20,946 |
 | `escape.f` | 22,232 | | `escdumpf.f` | 23,988 |
-| `codegen.f` | 59,166 | | `irdumpf.f` | 59,567 |
+| `codegen.f` | 64,049 | | `irdumpf.f` | 64,450 |
 
 **And the fixed point closes.** Linking the IR the self-hosted compiler
 emits for `bootstrap/irdumpf.f` gives a second-generation binary that
@@ -94,9 +92,9 @@ figure.
 the two implementations agree; it says nothing about whether the corpus
 could tell them apart if they stopped agreeing — and for four
 consecutive slices of the codegen port, the honest answer was that it
-could not. `bootstrap/canary.py` holds sixty-one deliberate breakages,
-one per mechanism, and asks the corpus whether it notices: **57 caught
-as a diff, 4 through the coverage ratchet, 0 not caught.** A failure
+could not. `bootstrap/canary.py` holds seventy-one deliberate
+breakages, one per mechanism, and asks the corpus whether it notices:
+**0 not caught.** A failure
 there is not a compiler bug — it means a `cases/` file has drifted and
 the mechanism behind it is unmeasured, so the fix is a corpus file
 rather than a code change. See "Canaries" below.
@@ -115,9 +113,14 @@ The check earned its keep on the very next slice: three of
 decisions.md #313's six canaries came back caught-but-with-one-witness,
 and in each case the witness was a driver or a stress file rather than
 a `cases/` file. `cases/drivers.f` is the answer, and with it the
-whole registry is clean on this measure for the first time — eight
-canaries still have a single witness, and in every one of the eight it
-is the `cases/` file written for the mechanism.
+whole registry was clean on this measure for the first time.
+
+And it earned it again on the slice after, this time at full strength:
+one of decisions.md #314's canaries came back **NOT CAUGHT** outright
+— no file in the whole corpus had a `map[text]` with a `forEach` over
+it, so the reinterpretation that canary is about never happened — and
+four more had a single stress-file witness. `cases/escape_hatch.f`
+settles all five.
 
 The lexer lexes itself; the parser parses itself; the code generator
 compiles itself; and the whole compiler compiles the whole compiler.
@@ -168,7 +171,7 @@ anonymous send, which no corpus file uses.
 
 ## What the corpus does and doesn't prove
 
-The 113-file repository corpus is a strong oracle for ordinary code and
+The 114-file repository corpus is a strong oracle for ordinary code and
 a weak one for edge cases — it contains no ambiguous `/` at all, and
 block comments appear in exactly one file. `cases/` closes that, and
 its own coverage is checked rather than assumed: deleting the
@@ -312,7 +315,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 250,007 of 278,447 file-specific IR lines
+## Codegen: 262,764 of 289,230 file-specific IR lines
 
 About 14,500 lines of Python, more than everything ported so far
 combined, and begun rather than finished. It depends on no language
@@ -381,8 +384,8 @@ times and so could not have varied either way.
 
 **The proportion turned over, and then kept going.** Four slices ago it
 was 3,715 of 4,849 — three quarters from `cases/` files written for the
-slices that claimed them. It is now **6,412 of 250,007, under three per
-cent**, because the bootstrap's own ten files contribute 242,390 lines
+slices that claimed them. It is now **7,429 of 262,764, under three per
+cent**, because the bootstrap's own ten files contribute 252,156 lines
 between them of programs written to be a compiler rather than to be
 measured.
 
@@ -393,11 +396,12 @@ mechanism with one witness. The `cases/` files are small precisely so
 that each one's coverage is deliberate; see the canary note above for
 what happened when a slice's mechanisms were left to `codegen.f` alone.
 
-The twelve largest case files are `owning_containers.f` (889),
-`owning_elements.f` (652), `blobs_and_scopes.f` (597), `drivers.f`
-(565), `escape_locals.f` (538), `maps.f` (521), `text_building.f`
-(418), `nulls.f` (393), `array_literals.f` (379), `struct_fields.f`
-(348), `indexing.f` (252) and `conversions.f` (252). Non-scalar parameters were the one slice
+The twelve largest case files are `escape_hatch.f` (1,017),
+`owning_containers.f` (889), `owning_elements.f` (652),
+`blobs_and_scopes.f` (597), `drivers.f` (565), `escape_locals.f`
+(538), `maps.f` (521), `text_building.f` (418), `nulls.f` (393),
+`array_literals.f` (379), `struct_fields.f` (348) and `indexing.f`
+(252). Non-scalar parameters were the one slice
 so far to bring in pre-existing files instead: `examples/geometry.f`
 and `examples/multifile.f`, the two the blocker table listed as one
 construct away. Struct fields and container globals
@@ -488,7 +492,7 @@ are the ones worth knowing about.
 
 The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
-**242,390 of the 278,447 file-specific IR lines**, and they need none
+**252,156 of the 289,230 file-specific IR lines**, and they need none
 of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the

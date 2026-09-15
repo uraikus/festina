@@ -6381,3 +6381,31 @@ That ordering is also what keeps the suite affordable. Re-dumping the whole matc
 **Six new canaries, all caught: five as diffs and one through the ratchet. 61 in total.** Three of the five take `cases/drivers.f` as a witness; the other two are witnessed by two drivers each, which is what the two-witness bar asks for. `argv` is necessarily the ratchet one — leaving the registration out does not produce a wrong compiler, it produces one that cannot see the name, and there is no "wrong argv" that still compiles.
 
 **Verified.** Lexer 113/113, parser 113/113, semantic 113/113, escape analysis 94 match with 1,716 of 1,769 records, codegen 38 match and 0 differ. All ten bootstrap files self-host and the generation-2 binary is byte-identical. All 61 canaries caught — 57 as diffs, 4 through the ratchet — and for the first time NONE relies on a lone witness that is not a `cases/` file: eight have a single witness and in every one it is the file written for the mechanism. `cases/drivers.f` is valgrind-clean. Full suite: 2,812 passed, 36 failed — the environment's own baseline (24 graphics tests with no window manager, 12 leak-stress tests whose ASan link cannot resolve `festina_register_tls_hooks`), identical to what the pristine tree produces.
+
+314. THE ESCAPE HATCH, FUNCTION VALUES, AND RECOVERY
+
+Three language features that turned out to share a mechanism, and the first slice of the subsystems. **262,764 of 289,230 file-specific IR lines, up from 250,007 -- 90.8% -- and 44 files match, 0 differ.**
+
+**`free`/`clear`, and why the null store is half the design.** `free name` releases what the binding holds and then NULLS it. Every release in this runtime is null-safe, so the automatic scope-exit release that later visits the same binding finds null and does nothing: manual and automatic reclamation coexist with no bookkeeping between them, `free x` twice is a no-op rather than a double free, and use-after-free THROUGH THAT BINDING is impossible, because reading it afterwards reads the ordinary absent value. `clear` is the same statement with zeroing, and the intent cannot ride on the call site -- a release runs a cascade the site does not walk, so it travels as runtime state set around the whole cascade.
+
+**And one line in the escape analysis is what makes `free` safe rather than merely implemented.** A `free` target is treated as escaping, which forces the binding onto the heap behind a real refcount header; calling a refcounted release on a frame address underflows into the stack frame.
+
+**Which found that `__festina_main` had never had escape analysis at all.** Every function body gets it; main's own body did not, so a local declared in a NESTED block at the top level -- `text row = a + b` in a top-level `while`, the shape a game loop is written in -- got the wrong storage answer. Invisible until a top-level `clear` needed the heap.
+
+**First-class function values, which gate more than they look like.** `.sort()`, `.forEach()`, `.callback()`, arrow functions and calls through a computed member all need one. A function value is a bare LLVM pointer -- never allocated, never freed, no refcount, because a declared function is immortal for the process's lifetime -- so it rides every SCALAR-shaped path unchanged, and a bare reference to a function's name is its own global symbol with no address-of step and nothing to load.
+
+**A type had to become a string, a second time.** #311 spelled `arr[T]` as `arr:T` because the port keys releases on `(fty, ety)`. A `func[int,int]:int` has the same problem and the same answer: the signature is encoded into the one element-type slot a binding gets, parameters as `fty:key` joined by `;` with the return after `|`, decodable by `.split()` alone.
+
+**`.sort()` and `.forEach()` reach Festina code through GENERATED trampolines, and what each one does is the whole mechanism.** The comparator trampoline decodes two raw slots as THIS element type -- a `text` array and an `int` array need different ones, and one that assumed i64 would read a pointer as an integer. The forEach trampoline reinterprets a raw i64 as this map's value type. The runtime knows neither, and only the compiler does.
+
+**`try` changes the whole program, not just its own body.** A throw unwinds frames that never heard of it, so with a `try` anywhere every tracked binding ANYWHERE registers itself on a runtime cleanup stack as it is bound, paired with a generated function that releases it THROUGH ITS SLOT -- so a binding reassigned before the throw releases what it holds then, and one nulled by `free` releases nothing. A program with no `try` pays literally nothing: the IR is unchanged.
+
+**And the push is not where the tracking is.** A text LOCAL's cleanup-stack push comes after its initializer's store, because the original tracks a local only once its whole declaration statement has been emitted; a PARAMETER's comes before, its binding store being the last thing that happens. Neither order is derivable from the other and the difference is visible in the IR, so both are spelled out.
+
+**A thrown text that ALIASES a local is copied first**, because the unwinding is about to release that local and the message has to outlive it.
+
+**A canary went AMBIGUOUS rather than stale, which is the other half of that check working.** `call-frees-owning-arguments` was aimed at one call site; claude.md #141 gave calls a second form, and the anchor matched both. Re-aimed at the shared helper, which is where the mechanism always was.
+
+**Ten new canaries. 71 in total.** One -- the forEach trampoline's reinterpretation -- came back NOT CAUGHT on its first run: no file in the corpus had a `map[text]` with a `forEach` over it, so the reinterpretation the mechanism is about never happened. That is the check working, not the compiler failing, and `cases/escape_hatch.f` is the answer. Four more came back caught-but-with-one-witness, in every case a stress file rather than a `cases/` one, which the same file also settles.
+
+**Verified.** Lexer 114/114, parser 114/114, semantic 114/114, escape analysis 96 match with 1,778 of 1,831 records, codegen 44 match and 0 differ. All ten bootstrap files still self-host. `cases/escape_hatch.f` is valgrind-clean.

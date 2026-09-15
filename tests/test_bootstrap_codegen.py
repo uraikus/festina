@@ -494,6 +494,67 @@ class TestTheCoverageNumberIsHonest:
             "nothing reclaimed, so an element write that leaked the "
             "value it replaced would go unnoticed")
 
+    def test_the_escape_hatch_case_really_has_all_seven_mechanisms(self):
+        """`cases/escape_hatch.f` carries the three things a program
+        does when it wants to decide something for itself: reclaim by
+        hand, pass a function around, and recover from an error.
+
+        They share a mechanism, which is why they share a file. `free`
+        marks its target as ESCAPING -- calling a refcounted release on
+        a frame address underflows into the stack frame -- and `try`
+        makes every tracked binding in the WHOLE program register
+        itself for unwinding, because a throw crosses frames that know
+        nothing about it.
+        """
+        dump = irdump.dump_file("bootstrap/cases/escape_hatch.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/escape_hatch.f no longer compiles, so it measures "
+            "nothing at all: " + dump[0])
+        body = "\n".join(dump)
+        # 1 and 2: free nulls, and clear goes through the flag.
+        assert "store ptr null, ptr %gone" in body, (
+            "no null store after a free, so a second free would be a "
+            "double free and nothing here would notice")
+        assert "@festina_begin_clearing()" in body, (
+            "no clear, so nothing distinguishes it from a plain free")
+        assert "@festina_clear_text(" in body, "no cleared text local"
+        # 3: a freed binding is on the heap, not in the frame.
+        assert "%owned.storage." not in body, (
+            "the freed container local is frame-allocated, so releasing "
+            "it would underflow into the frame -- the escape rule that "
+            "makes `free` safe is not being applied")
+        # 4: a function name as a value.
+        assert "store ptr @byAsc" in body, (
+            "no function value stored, so the global-symbol-is-the-value "
+            "rule is unmeasured")
+        # 5: both trampoline families.
+        assert any(line.startswith("define i32 @__festina_sortcmp_")
+                   for line in dump), "no comparator trampoline"
+        assert any(line.startswith("define void @__festina_maptrampoline_")
+                   for line in dump), "no forEach trampoline"
+        # 6: the cleanup stack, and the catch frame.
+        assert "@festina_try_push(" in body, "no try"
+        assert "@festina_try_pop()" in body, (
+            "no catch-frame pop, so a later unrelated throw could land "
+            "back in a stale catch block")
+        assert "@festina_cleanup_push(" in body, (
+            "no unwind registration, so a throw would walk past every "
+            "live local without releasing it")
+        assert "@festina_cleanup_pop_n(" in body, (
+            "nothing popped, so the cleanup stack would grow without "
+            "bound on every ordinary exit")
+        assert any(line.startswith("define void @__festina_unwind_")
+                   for line in dump), "no unwind function generated"
+        # 7: the thrown message is copied off its alias.
+        # The CALL, not the declaration at the top of the module --
+        # which is what this found first on the way in.
+        throw_at = next(i for i, line in enumerate(dump)
+                        if "call void @festina_throw(" in line)
+        assert any("@festina_text_own(" in line
+                   for line in dump[max(0, throw_at - 4):throw_at]), (
+            "the thrown message is handed over without an owning copy, "
+            "so the unwinding would free it out from under the catch")
+
     def test_the_driver_case_really_has_all_six_mechanisms(self):
         """`cases/drivers.f` carries what a program needs to be a
         COMMAND, and the two scope bugs only a command reaches.
@@ -660,7 +721,8 @@ class TestTheCoverageNumberIsHonest:
                                       "nulls.f",
                                       "blobs_and_scopes.f",
                                       "owning_containers.f",
-                                      "drivers.f"])
+                                      "drivers.f",
+                                      "escape_hatch.f"])
     def test_the_container_cases_really_run(self, compile_and_run, case):
         """The two container case files are PROGRAMS, not only sources
         of IR, and this runs them to prove it.
@@ -771,6 +833,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 250007, (
+        assert reproduced >= 262764, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 250007")
+            f"the port previously emitted at least 262764")

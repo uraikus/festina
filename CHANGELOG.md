@@ -97,9 +97,9 @@ round-by-round design and implementation record predating 0.1 lives in
 
 - **`bootstrap/escape.f`** — `festina/escape_analysis.py` ported to
   Festina, the fifth module the codegen port turned out to need and one
-  that was not in its original estimate: **94 of 113 corpus files
+  that was not in its original estimate: **96 of 114 corpus files
   produce an identical record sequence, 0 differ, 7 not yet ported, 11
-  rejected by both** — 1,716 of 1,769 records. It decides whether every
+  rejected by both** — 1,778 of 1,831 records. It decides whether every
   container and struct local lives in the frame or behind a heap
   refcount header, so the codegen port cannot emit one without agreeing
   here first. The ORDER bodies are analyzed in is part of the answer
@@ -111,9 +111,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage: **38 of 113 corpus files emit
-  byte-identical LLVM IR, 0 differ, 64 not yet ported, 11 rejected by
-  both** — 250,007 of 278,447 file-specific IR lines. **The bootstrap
+  the fourth and last stage: **44 of 114 corpus files emit
+  byte-identical LLVM IR, 0 differ, 59 not yet ported, 11 rejected by
+  both** — 262,764 of 289,230 file-specific IR lines. **The bootstrap
   compiler reproduces its own compilation**: all ten of its files —
   `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
   `escape.f` (22,232), `codegen.f` (59,166) and the five command-line
@@ -172,19 +172,22 @@ round-by-round design and implementation record predating 0.1 lives in
   scope rules a driver is the first program to reach — a managed
   declaration inside a function is local even when a global shares its
   name, and `__festina_main` gets a fresh local scope rather than
-  inheriting the last function's. `bootstrap/irdump.py` and
+  inheriting the last function's. And the manual escape hatch
+  (`free`/`clear`), first-class function values with `.sort()` and
+  `.forEach()`, and `try`/`catch`/`throw` — which changes the whole
+  program, registering every tracked binding anywhere on a runtime
+  cleanup stack so a throw can unwind frames that never heard of it. `bootstrap/irdump.py` and
   `bootstrap/irdiff.py` run the comparison; the oracle is the IR text
   itself, so it needed no canonical form of its own (decisions.md
-  #289–#313).
+  #289–#314).
 
 - **`bootstrap/canary.py` — the breakages the harness is supposed to
   catch, as a test rather than as prose.** A green differential run says
   the two implementations agree; it says nothing about whether the
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
-  not. Sixty-one deliberate breakages, one per mechanism, re-run by
-  `tests/test_bootstrap_canary.py`: **57 caught as a diff, 4 through
-  the coverage ratchet, 0 not caught**. And "caught" is
+  not. Seventy-one deliberate breakages, one per mechanism, re-run by
+  `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
   no longer the whole verdict: a canary looks for TWO independent
   witnesses and reports a lone one in its own output, because
   decisions.md #312's seven canaries all fired and all seven fired on

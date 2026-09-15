@@ -354,9 +354,15 @@ CANARIES = [
     Canary(
         "call-frees-owning-arguments", "#311",
         "a call borrows its arguments, so an owning one is the caller's to reclaim",
-        """        cgFreeCallArgs(args, argVals)
-        return cgVal('', 'void', 'void')""",
-        """        return cgVal('', 'void', 'void')""",
+        # Aimed at the shared helper rather than at one call site:
+        # claude.md #141 gave calls a SECOND form (indirect, through a
+        # function value), and a canary pinned to the direct site alone
+        # went ambiguous the moment the second one appeared. The
+        # mechanism was always the helper.
+        """void func cgFreeCallArgs(args:arr[Node], vals:arr[Val]) {
+    int i = 0""",
+        """void func cgFreeCallArgs(args:arr[Node], vals:arr[Val]) {
+    int i = vals.length""",
     ),
     Canary(
         "discarded-result-released", "#311",
@@ -729,6 +735,93 @@ CANARIES = [
         "a release trampoline",
         """    if cgElemOwnsSomething(obj.ety) { delFn = cgMapReleaseTrampoline(obj.ety) }""",
         """    if false { delFn = cgMapReleaseTrampoline(obj.ety) }""",
+    ),
+
+    # --- decisions.md #314: the escape hatch, function values, try ----
+    Canary(
+        "free-nulls-the-binding", "#314",
+        "`free` nulls the binding, which is what makes it composable "
+        "with automatic reclamation",
+        """        cgOut(`  store ptr null, ptr ${slot}`)
+        return
+    }
+    cgOut(`  store ${lty} ${cgNullValue(fty)}, ptr ${slot}`)""",
+        """        return
+    }
+    cgOut(`  store ${lty} ${cgNullValue(fty)}, ptr ${slot}`)""",
+    ),
+    Canary(
+        "clear-is-not-free", "#314",
+        "`clear` zeroes through the runtime's clearing flag; `free` "
+        "does not",
+        """            if zeroing { cgOut('  call void @festina_begin_clearing()') }""",
+        """            if false { cgOut('  call void @festina_begin_clearing()') }""",
+    ),
+    Canary(
+        "main-gets-escape-analysis", "#314",
+        "a local declared in a nested block at the TOP level gets the "
+        "same storage answer a function's does",
+        """    CG_ESC = findEscapingNames(body)""",
+        """    map[int] noEsc = {}
+    CG_ESC = noEsc""",
+    ),
+    Canary(
+        "function-name-is-a-value", "#314",
+        "a bare reference to a function's name is its own global symbol",
+        """                    Val fv = cgVal(`@${name}`, 'ptr', 'func')""",
+        """                    Val fv = cgVal('null', 'ptr', 'func')""",
+    ),
+    Canary(
+        "sort-trampoline-decodes-the-element", "#314",
+        "the comparator trampoline decodes both raw slots as THIS "
+        "element type",
+        """    text elemLty = cgElemLty(ety)
+
+    arr[text] saved = CUR""",
+        """    text elemLty = 'i64'
+
+    arr[text] saved = CUR""",
+    ),
+    Canary(
+        "foreach-trampoline-reinterprets", "#314",
+        "a map forEach trampoline reinterprets the raw i64 into the "
+        "map's own value type",
+        """    text v = cgMapFromI64('%raw', vlty)
+    cgOut(`  call void ${cbName}(${vlty} ${v}, ptr %key)`)""",
+        """    text v = '%raw'
+    cgOut(`  call void ${cbName}(${vlty} ${v}, ptr %key)`)""",
+    ),
+    Canary(
+        "try-pushes-the-catch-frame", "#314",
+        "a try body registers its setjmp buffer as the top catch frame",
+        """    cgOut(`  call void @festina_try_push(ptr ${bufp})`)""",
+        """    cgOut(`  ; no try push for ${bufp}`)""",
+    ),
+    Canary(
+        "try-frame-popped-on-every-exit", "#314",
+        "every exit from a try body pops the runtime's catch frame",
+        """        if CG_SKIP_TRY_POP == false { cgOut('  call void @festina_try_pop()') }""",
+        """        if false { cgOut('  call void @festina_try_pop()') }""",
+    ),
+    Canary(
+        "cleanup-stack-tracks-every-binding", "#314",
+        "with a try in the program, every tracked binding is registered "
+        "for unwinding as it is bound",
+        """    if CG_HAS_TRY {
+        cgOut(`  call void @festina_cleanup_push(ptr ${slot}, ptr ${cgUnwindFn(kind, ety)})`)
+    }""",
+        "",
+    ),
+    Canary(
+        "throw-owns-an-aliased-message", "#314",
+        "a thrown text that aliases a local is copied before the "
+        "unwinding releases it",
+        """        if cgOwnsText(ex, v) == false {
+            text owned = cgTmp()
+            cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${val})`)
+            val = owned
+        }""",
+        "",
     ),
 
     Canary(
