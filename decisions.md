@@ -6409,3 +6409,29 @@ Three language features that turned out to share a mechanism, and the first slic
 **Ten new canaries. 71 in total.** One -- the forEach trampoline's reinterpretation -- came back NOT CAUGHT on its first run: no file in the corpus had a `map[text]` with a `forEach` over it, so the reinterpretation the mechanism is about never happened. That is the check working, not the compiler failing, and `cases/escape_hatch.f` is the answer. Four more came back caught-but-with-one-witness, in every case a stress file rather than a `cases/` one, which the same file also settles.
 
 **Verified.** Lexer 114/114, parser 114/114, semantic 114/114, escape analysis 96 match with 1,778 of 1,831 records, codegen 44 match and 0 differ. All ten bootstrap files still self-host. `cases/escape_hatch.f` is valgrind-clean.
+
+315. NESTING, HANDLES, AND PATTERNS
+
+The second slice of the subsystems. **269,178 of 294,353 file-specific IR lines, up from 262,764 -- 91.4% -- and 50 files match, 0 differ.** All ten bootstrap files still self-host.
+
+**A container of containers.** An `arr[arr[int]]`'s slots hold whole references even though `int` owns nothing, so the array needs a generated cascade and each slot is RELEASED as the container it is rather than freed as a buffer. The element type is spelled with the same `arr:T` key #311 introduced for release caching, and a colon is what tells one from a scalar or a struct name -- a third use for that one encoding.
+
+**Which made the ownership question per-element rather than per-struct.** Four sites asked `SF_NAMES[ety] != null` -- "is this element a struct?" -- when the question they meant was "does this element hold a reference?". A nested container answers yes to the second and no to the first.
+
+**Timers, and what makes a program use them.** `setTimeout`/`setInterval` hand a declared function's own symbol to the runtime and answer an id. Only those two make a program "use timers": clearing alone schedules nothing, so a program that only ever clears needs no loop to wait in -- the same "only pay for what you use" rule the graphics loader follows. The shutdown handler travels with the loop, because the loop is what polls for a shutdown request.
+
+**A handle's `save()` with no argument passes a NULL path**, which is how the runtime is told to use the path the handle already carries. An empty string would be a different instruction.
+
+**A `/pattern/` literal is compiled once per call site and MARKED.** The same node always yields the same automaton, so recompiling on every arrival is waste -- but the cached value is shared by every later execution of that line, so `free` on a binding aliasing it must not free it. The VALUE carries the answer rather than the call site, which is what lets the release be an ordinary no-op.
+
+**And it is FRESH for a store but not an owning source for a RELEASE.** Not because it was allocated there: retain and release are both no-ops on something immortal, so skipping the retain is simply the cheaper right answer. The original keeps those two predicates apart deliberately, and the port had conflated them into one `Val.fresh` flag -- which is correct at every store site and would have been wrong at a release site, had one been reachable. Written down rather than papered over.
+
+**`regex(p, f)` is MEMOIZED, not cached.** The pattern is an arbitrary runtime expression, so the same site can legitimately see a different one each time and caching by site would serve the first pattern forever. The runtime remembers what this site compiled last and recompiles on a mismatch.
+
+**A regex split takes its arguments the other way round** -- pattern first, subject second -- unlike a text split.
+
+**Another canary went stale**, and again from a widening rather than a move: `split-receiver-not-freed` was anchored to the two frees at the end of `.split()`, and a regex separator added a third.
+
+**Ten new canaries. 81 in total.**
+
+**Verified.** Lexer 115/115, parser 115/115, semantic 115/115, escape analysis 97 match with 1,800 of 1,853 records, codegen 50 match and 0 differ. `cases/handles_and_nesting.f` is valgrind-clean.

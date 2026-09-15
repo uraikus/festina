@@ -494,6 +494,55 @@ class TestTheCoverageNumberIsHonest:
             "nothing reclaimed, so an element write that leaked the "
             "value it replaced would go unnoticed")
 
+    def test_the_handles_case_really_has_all_six_mechanisms(self):
+        """`cases/handles_and_nesting.f`: four unrelated-looking
+        mechanisms that share one property -- each is a case where the
+        TYPE decides something the value cannot say for itself.
+
+        A nested container's slots hold whole references while an
+        `arr[int]`'s hold nothing. A regex literal is immortal while a
+        `regex(p, f)` result is not. A scheduled callback needs a loop
+        that a cleared one does not. And a handle's no-argument
+        `save()` means "the path you already have", which only a null
+        can spell.
+        """
+        dump = irdump.dump_file("bootstrap/cases/handles_and_nesting.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/handles_and_nesting.f no longer compiles, so it "
+            "measures nothing at all: " + dump[0])
+        body = "\n".join(dump)
+        # 1: a nested element is released as a container, not freed.
+        assert "@festina_release_array(ptr" in body, (
+            "no nested container element released, so an arr[arr[T]] "
+            "whose slots were freed as buffers would go unnoticed")
+        assert any(line.startswith("define void @__festina_release_array_")
+                   for line in dump), (
+            "no generated cascade, so nothing shows a nested element "
+            "needing one")
+        # 2 and 3: a literal is cached and marked; regex() is memoized.
+        assert "@.regex.cache." in body, "no cached regex literal"
+        assert "@festina_regex_mark_cached(" in body, (
+            "the cached compilation is not marked, so `free` on a "
+            "binding aliasing it would free what every later execution "
+            "of that line shares")
+        assert "@.regex.memo." in body, (
+            "no dynamic regex(), so nothing distinguishes memoizing "
+            "from caching")
+        assert "@festina_regex_compile_memo(" in body
+        # 4: the two splits, and their opposite argument orders.
+        assert "@festina_regex_split(" in body, "no split by regex"
+        assert "@festina_text_split(" in body, (
+            "no split by text, so the argument order that differs "
+            "between them is unmeasured")
+        # 5: scheduling, clearing, and the loop.
+        assert "@festina_set_timeout(" in body and "@festina_set_interval(" in body
+        assert "@festina_clear_timeout(" in body and "@festina_clear_interval(" in body
+        assert "@festina_run_timer_loop()" in body, (
+            "no timer loop, so the scheduled callbacks would never "
+            "fire and nothing here would notice")
+        # 6: both save spellings.
+        assert "@festina_blob_save_copy(ptr" in body, "no saveCopy"
+
     def test_the_escape_hatch_case_really_has_all_seven_mechanisms(self):
         """`cases/escape_hatch.f` carries the three things a program
         does when it wants to decide something for itself: reclaim by
@@ -722,7 +771,8 @@ class TestTheCoverageNumberIsHonest:
                                       "blobs_and_scopes.f",
                                       "owning_containers.f",
                                       "drivers.f",
-                                      "escape_hatch.f"])
+                                      "escape_hatch.f",
+                                      "handles_and_nesting.f"])
     def test_the_container_cases_really_run(self, compile_and_run, case):
         """The two container case files are PROGRAMS, not only sources
         of IR, and this runs them to prove it.
@@ -833,6 +883,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 262764, (
+        assert reproduced >= 269178, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 262764")
+            f"the port previously emitted at least 269178")

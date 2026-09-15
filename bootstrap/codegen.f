@@ -891,6 +891,9 @@ text func cgLtyOf(fty:text) {
     // field, array element, map value, argument passing) unchanged,
     // with no refcount, no tracking and no release.
     if fty == 'func' { return 'ptr' }
+    // A regex is a handle, like a blob: one pointer, no payload of its
+    // own that codegen lays out.
+    if fty == 'regex' { return 'ptr' }
     return ''
 }
 
@@ -1057,6 +1060,7 @@ text func cgManagedFty(t:Ty) {
     // instead of codegen generating it per type.
     if t.kind == 'prim' {
         if t.name == 'blob' { return 'blob' }
+        if t.name == 'regex' { return 'regex' }
     }
     return ''
 }
@@ -1217,6 +1221,20 @@ bool CG_HAS_TRY = false
 // Set only while a THROW emits its own scope walk, so a try-frame
 // marker in the range is left alone. See cgFreeOne.
 bool CG_SKIP_TRY_POP = false
+
+// Module-level globals a call SITE needs -- a regex literal's cached
+// compilation, a dynamic regex()'s memo slot. They are emitted in
+// their own section between the ordinary globals and the function
+// definitions, and numbered in the order the sites are reached.
+arr[text] CG_EXTRA = []
+int CG_REGEX_CACHES = 0
+int CG_REGEX_MEMOS = 0
+
+// claude.md #116: whether any setTimeout/setInterval call was emitted.
+// Only the SCHEDULING pair sets it -- clearing alone schedules
+// nothing, so a program that only ever clears needs no loop to wait
+// in, the same "only pay for what you use" rule loadImage() follows.
+bool CG_USES_TIMERS = false
 
 // The function currently being emitted, and its return type. A
 // `return null` takes its type from the signature rather than from
@@ -1495,6 +1513,20 @@ Val func cgExpr(e:Node) {
         return cgVal(t, lty, fty)
     }
 
+    // claude.md #67: a /pattern/flags literal compiles to the same
+    // automaton every time this line is reached, so the compilation is
+    // cached in a private global filled on first arrival. The cached
+    // value is also MARKED, because `free` on a binding aliasing it
+    // must not free something every later execution of this line
+    // shares -- the value carries the answer, so festina_regex_free
+    // can no-op on it.
+    //
+    // Deliberately NOT extended to `regex(p, f)`: there the pattern is
+    // an arbitrary runtime expression, so the same site can
+    // legitimately see a different one each time, and caching by site
+    // would silently keep serving the first pattern forever.
+    if e.kind == 'RegexLit' { return cgRegexLit(e) }
+
     if e.kind == 'BinOp' { return cgBinOp(e) }
     if e.kind == 'LogicalOp' { return cgLogical(e) }
     if e.kind == 'UnaryOp' { return cgUnary(e) }
@@ -1505,6 +1537,45 @@ Val func cgExpr(e:Node) {
 
     cgUnported(`expression ${e.kind}`)
     return none
+}
+
+Val func cgRegexLit(e:Node) {
+    text cache = `@.regex.cache.${CG_REGEX_CACHES}`
+    CG_REGEX_CACHES = CG_REGEX_CACHES + 1
+    CG_EXTRA.push(`${cache} = private global ptr null`)
+
+    text loaded = cgTmp()
+    cgOut(`  ${loaded} = load ptr, ptr ${cache}`)
+    text isNull = cgTmp()
+    cgOut(`  ${isNull} = icmp eq ptr ${loaded}, null`)
+    text compileL = cgLabel('regex.compile')
+    text doneL = cgLabel('regex.done')
+    cgOut(`  br i1 ${isNull}, label %${compileL}, label %${doneL}`)
+    text loadPred = CG_BLOCK
+
+    cgBlockLabel(compileL)
+    text pat = cgStringConst(rawText(e, 'pattern'))
+    text flg = cgStringConst(rawText(e, 'flags'))
+    text compiled = cgTmp()
+    cgOut(`  ${compiled} = call ptr @festina_regex_compile(ptr ${pat}, ptr ${flg})`)
+    cgOut(`  call void @festina_regex_mark_cached(ptr ${compiled})`)
+    cgOut(`  store ptr ${compiled}, ptr ${cache}`)
+    text compilePred = CG_BLOCK
+    cgOut(`  br label %${doneL}`)
+
+    cgBlockLabel(doneL)
+    text out = cgTmp()
+    cgOut(`  ${out} = phi ptr [ ${loaded}, %${loadPred} ], [ ${compiled}, %${compilePred} ]`)
+    // claude.md #118: a literal's compilation is FRESH for the purpose
+    // of a store -- not because it was allocated here, but because it
+    // is immortal, so retain and release are both no-ops on it and the
+    // cheaper answer is the right one. It is deliberately NOT an
+    // owning source for a RELEASE: the original keeps those two
+    // predicates apart, and only a `regex(p, f)` CALL result is
+    // released where it is used (cgFreeRegexTemp).
+    Val rv = cgVal(out, 'ptr', 'regex')
+    rv.fresh = true
+    return rv
 }
 
 Val func cgBinOp(e:Node) {
@@ -1896,7 +1967,7 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
     arr[int] owned = []
     int i = 0
     while i < elems.length {
-        Val v = cgExprExpecting(elems[i], ety, '')
+        Val v = cgExprExpectingElem(elems[i], ety)
         if CG_STUCK { return none }
         if cgValIsElem(v, ety) == false {
             cgUnported(`array literal element of type ${v.fty} in an array of ${ety}`)
@@ -1904,7 +1975,7 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
         }
         vals.push(v.v)
         bool isOwning = cgOwnsText(elems[i], v)
-        if SF_NAMES[ety] != null { isOwning = cgIsOwningRefcountedSource(elems[i]) }
+        if cgElemIsRefcounted(ety) { isOwning = cgIsOwningRefcountedSource(elems[i]) }
         if isOwning { owned.push(1) } else { owned.push(0) }
         i++
     }
@@ -2585,10 +2656,7 @@ Val func cgIndexRead(e:Node, obj:Val) {
     cgOut(`  ${slot} = getelementptr ${elemLty}, ptr ${dataV}, i64 ${idx.v}`)
     text out = cgTmp()
     cgOut(`  ${out} = load ${elemLty}, ptr ${slot}`)
-    if SF_NAMES[obj.ety] != null {
-        return cgMintAndReleaseComputed(e, cgStructVal(out, obj.ety), obj)
-    }
-    return cgMintAndReleaseComputed(e, cgVal(out, elemLty, obj.ety), obj)
+    return cgMintAndReleaseComputed(e, cgElemVal(out, obj.ety), obj)
 }
 
 // Every member access, computed or not, dispatched on the receiver's
@@ -3265,17 +3333,22 @@ Val func cgMethodCall(e:Node, callee:Node) {
         }
         Val sep = cgExpr(args[0])
         if CG_STUCK { return none }
-        if sep.fty != 'text' {
-            // A regex separator goes to festina_regex_split instead,
-            // which is a different call and a different temporary to
-            // reclaim; `regex` is not ported at all yet.
+        if sep.fty != 'text' && sep.fty != 'regex' {
             cgUnported(`.split() by ${sep.fty}`)
             return none
         }
         text out = cgTmp()
-        cgOut(`  ${out} = call ptr @festina_text_split(ptr ${r.v}, ptr ${sep.v})`)
+        // A regex separator is a different call with its arguments the
+        // other way round -- the pattern first, the subject second --
+        // and a different temporary to reclaim.
+        if sep.fty == 'regex' {
+            cgOut(`  ${out} = call ptr @festina_regex_split(ptr ${sep.v}, ptr ${r.v})`)
+        } else {
+            cgOut(`  ${out} = call ptr @festina_text_split(ptr ${r.v}, ptr ${sep.v})`)
+        }
         cgFreeTextTemp(recv, r)
         cgFreeTextTemp(args[0], sep)
+        cgFreeRegexTemp(args[0], sep)
         return cgArrVal(out, 'text')
     }
     if m == 'join' && args.length == 1 {
@@ -3299,6 +3372,100 @@ Val func cgMethodCall(e:Node, callee:Node) {
         cgOut(`  ${out} = call ptr @festina_arr_join(ptr ${r.v}, ptr ${sep.v}, ptr ${cgStringConst(r.ety)})`)
         cgFreeTextTemp(args[0], sep)
         return cgVal(out, 'ptr', 'text')
+    }
+
+    // claude.md #67/#68/#107: the regex trio. `pattern.test(value)`,
+    // `value.match(pattern)` and `value.replace(search, replacement)`
+    // -- note that test's receiver is the PATTERN and match's is the
+    // text, which is the original's asymmetry rather than a slip.
+    //
+    // How many matches a replace touches is not decided here: a regex
+    // carries its own `g` flag and the runtime reads it, while a text
+    // search has no flags and replaces the first match only. There is
+    // nothing left for codegen to pass, which is the point -- the old
+    // constant argument could never have said "global" for a pattern
+    // built at runtime.
+    if m == 'test' && args.length == 1 {
+        Val rx = cgExpr(recv)
+        if CG_STUCK { return none }
+        if rx.fty == 'regex' {
+            Val sv = cgExpr(args[0])
+            if CG_STUCK { return none }
+            text tout = cgTmp()
+            cgOut(`  ${tout} = call i8 @festina_regex_test(ptr ${rx.v}, ptr ${sv.v})`)
+            cgFreeTextTemp(args[0], sv)
+            cgFreeRegexTemp(recv, rx)
+            return cgVal(tout, 'i8', 'bool')
+        }
+        cgUnported(`.test() on ${rx.fty}`)
+        return none
+    }
+    if m == 'match' && args.length == 1 {
+        Val sv = cgExpr(recv)
+        if CG_STUCK { return none }
+        if sv.fty == 'text' {
+            Val rx = cgExpr(args[0])
+            if CG_STUCK { return none }
+            text mout = cgTmp()
+            cgOut(`  ${mout} = call ptr @festina_regex_match(ptr ${rx.v}, ptr ${sv.v})`)
+            cgFreeTextTemp(recv, sv)
+            cgFreeRegexTemp(args[0], rx)
+            return cgVal(mout, 'ptr', 'text')
+        }
+        cgUnported(`.match() on ${sv.fty}`)
+        return none
+    }
+    if m == 'replace' && args.length == 2 {
+        Val sv = cgExpr(recv)
+        if CG_STUCK { return none }
+        if sv.fty == 'text' {
+            Val needle = cgExpr(args[0])
+            if CG_STUCK { return none }
+            Val repl = cgExpr(args[1])
+            if CG_STUCK { return none }
+            text rout2 = cgTmp()
+            if needle.fty == 'regex' {
+                cgOut(`  ${rout2} = call ptr @festina_regex_replace(ptr ${needle.v}, ptr ${sv.v}, ptr ${repl.v})`)
+            } else {
+                cgOut(`  ${rout2} = call ptr @festina_str_replace(ptr ${sv.v}, ptr ${needle.v}, ptr ${repl.v})`)
+            }
+            cgFreeTextTemp(recv, sv)
+            cgFreeTextTemp(args[0], needle)
+            cgFreeRegexTemp(args[0], needle)
+            cgFreeTextTemp(args[1], repl)
+            return cgVal(rout2, 'ptr', 'text')
+        }
+        cgUnported(`.replace() on ${sv.fty}`)
+        return none
+    }
+
+    // claude.md #109: `.save()` and `.saveCopy()` on a handle. The
+    // receiver already holds its own path, so the no-argument form
+    // passes a NULL path and the runtime uses it -- which is why these
+    // take a `ptr` either way rather than having two shapes.
+    if m == 'save' || m == 'saveCopy' {
+        Val h = cgExpr(recv)
+        if CG_STUCK { return none }
+        text base = ''
+        if h.fty == 'blob' { base = 'festina_blob' }
+        if base == '' {
+            cgUnported(`.${m}() on ${h.fty}`)
+            return none
+        }
+        text suffix = '_save'
+        if m == 'saveCopy' { suffix = '_save_copy' }
+        text pathV = 'null'
+        Val pathArg
+        if args.length > 0 {
+            pathArg = cgExpr(args[0])
+            if CG_STUCK { return none }
+            pathV = pathArg.v
+        }
+        text sout = cgTmp()
+        cgOut(`  ${sout} = call i8 @${base}${suffix}(ptr ${h.v}, ptr ${pathV})`)
+        if args.length > 0 { cgFreeTextTemp(args[0], pathArg) }
+        cgReleaseOwnedReceiver(recv, h)
+        return cgVal(sout, 'i8', 'bool')
     }
 
     // claude.md #184: `.sort(cmp)` -- an in-place, stable sort whose
@@ -3628,6 +3795,81 @@ Val func cgCall(e:Node, wantValue:bool) {
     // Checked before the user-function table so a program that happens
     // to declare its own `close` still gets the builtin, which is the
     // original's own order.
+    // claude.md #116: the timers. setTimeout/setInterval take a
+    // declared function's own symbol -- semantic analysis has already
+    // established the shape -- and answer an id the clear pair takes
+    // back. Only the two SCHEDULING calls make a program "use timers";
+    // clearing alone schedules nothing, the same "only pay for what
+    // you use" rule loadImage() follows.
+    // claude.md #118: `regex(pattern, flags)` -- memoized per call
+    // SITE rather than cached. The runtime remembers what this site
+    // compiled last time, reuses it on a match and recompiles on a
+    // mismatch, so a fixed pattern built from config costs what a
+    // literal does and a genuinely varying one is never served a stale
+    // automaton. Evicting the superseded compilation is safe only
+    // because a regex is refcounted: a binding still aliasing the old
+    // one keeps it alive.
+    if name == 'regex' {
+        arr[Node] rargs = listOf(e, 'args')
+        if rargs.length == 0 {
+            cgUnported('regex() with no pattern')
+            return none
+        }
+        Val pv = cgExpr(rargs[0])
+        if CG_STUCK { return none }
+        if pv.fty != 'text' {
+            cgUnported(`regex() pattern of type ${pv.fty}`)
+            return none
+        }
+        text flagsV = ''
+        Val fv
+        if rargs.length > 1 {
+            fv = cgExpr(rargs[1])
+            if CG_STUCK { return none }
+            if fv.fty != 'text' {
+                cgUnported(`regex() flags of type ${fv.fty}`)
+                return none
+            }
+            flagsV = fv.v
+        } else {
+            flagsV = cgStringConst('')
+        }
+        text memo = `@.regex.memo.${CG_REGEX_MEMOS}`
+        CG_REGEX_MEMOS = CG_REGEX_MEMOS + 1
+        CG_EXTRA.push(`${memo} = private global [3 x ptr] zeroinitializer`)
+        text rout = cgTmp()
+        cgOut(`  ${rout} = call ptr @festina_regex_compile_memo(ptr ${pv.v}, ptr ${flagsV}, ptr ${memo})`)
+        return cgVal(rout, 'ptr', 'regex')
+    }
+    if name == 'setTimeout' || name == 'setInterval' {
+        arr[Node] targs = listOf(e, 'args')
+        if targs.length != 2 || targs[0].kind != 'Identifier' {
+            cgUnported(`${name}() with an unexpected shape`)
+            return none
+        }
+        text cb = `@${rawText(targs[0], 'name')}`
+        Val delay = cgExprExpecting(targs[1], 'int', '')
+        if CG_STUCK { return none }
+        CG_USES_TIMERS = true
+        text tfn = 'festina_set_timeout'
+        if name == 'setInterval' { tfn = 'festina_set_interval' }
+        text tout = cgTmp()
+        cgOut(`  ${tout} = call i64 @${tfn}(ptr ${cb}, i64 ${delay.v})`)
+        return cgVal(tout, 'i64', 'int')
+    }
+    if name == 'clearTimeout' || name == 'clearInterval' {
+        arr[Node] targs = listOf(e, 'args')
+        if targs.length != 1 {
+            cgUnported(`${name}() with other than one argument`)
+            return none
+        }
+        Val id = cgExprExpecting(targs[0], 'int', '')
+        if CG_STUCK { return none }
+        text cfn = 'festina_clear_timeout'
+        if name == 'clearInterval' { cfn = 'festina_clear_interval' }
+        cgOut(`  call void @${cfn}(i64 ${id.v})`)
+        return cgVal('0', 'void', 'void')
+    }
     if name == 'close' {
         arr[Node] cargs = listOf(e, 'args')
         if cargs.length != 1 {
@@ -3792,16 +4034,17 @@ void func cgStmt(s:Node) {
             // nothing else -- no frame storage to zero, no header to
             // calloc, and no stack-versus-heap decision to make: there
             // is no payload that could live in the frame.
-            if managed == 'blob' {
+            // A regex is the same shape for the same reason.
+            if managed == 'blob' || managed == 'regex' {
                 Node binit = childOf(s, 'init')
                 if binit == null {
-                    cgUnported('blob declaration with no initializer')
+                    cgUnported(`${managed} declaration with no initializer`)
                     return
                 }
-                Val bv = cgExprExpecting(binit, 'blob', '')
+                Val bv = cgExprExpecting(binit, managed, '')
                 if CG_STUCK { return }
-                if bv.fty != 'blob' {
-                    cgUnported(`initializer of type ${bv.fty} for blob`)
+                if bv.fty != managed {
+                    cgUnported(`initializer of type ${bv.fty} for ${managed}`)
                     return
                 }
                 text bslot = `%${gname}.${cgUid()}`
@@ -3812,9 +4055,9 @@ void func cgStmt(s:Node) {
                     cgOut(`  call void @festina_retain(ptr ${bv.v})`)
                 }
                 cgOut(`  store ptr ${bv.v}, ptr ${bslot}`)
-                cgTrackLive('blob', bslot, '')
+                cgTrackLive(managed, bslot, '')
                 L_SLOT[gname] = bslot
-                L_FTY[gname] = 'blob'
+                L_FTY[gname] = managed
                 return
             }
             text declEty = ''
@@ -3825,18 +4068,13 @@ void func cgStmt(s:Node) {
                 // cascade wrapper rather than the plain release. That is
                 // its own mechanism; a scalar element type needs none of
                 // it.
-                Ty et = dt.elem
-                if et == null { 
+                declEty = cgEtyOfTy(dt)
+                if declEty == '' {
                     cgUnported(`${managed} local of a non-scalar type`)
                     return
                 }
-                if et.kind != 'prim' && et.kind != 'struct' {
-                    cgUnported(`${managed} local of a non-scalar type`)
-                    return
-                }
-                declEty = et.name
                 if cgStorableRefcounted(managed, declEty) == false {
-                    cgUnported(`${managed} local of ${et.name}`)
+                    cgUnported(`${managed} local of ${declEty}`)
                     return
                 }
             }
@@ -3937,8 +4175,7 @@ void func cgStmt(s:Node) {
             if managed == 'struct' { L_SNAME[gname] = dt.name }
             if managed == 'arr' || managed == 'map' {
                 if dt.elem != null {
-                    if dt.elem.kind == 'prim' { L_ETY[gname] = dt.elem.name }
-                    if dt.elem.kind == 'struct' { L_ETY[gname] = dt.elem.name }
+                    L_ETY[gname] = cgEtyOfTy(dt)
                 }
             }
             return
@@ -4680,14 +4917,14 @@ void func cgIndexAssign(e:Node, target:Node) {
     text slot = cgTmp()
     cgOut(`  ${slot} = getelementptr ${elemLty}, ptr ${dataV}, i64 ${idx.v}`)
     Node valueNode = childOf(e, 'value')
-    Val v = cgExprExpecting(valueNode, obj.ety, '')
+    Val v = cgExprExpectingElem(valueNode, obj.ety)
     if CG_STUCK { return }
     if cgValIsElem(v, obj.ety) == false {
         cgUnported(`assigning ${v.fty} into an array of ${obj.ety}`)
         return
     }
     text stored = v.v
-    if SF_NAMES[obj.ety] != null {
+    if cgElemIsRefcounted(obj.ety) {
         // A refcounted element: the slot's old value is read, the new
         // one takes its reference, the store happens, and only THEN is
         // the old one released -- claude.md #120's store-before-release
@@ -4701,7 +4938,7 @@ void func cgIndexAssign(e:Node, target:Node) {
             cgOut(`  call void @festina_retain(ptr ${stored})`)
         }
         cgOut(`  store ${elemLty} ${stored}, ptr ${slot}`)
-        cgOut(`  call void ${cgReleaseFnFor('struct', obj.ety)}(ptr ${old})`)
+        cgOut(`  call void ${cgElemReleaseFn(obj.ety)}(ptr ${old})`)
         return
     }
     if obj.ety == 'text' {
@@ -4859,10 +5096,24 @@ void func cgAssign(e:Node) {
 // the original hands to whatever comes next. It cost an afternoon's
 // worth of off-by-sixteen temp numbers to notice.
 bool func cgStorableRefcounted(fty:text, ety:text) {
-    if fty == 'struct' || fty == 'blob' { return true }
+    if fty == 'struct' || fty == 'blob' || fty == 'regex' { return true }
     if ety == '' { return false }
     if ety == 'int' || ety == 'float' || ety == 'bool' { return true }
     return cgElemOwnsSomething(ety)
+}
+
+// The Val for one element read out of a container, given the element
+// type. A nested container's element is itself a container, so it
+// needs its own fty and its own element type rather than the scalar
+// shape every other element read has.
+Val func cgElemVal(v:text, ety:text) {
+    if SF_NAMES[ety] != null { return cgStructVal(v, ety) }
+    if cgIsNestedElem(ety) {
+        text kf = cgKeyFty(ety)
+        if kf == 'arr' { return cgArrVal(v, cgKeyEty(ety)) }
+        return cgMapVal(v, cgKeyEty(ety))
+    }
+    return cgVal(v, cgElemLty(ety), ety)
 }
 
 void func cgStoreRefcounted(slot:text, fty:text, ety:text, v:text, owning:bool) {
@@ -4898,12 +5149,17 @@ text func cgReleaseFn(fty:text) {
     if fty == 'arr' { return '@festina_release_array' }
     if fty == 'map' { return '@festina_release_map' }
     if fty == 'blob' { return '@festina_blob_release' }
+    // claude.md #118: regfree on the last reference. A cached
+    // /pattern/ literal is immortal and no-ops through here, which is
+    // what lets `free` on a binding that aliases one be safe.
+    if fty == 'regex' { return '@festina_regex_free' }
     return '@festina_release'
 }
 
 // Whether a container of this element type can use the generic
 // release. A scalar element owns nothing; a `text` one owns a buffer.
 bool func cgIsRefcounted(fty:text) {
+    if fty == 'regex' { return true }
     return fty == 'struct' || fty == 'arr' || fty == 'map' || fty == 'blob'
 }
 
@@ -4912,7 +5168,21 @@ bool func cgIsRefcounted(fty:text) {
 // a STRUCT one owns a whole reference, whatever its own fields are.
 bool func cgElemOwnsSomething(ety:text) {
     if ety == 'text' { return true }
+    // A NESTED container element owns a whole reference, whatever it
+    // holds -- an `arr[arr[int]]`'s slots are counted values even
+    // though `int` owns nothing. The element type is spelled with the
+    // same `arr:T` key #311 introduced, so a colon is what
+    // distinguishes one from a scalar or a struct name.
+    if cgIsNestedElem(ety) { return true }
     return SF_NAMES[ety] != null
+}
+
+// Whether this element type is itself a container. The key spelling is
+// the test: `arr:int`, `map:text`. A struct element is a bare name and
+// a scalar is a bare word, so neither can be mistaken for one.
+bool func cgIsNestedElem(ety:text) {
+    if ety == '' { return false }
+    return ety.split(':').length == 2
 }
 
 // The LLVM type of one element. Every non-scalar is a pointer to its
@@ -4922,11 +5192,36 @@ bool func cgElemOwnsSomething(ety:text) {
 // NAME, so the two are never directly comparable.
 bool func cgValIsElem(v:Val, ety:text) {
     if SF_NAMES[ety] != null { return v.fty == 'struct' && v.sname == ety }
+    if cgIsNestedElem(ety) {
+        return v.fty == cgKeyFty(ety) && v.ety == cgKeyEty(ety)
+    }
     return v.fty == ety
+}
+
+// Emitting an expression in an ELEMENT position, where the type is
+// spelled as an element type rather than as an (fty, key) pair. A
+// nested container has to be split back into the two, because a
+// literal in that position needs to know both which container it is
+// building and what its own elements are.
+Val func cgExprExpectingElem(e:Node, ety:text) {
+    if cgIsNestedElem(ety) {
+        return cgExprExpecting(e, cgKeyFty(ety), cgKeyEty(ety))
+    }
+    return cgExprExpecting(e, ety, '')
+}
+
+// Whether an element of this type holds a REFERENCE -- a struct or a
+// nested container -- as opposed to a buffer (text) or nothing at all
+// (a scalar). What separates them is which ownership question a store
+// into the slot has to ask.
+bool func cgElemIsRefcounted(ety:text) {
+    if SF_NAMES[ety] != null { return true }
+    return cgIsNestedElem(ety)
 }
 
 text func cgElemLty(ety:text) {
     if SF_NAMES[ety] != null { return 'ptr' }
+    if cgIsNestedElem(ety) { return 'ptr' }
     return cgLtyOf(ety)
 }
 
@@ -4943,6 +5238,7 @@ text func cgReleaseFnFor(fty:text, ety:text) {
 // alias and freed outright; a struct hands back its reference instead,
 // through its own cascade -- the same shape with a different call.
 text func cgElemReleaseFn(ety:text) {
+    if cgIsNestedElem(ety) { return cgReleaseFnFor(cgKeyFty(ety), cgKeyEty(ety)) }
     if SF_NAMES[ety] != null { return cgReleaseFnFor('struct', ety) }
     return '@free'
 }
@@ -5089,6 +5385,27 @@ text func cgRelKeyVal(v:Val) {
 // Spelled `arr:T` rather than `arr[T]`: Festina's `text` has no
 // `.slice()`, so a key has to be decodable by `.split()`, and a struct
 // name never contains a colon.
+// The element type of a container, as the port spells one: a scalar's
+// own name, a struct's name, or -- for a NESTED container -- the same
+// `arr:T`/`map:T` key a release is cached under. One slot, three
+// shapes, distinguished by whether it carries a colon.
+text func cgEtyOfTy(t:Ty) {
+    if t == null { return '' }
+    if t.elem == null { return '' }
+    if t.elem.kind == 'prim' { return t.elem.name }
+    if t.elem.kind == 'struct' { return t.elem.name }
+    if t.elem.kind == 'arr' || t.elem.kind == 'map' {
+        text inner = cgEtyOfTy(t.elem)
+        if inner == '' { return '' }
+        // Only one level deep: `arr[arr[arr[int]]]` would need a key
+        // that nests, and nothing reaches for one. Refused rather than
+        // mis-spelled.
+        if cgIsNestedElem(inner) { return '' }
+        return cgTypeKey(t.elem.kind, inner)
+    }
+    return ''
+}
+
 text func cgTypeKey(fty:text, ety:text) {
     if fty == 'struct' { return ety }
     if fty == 'arr' { return `arr:${ety}` }
@@ -5790,6 +6107,19 @@ void func cgReleaseOwnedReceiver(e:Node, v:Val) {
     cgOut(`  call void ${cgReleaseFnFor(v.fty, cgRelKeyVal(v))}(ptr ${v.v})`)
 }
 
+// claude.md #118: a regex that this expression COMPILED is released
+// where it is used. `regex(p, f)` hands back the memo's own +1; a
+// /pattern/ literal's cached compilation is immortal, so releasing it
+// here is a harmless no-op. A regex bound to a VARIABLE is an
+// identifier at its use sites and is not released here -- its own
+// binding's scope exit owns that reference.
+void func cgFreeRegexTemp(e:Node, v:Val) {
+    if v.fty != 'regex' { return }
+    if e == null { return }
+    if e.kind != 'Call' { return }
+    cgOut(`  call void @festina_regex_free(ptr ${v.v})`)
+}
+
 void func cgFreeTextTemp(e:Node, v:Val) {
     if v.fty != 'text' { return }
     // The VALUE can own a buffer its own expression does not: a text
@@ -6184,8 +6514,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 if ffty == 'struct' { SF_SNAME[key] = ft.name }
                 if ffty == 'arr' || ffty == 'map' {
                     if ft.elem != null {
-                        if ft.elem.kind == 'prim' { SF_ETY[key] = ft.elem.name }
-                        if ft.elem.kind == 'struct' { SF_ETY[key] = ft.elem.name }
+                        SF_ETY[key] = cgEtyOfTy(ft)
                     }
                 }
                 fi++
@@ -6264,10 +6593,11 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 // pointer that starts null. So it takes the plain form
                 // a scalar global takes, not the {refcount, payload}
                 // one every other refcounted global has.
-                if cgManagedFty(gt) == 'blob' {
+                text handleG = cgManagedFty(gt)
+                if handleG == 'blob' || handleG == 'regex' {
                     cgEmit(`@${gn} = global ptr null`)
                     G_SLOT[gn] = `@${gn}`
-                    G_FTY[gn] = 'blob'
+                    G_FTY[gn] = handleG
                 }
                 text payload = cgPayloadFor(gt)
                 if payload != '' {
@@ -6278,8 +6608,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                     if gt.kind == 'struct' { G_SNAME[gn] = gt.name }
                     if gt.kind == 'arr' || gt.kind == 'map' {
                         if gt.elem != null {
-                            if gt.elem.kind == 'prim' { G_ETY[gn] = gt.elem.name }
-                            if gt.elem.kind == 'struct' { G_ETY[gn] = gt.elem.name }
+                            G_ETY[gn] = cgEtyOfTy(gt)
                         }
                     }
                 }
@@ -6405,7 +6734,15 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     cgOut('  call void @festina_runtime_init()')
     cgOut('  %argv_arr = call ptr @festina_argv_array(i32 %argc, ptr %argv_raw)')
     cgOut('  store ptr %argv_arr, ptr @argv')
+    // A program with scheduled callbacks needs a blocking loop for
+    // them to fire in -- the pure-POSIX one, which lives in the core
+    // translation unit, so a timers-only program never links the
+    // graphics object just to wait. The shutdown handler goes with it:
+    // the loop polls festina_shutdown_requested() once per iteration,
+    // which is what makes installing one meaningful here.
+    if CG_USES_TIMERS { cgOut('  call void @festina_install_shutdown_handler()') }
     cgOut('  call void @__festina_main()')
+    if CG_USES_TIMERS { cgOut('  call void @festina_run_timer_loop()') }
     cgOut('  ret i32 0')
     cgOut('}')
 
@@ -6415,6 +6752,11 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // line), then a separator, then the entry points, then a separator
     // and the string constants.
     cgEmit('')
+    int xg = 0
+    while xg < CG_EXTRA.length {
+        cgEmit(CG_EXTRA[xg])
+        xg++
+    }
     cgEmit('')
     int ff = 0
     while ff < CG_FUNCS.length {

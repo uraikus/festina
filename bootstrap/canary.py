@@ -575,6 +575,7 @@ CANARIES = [
         "split frees the receiver AND the separator it allocated",
         """        cgFreeTextTemp(recv, r)
         cgFreeTextTemp(args[0], sep)
+        cgFreeRegexTemp(args[0], sep)
         return cgArrVal(out, 'text')""",
         """        return cgArrVal(out, 'text')""",
     ),
@@ -822,6 +823,78 @@ CANARIES = [
             val = owned
         }""",
         "",
+    ),
+
+    # --- decisions.md #315: nesting, timers, handles, regex ----------
+    Canary(
+        "nested-element-owns-a-reference", "#315",
+        "a container element that is itself a container owns a whole "
+        "reference, whatever it holds",
+        """    if cgIsNestedElem(ety) { return true }
+    return SF_NAMES[ety] != null""",
+        """    return SF_NAMES[ety] != null""",
+    ),
+    Canary(
+        "nested-element-releases-through-its-own-type", "#315",
+        "a nested container element is released as the container it "
+        "is, not freed as a buffer",
+        """    if cgIsNestedElem(ety) { return cgReleaseFnFor(cgKeyFty(ety), cgKeyEty(ety)) }""",
+        """    if false { return cgReleaseFnFor(cgKeyFty(ety), cgKeyEty(ety)) }""",
+    ),
+    Canary(
+        "timers-need-a-loop-to-fire-in", "#315",
+        "a program that schedules a callback gets a blocking loop for "
+        "it to fire in",
+        """    if CG_USES_TIMERS { cgOut('  call void @festina_run_timer_loop()') }""",
+        "",
+    ),
+    Canary(
+        "clearing-alone-schedules-nothing", "#315",
+        "only setTimeout/setInterval make a program use timers",
+        """        CG_USES_TIMERS = true
+        text tfn = 'festina_set_timeout'""",
+        """        text tfn = 'festina_set_timeout'""",
+    ),
+    Canary(
+        "save-with-no-path-uses-the-handles-own", "#315",
+        "a no-argument save passes a NULL path, which is how the "
+        "runtime is told to use the handle's own",
+        """        text pathV = 'null'""",
+        """        text pathV = cgStringConst('')""",
+    ),
+    Canary(
+        "regex-literal-is-compiled-once", "#315",
+        "a /pattern/ literal's compilation is cached per call site",
+        """    cgOut(`  br i1 ${isNull}, label %${compileL}, label %${doneL}`)""",
+        """    cgOut(`  br i1 true, label %${compileL}, label %${doneL}`)""",
+    ),
+    Canary(
+        "cached-regex-is-marked-immortal", "#315",
+        "a cached compilation is marked, so `free` on a binding "
+        "aliasing it cannot free what every later execution shares",
+        """    cgOut(`  call void @festina_regex_mark_cached(ptr ${compiled})`)""",
+        "",
+    ),
+    Canary(
+        "regex-literal-is-fresh-for-a-store", "#315",
+        "an immortal compilation needs no retain when it is stored",
+        """    Val rv = cgVal(out, 'ptr', 'regex')
+    rv.fresh = true""",
+        """    Val rv = cgVal(out, 'ptr', 'regex')""",
+    ),
+    Canary(
+        "regex-split-takes-its-arguments-the-other-way", "#315",
+        "a regex split passes the pattern first and the subject "
+        "second, unlike a text split",
+        """            cgOut(`  ${out} = call ptr @festina_regex_split(ptr ${sep.v}, ptr ${r.v})`)""",
+        """            cgOut(`  ${out} = call ptr @festina_regex_split(ptr ${r.v}, ptr ${sep.v})`)""",
+    ),
+    Canary(
+        "dynamic-regex-is-memoized-not-cached", "#315",
+        "regex(p, f) is memoized per call site by the runtime, which "
+        "recompiles when the pattern actually changes",
+        """        cgOut(`  ${rout} = call ptr @festina_regex_compile_memo(ptr ${pv.v}, ptr ${flagsV}, ptr ${memo})`)""",
+        """        cgOut(`  ${rout} = call ptr @festina_regex_compile(ptr ${pv.v}, ptr ${flagsV})`)""",
     ),
 
     Canary(
