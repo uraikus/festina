@@ -6554,6 +6554,10 @@ A small slice, and a line worth drawing carefully. **300,464 of 319,458 file-spe
 
 **A canary anchor went ambiguous rather than stale**, which is the failure mode the count check exists for and the first time it has fired. `owned-container-receiver` anchored on a length load and its release; the new ascii length branch ends with the identical two lines, so the anchor named two sites and would have broken whichever came first. Re-aimed at the array branch's own preceding GEP. Stale anchors this registry has caught before; two sites is the other half of the same check, and it is worth knowing it works.
 
+**Three of the six had ONE witness and it was not a case file**, which is the arrangement #312 added the witness check to report and the registry said so in its own output. `cases/splice_and_ascii.f` is the answer: both splice canaries hung on `tests/stress/splice_insert_churn.f` alone and the ascii-declaration one on `tests/stress/ascii_churn.f` alone, so each mechanism would have gone unmeasured the day its single file stopped matching for any unrelated reason.
+
+**That case file cannot be run under this machine's valgrind, and the leak claim rests elsewhere rather than being waived.** LLVM emits an EVEX-encoded (AVX-512) instruction in the ascii scan function that valgrind 3.22 cannot decode, so the run dies with SIGILL -- after reporting `definitely lost: 0` and `indirectly lost: 0`, but before finishing. Keeping the scan loop scalar was tried and is not the trigger; bisecting further would have meant contorting the file away from the shapes it exists to witness. What carries the leak question instead is the ASan/LSan leak-stress suite, which covers `ascii_churn.f` and `splice_insert_churn.f` directly -- real corpus programs, the stronger tool, and green. A case file's job here is to be a second WITNESS for the canaries, and that needs no valgrind at all.
+
 **Six new canaries. 112 in total.**
 
-**Verified.** Lexer 119/119, parser 119/119, semantic 119/119, codegen 71 match and 0 differ.
+**Verified.** Lexer 119/119, parser 119/119, semantic 119/119, codegen 71 match and 0 differ (72 with this slice's own case file, which matches at 100%). Seven canaries run -- the six new ones and the one this slice made ambiguous: all caught as diffs, 0 through the ratchet, 0 missed, 0 broken.
