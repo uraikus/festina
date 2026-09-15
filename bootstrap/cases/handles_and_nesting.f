@@ -136,11 +136,29 @@ int func saves() {
     return n + src.length
 }
 
+// The time and filesystem builtins, each handed a COMPUTED path rather
+// than a literal. That is the whole point of these three lines: none
+// of these runtime functions keeps a pointer past the call -- the file
+// helpers read or write and close, strftime copies into its own buffer
+// -- so a temporary is the caller's to free, and a literal argument
+// would measure nothing because a literal is never freed anyway.
+text dir = '/tmp'
+
+int func paths() {
+    text stamp = formatTime(now(), `%Y-%m-%d${''}`)
+    bool made = mkdir(`${dir}/festina-case-dir`)
+    arr[text] listed = ls(`${dir}${''}`)
+    int n = stamp.length + listed.length
+    if made { n = n + 1 }
+    return n
+}
+
 log(nested())
 log(patterns())
 log(freesAnAlias())
 log(schedules())
 log(saves())
+log(paths())
 log(grid.length)
 log(words.length)
 log(seen.keys().length)

@@ -6435,3 +6435,29 @@ The second slice of the subsystems. **269,178 of 294,353 file-specific IR lines,
 **Ten new canaries. 81 in total.**
 
 **Verified.** Lexer 115/115, parser 115/115, semantic 115/115, escape analysis 97 match with 1,800 of 1,853 records, codegen 50 match and 0 differ. `cases/handles_and_nesting.f` is valgrind-clean.
+
+316. JSON, TERNARIES, AND WHAT A CALL SITE OWES
+
+The third slice of the subsystems. **287,064 of 307,954 file-specific IR lines, up from 269,178 -- 93.2% -- and 56 files match, 0 differ.** All ten bootstrap files still self-host.
+
+**Parsing JSON into a declared type.** `.toStruct(T)` and `.toArr(T)` generate a builder per target type, cached, walking a cursor the runtime owns. Every read either returns a valid value or throws from inside the runtime and never returns, so nothing generated branches on failure. What the generated code DOES handle is a throw from deeper: a half-built value is on this frame and nothing else owns it yet, so each builder registers what it holds -- the header it is filling in, each key text between its read and its free -- and festina_throw releases them on the way out. Nested builders push and pop above their caller's entries, which is what makes the order right: an inner half-built value goes before the outer one it would have been stored into.
+
+**A struct target and a map target are opposite loops on the same syntax.** A struct matches each key against a FIXED field set and skips anything else; a map takes every key as an entry. A duplicate key overwrites in both, last one wins -- which means giving back what the earlier one stored.
+
+**Rendering is the reverse, and it caps its depth at 32.** A cyclic value is constructible, and a debug rendering that crashed the program it is debugging would be worse than an honest truncation. A map renders live entries only: buckets are walked by capacity, so an empty slot and a tombstone both have to be recognized, and whether a comma is owed cannot be read off the index the way an array's can.
+
+**A ternary ARM is normalized to something genuinely owned before the phi**, rather than the whole ternary being read as aliasing afterwards. The old rule was right only when BOTH arms were aliasing and leaked the moment either was fresh: the caller claimed the result once whichever arm ran, so a fresh arm's own correct ownership got an extra claim with nothing to balance it. And the normalized result is then an OWNING source, which is the other half -- getting one without the other turns a leak into a double free.
+
+**A null arm has no type of its own**, so when the CONSEQUENT is the null one the two arms are emitted in the opposite order. Observable whenever the non-null arm has effects.
+
+**A call site's fresh argument temporaries survive a throwing callee.** It owns whatever it built for the call -- a literal, a template text, a call result -- and releases them right after. A callee that throws never returns there, so they are registered for the duration of the call. That was the last thing leaking once every frame's locals were covered.
+
+**And the UID ORDER of parameter bindings is observable.** An escaping parameter's binding may GENERATE a function (the unwind wrapper), and that generation happens between this parameter's slot and the next one's. The port took every slot's uid first and left the generated function numbered after all of them -- invisible until a program had both an escaping parameter and a `try`.
+
+**A void return type is a `prim` named `void`, not an absent one.** The signature encoder checked the pointer and refused every void function, which silently disabled the whole typed-argument path for them.
+
+**Three canaries went stale or ambiguous, all from widenings**, and one of them went quiet in a way worth recording: `null-argument-signature` was re-aimed at the FN_PARAMS lookup alone, and stopped firing -- the encoded signature added beside it still supplied a type. Breaking one of two tables is not breaking the mechanism. Caught by re-running it rather than by reading it.
+
+**Twelve new canaries. 93 in total.**
+
+**Verified.** Lexer 116/116, parser 116/116, semantic 116/116, escape analysis 98 match with 1,833 of 1,886 records, codegen 56 match and 0 differ. `cases/json_and_choices.f` is valgrind-clean.

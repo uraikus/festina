@@ -416,7 +416,7 @@ CANARIES = [
         "refcounted-element-write-retains", "#311",
         "a refcounted array element write retains, stores, then releases the old",
         """        cgOut(`  store ${elemLty} ${stored}, ptr ${slot}`)
-        cgOut(`  call void ${cgReleaseFnFor('struct', obj.ety)}(ptr ${old})`)""",
+        cgOut(`  call void ${cgElemReleaseFn(obj.ety)}(ptr ${old})`)""",
         """        cgOut(`  store ${elemLty} ${stored}, ptr ${slot}`)""",
     ),
     Canary(
@@ -566,9 +566,22 @@ CANARIES = [
     Canary(
         "null-argument-signature", "#309",
         "a null ARGUMENT takes the parameter's type, not the call site's",
+        # BOTH tables the call site consults, not one: claude.md #141
+        # added the encoded signature beside FN_PARAMS, and breaking
+        # either alone leaves the other still supplying a type -- so
+        # the canary would pass while measuring nothing. Found by
+        # re-aiming it and noticing it stopped firing.
         """        text want = ''
-        if i < ptys.length { want = ptys[i] }""",
-        """        text want = ''""",
+        text wantKey = ''
+        if i < ptys.length { want = ptys[i] }
+        if want == '' {
+            if i < sigPtys.length {
+                want = cgSigFty(sigPtys[i])
+                wantKey = cgSigKey(sigPtys[i])
+            }
+        }""",
+        """        text want = ''
+        text wantKey = ''""",
     ),
     Canary(
         "split-receiver-not-freed", "#309",
@@ -895,6 +908,107 @@ CANARIES = [
         "recompiles when the pattern actually changes",
         """        cgOut(`  ${rout} = call ptr @festina_regex_compile_memo(ptr ${pv.v}, ptr ${flagsV}, ptr ${memo})`)""",
         """        cgOut(`  ${rout} = call ptr @festina_regex_compile(ptr ${pv.v}, ptr ${flagsV})`)""",
+    ),
+
+    # --- decisions.md #316: JSON, ternaries, and unwind guards -------
+    Canary(
+        "json-struct-skips-unknown-keys", "#316",
+        "an unrecognized JSON key's value is SKIPPED, not refused",
+        """    cgOut('  call void @festina_json_skip_field_value(ptr %cursor)')""",
+        "",
+    ),
+    Canary(
+        "json-duplicate-key-frees-the-old", "#316",
+        "a duplicate JSON key overwrites, and gives back what the "
+        "earlier one stored",
+        """        if oldVal != '' {
+            if ffty == 'text' {
+                cgOut(`  call void @free(ptr ${oldVal})`)
+            } else {
+                cgOut(`  call void ${cgReleaseFnFor(ffty, fkey)}(ptr ${oldVal})`)
+            }
+        }""",
+        "",
+    ),
+    Canary(
+        "json-builder-registers-what-it-holds", "#316",
+        "a half-built JSON value is released if a deeper parse throws",
+        """    cgOut(`  call void @festina_cleanup_push(ptr ${out}, ptr ${cgReleaseFnFor('struct', sname)})`)""",
+        "",
+    ),
+    Canary(
+        "json-map-takes-every-key", "#316",
+        "a map target takes arbitrary keys, where a struct target "
+        "matches a fixed set",
+        """    if cgKeyFty(key) == 'map' { return cgFromJsonMapFn(cgKeyEty(key)) }""",
+        "",
+    ),
+    Canary(
+        "json-render-caps-its-depth", "#316",
+        "a cyclic value renders as null at the cap rather than "
+        "overflowing the stack",
+        """    cgOut(`  ${toodeep} = icmp sgt i64 %depth, 32`)""",
+        """    cgOut(`  ${toodeep} = icmp sgt i64 %depth, -1`)""",
+    ),
+    Canary(
+        "json-render-skips-tombstones", "#316",
+        "a map renders its live entries only, walking buckets by "
+        "capacity",
+        """        cgOut(`  ${skip} = or i1 ${isNull2}, ${isTomb}`)""",
+        """        cgOut(`  ${skip} = and i1 ${isNull2}, ${isTomb}`)""",
+    ),
+    Canary(
+        "ternary-arm-is-owned-before-the-phi", "#316",
+        "claude.md #173: a ternary ARM is normalized to something "
+        "genuinely owned, rather than the whole ternary read as aliasing",
+        """        a = cgOwnTernaryBranch(a, consN)""",
+        """        a = a""",
+    ),
+    Canary(
+        "ternary-is-an-owning-source", "#316",
+        "and the normalized result is then owning, so the caller does "
+        "not claim it a second time",
+        """    if e.kind == 'Ternary' { return true }
+    return e.kind == 'Call'
+}""",
+        """    return e.kind == 'Call'
+}""",
+    ),
+    Canary(
+        "null-ternary-arm-takes-the-other-side", "#316",
+        "a null arm has no type of its own, so the other arm is "
+        "emitted FIRST when the consequent is the null one",
+        """    if consNull && altNull == false {""",
+        """    if false {""",
+    ),
+    Canary(
+        "call-arguments-survive-a-throwing-callee", "#316",
+        "claude.md #236: a call site's own fresh argument temporaries "
+        "are released by the unwinding when the callee never returns",
+        """    int guarded = cgGuardCallArgs(args, argVals)
+    if retF == 'void' {""",
+        """    int guarded = 0
+    if retF == 'void' {""",
+    ),
+    Canary(
+        "parameter-uid-order-is-interleaved", "#316",
+        "an escaping parameter's binding may generate a function, and "
+        "it is numbered between this parameter's slot and the next",
+        """        text slot = `%${pnames[q]}.${cgUid()}`
+        cgOut(`  ${slot} = alloca ${pltys[q]}`)""",
+        """        text slot = `%${pnames[q]}.${cgUid()}${cgUid()}`
+        cgOut(`  ${slot} = alloca ${pltys[q]}`)""",
+    ),
+    Canary(
+        "time-and-file-builtins-free-their-paths", "#316",
+        "formatTime/mkdir/ls keep no pointer past the call, so a "
+        "temporary path is the caller's to free",
+        """        int fk = 0
+        while fk < fvals.length {
+            cgFreeTextTemp(fargs[fk], fvals[fk])
+            fk++
+        }""",
+        "",
     ),
 
     Canary(

@@ -494,6 +494,50 @@ class TestTheCoverageNumberIsHonest:
             "nothing reclaimed, so an element write that leaked the "
             "value it replaced would go unnoticed")
 
+    def test_the_json_case_really_has_all_six_mechanisms(self):
+        """`cases/json_and_choices.f`: three mechanisms that only look
+        unrelated, each a case where something OUTSIDE the expression
+        decides its ownership.
+
+        A JSON builder half-fills a value nothing else owns yet; a
+        ternary hands back whichever arm ran; a call site holds
+        temporaries across a call that may unwind past it.
+        """
+        dump = irdump.dump_file("bootstrap/cases/json_and_choices.f")
+        assert not dump[0].startswith("SEMERR"), (
+            "cases/json_and_choices.f no longer compiles, so it "
+            "measures nothing at all: " + dump[0])
+        body = "\n".join(dump)
+        # 1: lenient parsing, and the duplicate-key overwrite.
+        assert "@festina_json_skip_field_value(" in body, (
+            "no unknown-key skip, so a parse that refused an extra "
+            "field would go unnoticed")
+        assert "@festina_json_key_matches(" in body
+        # 2: the unwind registrations inside the builders.
+        assert "@festina_cleanup_push(" in body, (
+            "no unwind registration, so a throw mid-parse would leak "
+            "the half-built value")
+        # 3: all three builder families.
+        assert any(l.startswith("define ptr @__festina_from_json_struct_")
+                   for l in dump), "no struct builder"
+        assert any(l.startswith("define ptr @__festina_from_json_arr_")
+                   for l in dump), "no array builder"
+        assert any(l.startswith("define ptr @__festina_from_json_map_")
+                   for l in dump), (
+            "no map builder, so the arbitrary-key loop that "
+            "distinguishes a map target from a struct one is unmeasured")
+        # 4: the render, its depth cap and its tombstone skip.
+        assert any(l.startswith("define void @__festina_json_")
+                   for l in dump), "no JSON walker"
+        assert "icmp sgt i64 %depth, 32" in body, (
+            "no depth cap, so a cyclic value would overflow the stack")
+        assert "inttoptr (i64 1 to ptr)" in body, (
+            "no tombstone check, so a deleted map entry would render")
+        # 5: the ternary arms, normalized.
+        assert "tern.then" in body and "tern.else" in body
+        # 6: the call-site guard around a throwing callee.
+        assert "@festina_cleanup_pop_n(" in body
+
     def test_the_handles_case_really_has_all_six_mechanisms(self):
         """`cases/handles_and_nesting.f`: four unrelated-looking
         mechanisms that share one property -- each is a case where the
@@ -772,7 +816,8 @@ class TestTheCoverageNumberIsHonest:
                                       "owning_containers.f",
                                       "drivers.f",
                                       "escape_hatch.f",
-                                      "handles_and_nesting.f"])
+                                      "handles_and_nesting.f",
+                                      "json_and_choices.f"])
     def test_the_container_cases_really_run(self, compile_and_run, case):
         """The two container case files are PROGRAMS, not only sources
         of IR, and this runs them to prove it.
@@ -883,6 +928,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 269178, (
+        assert reproduced >= 287128, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 269178")
+            f"the port previously emitted at least 287128")

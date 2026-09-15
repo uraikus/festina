@@ -971,10 +971,15 @@ text func cgSigOfDeclNode(d:Node) {
     text rf = 'void'
     text rkey = ''
     Ty rt = resolveTypeField(d, 'return_type')
+    // A void function's own return type resolves to a `prim` named
+    // `void` rather than to nothing, so the check is on the NAME and
+    // not on the pointer -- which cost an afternoon the first time.
     if rt != null {
-        rf = cgFtyOfTy(rt)
-        if rf == '' || rf == 'void' { return '' }
-        rkey = cgTyKeyOf(rt)
+        if rt.kind != 'prim' || rt.name != 'void' {
+            rf = cgFtyOfTy(rt)
+            if rf == '' || rf == 'void' { return '' }
+            rkey = cgTyKeyOf(rt)
+        }
     }
     return `${out}|${rf}:${rkey}`
 }
@@ -1147,6 +1152,12 @@ map[text] CG_MAP_REL = {}
 
 // Comparator trampolines, cached per element type (claude.md #184).
 map[text] CG_SORT_TRAMP = {}
+
+// JSON builders, cached by the target type's own spelling.
+map[text] CG_FROMJSON = {}
+
+// JSON walkers, cached by the type's own spelling.
+map[text] CG_JSON = {}
 map[text] L_SNAME = {}
 map[text] L_ETY = {}
 
@@ -2694,28 +2705,89 @@ Val func cgTernary(e:Node) {
     text elseL = cgLabel('tern.else')
     text endL = cgLabel('tern.end')
     cgOut(`  br i1 ${cond}, label %${thenL}, label %${elseL}`)
-    cgBlockLabel(thenL)
-    Val a = cgExpr(childOf(e, 'cons'))
-    if CG_STUCK { return none }
-    text thenPred = CG_BLOCK
-    cgOut(`  br label %${endL}`)
-    cgBlockLabel(elseL)
-    Val b = cgExpr(childOf(e, 'alt'))
-    if CG_STUCK { return none }
-    text elsePred = CG_BLOCK
-    cgOut(`  br label %${endL}`)
-    cgBlockLabel(endL)
-    if a.fty != 'int' && a.fty != 'float' && a.fty != 'bool' {
-        cgUnported(`ternary of type ${a.fty}`)
-        return none
+
+    // claude.md #173: a null branch takes its type from the OTHER one,
+    // so when the CONSEQUENT is null the two arms are emitted in the
+    // opposite order -- there is nothing to emit for a null until the
+    // type is known. Observable whenever the non-null arm has effects.
+    Node consN = childOf(e, 'cons')
+    Node altN = childOf(e, 'alt')
+    bool consNull = consN.kind == 'NullLit'
+    bool altNull = altN.kind == 'NullLit'
+    Val a
+    Val b
+    text thenPred = ''
+    text elsePred = ''
+    if consNull && altNull == false {
+        cgBlockLabel(elseL)
+        b = cgExpr(altN)
+        if CG_STUCK { return none }
+        b = cgOwnTernaryBranch(b, altN)
+        elsePred = CG_BLOCK
+        cgOut(`  br label %${endL}`)
+        cgBlockLabel(thenL)
+        a = cgExprExpecting(consN, b.fty, cgRelKeyVal(b))
+        if CG_STUCK { return none }
+        thenPred = CG_BLOCK
+        cgOut(`  br label %${endL}`)
+    } else {
+        cgBlockLabel(thenL)
+        a = cgExpr(consN)
+        if CG_STUCK { return none }
+        a = cgOwnTernaryBranch(a, consN)
+        thenPred = CG_BLOCK
+        cgOut(`  br label %${endL}`)
+        cgBlockLabel(elseL)
+        if altNull {
+            b = cgExprExpecting(altN, a.fty, cgRelKeyVal(a))
+        } else {
+            b = cgExpr(altN)
+            if CG_STUCK { return none }
+            b = cgOwnTernaryBranch(b, altN)
+        }
+        if CG_STUCK { return none }
+        elsePred = CG_BLOCK
+        cgOut(`  br label %${endL}`)
     }
-    if a.fty != b.fty {
-        cgUnported(`ternary mixing ${a.fty} and ${b.fty}`)
+    cgBlockLabel(endL)
+    Val shape = a
+    if consNull { shape = b }
+    if cgLtyOf(shape.fty) == '' {
+        cgUnported(`ternary of type ${shape.fty}`)
         return none
     }
     text out = cgTmp()
-    cgOut(`  ${out} = phi ${a.lty} [ ${a.v}, %${thenPred} ], [ ${b.v}, %${elsePred} ]`)
-    return cgVal(out, a.lty, a.fty)
+    cgOut(`  ${out} = phi ${cgLtyOf(shape.fty)} [ ${a.v}, %${thenPred} ], [ ${b.v}, %${elsePred} ]`)
+    if shape.fty == 'struct' { return cgStructVal(out, shape.sname) }
+    if shape.fty == 'arr' { return cgArrVal(out, shape.ety) }
+    if shape.fty == 'map' { return cgMapVal(out, shape.ety) }
+    return cgVal(out, cgLtyOf(shape.fty), shape.fty)
+}
+
+// claude.md #173: a ternary ARM is normalized to something genuinely
+// owned before the phi, rather than the whole ternary being treated as
+// aliasing afterwards. The old rule was right only when BOTH arms were
+// aliasing, and silently leaked the moment either was fresh: the
+// caller copied or retained the result exactly once whichever arm
+// ran, so a fresh arm's own correct ownership got an extra claim with
+// nothing to balance it. Found by a sanitizer, not by inspection.
+Val func cgOwnTernaryBranch(v:Val, src:Node) {
+    if v.fty == 'text' {
+        if cgOwnsText(src, v) == false {
+            text owned = cgTmp()
+            cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${v.v})`)
+            Val o = cgVal(owned, 'ptr', 'text')
+            o.fresh = true
+            return o
+        }
+        return v
+    }
+    if cgIsRefcounted(v.fty) {
+        if cgOwnsRefcounted(src, v) == false {
+            cgOut(`  call void @festina_retain(ptr ${v.v})`)
+        }
+    }
+    return v
 }
 
 // claude.md #114's implicit `.toText()`: what a non-text value becomes
@@ -2742,6 +2814,26 @@ Val func cgToText(a:Val) {
     }
     if a.fty == 'bool' {
         cgOut(`  ${out} = call ptr @festina_str_from_bool(i8 ${a.v})`)
+        return cgVal(out, 'ptr', 'text')
+    }
+    // claude.md #114: a struct or container renders as JSON, through
+    // the walker generated for its own type. The builder is a runtime
+    // value that owns its buffer until it is finished, which is what
+    // makes the recursive append cheap: one allocation for the whole
+    // rendering rather than one per piece.
+    if a.fty == 'struct' || a.fty == 'arr' || a.fty == 'map' {
+        text key = cgTypeKey(a.fty, cgRelKeyVal(a))
+        text fn = cgJsonFn(key)
+        text sb = cgTmp()
+        cgOut(`  ${sb} = call ptr @festina_sb_new()`)
+        cgOut(`  call void ${fn}(ptr ${a.v}, ptr ${sb}, i64 0)`)
+        cgOut(`  ${out} = call ptr @festina_sb_finish(ptr ${sb})`)
+        return cgVal(out, 'ptr', 'text')
+    }
+    // claude.md #115: a blob renders its CONTENTS, which is exactly
+    // what its explicit toText() does -- the two must not disagree.
+    if a.fty == 'blob' {
+        cgOut(`  ${out} = call ptr @festina_blob_to_text(ptr ${a.v})`)
         return cgVal(out, 'ptr', 'text')
     }
     cgUnported(`interpolation of ${a.fty}`)
@@ -3374,6 +3466,71 @@ Val func cgMethodCall(e:Node, callee:Node) {
         return cgVal(out, 'ptr', 'text')
     }
 
+    // claude.md #159/#233: `text.toStruct(T)` / `text.toArr(T)`. The
+    // whole call site is bracketed by cleanup-stack registrations,
+    // because a parse can still throw at any point: a temporary
+    // receiver text, the cursor, and -- once the builder has returned
+    // it -- the finished value itself, which festina_json_expect_end
+    // can still reject for trailing data. That last one is the one
+    // that is easy to miss: by then the value is off the builder's own
+    // frame and nothing else owns it yet.
+    if m == 'toStruct' || m == 'toArr' {
+        if args.length != 1 || args[0].kind != 'TypeArg' {
+            cgUnported(`.${m}() without a type argument`)
+            return none
+        }
+        Val rv = cgExpr(recv)
+        if CG_STUCK { return none }
+        if rv.fty != 'text' {
+            cgUnported(`.${m}() on ${rv.fty}`)
+            return none
+        }
+        Ty tt = resolveTypeField(args[0], 'type_expr')
+        text tfty = cgFtyOfTy(tt)
+        text tkey = cgTyKeyOf(tt)
+        if tfty == '' || tfty == 'void' {
+            cgUnported(`.${m}() into an unsupported type`)
+            return none
+        }
+        bool owningRecv = cgOwnsText(recv, rv)
+        if owningRecv {
+            cgOut(`  call void @festina_cleanup_push(ptr ${rv.v}, ptr @free)`)
+        }
+        text cursor = cgTmp()
+        cgOut(`  ${cursor} = call ptr @festina_json_cursor_new(ptr ${rv.v})`)
+        cgOut(`  call void @festina_cleanup_push(ptr ${cursor}, ptr @festina_json_cursor_free)`)
+        text builder = ''
+        text resFty = ''
+        text resKey = ''
+        if m == 'toStruct' {
+            if tfty != 'struct' {
+                cgUnported(`.toStruct() into a ${tfty}`)
+                return none
+            }
+            builder = cgFromJsonStructFn(tkey)
+            resFty = 'struct'
+            resKey = tkey
+        } else {
+            text ety = tfty
+            if tfty == 'struct' { ety = tkey }
+            else if tfty == 'arr' || tfty == 'map' { ety = cgTypeKey(tfty, tkey) }
+            builder = cgFromJsonArrFn(ety)
+            resFty = 'arr'
+            resKey = ety
+        }
+        text jout = cgTmp()
+        cgOut(`  ${jout} = call ptr ${builder}(ptr ${cursor})`)
+        cgOut(`  call void @festina_cleanup_push(ptr ${jout}, ptr ${cgReleaseFnFor(resFty, resKey)})`)
+        cgOut(`  call void @festina_json_expect_end(ptr ${cursor})`)
+        cgOut('  call void @festina_cleanup_pop()')
+        cgOut('  call void @festina_cleanup_pop()')
+        if owningRecv { cgOut('  call void @festina_cleanup_pop()') }
+        cgOut(`  call void @festina_json_cursor_free(ptr ${cursor})`)
+        cgFreeTextTemp(recv, rv)
+        if resFty == 'struct' { return cgStructVal(jout, resKey) }
+        return cgArrVal(jout, resKey)
+    }
+
     // claude.md #67/#68/#107: the regex trio. `pattern.test(value)`,
     // `value.match(pattern)` and `value.replace(search, replacement)`
     // -- note that test's receiver is the PATTERN and match's is the
@@ -3675,6 +3832,15 @@ Val func cgMethodCall(e:Node, callee:Node) {
         cgReleaseOwnedReceiver(recv, again)
         return cgVal(bt, 'ptr', 'text')
     }
+    // A struct or container renders as JSON, through the same
+    // cgToText a template interpolation uses -- one path rather than
+    // two that could drift apart.
+    if r.fty == 'struct' || r.fty == 'arr' || r.fty == 'map' {
+        Val t = cgToText(r)
+        if CG_STUCK { return none }
+        cgReleaseOwnedReceiver(recv, r)
+        return t
+    }
     if r.fty != 'int' && r.fty != 'float' && r.fty != 'bool' {
         cgUnported(`.toText() on ${r.fty}`)
         return none
@@ -3691,6 +3857,45 @@ Val func cgMethodCall(e:Node, callee:Node) {
 // field store retains, a returned alias is retained by the return
 // path), so the caller's is provably the last one nothing else will
 // drop.
+// claude.md #236: the call-site half of throw unwinding. A call site
+// owns whatever fresh argument values it built -- a literal, a
+// template text, a call result, a handle a coercion minted -- and
+// releases them right after the call returns. A callee that THROWS
+// never returns here, so those temporaries were the one thing left
+// leaking once every frame's locals were covered. Registered as
+// (value, release) pairs for the duration of the call only; no slot is
+// needed, which is the same shape the JSON builders use.
+//
+// The predicate is deliberately the same one cgFreeCallArgs uses:
+// exactly what that function would free is exactly what a throw has to
+// free instead, and two predicates that could drift apart would leak
+// on one path or double-free on the other.
+int func cgGuardCallArgs(args:arr[Node], vals:arr[Val]) {
+    if CG_HAS_TRY == false { return 0 }
+    int pushed = 0
+    int i = 0
+    while i < vals.length {
+        Val a = vals[i]
+        if cgIsRefcounted(a.fty) {
+            if cgOwnsRefcounted(args[i], a) {
+                cgOut(`  call void @festina_cleanup_push(ptr ${a.v}, ptr ${cgReleaseFnFor(a.fty, cgRelKeyVal(a))})`)
+                pushed++
+            }
+        } else if a.fty == 'text' {
+            if cgOwnsText(args[i], a) {
+                cgOut(`  call void @festina_cleanup_push(ptr ${a.v}, ptr @free)`)
+                pushed++
+            }
+        }
+        i++
+    }
+    return pushed
+}
+
+void func cgUnguardCallArgs(pushed:int) {
+    if pushed > 0 { cgOut(`  call void @festina_cleanup_pop_n(i64 ${pushed})`) }
+}
+
 void func cgFreeCallArgs(args:arr[Node], vals:arr[Val]) {
     int i = 0
     while i < vals.length {
@@ -3745,13 +3950,16 @@ Val func cgIndirectCall(e:Node, name:text) {
         j++
     }
     text rf = cgSigFty(cgSigRet(sig))
+    int guarded = cgGuardCallArgs(args, argVals)
     if rf == 'void' {
         cgOut(`  call void ${fnPtr}(${joined})`)
+        cgUnguardCallArgs(guarded)
         cgFreeCallArgs(args, argVals)
         return cgVal('', 'void', 'void')
     }
     text out = cgTmp()
     cgOut(`  ${out} = call ${cgLtyOf(rf)} ${fnPtr}(${joined})`)
+    cgUnguardCallArgs(guarded)
     cgFreeCallArgs(args, argVals)
     text rkey = cgSigKey(cgSigRet(sig))
     if rf == 'struct' { return cgStructVal(out, rkey) }
@@ -3839,7 +4047,60 @@ Val func cgCall(e:Node, wantValue:bool) {
         CG_EXTRA.push(`${memo} = private global [3 x ptr] zeroinitializer`)
         text rout = cgTmp()
         cgOut(`  ${rout} = call ptr @festina_regex_compile_memo(ptr ${pv.v}, ptr ${flagsV}, ptr ${memo})`)
+        // claude.md #83: the memo strdups whatever it keeps and
+        // regcomp reads its argument inline, so neither pointer is
+        // held past this call and a temporary passed for either is the
+        // caller's to free.
+        cgFreeTextTemp(rargs[0], pv)
+        if rargs.length > 1 { cgFreeTextTemp(rargs[1], fv) }
         return cgVal(rout, 'ptr', 'regex')
+    }
+    // claude.md #93/#132: time, and the two filesystem calls that
+    // stayed free functions when the rest moved onto `blob` itself.
+    // Each frees any text temporary it was handed: none of these
+    // runtime functions keeps a pointer past the call -- the file
+    // helpers read or write and close, strftime copies into its own
+    // buffer.
+    if name == 'now' && listOf(e, 'args').length == 0 {
+        text nout = cgTmp()
+        cgOut(`  ${nout} = call i64 @festina_now_ms()`)
+        return cgVal(nout, 'i64', 'int')
+    }
+    if name == 'formatTime' || name == 'mkdir' || name == 'ls' {
+        arr[Node] fargs = listOf(e, 'args')
+        arr[Val] fvals = []
+        arr[text] fparts = []
+        int fi = 0
+        while fi < fargs.length {
+            Val fa = cgExpr(fargs[fi])
+            if CG_STUCK { return none }
+            text fl = 'ptr'
+            if fa.fty == 'int' { fl = 'i64' }
+            fparts.push(`${fl} ${fa.v}`)
+            fvals.push(fa)
+            fi++
+        }
+        text fjoined = ''
+        int fj = 0
+        while fj < fparts.length {
+            if fj > 0 { fjoined = fjoined + ', ' }
+            fjoined = fjoined + fparts[fj]
+            fj++
+        }
+        text ffn = 'festina_format_time'
+        text fret = 'ptr'
+        text fty2 = 'text'
+        if name == 'mkdir' { ffn = 'festina_mkdir'  fret = 'i8'  fty2 = 'bool' }
+        if name == 'ls' { ffn = 'festina_ls' }
+        text fout = cgTmp()
+        cgOut(`  ${fout} = call ${fret} @${ffn}(${fjoined})`)
+        int fk = 0
+        while fk < fvals.length {
+            cgFreeTextTemp(fargs[fk], fvals[fk])
+            fk++
+        }
+        if name == 'ls' { return cgArrVal(fout, 'text') }
+        return cgVal(fout, fret, fty2)
     }
     if name == 'setTimeout' || name == 'setInterval' {
         arr[Node] targs = listOf(e, 'args')
@@ -3901,13 +4162,32 @@ Val func cgCall(e:Node, wantValue:bool) {
     if FN_PARAMS[name] != null {
         if FN_PARAMS[name] != '' { ptys = FN_PARAMS[name].split('|') }
     }
+    // FN_PARAMS deliberately spells a non-scalar parameter as '' (see
+    // its own comment: a `null` argument needs only enough type to
+    // pick a null constant, and every non-scalar's is the same
+    // pointer). A LITERAL argument needs more than that -- an array
+    // literal has to know its own element type -- so the full encoded
+    // signature is consulted where there is one. The two agree
+    // everywhere they overlap: for a ptr-shaped parameter, an untyped
+    // null and a typed one are the same constant.
+    arr[text] sigPtys = []
+    if FN_SIG[name] != null {
+        if FN_SIG[name] != '' { sigPtys = cgSigParams(FN_SIG[name]) }
+    }
     arr[text] parts = []
     arr[Val] argVals = []
     int i = 0
     while i < args.length {
         text want = ''
+        text wantKey = ''
         if i < ptys.length { want = ptys[i] }
-        Val a = cgExprExpecting(args[i], want, '')
+        if want == '' {
+            if i < sigPtys.length {
+                want = cgSigFty(sigPtys[i])
+                wantKey = cgSigKey(sigPtys[i])
+            }
+        }
+        Val a = cgExprExpecting(args[i], want, wantKey)
         if CG_STUCK { return none }
         parts.push(`${a.lty} ${a.v}`)
         argVals.push(a)
@@ -3920,8 +4200,10 @@ Val func cgCall(e:Node, wantValue:bool) {
         joined = joined + parts[j]
         j++
     }
+    int guarded = cgGuardCallArgs(args, argVals)
     if retF == 'void' {
         cgOut(`  call void @${name}(${joined})`)
+        cgUnguardCallArgs(guarded)
         cgFreeCallArgs(args, argVals)
         return cgVal('', 'void', 'void')
     }
@@ -3929,6 +4211,7 @@ Val func cgCall(e:Node, wantValue:bool) {
     if lty == '' { lty = 'ptr' }
     text t = cgTmp()
     cgOut(`  ${t} = call ${lty} @${name}(${joined})`)
+    cgUnguardCallArgs(guarded)
     cgFreeCallArgs(args, argVals)
     if retF == 'struct' { return cgStructVal(t, FN_RETKEY[name]) }
     if retF == 'arr' { return cgArrVal(t, FN_RETKEY[name]) }
@@ -5902,6 +6185,543 @@ text func cgMapForEachTrampoline(vty:text, cbName:text) {
     return name
 }
 
+// ---------------------------------------------------------------------
+// claude.md #159/#173/#233: parsing JSON into a declared type.
+//
+// `text.toStruct(T)` and `text.toArr(T)` generate a builder per target
+// type, cached, that walks a cursor the runtime owns. Every read
+// either returns a valid value or throws from inside the runtime and
+// never returns, so nothing generated here branches on failure.
+//
+// What the generated code DOES have to handle is a throw from
+// somewhere deeper: a half-built value is on this frame and nothing
+// else owns it yet. Each builder registers what it holds on the
+// runtime's cleanup stack -- the header it is filling in, and each
+// key text between its read and its free -- so festina_throw releases
+// them on the way to the catching try. Nested builders push and pop
+// above their caller's entries, which is what makes the release order
+// right: an inner half-built value goes before the outer one it would
+// have been stored into.
+//
+// This is deliberately NOT the sjlj-per-builder design an earlier
+// round used: that made any program using .toStruct() a "uses try"
+// program, which has no lowering at all on wasm32 or AArch64.
+
+// The builder for one target type, generated on first use and cached.
+// The key is the type spelling, so `arr[int]` and a struct named `int`
+// could never collide -- they are `arr:int` and `int`.
+text func cgFromJsonFn(key:text) {
+    if CG_FROMJSON[key] != null { return CG_FROMJSON[key] }
+    if cgKeyFty(key) == 'arr' { return cgFromJsonArrFn(cgKeyEty(key)) }
+    if cgKeyFty(key) == 'map' { return cgFromJsonMapFn(cgKeyEty(key)) }
+    return cgFromJsonStructFn(key)
+}
+
+// Reading ONE value at the cursor. A scalar is a single runtime call;
+// a nested struct or container recurses into its own builder, exactly
+// as JSON rendering recurses.
+text func cgJsonReadValue(fty:text, key:text) {
+    if fty == 'struct' || fty == 'arr' || fty == 'map' {
+        text fn = cgFromJsonFn(cgTypeKey(fty, key))
+        text v = cgTmp()
+        cgOut(`  ${v} = call ptr ${fn}(ptr %cursor)`)
+        return v
+    }
+    text v2 = cgTmp()
+    if fty == 'int' { cgOut(`  ${v2} = call i64 @festina_json_read_int(ptr %cursor)`) }
+    else if fty == 'float' { cgOut(`  ${v2} = call double @festina_json_read_float(ptr %cursor)`) }
+    else if fty == 'bool' { cgOut(`  ${v2} = call i8 @festina_json_read_bool(ptr %cursor)`) }
+    else { cgOut(`  ${v2} = call ptr @festina_json_read_text(ptr %cursor)`) }
+    return v2
+}
+
+text func cgFromJsonStructFn(sname:text) {
+    text key = sname
+    if CG_FROMJSON[key] != null { return CG_FROMJSON[key] }
+    text name = `@__festina_from_json_struct_${cgUid()}`
+    CG_FROMJSON[key] = name
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define ptr ${name}(ptr %cursor) {`)
+    cgBlockLabel('entry')
+    text out = cgFreshHeader(`%struct.${sname}`)
+    cgOut(`  call void @festina_cleanup_push(ptr ${out}, ptr ${cgReleaseFnFor('struct', sname)})`)
+    cgOut('  call void @festina_json_object_start(ptr %cursor)')
+    text first = cgTmp()
+    cgOut(`  ${first} = alloca i8`)
+    cgOut(`  store i8 1, ptr ${first}`)
+    text loopL = cgLabel('fromjson.loop')
+    text endL = cgLabel('fromjson.end')
+    text readkeyL = cgLabel('fromjson.readkey')
+    text keydoneL = cgLabel('fromjson.keydone')
+    cgOut(`  br label %${loopL}`)
+    cgBlockLabel(loopL)
+    text done = cgTmp()
+    cgOut(`  ${done} = call i8 @festina_json_object_next(ptr %cursor, ptr ${first})`)
+    text doneB = cgTmp()
+    cgOut(`  ${doneB} = icmp ne i8 ${done}, 0`)
+    cgOut(`  br i1 ${doneB}, label %${endL}, label %${readkeyL}`)
+    cgBlockLabel(readkeyL)
+    text keyReg = cgTmp()
+    cgOut(`  ${keyReg} = call ptr @festina_json_read_key(ptr %cursor)`)
+    cgOut(`  call void @festina_cleanup_push(ptr ${keyReg}, ptr @free)`)
+
+    arr[text] names = SF_NAMES[sname].split('|')
+    int i = 0
+    while i < names.length {
+        text fk = `${sname}.${names[i]}`
+        text matchL = cgLabel(`fromjson.match${i}`)
+        text nextL = cgLabel(`fromjson.check${i}`)
+        text matches = cgTmp()
+        cgOut(`  ${matches} = call i8 @festina_json_key_matches(ptr ${keyReg}, ptr ${cgStringConst(names[i])})`)
+        text matchesB = cgTmp()
+        cgOut(`  ${matchesB} = icmp ne i8 ${matches}, 0`)
+        cgOut(`  br i1 ${matchesB}, label %${matchL}, label %${nextL}`)
+        cgBlockLabel(matchL)
+        text slot = cgTmp()
+        cgOut(`  ${slot} = getelementptr %struct.${sname}, ptr ${out}, i32 0, i32 ${SF_IDX[fk]}`)
+        text ffty = SF_FTY[fk]
+        text fkey = ''
+        if ffty == 'struct' { fkey = SF_SNAME[fk] }
+        if ffty == 'arr' || ffty == 'map' { fkey = SF_ETY[fk] }
+        text oldVal = ''
+        if ffty == 'text' || cgIsRefcounted(ffty) {
+            oldVal = cgTmp()
+            cgOut(`  ${oldVal} = load ptr, ptr ${slot}`)
+        }
+        text v = cgJsonReadValue(ffty, fkey)
+        cgOut(`  store ${SF_LTY[fk]} ${v}, ptr ${slot}`)
+        // A duplicate key overwrites, last one wins -- which means
+        // whatever the earlier one stored has to be given back, the
+        // same convention a map literal's own repeated key follows.
+        if oldVal != '' {
+            if ffty == 'text' {
+                cgOut(`  call void @free(ptr ${oldVal})`)
+            } else {
+                cgOut(`  call void ${cgReleaseFnFor(ffty, fkey)}(ptr ${oldVal})`)
+            }
+        }
+        cgOut(`  br label %${keydoneL}`)
+        cgBlockLabel(nextL)
+        i++
+    }
+    // An unrecognized key's value is skipped rather than refused:
+    // lenient, forward-compatible parsing.
+    cgOut('  call void @festina_json_skip_field_value(ptr %cursor)')
+    cgOut(`  br label %${keydoneL}`)
+    cgBlockLabel(keydoneL)
+    cgOut('  call void @festina_cleanup_pop()')
+    cgOut(`  call void @free(ptr ${keyReg})`)
+    cgOut(`  br label %${loopL}`)
+    cgBlockLabel(endL)
+    cgOut('  call void @festina_cleanup_pop()')
+    cgOut(`  ret ptr ${out}`)
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
+// claude.md #173: the map[T] counterpart. Unlike the struct builder's
+// own loop -- which matches each key against a FIXED set of field
+// names and skips anything else -- every key here becomes an entry.
+// That is the whole difference: arbitrary keys are what a map target
+// is for.
+// ---------------------------------------------------------------------
+// claude.md #114/#190: rendering a value as JSON.
+//
+// One generated walker per type, cached, registered BEFORE its body is
+// generated so a self-referencing struct produces ONE function that
+// calls itself rather than recursing forever at compile time -- the
+// same load-bearing cache write the release wrappers use.
+//
+// The recursion is depth-capped at 32 and a value past the cap renders
+// as null. A cyclic value is constructible, and a DEBUG rendering that
+// crashed the program it is debugging would be worse than an honest
+// truncation.
+
+// A compile-time-known string, appended with its length rather than
+// through a runtime strlen the compiler already knows the answer to.
+// A literal double quote. Festina's single-quoted strings take `\'`
+// for their own delimiter, so a bare `"` is ordinary -- but a template
+// literal is the only place this is ever interpolated, and spelling it
+// once keeps the JSON key construction below readable.
+text func cgDq() {
+    return 34.toChar()
+}
+
+void func cgSbConst(sb:text, lit:text) {
+    cgOut(`  call void @festina_sb_append_n(ptr ${sb}, ptr ${cgStringConst(lit)}, i64 ${cgUtf8Bytes(lit)})`)
+}
+
+// ONE value, at a slot, of a given type -- the shared field, element
+// and entry emitter every generated walker is built from.
+void func cgJsonSlot(sb:text, fty:text, key:text, slot:text, depth:text) {
+    text v = cgTmp()
+    if fty == 'int' {
+        cgOut(`  ${v} = load i64, ptr ${slot}`)
+        cgOut(`  call void @festina_sb_append_json_int(ptr ${sb}, i64 ${v})`)
+        return
+    }
+    if fty == 'float' {
+        cgOut(`  ${v} = load double, ptr ${slot}`)
+        cgOut(`  call void @festina_sb_append_json_float(ptr ${sb}, double ${v})`)
+        return
+    }
+    if fty == 'bool' {
+        cgOut(`  ${v} = load i8, ptr ${slot}`)
+        cgOut(`  call void @festina_sb_append_json_bool(ptr ${sb}, i8 ${v})`)
+        return
+    }
+    if fty == 'text' {
+        cgOut(`  ${v} = load ptr, ptr ${slot}`)
+        cgOut(`  call void @festina_sb_append_json_text(ptr ${sb}, ptr ${v})`)
+        return
+    }
+    if fty == 'struct' || fty == 'arr' || fty == 'map' {
+        cgOut(`  ${v} = load ptr, ptr ${slot}`)
+        text inner = cgJsonFn(cgTypeKey(fty, key))
+        text d = cgTmp()
+        cgOut(`  ${d} = add i64 ${depth}, 1`)
+        cgOut(`  call void ${inner}(ptr ${v}, ptr ${sb}, i64 ${d})`)
+        return
+    }
+    // Anything with no text form of its own renders as a labelled
+    // handle rather than as nothing.
+    cgOut(`  ${v} = load ptr, ptr ${slot}`)
+    text q = cgDq()
+    text label = cgStringConst(`${q}<${fty}>${q}`)
+    cgOut(`  call void @festina_sb_append_handle(ptr ${sb}, ptr ${v}, ptr ${label})`)
+}
+
+text func cgJsonFn(key:text) {
+    if CG_JSON[key] != null { return CG_JSON[key] }
+    text name = `@__festina_json_${cgUid()}`
+    CG_JSON[key] = name
+    text kf = cgKeyFty(key)
+    text ke = cgKeyEty(key)
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define void ${name}(ptr %v, ptr %sb, i64 %depth) {`)
+    cgBlockLabel('entry')
+    text nullL = cgLabel('json.null')
+    text deepL = cgLabel('json.deep')
+    text goL = cgLabel('json.go')
+    text isnull = cgTmp()
+    cgOut(`  ${isnull} = icmp eq ptr %v, null`)
+    cgOut(`  br i1 ${isnull}, label %${nullL}, label %${deepL}`)
+    cgBlockLabel(nullL)
+    cgSbConst('%sb', 'null')
+    cgOut('  ret void')
+    cgBlockLabel(deepL)
+    text toodeep = cgTmp()
+    cgOut(`  ${toodeep} = icmp sgt i64 %depth, 32`)
+    cgOut(`  br i1 ${toodeep}, label %${nullL}, label %${goL}`)
+    cgBlockLabel(goL)
+
+    if kf == 'struct' {
+        arr[text] fnames = []
+        if SF_NAMES[ke] != '' { fnames = SF_NAMES[ke].split('|') }
+        int i = 0
+        while i < fnames.length {
+            text prefix = ',"'
+            if i == 0 { prefix = '{"' }
+            cgSbConst('%sb', `${prefix}${fnames[i]}${cgDq()}:`)
+            text fk = `${ke}.${fnames[i]}`
+            text fp = cgTmp()
+            cgOut(`  ${fp} = getelementptr %struct.${ke}, ptr %v, i32 0, i32 ${SF_IDX[fk]}`)
+            text ffty = SF_FTY[fk]
+            text fkey = ''
+            if ffty == 'struct' { fkey = SF_SNAME[fk] }
+            if ffty == 'arr' || ffty == 'map' { fkey = SF_ETY[fk] }
+            cgJsonSlot('%sb', ffty, fkey, fp, '%depth')
+            i++
+        }
+        if fnames.length == 0 { cgSbConst('%sb', '{') }
+        cgSbConst('%sb', '}')
+    } else if kf == 'arr' {
+        text elemLty = cgElemLty(ke)
+        text esize = '8'
+        if ke == 'bool' { esize = '1' }
+        cgSbConst('%sb', '[')
+        text lenP = cgTmp()
+        cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr %v, i32 0, i32 0`)
+        text n = cgTmp()
+        cgOut(`  ${n} = load i64, ptr ${lenP}`)
+        text dataP = cgTmp()
+        cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr %v, i32 0, i32 1`)
+        text dataV = cgTmp()
+        cgOut(`  ${dataV} = load ptr, ptr ${dataP}`)
+        text iSlot = cgTmp()
+        cgOut(`  ${iSlot} = alloca i64`)
+        cgOut(`  store i64 0, ptr ${iSlot}`)
+        text condL = cgLabel('json.acond')
+        text loopL = cgLabel('json.abody')
+        text sepL = cgLabel('json.asep')
+        text elemL = cgLabel('json.aelem')
+        text doneL = cgLabel('json.adone')
+        cgOut(`  br label %${condL}`)
+        cgBlockLabel(condL)
+        text iv = cgTmp()
+        cgOut(`  ${iv} = load i64, ptr ${iSlot}`)
+        text more = cgTmp()
+        cgOut(`  ${more} = icmp slt i64 ${iv}, ${n}`)
+        cgOut(`  br i1 ${more}, label %${loopL}, label %${doneL}`)
+        cgBlockLabel(loopL)
+        text nonfirst = cgTmp()
+        cgOut(`  ${nonfirst} = icmp sgt i64 ${iv}, 0`)
+        cgOut(`  br i1 ${nonfirst}, label %${sepL}, label %${elemL}`)
+        cgBlockLabel(sepL)
+        cgSbConst('%sb', ',')
+        cgOut(`  br label %${elemL}`)
+        cgBlockLabel(elemL)
+        text off = cgTmp()
+        cgOut(`  ${off} = mul i64 ${iv}, ${esize}`)
+        text ep = cgTmp()
+        cgOut(`  ${ep} = getelementptr i8, ptr ${dataV}, i64 ${off}`)
+        text efty = ke
+        text ekey = ''
+        if SF_NAMES[ke] != null { efty = 'struct'  ekey = ke }
+        else if cgIsNestedElem(ke) { efty = cgKeyFty(ke)  ekey = cgKeyEty(ke) }
+        cgJsonSlot('%sb', efty, ekey, ep, '%depth')
+        text nx = cgTmp()
+        cgOut(`  ${nx} = add i64 ${iv}, 1`)
+        cgOut(`  store i64 ${nx}, ptr ${iSlot}`)
+        cgOut(`  br label %${condL}`)
+        cgBlockLabel(doneL)
+        cgSbConst('%sb', ']')
+    } else {
+        // A map walks its BUCKETS by capacity rather than a dense
+        // range, so a tombstone and an empty slot both have to be
+        // recognized and skipped -- and whether a comma is owed cannot
+        // be read off the index the way an array's can, because the
+        // live entries are not contiguous.
+        text capP = cgTmp()
+        cgOut(`  ${capP} = getelementptr %struct._FestinaMap, ptr %v, i32 0, i32 2`)
+        text cap = cgTmp()
+        cgOut(`  ${cap} = load i64, ptr ${capP}`)
+        text entP = cgTmp()
+        cgOut(`  ${entP} = getelementptr %struct._FestinaMap, ptr %v, i32 0, i32 1`)
+        text ents = cgTmp()
+        cgOut(`  ${ents} = load ptr, ptr ${entP}`)
+        cgSbConst('%sb', '{')
+        text iSlot = cgTmp()
+        cgOut(`  ${iSlot} = alloca i64`)
+        cgOut(`  store i64 0, ptr ${iSlot}`)
+        text emittedSlot = cgTmp()
+        cgOut(`  ${emittedSlot} = alloca i8`)
+        cgOut(`  store i8 0, ptr ${emittedSlot}`)
+        text condL = cgLabel('json.mcond')
+        text loopL = cgLabel('json.mbody')
+        text liveL = cgLabel('json.mlive')
+        text sepL = cgLabel('json.msep')
+        text kvL = cgLabel('json.mkv')
+        text nextL = cgLabel('json.mnext')
+        text doneL = cgLabel('json.mdone')
+        cgOut(`  br label %${condL}`)
+        cgBlockLabel(condL)
+        text iv = cgTmp()
+        cgOut(`  ${iv} = load i64, ptr ${iSlot}`)
+        text more = cgTmp()
+        cgOut(`  ${more} = icmp slt i64 ${iv}, ${cap}`)
+        cgOut(`  br i1 ${more}, label %${loopL}, label %${doneL}`)
+        cgBlockLabel(loopL)
+        text off = cgTmp()
+        cgOut(`  ${off} = mul i64 ${iv}, 16`)
+        text entp = cgTmp()
+        cgOut(`  ${entp} = getelementptr i8, ptr ${ents}, i64 ${off}`)
+        text keyv = cgTmp()
+        cgOut(`  ${keyv} = load ptr, ptr ${entp}`)
+        text isNull2 = cgTmp()
+        cgOut(`  ${isNull2} = icmp eq ptr ${keyv}, null`)
+        text isTomb = cgTmp()
+        cgOut(`  ${isTomb} = icmp eq ptr ${keyv}, inttoptr (i64 1 to ptr)`)
+        text skip = cgTmp()
+        cgOut(`  ${skip} = or i1 ${isNull2}, ${isTomb}`)
+        cgOut(`  br i1 ${skip}, label %${nextL}, label %${liveL}`)
+        cgBlockLabel(liveL)
+        text emitted = cgTmp()
+        cgOut(`  ${emitted} = load i8, ptr ${emittedSlot}`)
+        text nonfirst = cgTmp()
+        cgOut(`  ${nonfirst} = icmp ne i8 ${emitted}, 0`)
+        cgOut(`  br i1 ${nonfirst}, label %${sepL}, label %${kvL}`)
+        cgBlockLabel(sepL)
+        cgSbConst('%sb', ',')
+        cgOut(`  br label %${kvL}`)
+        cgBlockLabel(kvL)
+        cgOut(`  call void @festina_sb_append_json_text(ptr %sb, ptr ${keyv})`)
+        cgSbConst('%sb', ':')
+        text vslot = cgTmp()
+        cgOut(`  ${vslot} = getelementptr i8, ptr ${entp}, i64 8`)
+        text vfty = ke
+        text vkey = ''
+        if SF_NAMES[ke] != null { vfty = 'struct'  vkey = ke }
+        else if cgIsNestedElem(ke) { vfty = cgKeyFty(ke)  vkey = cgKeyEty(ke) }
+        cgJsonSlot('%sb', vfty, vkey, vslot, '%depth')
+        cgOut(`  store i8 1, ptr ${emittedSlot}`)
+        cgOut(`  br label %${nextL}`)
+        cgBlockLabel(nextL)
+        text nx = cgTmp()
+        cgOut(`  ${nx} = add i64 ${iv}, 1`)
+        cgOut(`  store i64 ${nx}, ptr ${iSlot}`)
+        cgOut(`  br label %${condL}`)
+        cgBlockLabel(doneL)
+        cgSbConst('%sb', '}')
+    }
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
+text func cgFromJsonMapFn(vty:text) {
+    text key = `map:${vty}`
+    if CG_FROMJSON[key] != null { return CG_FROMJSON[key] }
+    text name = `@__festina_from_json_map_${cgUid()}`
+    CG_FROMJSON[key] = name
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define ptr ${name}(ptr %cursor) {`)
+    cgBlockLabel('entry')
+    text out = cgFreshHeader('%struct._FestinaMap')
+    cgOut(`  call void @festina_cleanup_push(ptr ${out}, ptr ${cgReleaseFnFor('map', vty)})`)
+    cgOut('  call void @festina_json_object_start(ptr %cursor)')
+    text first = cgTmp()
+    cgOut(`  ${first} = alloca i8`)
+    cgOut(`  store i8 1, ptr ${first}`)
+    text loopL = cgLabel('fromjson.mloop')
+    text endL = cgLabel('fromjson.mend')
+    text entryL = cgLabel('fromjson.mentry')
+    cgOut(`  br label %${loopL}`)
+    cgBlockLabel(loopL)
+    text done = cgTmp()
+    cgOut(`  ${done} = call i8 @festina_json_object_next(ptr %cursor, ptr ${first})`)
+    text doneB = cgTmp()
+    cgOut(`  ${doneB} = icmp ne i8 ${done}, 0`)
+    cgOut(`  br i1 ${doneB}, label %${endL}, label %${entryL}`)
+    cgBlockLabel(entryL)
+    text keyReg = cgTmp()
+    cgOut(`  ${keyReg} = call ptr @festina_json_read_key(ptr %cursor)`)
+    cgOut(`  call void @festina_cleanup_push(ptr ${keyReg}, ptr @free)`)
+    text vfty = vty
+    text vkey = ''
+    if SF_NAMES[vty] != null { vfty = 'struct'  vkey = vty }
+    else if cgIsNestedElem(vty) { vfty = cgKeyFty(vty)  vkey = cgKeyEty(vty) }
+    text v = cgJsonReadValue(vfty, vkey)
+
+    // The entry is stored WITHOUT a retain: every JSON read hands back
+    // a fresh value rather than an alias, the same reasoning the array
+    // builder's push relies on. A duplicate key -- the only way this
+    // is ever asked to overwrite -- still releases what the key
+    // already mapped to, AFTER the set, which is claude.md #120's own
+    // ordering.
+    text countP = cgTmp()
+    cgOut(`  ${countP} = getelementptr %struct._FestinaMap, ptr ${out}, i32 0, i32 0`)
+    text entP = cgTmp()
+    cgOut(`  ${entP} = getelementptr %struct._FestinaMap, ptr ${out}, i32 0, i32 1`)
+    text capP = cgTmp()
+    cgOut(`  ${capP} = getelementptr %struct._FestinaMap, ptr ${out}, i32 0, i32 2`)
+    text tombP = cgTmp()
+    cgOut(`  ${tombP} = getelementptr %struct._FestinaMap, ptr ${out}, i32 0, i32 3`)
+    text entV = cgTmp()
+    cgOut(`  ${entV} = load ptr, ptr ${entP}`)
+    text capV = cgTmp()
+    cgOut(`  ${capV} = load i64, ptr ${capP}`)
+    text oldRaw = cgTmp()
+    cgOut(`  ${oldRaw} = call i64 @festina_map_get(ptr ${entV}, i64 ${capV}, ptr ${keyReg}, i64 0)`)
+    text oldPtr = cgTmp()
+    cgOut(`  ${oldPtr} = inttoptr i64 ${oldRaw} to ptr`)
+    text raw = cgMapToI64(v, cgElemLty(vty))
+    cgOut(`  call void @festina_map_set(ptr ${countP}, ptr ${entP}, ptr ${capP}, ptr ${tombP}, ptr ${keyReg}, i64 ${raw})`)
+    if cgElemIsRefcounted(vty) {
+        cgOut(`  call void ${cgElemReleaseFn(vty)}(ptr ${oldPtr})`)
+    } else if vty == 'text' {
+        cgOut(`  call void @free(ptr ${oldPtr})`)
+    }
+    cgOut('  call void @festina_cleanup_pop()')
+    cgOut(`  call void @free(ptr ${keyReg})`)
+    cgOut(`  br label %${loopL}`)
+    cgBlockLabel(endL)
+    cgOut('  call void @festina_cleanup_pop()')
+    cgOut(`  ret ptr ${out}`)
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
+text func cgFromJsonArrFn(ety:text) {
+    text key = `arr:${ety}`
+    if CG_FROMJSON[key] != null { return CG_FROMJSON[key] }
+    text name = `@__festina_from_json_arr_${cgUid()}`
+    CG_FROMJSON[key] = name
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define ptr ${name}(ptr %cursor) {`)
+    cgBlockLabel('entry')
+    text out = cgFreshHeader('%struct._FestinaArray')
+    cgOut(`  call void @festina_cleanup_push(ptr ${out}, ptr ${cgReleaseFnFor('arr', ety)})`)
+    cgOut('  call void @festina_json_array_start(ptr %cursor)')
+    text first = cgTmp()
+    cgOut(`  ${first} = alloca i8`)
+    cgOut(`  store i8 1, ptr ${first}`)
+    text elemLty = cgElemLty(ety)
+    text esize = '8'
+    if ety == 'bool' { esize = '1' }
+    text slot = cgTmp()
+    cgOut(`  ${slot} = alloca ${elemLty}`)
+    text loopL = cgLabel('fromjson.aloop')
+    text endL = cgLabel('fromjson.aend')
+    text elemL = cgLabel('fromjson.aelem')
+    cgOut(`  br label %${loopL}`)
+    cgBlockLabel(loopL)
+    text done = cgTmp()
+    cgOut(`  ${done} = call i8 @festina_json_array_next(ptr %cursor, ptr ${first})`)
+    text doneB = cgTmp()
+    cgOut(`  ${doneB} = icmp ne i8 ${done}, 0`)
+    cgOut(`  br i1 ${doneB}, label %${endL}, label %${elemL}`)
+    cgBlockLabel(elemL)
+    // Pushed with festina_array_push, the same helper `.push()` uses,
+    // and never needing an ownership copy first: every JSON read
+    // returns an already-fresh value rather than an alias.
+    text efty = ety
+    text ekey = ''
+    if SF_NAMES[ety] != null { efty = 'struct'  ekey = ety }
+    else if cgIsNestedElem(ety) { efty = cgKeyFty(ety)  ekey = cgKeyEty(ety) }
+    text v = cgJsonReadValue(efty, ekey)
+    cgOut(`  store ${elemLty} ${v}, ptr ${slot}`)
+    cgOut(`  call void @festina_array_push(ptr ${out}, ptr null, i64 ${esize}, ptr ${slot})`)
+    cgOut(`  br label %${loopL}`)
+    cgBlockLabel(endL)
+    cgOut('  call void @festina_cleanup_pop()')
+    cgOut(`  ret ptr ${out}`)
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
 text func cgMapReleaseTrampoline(vty:text) {
     text name = `@__festina_maprelease_${cgUid()}`
     // Resolved before the body's temps, because resolving it may
@@ -6035,6 +6855,9 @@ bool func cgIsOwningRefcountedSource(e:Node) {
     if e == null { return false }
     if e.kind == 'ArrayLit' { return true }
     if e.kind == 'MapLit' { return true }
+    // claude.md #173: see cgIsOwningTextSource's own note -- a ternary
+    // is owning because cgTernary already normalized whichever arm ran.
+    if e.kind == 'Ternary' { return true }
     return e.kind == 'Call'
 }
 
@@ -6083,6 +6906,14 @@ bool func cgIsOwningTextSource(e:Node) {
     // guarantees it, taking a festina_text_own copy in the one case
     // (a bare `${x}`) where it otherwise would not.
     if e.kind == 'TemplateLit' { return true }
+    // claude.md #173: a ternary too -- NOT because both arms are
+    // somehow guaranteed fresh (most are not), but because cgTernary
+    // normalizes whichever arm actually ran into a genuinely owned
+    // value BEFORE this is ever asked. Treating one as aliasing after
+    // that is what leaked: the caller claimed the result once
+    // whichever arm ran, so a fresh arm's own correct ownership got an
+    // extra claim with nothing to balance it.
+    if e.kind == 'Ternary' { return true }
     // In a text context `+` is concatenation, which is exactly one
     // @festina_str_concat and mallocs unconditionally: there is no
     // operand-passthrough path, not even for an empty operand. Leaving
@@ -6271,18 +7102,13 @@ void func cgFunc(d:Node) {
             } else if pf == 'struct' {
                 psname = pt.name
             } else {
-                Ty pe = pt.elem
-                if pe == null { 
+                pety = cgEtyOfTy(pt)
+                if pety == '' {
                     cgUnported(`${pf} parameter of a non-scalar type`)
                     return
                 }
-                if pe.kind != 'prim' && pe.kind != 'struct' {
-                    cgUnported(`${pf} parameter of a non-scalar type`)
-                    return
-                }
-                pety = pe.name
                 if cgStorableRefcounted(pf, pety) == false {
-                    cgUnported(`${pf} parameter of ${pe.name}`)
+                    cgUnported(`${pf} parameter of ${pety}`)
                     return
                 }
             }
@@ -6341,25 +7167,6 @@ void func cgFunc(d:Node) {
     cgOut(`define ${retL} @${name}(${joined}) {`)
     cgBlockLabel(cgLabel('entry'))
 
-    // Allocas first, matching what alloca hoisting leaves behind: a
-    // text parameter's slot is followed immediately by claude.md #243's
-    // {pointer, length} append shadow, grouped per parameter rather
-    // than all slots then all shadows.
-    int p = 0
-    while p < pnames.length {
-        text slot = `%${pnames[p]}.${cgUid()}`
-        cgOut(`  ${slot} = alloca ${pltys[p]}`)
-        if pftys[p] == 'text' {
-            cgOut(`  ${slot}.ap = alloca ptr`)
-            cgOut(`  ${slot}.aplen = alloca i64`)
-        }
-        L_SLOT[pnames[p]] = slot
-        L_FTY[pnames[p]] = pftys[p]
-        if psnames[p] != '' { L_SNAME[pnames[p]] = psnames[p] }
-        if petys[p] != '' { L_ETY[pnames[p]] = petys[p] }
-        p++
-    }
-
     // A fresh live-value list per function: a frame left over from a
     // previous function would be freed inside this one. Both are reset
     // before the parameter stores below, because an escaping text
@@ -6371,9 +7178,26 @@ void func cgFunc(d:Node) {
     CG_FRAME = freshFrames
     CG_PARAM_LIVE = freshParams
 
+    // One pass, alloca and binding together per parameter, because the
+    // UID ORDER is observable: an escaping parameter's binding may
+    // GENERATE a function of its own (the unwind wrapper claude.md
+    // #236 registers it with), and that generation happens between
+    // this parameter's slot and the next one's. Two separate loops
+    // took every slot's uid first and left the generated function
+    // numbered after all of them. The allocas still come out grouped
+    // at the top -- hoisting does that, not this loop.
     int q = 0
     while q < pnames.length {
-        text slot = L_SLOT[pnames[q]]
+        text slot = `%${pnames[q]}.${cgUid()}`
+        cgOut(`  ${slot} = alloca ${pltys[q]}`)
+        if pftys[q] == 'text' {
+            cgOut(`  ${slot}.ap = alloca ptr`)
+            cgOut(`  ${slot}.aplen = alloca i64`)
+        }
+        L_SLOT[pnames[q]] = slot
+        L_FTY[pnames[q]] = pftys[q]
+        if psnames[q] != '' { L_SNAME[pnames[q]] = psnames[q] }
+        if petys[q] != '' { L_ETY[pnames[q]] = petys[q] }
         text arg = `%arg.${pnames[q]}`
         if pftys[q] == 'text' {
             cgOut(`  store ptr null, ptr ${slot}.ap`)
