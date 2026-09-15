@@ -843,9 +843,14 @@ CANARIES = [
         "nested-element-owns-a-reference", "#315",
         "a container element that is itself a container owns a whole "
         "reference, whatever it holds",
+        # Anchored on the comment that follows rather than on the line
+        # that used to, because decisions.md #318 put a handle-element
+        # case between this check and the struct one -- and the bare
+        # check now appears in cgElemIsRefcounted too, so it no longer
+        # names one site on its own.
         """    if cgIsNestedElem(ety) { return true }
-    return SF_NAMES[ety] != null""",
-        """    return SF_NAMES[ety] != null""",
+    // A refcounted HANDLE element""",
+        """    // A refcounted HANDLE element""",
     ),
     Canary(
         "nested-element-releases-through-its-own-type", "#315",
@@ -1029,16 +1034,14 @@ CANARIES = [
             # itself changes -- only which constant each `ptr` names.
             #
             # The first spelling of this canary moved where the name was
-            # interned but left it after both column loops either way,
-            # so it broke nothing and reported NOT CAUGHT -- which read
-            # as a corpus failure and was a canary failure. Interning is
-            # memoized, so what decides the number is the FIRST ask, and
-            # only an ask placed before the loops changes anything.
-            ("""        arr[text] cnames = TBL_COLS[tn].split('|')""",
-             """        text tnFirst = cgStringConst(tn)
-        arr[text] cnames = TBL_COLS[tn].split('|')"""),
-            ("""        text tnConst = cgStringConst(tn)""",
-             """        text tnConst = tnFirst"""),
+            # interned but left it after the columns either way, so it
+            # broke nothing and reported NOT CAUGHT -- which read as a
+            # corpus failure and was a canary failure. Interning is
+            # memoized, so what decides the number is the FIRST ask.
+            ("""        cgTableArrays(tn)
+        text tnConst = cgStringConst(tn)""",
+             """        text tnConst = cgStringConst(tn)
+        cgTableArrays(tn)"""),
         ],
     ),
     Canary(
@@ -1055,6 +1058,73 @@ CANARIES = [
             cgBindLocalDecl(s, name, fty, localSlot)
         }"""),
         ],
+    ),
+
+    Canary(
+        "handle-element-owns-a-reference", "#318",
+        "a blob/regex ELEMENT holds a whole reference, so its container "
+        "needs a generated cascade rather than the plain release",
+        """    if cgIsRefcounted(ety) { return true }
+    // A ROW element owns whatever its own text/blob columns hold""",
+        """    // A ROW element owns whatever its own text/blob columns hold""",
+    ),
+    Canary(
+        "handle-element-gets-its-own-destructor", "#318",
+        "a handle element is released through its own type's destructor, "
+        "never plain free",
+        """    if cgIsRefcounted(ety) { return cgReleaseFn(ety) }
+    return '@free'""",
+        """    return '@free'""",
+    ),
+    Canary(
+        "row-release-frees-its-text-columns", "#318",
+        "a sqlite row frees each of its own text columns before the "
+        "allocation they hang off",
+        """        if ctypes[i] == 'text' {
+            text slot = cgTmp()""",
+        """        if false {
+            text slot = cgTmp()""",
+    ),
+    Canary(
+        "row-is-freed-from-its-base", "#318",
+        "a row's allocation starts one i64 before the payload every "
+        "column offset is measured from",
+        """    cgOut(`  ${base} = getelementptr i8, ptr %row, i64 -8`)""",
+        """    cgOut(`  ${base} = getelementptr i8, ptr %row, i64 0`)""",
+    ),
+    Canary(
+        "collected-rows-need-no-repacking", "#318",
+        "the runtime's own row-pointer buffer IS an arr[T] data pointer, "
+        "so a fresh header is built around it as it stands",
+        [
+            # Copy the buffer into a second allocation instead of
+            # adopting it. Both halves are needed: the header still has
+            # to be filled in, or the result is not an array at all.
+            ("""    text header = cgFreshHeader('%struct._FestinaArray')
+    text lenP = cgTmp()
+    cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${header}, i32 0, i32 0`)
+    cgOut(`  store i64 ${nv}, ptr ${lenP}`)""",
+             """    text header = cgFreshHeader('%struct._FestinaArray')
+    text lenP = cgTmp()
+    cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${header}, i32 0, i32 0`)
+    cgOut(`  store i64 0, ptr ${lenP}`)"""),
+        ],
+    ),
+    Canary(
+        "map-set-releases-the-old-value-by-its-own-type", "#318",
+        "the value a map key used to hold is released through the "
+        "element dispatch, not the struct one",
+        """            oldFn = cgElemReleaseFn(vty)""",
+        """            oldFn = cgReleaseFnFor('struct', vty)""",
+    ),
+    Canary(
+        "database-url-runs-before-the-open", "#318",
+        "the DatabaseURL directive is evaluated in main's prologue, "
+        "ahead of festina_db_open, not where it was written",
+        """    text url = ''
+    if CG_DB_URL != null {""",
+        """    text url = ''
+    if false {""",
     ),
 
     Canary(

@@ -863,6 +863,21 @@ Val func cgMapVal(v:text, ety:text) {
     return r
 }
 
+// A sqlite result ROW. Deliberately not a struct Val with a different
+// name: a row is not laid out the way a struct is -- flat 8-byte slots
+// with no LLVM type of its own -- so every place that reaches for
+// %struct.<name> has to miss it. The table name rides in `sname`
+// because that is the one slot a value's own type name has, and
+// TBL_COLS is what tells a table name from a struct one.
+Val func cgTableVal(v:text, tname:text) {
+    Val r
+    r.v = v
+    r.lty = 'ptr'
+    r.fty = 'table'
+    r.sname = tname
+    return r
+}
+
 Val func cgStructVal(v:text, sname:text) {
     Val r
     r.v = v
@@ -884,6 +899,9 @@ text func cgLtyOf(fty:text) {
     if fty == 'arr' { return 'ptr' }
     if fty == 'map' { return 'ptr' }
     if fty == 'struct' { return 'ptr' }
+    // A row is one pointer too, to storage the RUNTIME laid out rather
+    // than codegen -- which is why it has no payload type of its own.
+    if fty == 'table' { return 'ptr' }
     // claude.md #141: a first-class function value is a bare LLVM
     // function pointer. It is never allocated and never freed -- a
     // declared function is immortal for the process's lifetime -- so
@@ -1058,6 +1076,7 @@ text func cgManagedFty(t:Ty) {
     if t.kind == 'arr' { return 'arr' }
     if t.kind == 'map' { return 'map' }
     if t.kind == 'struct' { return 'struct' }
+    if t.kind == 'table' { return 'table' }
     // claude.md #109: a blob carries the ordinary refcount header, so
     // the only thing the generic release cannot do for it is free the
     // path and byte buffer hanging off the payload -- exactly the shape
@@ -1148,6 +1167,7 @@ map[text] G_ETY = {}
 // Lazily-generated per-element-type release cascades, cached by the
 // element type so one is generated per type and not per site.
 map[text] CG_ARR_REL = {}
+map[text] CG_ROW_REL = {}
 map[text] CG_MAP_REL = {}
 
 // Comparator trampolines, cached per element type (claude.md #184).
@@ -1272,6 +1292,20 @@ map[text] TBL_TYPES = {}
 // because a table with no columns at all joins to the empty text and a
 // split of that answers one, not zero.
 map[int] TBL_NCOLS = {}
+// Per-column, keyed '<Table>.<column>': the slot index and the
+// festina-level type. A row's slots are flat 8-byte cells in
+// declaration order, so the index IS the offset divided by eight --
+// unlike a struct, whose fields are laid out by LLVM.
+map[int] TBL_ARRAYS = {}
+// claude.md #70: the `DatabaseURL = <expr>` directive's own value
+// expression, or null. Not a statement the program runs: it is lifted
+// out of the body and evaluated in main's prologue instead, ahead of
+// festina_db_open -- and so ahead of every ordinary global's own
+// initializer, which is why referencing another global from it would
+// read a zero rather than that global's value.
+Node CG_DB_URL = null
+map[int] TB_IDX = {}
+map[text] TB_FTY = {}
 
 // The function currently being emitted, and its return type. A
 // `return null` takes its type from the signature rather than from
@@ -1544,6 +1578,7 @@ Val func cgExpr(e:Node) {
         text t = cgTmp()
         cgOut(`  ${t} = load ${lty}, ptr ${slot}`)
         if fty == 'struct' { return cgStructVal(t, cgSnameOf(name)) }
+        if fty == 'table' { return cgTableVal(t, cgSnameOf(name)) }
         if fty == 'arr' { return cgArrVal(t, cgEtyOf(name)) }
         if fty == 'map' { return cgMapVal(t, cgEtyOf(name)) }
         if fty == 'func' { return cgFuncVal(t, cgEtyOf(name)) }
@@ -1886,6 +1921,28 @@ Val func cgFieldPtr(e:Node) {
     }
     Val obj = cgExpr(childOf(e, 'obj'))
     if CG_STUCK { return none }
+    // A ROW's columns are flat 8-byte cells the runtime laid out, so
+    // the address is plain byte arithmetic rather than a typed
+    // getelementptr into a named struct -- there is no LLVM type here
+    // to index into.
+    if obj.fty == 'table' {
+        text ckey = `${obj.sname}.${rawText(e, 'prop')}`
+        if TB_FTY[ckey] == null {
+            cgUnported(`column ${rawText(e, 'prop')} of ${obj.sname}`)
+            return none
+        }
+        text cfty = TB_FTY[ckey]
+        if cgLtyOf(cfty) == '' {
+            cgUnported(`column of type ${cfty}`)
+            return none
+        }
+        int coff = TB_IDX[ckey] * 8
+        text cfp = cgTmp()
+        cgOut(`  ${cfp} = getelementptr i8, ptr ${obj.v}, i64 ${coff}`)
+        Val cr = cgVal(cfp, cgLtyOf(cfty), cfty)
+        CG_FIELD_BASE = obj
+        return cr
+    }
     if obj.fty != 'struct' {
         cgUnported(`member access on ${obj.fty}`)
         return none
@@ -2091,6 +2148,24 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
         }
         return cgArrayLit(e, ety, '')
     }
+    // claude.md #32-34: a `sqlite()` whose rows are COLLECTED, which
+    // only the destination's declared type can say. Placed here beside
+    // the literal cases for the same reason they are here: the
+    // expression's own shape is not enough to emit it.
+    if e.kind == 'Call' {
+        if fty == 'arr' {
+            if TBL_COLS[ety] != null {
+                Node scal = childOf(e, 'callee')
+                if scal != null {
+                    if scal.kind == 'Identifier' {
+                        if rawText(scal, 'name') == 'sqlite' {
+                            return cgSqliteCollect(e, ety)
+                        }
+                    }
+                }
+            }
+        }
+    }
     if e.kind == 'MapLit' {
         if fty != 'map' {
             Val none
@@ -2212,6 +2287,11 @@ Val func cgMapGet(objV:text, vty:text, keyV:text) {
     cgOut(`  ${raw} = call i64 @festina_map_get(ptr ${ent}, i64 ${cap}, ptr ${keyV}, i64 ${cgMapMissing(vlty)})`)
     text out = cgMapFromI64(raw, vlty)
     if SF_NAMES[vty] != null { return cgStructVal(out, vty) }
+    // A row read out of a map, on exactly a struct's terms: the value
+    // type here is the TABLE name, so a plain cgVal would hand back a
+    // value whose fty was 'People' -- a type nothing downstream knows
+    // -- instead of a row that remembers which table it came from.
+    if TBL_COLS[vty] != null { return cgTableVal(out, vty) }
     return cgVal(out, vlty, vty)
 }
 
@@ -2273,7 +2353,14 @@ void func cgMapSet(mapPtr:text, vty:text, keyV:text, valV:text, keyOwned:bool, v
             // takes a temp -- generating the value type's cascade is
             // what this call may do, and those temps come first.
             oldPtr = old
-            oldFn = cgReleaseFnFor('struct', vty)
+            // Through the ELEMENT dispatch, not a hardcoded 'struct'.
+            // The two agree for a struct value type, which is why the
+            // narrower spelling survived this long -- but a map of
+            // rows, of handles, or of containers all need their own
+            // release here, and the generic one would drop a row's
+            // columns, a blob's buffer or an inner array's elements on
+            // the floor.
+            oldFn = cgElemReleaseFn(vty)
         }
     }
     text raw = cgMapToI64(stored, vlty)
@@ -2701,6 +2788,22 @@ Val func cgIndexRead(e:Node, obj:Val) {
 Val func cgMemberAccess(e:Node) {
     Val none
     bool computed = fieldOf(e, 'computed').raw == 'true'
+    // claude.md #71: `environment.NAME` and `environment[keyExpr]`.
+    // Intercepted before the object is emitted at all, because
+    // `environment` is not a value -- there is nothing to load, and
+    // evaluating it would report an unknown name. The dot form's key
+    // is a compile-time constant; the bracket form's is an ordinary
+    // text expression, and both end at the same call.
+    Node envObj = childOf(e, 'obj')
+    if envObj != null {
+        if envObj.kind == 'Identifier' {
+            if rawText(envObj, 'name') == 'environment' {
+                if cgSlotOf('environment') == '' {
+                    return cgEnvironmentGet(e, computed)
+                }
+            }
+        }
+    }
     if computed == false {
         // A struct field still goes the long way round, because
         // cgFieldPtr is shared with the assignment path and emits the
@@ -2711,6 +2814,25 @@ Val func cgMemberAccess(e:Node) {
     if CG_STUCK { return none }
     if computed { return cgIndexRead(e, obj) }
     return cgLengthOf(e, obj)
+}
+
+// The one reader of the process environment. The result is NOT an
+// owning text: festina_getenv hands back a pointer into the
+// environment block rather than a fresh buffer, so a binding copies it
+// and nothing ever frees what came back.
+Val func cgEnvironmentGet(e:Node, computed:bool) {
+    Val none
+    text key = ''
+    if computed {
+        Val k = cgExprExpecting(childOf(e, 'prop'), 'text', '')
+        if CG_STUCK { return none }
+        key = k.v
+    } else {
+        key = cgStringConst(rawText(e, 'prop'))
+    }
+    text out = cgTmp()
+    cgOut(`  ${out} = call ptr @festina_getenv(ptr ${key})`)
+    return cgVal(out, 'ptr', 'text')
 }
 
 // Numbers and bools only. A text ternary owns its value inside each
@@ -4157,37 +4279,19 @@ Val func cgCall(e:Node, wantValue:bool) {
         cgOut(`  call void @${cfn}(i64 ${id.v})`)
         return cgVal('0', 'void', 'void')
     }
-    // claude.md #32-34. Only the form whose result nobody captures is
-    // here: the statement is prepared, its parameters bound, and then
-    // run to completion. That is every INSERT/UPDATE/DELETE and a
-    // SELECT nobody keeps -- collecting rows into an `arr[Table]` is a
-    // different emission entirely, and asks for a row type this port
-    // does not have yet, so a captured result stops rather than
-    // quietly running the query and discarding what it returned.
+    // claude.md #32-34. This is the form whose result nobody catches:
+    // the statement is prepared, its parameters bound, and run to
+    // completion -- every INSERT/UPDATE/DELETE and a SELECT nobody
+    // keeps. Collecting rows is a different emission reached from
+    // cgExprExpecting instead, because only the DECLARED type of where
+    // the result flows can say which of the two a call is.
     if name == 'sqlite' {
         if wantValue {
-            cgUnported('a captured sqlite() result')
+            cgUnported('a sqlite() result in a non-arr[Table] position')
             return none
         }
-        arr[Node] qargs = listOf(e, 'args')
-        if qargs.length == 0 || qargs.length > 2 {
-            cgUnported('sqlite() with an unexpected argument count')
-            return none
-        }
-        CG_USES_SQLITE = true
-        Val sql = cgExprExpecting(qargs[0], 'text', '')
+        text stmt = cgSqliteStmt(e)
         if CG_STUCK { return none }
-        text db = cgTmp()
-        cgOut(`  ${db} = load ptr, ptr @__festina_db`)
-        text stmt = cgSqlitePrepare(qargs[0], sql.v, db)
-        // claude.md #83: prepare COMPILES the SQL rather than keeping
-        // the string, so a template built for this call is the caller's
-        // to free the moment the statement exists.
-        cgFreeTextTemp(qargs[0], sql)
-        if qargs.length == 2 {
-            cgSqliteBind(qargs[1], stmt)
-            if CG_STUCK { return none }
-        }
         cgOut(`  call void @festina_sqlite_exec(ptr ${stmt})`)
         return cgVal('0', 'void', 'void')
     }
@@ -4320,6 +4424,22 @@ void func cgStmt(s:Node) {
     // main's own prologue, long before __festina_main starts. Nothing
     // is owed here either way.
     if s.kind == 'TableDecl' { return }
+    // And the DatabaseURL directive, which cgProgram already lifted:
+    // it is spent in main's prologue, so there is nothing left to run
+    // where it was written.
+    if s.kind == 'ExprStmt' {
+        Node dbex = childOf(s, 'expr')
+        if dbex != null {
+            if dbex.kind == 'Assign' {
+                Node dbtg = childOf(dbex, 'target')
+                if dbtg != null {
+                    if dbtg.kind == 'Identifier' {
+                        if rawText(dbtg, 'name') == 'DatabaseURL' { return }
+                    }
+                }
+            }
+        }
+    }
 
     if s.kind == 'VarDecl' {
         if fieldOf(s, 'is_const').raw == 'true' {
@@ -4383,8 +4503,10 @@ void func cgStmt(s:Node) {
             // nothing else -- no frame storage to zero, no header to
             // calloc, and no stack-versus-heap decision to make: there
             // is no payload that could live in the frame.
-            // A regex is the same shape for the same reason.
-            if managed == 'blob' || managed == 'regex' {
+            // A regex is the same shape for the same reason -- and so
+            // is a ROW, whose storage the runtime laid out and whose
+            // local is therefore one pointer to it and nothing more.
+            if managed == 'blob' || managed == 'regex' || managed == 'table' {
                 Node binit = childOf(s, 'init')
                 if binit == null {
                     cgUnported(`${managed} declaration with no initializer`)
@@ -4404,9 +4526,16 @@ void func cgStmt(s:Node) {
                     cgOut(`  call void @festina_retain(ptr ${bv.v})`)
                 }
                 cgOut(`  store ptr ${bv.v}, ptr ${bslot}`)
-                cgTrackLive(managed, bslot, '')
+                // A row's release can only be generated from its TABLE
+                // name, so that is what travels with the tracking
+                // entry -- the slot a struct binding uses for the same
+                // purpose.
+                text bkey = ''
+                if managed == 'table' { bkey = dt.name }
+                cgTrackLive(managed, bslot, bkey)
                 L_SLOT[gname] = bslot
                 L_FTY[gname] = managed
+                if managed == 'table' { L_SNAME[gname] = dt.name }
                 return
             }
             text declEty = ''
@@ -4698,6 +4827,70 @@ void func cgEvalForEffect(ex:Node) {
 // column TYPES, and only then the table's own name -- which is the
 // order the original's own call site evaluates them in, the arrays
 // being built by a helper called before the name is asked for.
+// Everything a sqlite() call does before its two forms diverge: the
+// SQL evaluated, the connection loaded, the statement prepared, the
+// caller's temporary freed, and the parameters bound.
+text func cgSqliteStmt(e:Node) {
+    arr[Node] qargs = listOf(e, 'args')
+    if qargs.length == 0 || qargs.length > 2 {
+        cgUnported('sqlite() with an unexpected argument count')
+        return ''
+    }
+    CG_USES_SQLITE = true
+    Val sql = cgExprExpecting(qargs[0], 'text', '')
+    if CG_STUCK { return '' }
+    text db = cgTmp()
+    cgOut(`  ${db} = load ptr, ptr @__festina_db`)
+    text stmt = cgSqlitePrepare(qargs[0], sql.v, db)
+    // claude.md #83: prepare COMPILES the SQL rather than keeping the
+    // string, so a template built for this call is the caller's to
+    // free the moment the statement exists.
+    cgFreeTextTemp(qargs[0], sql)
+    if qargs.length == 2 {
+        cgSqliteBind(qargs[1], stmt)
+        if CG_STUCK { return '' }
+    }
+    return stmt
+}
+
+// The collecting form. The runtime hands back a count and a plain
+// buffer of row pointers -- one 8-byte pointer per row, which is
+// already exactly the layout an arr[T] data pointer expects when T is
+// pointer-shaped -- so there is nothing to repack: a fresh header is
+// built around the buffer as it stands.
+//
+// The result is FRESH in the strongest sense: nothing else references
+// it yet, the same way an array literal's own header is fresh.
+Val func cgSqliteCollect(e:Node, tname:text) {
+    Val none
+    text stmt = cgSqliteStmt(e)
+    if CG_STUCK { return none }
+    cgTableArrays(tname)
+    int n = TBL_NCOLS[tname]
+    text nSlot = cgTmp()
+    cgOut(`  ${nSlot} = alloca i64`)
+    text dataSlot = cgTmp()
+    cgOut(`  ${dataSlot} = alloca ptr`)
+    // claude.md #188: want_rowid is 1 here and only here -- a
+    // table-shaped row carries a `.rowid` slot, a struct-query row
+    // does not.
+    cgOut(`  call void @festina_sqlite_collect_rows(ptr ${stmt}, i32 ${n}, ptr @${tname}.types, ptr @${tname}.cols, ptr ${nSlot}, ptr ${dataSlot}, i8 1)`)
+    text nv = cgTmp()
+    cgOut(`  ${nv} = load i64, ptr ${nSlot}`)
+    text dv = cgTmp()
+    cgOut(`  ${dv} = load ptr, ptr ${dataSlot}`)
+    text header = cgFreshHeader('%struct._FestinaArray')
+    text lenP = cgTmp()
+    cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${header}, i32 0, i32 0`)
+    cgOut(`  store i64 ${nv}, ptr ${lenP}`)
+    text dataP = cgTmp()
+    cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr ${header}, i32 0, i32 1`)
+    cgOut(`  store ptr ${dv}, ptr ${dataP}`)
+    Val r = cgArrVal(header, tname)
+    r.fresh = true
+    return r
+}
+
 // claude.md #113: a SQL string that cannot change is compiled into
 // sqlite bytecode ONCE, through a private slot of this call site's
 // own, exactly the way a regex literal's automaton is cached. Anything
@@ -4762,41 +4955,64 @@ void func cgSqliteBind(paramsNode:Node, stmt:text) {
 
 void func cgSyncTables() {
     if TBL_ORDER.length == 0 && CG_USES_SQLITE == false { return }
-    // claude.md #70's DatabaseURL would be evaluated here, ahead of
-    // every other global's initializer. Until it is ported the default
-    // is the only path, and a program that sets one is stopped by the
-    // assignment itself rather than silently opening the wrong file.
-    text url = cgStringConst('festina.sqlite')
+    // claude.md #70: the directive's own expression, evaluated HERE --
+    // before festina_db_open, and so before __festina_main runs any
+    // other global's initializer. Without one the default path is the
+    // whole answer.
+    text url = ''
+    if CG_DB_URL != null {
+        Val uv = cgExprExpecting(CG_DB_URL, 'text', '')
+        if CG_STUCK { return }
+        url = uv.v
+    } else {
+        url = cgStringConst('festina.sqlite')
+    }
     cgOut(`  %db = call ptr @festina_db_open(ptr ${url})`)
     cgOut('  store ptr %db, ptr @__festina_db')
     int ti = 0
     while ti < TBL_ORDER.length {
         text tn = TBL_ORDER[ti]
         int n = TBL_NCOLS[tn]
-        text namesG = `@${tn}.cols`
-        text typesG = `@${tn}.types`
-        arr[text] cnames = TBL_COLS[tn].split('|')
-        arr[text] ctypes = TBL_TYPES[tn].split('|')
-        text namePtrs = ''
-        text typePtrs = ''
-        int ci = 0
-        while ci < n {
-            if ci > 0 { namePtrs = namePtrs + ', ' }
-            namePtrs = namePtrs + `ptr ${cgStringConst(cnames[ci])}`
-            ci++
-        }
-        int cj = 0
-        while cj < n {
-            if cj > 0 { typePtrs = typePtrs + ', ' }
-            typePtrs = typePtrs + `ptr ${cgStringConst(ctypes[cj])}`
-            cj++
-        }
-        CG_EXTRA.push(`${namesG} = private constant [${n} x ptr] [${namePtrs}]`)
-        CG_EXTRA.push(`${typesG} = private constant [${n} x ptr] [${typePtrs}]`)
+        cgTableArrays(tn)
         text tnConst = cgStringConst(tn)
-        cgOut(`  call void @festina_sync_table(ptr %db, ptr ${tnConst}, ptr ${namesG}, ptr ${typesG}, i32 ${n})`)
+        cgOut(`  call void @festina_sync_table(ptr %db, ptr ${tnConst}, ptr @${tn}.cols, ptr @${tn}.types, i32 ${n})`)
         ti++
     }
+}
+
+// The two column globals a table needs, emitted ONCE however many
+// places ask for them -- a second definition of the same LLVM global
+// name would not link.
+//
+// Where they are emitted from is not fixed, and that is the point: a
+// SELECT collected in the program's body asks first and interns the
+// column strings there, leaving only the table's own name for the
+// sync call in main's prologue to intern. A program that only declares
+// a table interns everything in the prologue. Constants are numbered,
+// so the difference is visible in the output and cannot be papered
+// over by emitting them somewhere convenient.
+void func cgTableArrays(tname:text) {
+    if TBL_ARRAYS[tname] != null { return }
+    TBL_ARRAYS[tname] = 1
+    int n = TBL_NCOLS[tname]
+    arr[text] cnames = TBL_COLS[tname].split('|')
+    arr[text] ctypes = TBL_TYPES[tname].split('|')
+    text namePtrs = ''
+    text typePtrs = ''
+    int ci = 0
+    while ci < n {
+        if ci > 0 { namePtrs = namePtrs + ', ' }
+        namePtrs = namePtrs + `ptr ${cgStringConst(cnames[ci])}`
+        ci++
+    }
+    int cj = 0
+    while cj < n {
+        if cj > 0 { typePtrs = typePtrs + ', ' }
+        typePtrs = typePtrs + `ptr ${cgStringConst(ctypes[cj])}`
+        cj++
+    }
+    CG_EXTRA.push(`@${tname}.cols = private constant [${n} x ptr] [${namePtrs}]`)
+    CG_EXTRA.push(`@${tname}.types = private constant [${n} x ptr] [${typePtrs}]`)
 }
 
 void func cgPushFrame() {
@@ -5584,6 +5800,7 @@ bool func cgStorableRefcounted(fty:text, ety:text) {
 // shape every other element read has.
 Val func cgElemVal(v:text, ety:text) {
     if SF_NAMES[ety] != null { return cgStructVal(v, ety) }
+    if TBL_COLS[ety] != null { return cgTableVal(v, ety) }
     if cgIsNestedElem(ety) {
         text kf = cgKeyFty(ety)
         if kf == 'arr' { return cgArrVal(v, cgKeyEty(ety)) }
@@ -5636,6 +5853,9 @@ text func cgReleaseFn(fty:text) {
 // release. A scalar element owns nothing; a `text` one owns a buffer.
 bool func cgIsRefcounted(fty:text) {
     if fty == 'regex' { return true }
+    // claude.md #265: a row is reference counted, so a row an array
+    // gave out survives the array it came from.
+    if fty == 'table' { return true }
     return fty == 'struct' || fty == 'arr' || fty == 'map' || fty == 'blob'
 }
 
@@ -5650,6 +5870,18 @@ bool func cgElemOwnsSomething(ety:text) {
     // same `arr:T` key #311 introduced, so a colon is what
     // distinguishes one from a scalar or a struct name.
     if cgIsNestedElem(ety) { return true }
+    // A refcounted HANDLE element -- a blob, a regex -- owns a whole
+    // reference exactly as a struct element does. It is retained on
+    // store and has to be released here, and the plain container
+    // release would drop every one of them on the floor: an
+    // `arr[blob]` that escaped, was reassigned or was returned leaked
+    // one open file handle per element, for as long as the array
+    // lived.
+    if cgIsRefcounted(ety) { return true }
+    // A ROW element owns whatever its own text/blob columns hold, and
+    // its allocation besides. Checked by name against the table
+    // registry, since a table name and a struct name look alike here.
+    if TBL_COLS[ety] != null { return true }
     return SF_NAMES[ety] != null
 }
 
@@ -5668,6 +5900,10 @@ bool func cgIsNestedElem(ety:text) {
 // NAME, so the two are never directly comparable.
 bool func cgValIsElem(v:Val, ety:text) {
     if SF_NAMES[ety] != null { return v.fty == 'struct' && v.sname == ety }
+    // A row's element type is its TABLE name, so the value's own fty
+    // ('table') never equals it -- the name is in `sname`, exactly as
+    // a struct's is.
+    if TBL_COLS[ety] != null { return v.fty == 'table' && v.sname == ety }
     if cgIsNestedElem(ety) {
         return v.fty == cgKeyFty(ety) && v.ety == cgKeyEty(ety)
     }
@@ -5692,11 +5928,16 @@ Val func cgExprExpectingElem(e:Node, ety:text) {
 // into the slot has to ask.
 bool func cgElemIsRefcounted(ety:text) {
     if SF_NAMES[ety] != null { return true }
-    return cgIsNestedElem(ety)
+    if TBL_COLS[ety] != null { return true }
+    if cgIsNestedElem(ety) { return true }
+    // A handle element, on exactly the terms above: a store into one
+    // of these slots is an alias and needs its own +1.
+    return cgIsRefcounted(ety)
 }
 
 text func cgElemLty(ety:text) {
     if SF_NAMES[ety] != null { return 'ptr' }
+    if TBL_COLS[ety] != null { return 'ptr' }
     if cgIsNestedElem(ety) { return 'ptr' }
     return cgLtyOf(ety)
 }
@@ -5705,6 +5946,11 @@ text func cgReleaseFnFor(fty:text, ety:text) {
     // `ety` carries the struct NAME for a struct, and the element type
     // for a container -- one slot, because a value is never both.
     if fty == 'struct' && cgStructOwnsAnything(ety) { return cgReleaseStructFn(ety) }
+    // claude.md #265: the same per-table wrapper an arr[Table]'s own
+    // cascade uses. It is a release rather than an unconditional free,
+    // which is what makes it safe to reach from an ordinary ownership
+    // site and not only from a container tearing its elements down.
+    if fty == 'table' { return cgTableRowReleaseFn(ety) }
     if fty == 'arr' && cgElemOwnsSomething(ety) { return cgReleaseArrayFn(ety) }
     if fty == 'map' && cgElemOwnsSomething(ety) { return cgReleaseMapFn(ety) }
     return cgReleaseFn(fty)
@@ -5716,6 +5962,12 @@ text func cgReleaseFnFor(fty:text, ety:text) {
 text func cgElemReleaseFn(ety:text) {
     if cgIsNestedElem(ety) { return cgReleaseFnFor(cgKeyFty(ety), cgKeyEty(ety)) }
     if SF_NAMES[ety] != null { return cgReleaseFnFor('struct', ety) }
+    if TBL_COLS[ety] != null { return cgTableRowReleaseFn(ety) }
+    // A handle element gets its own destructor, never plain @free: a
+    // blob owns its path and byte buffer, a regex its compiled
+    // automaton, and neither is reachable from the pointer the slot
+    // holds once that pointer is gone.
+    if cgIsRefcounted(ety) { return cgReleaseFn(ety) }
     return '@free'
 }
 
@@ -5830,11 +6082,15 @@ text func cgFieldEty(key:text) {
 
 text func cgRelKeyOf(name:text) {
     if cgFtyOf(name) == 'struct' { return cgSnameOf(name) }
+    if cgFtyOf(name) == 'table' { return cgSnameOf(name) }
     return cgEtyOf(name)
 }
 
 text func cgRelKeyVal(v:Val) {
     if v.fty == 'struct' { return v.sname }
+    // A row too: the table name is the only thing its release can be
+    // generated from, and it rides in the same slot a struct's does.
+    if v.fty == 'table' { return v.sname }
     return v.ety
 }
 
@@ -5870,6 +6126,12 @@ text func cgEtyOfTy(t:Ty) {
     if t.elem == null { return '' }
     if t.elem.kind == 'prim' { return t.elem.name }
     if t.elem.kind == 'struct' { return t.elem.name }
+    // A table name is spelled exactly like a struct name here, and
+    // TBL_COLS is what separates them everywhere it matters. Both are
+    // bare, which is deliberate: the colon in `arr:T` is reserved for
+    // telling a NESTED container from a named type, and a row is not
+    // one.
+    if t.elem.kind == 'table' { return t.elem.name }
     if t.elem.kind == 'arr' || t.elem.kind == 'map' {
         text inner = cgEtyOfTy(t.elem)
         if inner == '' { return '' }
@@ -6264,6 +6526,90 @@ void func cgCycleTrial(key:text, aliveL:text, doneL:text) {
 // wrapper may then call ITSELF, which is correct: the recursion it
 // performs is at runtime over the real object graph, bounded by
 // refcounts reaching zero.
+// claude.md #85/#265: frees exactly one sqlite result row -- each of
+// its own text columns, then the allocation itself.
+//
+// A row is deliberately not shaped like any other Festina value. The
+// runtime builds it as a flat `col_count * 8` block with each text
+// column strdup'd into its slot, and the refcount header sits one i64
+// BEFORE the payload every offset is measured from -- so the base, not
+// the payload, is what is freed. Nothing generic could be pointed at
+// one, which is why this is a bespoke function rather than a case
+// inside the ordinary release dispatch.
+//
+// Which columns hold a heap pointer is decided by the identical rule
+// the runtime used when BUILDING the row, read off the same declared
+// column types: `text` was strdup'd, everything else is a plain i64.
+// free(NULL) is a no-op, which covers a column that was SQL NULL and
+// so was never strdup'd at all.
+text func cgTableRowReleaseFn(tname:text) {
+    if CG_ROW_REL[tname] != null { return CG_ROW_REL[tname] }
+    // A blob/img/aud column is a heap pointer too, but not a plain
+    // buffer -- the runtime decoded the stored BLOB into a real handle
+    // and freeing it needs that type's own destructor. Refused rather
+    // than freed wrongly, and refused HERE rather than at the
+    // declaration, so a table with such a column can still be synced
+    // by a program that never queries it.
+    arr[text] pre = TBL_TYPES[tname].split('|')
+    int pi = 0
+    while pi < TBL_NCOLS[tname] {
+        if cgLtyOf(pre[pi]) == '' {
+            cgUnported(`table column of type ${pre[pi]}`)
+            return ''
+        }
+        pi++
+    }
+    text name = `@__festina_release_row_${tname}_${cgUid()}`
+    CG_ROW_REL[tname] = name
+
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define void ${name}(ptr %row) {`)
+    cgBlockLabel('entry')
+    // Null first: a row-typed binding reads null until it is assigned,
+    // and `free` nulls its slot again afterwards.
+    text nullL = cgLabel('relrow.null')
+    text checkL = cgLabel('relrow.check')
+    text freeL = cgLabel('relrow.free')
+    text isNull = cgTmp()
+    cgOut(`  ${isNull} = icmp eq ptr %row, null`)
+    cgOut(`  br i1 ${isNull}, label %${nullL}, label %${checkL}`)
+    cgBlockLabel(checkL)
+    text chk = cgTmp()
+    cgOut(`  ${chk} = call i8 @festina_release_check(ptr %row)`)
+    text cond = cgTmp()
+    cgOut(`  ${cond} = icmp ne i8 ${chk}, 0`)
+    cgOut(`  br i1 ${cond}, label %${freeL}, label %${nullL}`)
+    cgBlockLabel(freeL)
+    arr[text] ctypes = TBL_TYPES[tname].split('|')
+    int n = TBL_NCOLS[tname]
+    int i = 0
+    while i < n {
+        if ctypes[i] == 'text' {
+            text slot = cgTmp()
+            cgOut(`  ${slot} = getelementptr i64, ptr %row, i64 ${i}`)
+            text v = cgTmp()
+            cgOut(`  ${v} = load ptr, ptr ${slot}`)
+            cgOut(`  call void @free(ptr ${v})`)
+        }
+        i++
+    }
+    text base = cgTmp()
+    cgOut(`  ${base} = getelementptr i8, ptr %row, i64 -8`)
+    cgOut(`  call void @free(ptr ${base})`)
+    cgOut(`  br label %${nullL}`)
+    cgBlockLabel(nullL)
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return name
+}
+
 text func cgReleaseStructFn(sname:text) {
     if CG_STRUCT_REL[sname] != null { return CG_STRUCT_REL[sname] }
     text name = `@__festina_release_struct_${sname}`
@@ -7294,6 +7640,11 @@ void func cgFunc(d:Node) {
                 // or fields. Its release is the runtime's own.
             } else if pf == 'struct' {
                 psname = pt.name
+            } else if pf == 'table' {
+                // A row parameter is a borrowed pointer, like a struct
+                // one -- but its release is generated from the table
+                // name, which is what `sname` carries.
+                psname = pt.name
             } else {
                 pety = cgEtyOfTy(pt)
                 if pety == '' {
@@ -7562,6 +7913,33 @@ void func cgProgram(body:arr[Node], srcPath:text) {
         sd++
     }
 
+    // claude.md #70: the DatabaseURL directive, lifted out before any
+    // statement is emitted. festina/imports.py strips it from the
+    // ENTRY file's body and enforces that it is that file's first
+    // statement; by the time it reaches here the bodies are already
+    // merged, so position has been settled and all that is left is to
+    // find it and take it out of the run.
+    int du = 0
+    while du < body.length {
+        Node ds = body[du]
+        if ds.kind == 'ExprStmt' {
+            Node dex = childOf(ds, 'expr')
+            if dex != null {
+                if dex.kind == 'Assign' {
+                    Node dtg = childOf(dex, 'target')
+                    if dtg != null {
+                        if dtg.kind == 'Identifier' {
+                            if rawText(dtg, 'name') == 'DatabaseURL' {
+                                CG_DB_URL = childOf(dex, 'value')
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        du++
+    }
+
     // Every declared `table`'s columns, before anything is emitted.
     // A table's own declaration produces no code at all -- what it
     // produces is a line in main's prologue, which is built long after
@@ -7580,7 +7958,8 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                     cnames = cnames + '|'
                     ctypes = ctypes + '|'
                 }
-                cnames = cnames + rawText(tcols[ci], 'name')
+                text colName = rawText(tcols[ci], 'name')
+                cnames = cnames + colName
                 // The SQL type is the column's type expression SPELLED
                 // OUT, not a resolved type: festina_sync_table matches
                 // on the source's own word, and `analyzed.tables` keeps
@@ -7592,7 +7971,14 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                     cgUnported('table column of a non-scalar type')
                     return
                 }
-                ctypes = ctypes + rawText(tcols[ci], 'type_expr')
+                text colType = rawText(tcols[ci], 'type_expr')
+                ctypes = ctypes + colType
+                // A row's slots are flat 8-byte cells in DECLARATION
+                // order, so a column's index is its offset divided by
+                // eight -- unlike a struct field, whose offset only
+                // LLVM knows.
+                TB_IDX[`${tn}.${colName}`] = ci
+                TB_FTY[`${tn}.${colName}`] = colType
                 ci++
             }
             TBL_ORDER.push(tn)
