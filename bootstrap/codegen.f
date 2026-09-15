@@ -889,6 +889,9 @@ Val func cgStructVal(v:text, sname:text) {
 
 text func cgLtyOf(fty:text) {
     if fty == 'int' { return 'i64' }
+    // claude.md #91: a colour is a PACKED 0xRRGGBB integer, so it costs
+    // one register and comparing two is one integer compare.
+    if fty == 'color' { return 'i64' }
     if fty == 'float' { return 'double' }
     if fty == 'blob' { return 'ptr' }
     if fty == 'bool' { return 'i8' }
@@ -1293,6 +1296,156 @@ bool CG_USES_SQLITE = false
 // registers the image decoder in main's prologue; the separate,
 // narrower one below is what opens a window.
 bool CG_USES_GRAPHICS_CODE = false
+
+// claude.md #91: every CSS colour name this language understands, and
+// the hex its components come from. Kept as DATA rather than derived,
+// because it is data -- the same 148 names the original resolves
+// against, and a port that recognized a different set would compile a
+// different language rather than merely a different compiler.
+//
+// The table is the whole of it: `resolve` below is a case fold, a
+// `none` check, a hex branch and a lookup.
+map[text] CG_CSS_COLORS = {
+    'aliceblue': 'f0f8ff', 'antiquewhite': 'faebd7', 'aqua': '00ffff',
+    'aquamarine': '7fffd4', 'azure': 'f0ffff', 'beige': 'f5f5dc',
+    'bisque': 'ffe4c4', 'black': '000000', 'blanchedalmond': 'ffebcd',
+    'blue': '0000ff', 'blueviolet': '8a2be2', 'brown': 'a52a2a',
+    'burlywood': 'deb887', 'cadetblue': '5f9ea0', 'chartreuse': '7fff00',
+    'chocolate': 'd2691e', 'coral': 'ff7f50', 'cornflowerblue': '6495ed',
+    'cornsilk': 'fff8dc', 'crimson': 'dc143c', 'cyan': '00ffff',
+    'darkblue': '00008b', 'darkcyan': '008b8b',
+    'darkgoldenrod': 'b8860b', 'darkgray': 'a9a9a9',
+    'darkgreen': '006400', 'darkgrey': 'a9a9a9', 'darkkhaki': 'bdb76b',
+    'darkmagenta': '8b008b', 'darkolivegreen': '556b2f',
+    'darkorange': 'ff8c00', 'darkorchid': '9932cc', 'darkred': '8b0000',
+    'darksalmon': 'e9967a', 'darkseagreen': '8fbc8f',
+    'darkslateblue': '483d8b', 'darkslategray': '2f4f4f',
+    'darkslategrey': '2f4f4f', 'darkturquoise': '00ced1',
+    'darkviolet': '9400d3', 'deeppink': 'ff1493',
+    'deepskyblue': '00bfff', 'dimgray': '696969', 'dimgrey': '696969',
+    'dodgerblue': '1e90ff', 'firebrick': 'b22222',
+    'floralwhite': 'fffaf0', 'forestgreen': '228b22',
+    'fuchsia': 'ff00ff', 'gainsboro': 'dcdcdc', 'ghostwhite': 'f8f8ff',
+    'gold': 'ffd700', 'goldenrod': 'daa520', 'gray': '808080',
+    'green': '008000', 'greenyellow': 'adff2f', 'grey': '808080',
+    'honeydew': 'f0fff0', 'hotpink': 'ff69b4', 'indianred': 'cd5c5c',
+    'indigo': '4b0082', 'ivory': 'fffff0', 'khaki': 'f0e68c',
+    'lavender': 'e6e6fa', 'lavenderblush': 'fff0f5',
+    'lawngreen': '7cfc00', 'lemonchiffon': 'fffacd',
+    'lightblue': 'add8e6', 'lightcoral': 'f08080', 'lightcyan': 'e0ffff',
+    'lightgoldenrodyellow': 'fafad2', 'lightgray': 'd3d3d3',
+    'lightgreen': '90ee90', 'lightgrey': 'd3d3d3', 'lightpink': 'ffb6c1',
+    'lightsalmon': 'ffa07a', 'lightseagreen': '20b2aa',
+    'lightskyblue': '87cefa', 'lightslategray': '778899',
+    'lightslategrey': '778899', 'lightsteelblue': 'b0c4de',
+    'lightyellow': 'ffffe0', 'lime': '00ff00', 'limegreen': '32cd32',
+    'linen': 'faf0e6', 'magenta': 'ff00ff', 'maroon': '800000',
+    'mediumaquamarine': '66cdaa', 'mediumblue': '0000cd',
+    'mediumorchid': 'ba55d3', 'mediumpurple': '9370db',
+    'mediumseagreen': '3cb371', 'mediumslateblue': '7b68ee',
+    'mediumspringgreen': '00fa9a', 'mediumturquoise': '48d1cc',
+    'mediumvioletred': 'c71585', 'midnightblue': '191970',
+    'mintcream': 'f5fffa', 'mistyrose': 'ffe4e1', 'moccasin': 'ffe4b5',
+    'navajowhite': 'ffdead', 'navy': '000080', 'oldlace': 'fdf5e6',
+    'olive': '808000', 'olivedrab': '6b8e23', 'orange': 'ffa500',
+    'orangered': 'ff4500', 'orchid': 'da70d6', 'palegoldenrod': 'eee8aa',
+    'palegreen': '98fb98', 'paleturquoise': 'afeeee',
+    'palevioletred': 'db7093', 'papayawhip': 'ffefd5',
+    'peachpuff': 'ffdab9', 'peru': 'cd853f', 'pink': 'ffc0cb',
+    'plum': 'dda0dd', 'powderblue': 'b0e0e6', 'purple': '800080',
+    'rebeccapurple': '663399', 'red': 'ff0000', 'rosybrown': 'bc8f8f',
+    'royalblue': '4169e1', 'saddlebrown': '8b4513', 'salmon': 'fa8072',
+    'sandybrown': 'f4a460', 'seagreen': '2e8b57', 'seashell': 'fff5ee',
+    'sienna': 'a0522d', 'silver': 'c0c0c0', 'skyblue': '87ceeb',
+    'slateblue': '6a5acd', 'slategray': '708090', 'slategrey': '708090',
+    'snow': 'fffafa', 'springgreen': '00ff7f', 'steelblue': '4682b4',
+    'tan': 'd2b48c', 'teal': '008080', 'thistle': 'd8bfd8',
+    'tomato': 'ff6347', 'turquoise': '40e0d0', 'violet': 'ee82ee',
+    'wheat': 'f5deb3', 'white': 'ffffff', 'whitesmoke': 'f5f5f5',
+    'yellow': 'ffff00', 'yellowgreen': '9acd32'
+}
+
+// claude.md #91: a colour LITERAL resolved to the packed 0xRRGGBB
+// integer a `color` value IS. Negative means "no colour at all".
+//
+// Packing is what makes a colour cost one register instead of three,
+// and `a == b` a single integer compare; unpacking is three shift and
+// mask pairs in the runtime, paid once per fillStyle rather than per
+// pixel. Spelled as arithmetic here because Festina has no bitwise
+// operators -- r * 65536 + g * 256 + b is the same number
+// `(r << 16) | (g << 8) | b` names.
+//
+// Answers '' for anything this language does not recognize, which the
+// caller turns into an error naming the offending value: there is
+// deliberately no runtime resolver to fall back on, so a colour that
+// cannot be resolved at compile time cannot be resolved at all.
+text func cgColorValue(lit:text) {
+    text s = cgLowerAscii(lit.trim())
+    if s == '' { return '' }
+    if s == 'none' || s == 'transparent' { return '-1' }
+    // Read through charCodeAt rather than `s[0]`, because this file is
+    // compiled by the compiler it defines and that one does not index
+    // a text yet. Writing the shorter spelling here stops the whole
+    // module self-hosting, which is a far louder failure than it looks
+    // -- it was measured as a 160,000-line coverage collapse, not as a
+    // syntax error.
+    if s.charCodeAt(0) == 35 {
+        text h = ''
+        int i = 1
+        while i < s.length {
+            h = h + s.charCodeAt(i).toChar()
+            i++
+        }
+        // `#abc` expands to `#aabbcc`, the same doubling CSS does.
+        if h.length == 3 {
+            int d0 = h.charCodeAt(0)
+            int d1 = h.charCodeAt(1)
+            int d2 = h.charCodeAt(2)
+            h = d0.toChar() + d0.toChar() + d1.toChar() + d1.toChar()
+                + d2.toChar() + d2.toChar()
+        }
+        if h.length != 6 { return '' }
+        return cgPackHex(h)
+    }
+    if CG_CSS_COLORS[s] == null { return '' }
+    return cgPackHex(CG_CSS_COLORS[s])
+}
+
+// Six hex digits to the packed integer, or '' if any of them is not a
+// hex digit at all.
+text func cgPackHex(h:text) {
+    int acc = 0
+    int i = 0
+    while i < 6 {
+        int d = cgHexDigit(h.charCodeAt(i))
+        if d < 0 { return '' }
+        acc = acc * 16 + d
+        i++
+    }
+    return `${acc}`
+}
+
+int func cgHexDigit(code:int) {
+    if code >= 48 && code <= 57 { return code - 48 }
+    if code >= 97 && code <= 102 { return code - 87 }
+    return 0 - 1
+}
+
+// A to Z folded to a to z, and nothing else touched. Festina has no
+// case-folding method of its own, and a colour name is matched
+// case-insensitively, so the fold is written out here rather than
+// assumed away.
+text func cgLowerAscii(v:text) {
+    text out = ''
+    int i = 0
+    while i < v.length {
+        int code = v.charCodeAt(i)
+        if code >= 65 && code <= 90 { code = code + 32 }
+        out = out + code.toChar()
+        i++
+    }
+    return out
+}
 
 // claude.md #94/#180: the canvas operations that are a name, a runtime
 // function and a fixed argument list -- nothing else. Spelled
@@ -2269,6 +2422,29 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
         }
         return cgMapLit(e, ety, '')
     }
+    // claude.md #91: a colour must come from a LITERAL, so the
+    // compiler resolves it once -- and there is deliberately no runtime
+    // resolver to fall back on, which is why anything else in a colour
+    // position is an error rather than a deferred lookup. Placed before
+    // the expression is emitted at all, because a literal here produces
+    // no code: it IS the packed integer.
+    if fty == 'color' {
+        if e.kind == 'StringLit' {
+            text packed = cgColorValue(rawText(e, 'value'))
+            if packed == '' {
+                cgUnported(`colour literal ${rawText(e, 'value')}`)
+                Val none2
+                return none2
+            }
+            return cgVal(packed, 'i64', 'color')
+        }
+        if e.kind == 'NullLit' {
+            // `null` is not a text literal to resolve: it is colour's
+            // own 'none' sentinel, the same value an unassigned colour
+            // already reads as.
+            return cgVal('-1', 'i64', 'color')
+        }
+    }
     Val v = cgExpr(e)
     if CG_STUCK { return v }
     // claude.md #109: a text in a blob position OPENS it. The handle
@@ -2373,6 +2549,9 @@ text func cgMapFromI64(raw:text, vlty:text) {
 // distinct from cgMapMissing, which answers the same question in the
 // raw i64 every map call deals in.
 text func cgNullValue(fty:text) {
+    // claude.md #91: an unset colour is 'none', not 0 -- 0 is a real
+    // colour (opaque black), so a zero default would silently paint.
+    if fty == 'color' { return '-1' }
     if fty == 'float' { return '0x7FF8000000000000' }
     if fty == 'bool' { return '2' }
     if fty == 'int' { return '-9223372036854775808' }
@@ -5883,6 +6062,7 @@ text func cgDeclFty(d:Node) {
         return 'func'
     }
     if t.kind != 'prim' { return '' }
+    if t.name == 'color' { return 'color' }
     if t.name == 'int' { return 'int' }
     if t.name == 'float' { return 'float' }
     if t.name == 'bool' { return 'bool' }
@@ -8642,7 +8822,13 @@ void func cgProgram(body:arr[Node], srcPath:text) {
             text gf = cgDeclFty(d)
             if gf != '' {
                 text gl = cgLtyOf(gf)
-                cgEmit(`@${gn} = global ${gl} ${cgZeroFor(gl)}`)
+                // claude.md #91: a colour's zero is its 'none'
+                // sentinel, not 0 -- and cgZeroFor cannot tell the two
+                // apart, because a colour and an int are the same i64
+                // by then. The FTY is what still knows.
+                text gz = cgZeroFor(gl)
+                if gf == 'color' { gz = cgNullValue('color') }
+                cgEmit(`@${gn} = global ${gl} ${gz}`)
                 // claude.md #243: a text binding carries an append
                 // shadow -- the buffer it is growing in place and how
                 // much of it is used -- alongside the pointer itself.
