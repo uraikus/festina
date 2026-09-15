@@ -871,8 +871,8 @@ CANARIES = [
         "timers-need-a-loop-to-fire-in", "#315",
         "a program that schedules a callback gets a blocking loop for "
         "it to fire in",
-        """    if CG_USES_TIMERS { cgOut('  call void @festina_run_timer_loop()') }""",
-        "",
+        """    else if CG_USES_TIMERS || CG_USES_THREADS { cgOut('  call void @festina_run_timer_loop()') }""",
+        """    else if CG_USES_THREADS { cgOut('  call void @festina_run_timer_loop()') }""",
     ),
     Canary(
         "clearing-alone-schedules-nothing", "#315",
@@ -1248,8 +1248,89 @@ CANARIES = [
 """, ""),
         ],
     ),
-]
 
+    # --- decisions.md #323: threads ----------------------------------
+    Canary(
+        "if-both-arms-terminate", "#323",
+        "an `if` whose arms both end in a terminator emits no end block",
+        """    if thenTerm && elseTerm {
+        CG_TERM = true
+        return
+    }
+""",
+        "",
+    ),
+    Canary(
+        "thread-state-initializers-run", "#323",
+        "a thread's state initializers run inside its own on_load",
+        """                cgOut(`  store ${cgLtyOf(fty)} ${v.v}, ptr ${ref}`)""",
+        "",
+    ),
+    Canary(
+        "thread-state-shadows-a-global", "#323",
+        "a thread's private state is a scope of its own, not more globals",
+        """            if G_SLOT[sym] != null {
+                T_SLOT[vn] = G_SLOT[sym]""",
+        """            if G_SLOT[sym] == null {
+                T_SLOT[vn] = G_SLOT[sym]""",
+    ),
+    Canary(
+        "thread-send-names-the-calling-thread", "#323",
+        "a send from inside a thread passes THAT thread's handle as the sender",
+        """    if CG_THREAD_HANDLE != '' {
+        cgOut(`  ${sender} = load ptr, ptr ${CG_THREAD_HANDLE}`)
+    } else {
+        cgOut(`  ${sender} = call ptr @festina_thread_get_main_handle()`)
+    }""",
+        """    cgOut(`  ${sender} = call ptr @festina_thread_get_main_handle()`)""",
+    ),
+    Canary(
+        "thread-always-gets-three-adapters", "#323",
+        "an undeclared handler still gets a real, never-called adapter",
+        """        cgThreadStubAdapter(`@__festina_thread_${tname}_on_exit`, 'i64 %arg.code')""",
+        "",
+    ),
+    Canary(
+        "thread-handle-stored-before-spawn", "#323",
+        "a thread's handle global is stored before the thread is spawned",
+        [
+            ("""            cgOut(`  store ptr %__thread_${tn}, ptr @__festina_thread_${tn}_handle`)
+            cgOut(`  call void @festina_thread_spawn(ptr %__thread_${tn})`)""",
+             """            cgOut(`  call void @festina_thread_spawn(ptr %__thread_${tn})`)
+            cgOut(`  store ptr %__thread_${tn}, ptr @__festina_thread_${tn}_handle`)"""),
+        ],
+    ),
+    Canary(
+        "thread-text-payload-is-cloned", "#323",
+        "a text payload crosses the boundary as its own buffer, never shared",
+        """    if fty == 'text' {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${val})`)
+        return owned
+    }""",
+        """    if fty == 'text' {
+        return val
+    }""",
+    ),
+    Canary(
+        "bare-postmessage-loads-its-handle-first", "#323",
+        "a bare postMessage loads its own handle before boxing the payload",
+        [
+            ("""    text handle = cgTmp()
+    cgOut(`  ${handle} = load ptr, ptr ${CG_THREAD_HANDLE}`)
+    text box = cgThreadBox(v.v, CG_MAIN_MSG_IN)""",
+             """    text box = cgThreadBox(v.v, CG_MAIN_MSG_IN)
+    text handle = cgTmp()
+    cgOut(`  ${handle} = load ptr, ptr ${CG_THREAD_HANDLE}`)"""),
+        ],
+    ),
+    Canary(
+        "exec-releases-an-owning-argument", "#323",
+        "exec() releases the argument array when the expression owned it",
+        """        if cgIsRefcounted(ev.fty) && cgIsOwningRefcountedSource(eargs[0]) {""",
+        """        if cgIsRefcounted(ev.fty) && false {""",
+    ),
+]
 BY_NAME = {c.name: c for c in CANARIES}
 
 

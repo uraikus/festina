@@ -358,12 +358,12 @@ class TestTheCoverageNumberIsHonest:
         ("bootstrap/parser.f", 12000),
         ("bootstrap/semantic.f", 19000),
         ("bootstrap/escape.f", 20000),
-        ("bootstrap/codegen.f", 55000),
+        ("bootstrap/codegen.f", 88000),
         ("bootstrap/lexdump.f", 4000),
         ("bootstrap/astdumpf.f", 12000),
         ("bootstrap/semdumpf.f", 19000),
         ("bootstrap/escdumpf.f", 21000),
-        ("bootstrap/irdumpf.f", 55000),
+        ("bootstrap/irdumpf.f", 88000),
     ])
     def test_a_bootstrap_file_self_hosts(self, rel, floor):
         """The port compiling real pieces of itself -- now all ten.
@@ -928,6 +928,6 @@ class TestBootstrapCodegenMatchesPython:
         port grows; never lower it to make a run green.
         """
         reproduced = irdiff.lines_reproduced(codegen_binary)
-        assert reproduced >= 287128, (
+        assert reproduced >= 335929, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
-            f"the port previously emitted at least 287128")
+            f"the port previously emitted at least 335929")

@@ -928,6 +928,11 @@ text func cgLtyOf(fty:text) {
     // read-only data. Nothing allocates or frees one, so unlike every
     // other pointer-shaped type it is never retained or released.
     if fty == 'font' { return 'ptr' }
+    // claude.md #195/#216: a `thread` value is one opaque pointer to a
+    // FestinaThreadHandle the runtime owns for the process's lifetime.
+    // Nothing ever allocates, retains or releases one here, so it sits
+    // beside `font` rather than with the refcounted handles.
+    if fty == 'thread' { return 'ptr' }
     return ''
 }
 
@@ -1170,12 +1175,23 @@ map[text] CG_STRUCT_REL = {}
 // cgMemberRead, so the window in which it is live is one call wide.
 Val CG_FIELD_BASE
 
+// A thread's own state names, visible under their PLAIN spelling only
+// while that thread's own bodies are being emitted. This is the tier
+// the original's `state_env` occupies: between a body's own locals and
+// the program's globals, so a thread's `int total` shadows a top-level
+// one of the same name without either losing its own storage.
+map[text] T_SLOT = {}
+map[text] T_FTY = {}
+map[text] T_ETY = {}
+map[text] T_SNAME = {}
+
 bool func cgIsLocal(name:text) {
     return L_SLOT[name] != null
 }
 
 text func cgSlotOf(name:text) {
     if L_SLOT[name] != null { return L_SLOT[name] }
+    if T_SLOT[name] != null { return T_SLOT[name] }
     if G_SLOT[name] != null { return G_SLOT[name] }
     return ''
 }
@@ -1210,18 +1226,21 @@ map[text] L_ETY = {}
 
 text func cgEtyOf(name:text) {
     if L_ETY[name] != null { return L_ETY[name] }
+    if T_ETY[name] != null { return T_ETY[name] }
     if G_ETY[name] != null { return G_ETY[name] }
     return ''
 }
 
 text func cgSnameOf(name:text) {
     if L_SNAME[name] != null { return L_SNAME[name] }
+    if T_SNAME[name] != null { return T_SNAME[name] }
     if G_SNAME[name] != null { return G_SNAME[name] }
     return ''
 }
 
 text func cgFtyOf(name:text) {
     if L_FTY[name] != null { return L_FTY[name] }
+    if T_FTY[name] != null { return T_FTY[name] }
     if G_FTY[name] != null { return G_FTY[name] }
     return ''
 }
@@ -1354,6 +1373,42 @@ map[text] CG_EVENT_REG = {
 // exactly the behaviour it always had.
 text CG_FN_SYMBOL = ''
 text CG_FN_RET = ''
+
+// The declared threads in source order, which is the order main's own
+// prologue registers and spawns them in.
+arr[text] CG_THREADS = []
+// Each thread's inbound payload descriptor, keyed by thread name --
+// '<fty>|<key>', or '' for a thread that declared no `on message`.
+map[text] CG_TH_IN = {}
+bool CG_USES_THREADS = false
+// claude.md #208: the ONE program-wide top-level `on message` handler
+// and the type it receives. Every thread's outbound queue drains here,
+// so this is a single symbol rather than a per-thread callback.
+text CG_MAIN_MSG_SYM = ''
+text CG_MAIN_MSG_IN = ''
+// The handle global of the thread whose body is being emitted right
+// now, or '' outside any -- what a bare `postMessage(x)` posts from.
+text CG_THREAD_HANDLE = ''
+
+// What cgFunc should emit right after the entry label, before it binds
+// a single parameter: '' for an ordinary body, or one of the four
+// adapter shapes below. Consumed (and cleared) by cgFunc itself, the
+// same one-shot handshake CG_FN_SYMBOL/CG_FN_RET already use, because
+// cgFunc is shared with every other body in the program and takes only
+// the node it emits.
+text CG_FN_PRE = ''
+// The thread whose adapter that is -- '' for main's own `on message`,
+// which needs the identical unboxing but no thread context of its own.
+text CG_FN_PRE_NAME = ''
+// And its declaration node, which is where the state initializers an
+// on_load prologue runs actually live.
+Node CG_FN_PRE_DECL = null
+// The parameter list cgFunc should emit INSTEAD of the one its own
+// parameters spell. An `on message` adapter is reached from the C
+// runtime as (sender, payload), not as the two already-typed values its
+// handler body sees.
+text CG_FN_SIG = ''
+
 
 // claude.md #91: every CSS colour name this language understands, and
 // the hex its components come from. Kept as DATA rather than derived,
@@ -5119,6 +5174,20 @@ Val func cgCall(e:Node, wantValue:bool) {
         }
         Node recv = childOf(callee, 'obj')
         text prop = rawText(callee, 'prop')
+        // claude.md #195: a declared thread's own name is a closed
+        // namespace, so this is checked ahead of everything else in
+        // this branch -- semantic analysis has already proved the
+        // property is one of the handful a thread answers to.
+        if recv != null && recv.kind == 'Identifier' {
+            if CG_TH_IN[rawText(recv, 'name')] != null {
+                if prop == 'postMessage' {
+                    cgNamedPostMessage(rawText(recv, 'name'), listOf(e, 'args'))
+                    return cgVal('0', 'void', 'void')
+                }
+                cgUnported(`.${prop}() on a thread`)
+                return none
+            }
+        }
         if recv != null && recv.kind == 'Identifier' {
             // The namespace path is taken per METHOD NAME, not per
             // receiver: `Math.sqrt()` is the namespace even when a
@@ -5137,6 +5206,14 @@ Val func cgCall(e:Node, wantValue:bool) {
         return none
     }
     text name = rawText(callee, 'name')
+    // claude.md #208: the bare, context-implicit send -- FROM the
+    // thread whose body is being emitted, TO main. Checked first, and
+    // only inside a thread: at the top level `postMessage` is an
+    // ordinary name with nothing declared to answer to it.
+    if name == 'postMessage' && CG_THREAD_HANDLE != '' {
+        cgBarePostMessage(listOf(e, 'args'))
+        return cgVal('0', 'void', 'void')
+    }
     // claude.md #131: `close(code)` ends the program, running a
     // declared `on exit(code:int)` handler on the way out --
     // festina_program_exit does both, because the registered handler
@@ -5575,6 +5652,34 @@ Val func cgCall(e:Node, wantValue:bool) {
         cgOut(`  ${nout} = call i64 @festina_now_ms()`)
         return cgVal(nout, 'i64', 'int')
     }
+    // claude.md #150: `exec(args)` -- the blocking form, and the only
+    // one left (claude.md #221 removed the callback form, whose
+    // callback always ran on main's OS thread whichever thread
+    // dispatched it). `args` is an arr[text] passed as the same header
+    // pointer the runtime reads directly, and its cleanup is the
+    // ordinary "release if this expression owns it, otherwise it is
+    // borrowed" rule every other refcounted argument already gets.
+    if name == 'exec' {
+        arr[Node] eargs = listOf(e, 'args')
+        if eargs.length != 1 {
+            cgUnported(`exec() with ${eargs.length} arguments`)
+            return none
+        }
+        // The element type is named rather than inferred: exec's own
+        // signature is arr[text] and nothing else, so a literal
+        // argument has no other reading -- while the original reaches
+        // the same answer by inferring it from the first element.
+        Val ev = cgExprExpecting(eargs[0], 'arr', 'text')
+        if CG_STUCK { return none }
+        text eout = cgTmp()
+        cgOut(`  ${eout} = call i64 @festina_process_exec(ptr ${ev.v})`)
+        if cgIsRefcounted(ev.fty) && cgIsOwningRefcountedSource(eargs[0]) {
+            cgOut(`  call void ${cgReleaseFnFor(ev.fty, cgRelKeyVal(ev))}(ptr ${ev.v})`)
+        } else {
+            cgFreeTextTemp(eargs[0], ev)
+        }
+        return cgVal(eout, 'i64', 'int')
+    }
     if name == 'formatTime' || name == 'mkdir' || name == 'ls' {
         arr[Node] fargs = listOf(e, 'args')
         arr[Val] fvals = []
@@ -5800,6 +5905,10 @@ void func cgStmt(s:Node) {
     // An event handler's body was emitted with the functions; nothing
     // reaches main where the declaration stands.
     if s.kind == 'EventHandler' { return }
+    // A thread's three adapters were emitted with the functions, and
+    // its registration and spawn belong to main's own PROLOGUE -- so
+    // nothing reaches main where the declaration itself stands.
+    if s.kind == 'ThreadDecl' { return }
     // And the DatabaseURL directive, which cgProgram already lifted:
     // it is spent in main's prologue, so there is nothing left to run
     // where it was written.
@@ -6694,6 +6803,7 @@ void func cgIf(s:Node) {
     cgOut(`  br i1 ${t}, label %${thenL}, label %${elseL}`)
     cgBlockLabel(thenL)
     cgBlockInto(childOf(s, 'then'))
+    bool thenTerm = CG_TERM
     if CG_TERM == false { cgOut(`  br label %${endL}`) }
     cgBlockLabel(elseL)
     CG_TERM = false
@@ -6705,7 +6815,23 @@ void func cgIf(s:Node) {
             cgStmt(orelse)
         }
     }
+    bool elseTerm = CG_TERM
     if CG_TERM == false { cgOut(`  br label %${endL}`) }
+    // When BOTH arms end in a terminator nothing can reach the end
+    // block, so it is never emitted -- the label is still allocated
+    // (which is why the numbering does not shift), it simply names no
+    // block, and the `if` itself terminates whatever contains it.
+    //
+    // Emitting it anyway is what this port used to do, and it cost an
+    // unreachable `if.endN: br label %if.endM` block per occurrence
+    // plus a wrong CG_TERM for the enclosing statement. Nothing in the
+    // corpus had the shape until a chained `else if` whose every arm
+    // returned was written, so the difference sat unmeasured -- see
+    // decisions.md #323 and the `if-both-arms-terminate` canary.
+    if thenTerm && elseTerm {
+        CG_TERM = true
+        return
+    }
     cgBlockLabel(endL)
     // The end block itself falls through, so whatever follows the `if`
     // is reachable regardless of what the arms did.
@@ -6758,6 +6884,10 @@ text func cgDeclFty(d:Node) {
         if cgFuncSig(t) == '' { return '' }
         return 'func'
     }
+    // claude.md #195: the `worker:thread` parameter every `on message`
+    // handler takes. Scalar-shaped for exactly the reason a `func`
+    // binding is -- one immortal pointer, never retained or released.
+    if t.kind == 'thread' { return 'thread' }
     if t.kind != 'prim' { return '' }
     if t.name == 'color' { return 'color' }
     if t.name == 'font' { return 'font' }
@@ -9109,6 +9239,515 @@ void func cgReturn(s:Node) {
 }
 
 // ---------------------------------------------------------------------
+// claude.md #195: threads.
+//
+// `thread NAME { ... }` compiles to a registered FestinaThreadHandle
+// plus three real LLVM functions -- the on_load/on_message/on_exit
+// adapters -- emitted whether or not the matching handler was declared,
+// because a trivial `ret void` costs nothing and saves the C runtime a
+// NULL check at every call site that reaches for one.
+//
+// Thread-private state is ordinary NAMESPACED globals
+// (@__festina_thread_NAME_state_VAR), so every existing per-type
+// storage decision applies to them unchanged. Only their initializer
+// STORES are special: they run once inside on_load, on that thread's
+// own OS thread, rather than in __festina_main -- the storage belongs
+// to a thread that may not exist yet when __festina_main starts.
+//
+// What this port carries across a thread boundary so far is the
+// scalars and text. Everything else -- a struct/arr/map/enum payload
+// (each needing a generated deep-clone cascade), a pool, `.callback()`/
+// `.reply()`, a thread's own DatabaseURL or HTTP handlers, a private
+// function -- is refused by name rather than approximated.
+
+// The payload descriptor for a thread-message type -- '<fty>|<key>' --
+// or '' for one this port cannot carry yet. The key half is empty for
+// every type phase one handles; it is there because the types that
+// come next (a struct's own name, a container's element type) are
+// exactly what a clone and a release cascade are generated from.
+text func cgThreadDesc(t:Ty) {
+    if t == null { return '' }
+    if t.kind != 'prim' { return '' }
+    text n = t.name
+    if n == 'int' || n == 'float' || n == 'bool' || n == 'text' { return `${n}|` }
+    return ''
+}
+
+text func cgDescFty(desc:text) {
+    if desc == '' { return '' }
+    return desc.split('|')[0]
+}
+
+// Turns a value into the single `void *payload` festina_thread_post
+// carries. text needs no separate wrapper -- it is CLONED in place and
+// the fresh buffer IS the payload; a scalar rides in a fresh malloc'd
+// 8-byte box holding its raw bit pattern.
+text func cgThreadBox(val:text, desc:text) {
+    text fty = cgDescFty(desc)
+    if fty == 'text' {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${val})`)
+        return owned
+    }
+    text box = cgTmp()
+    cgOut(`  ${box} = call ptr @malloc(i64 8)`)
+    cgOut(`  store ${cgLtyOf(fty)} ${val}, ptr ${box}`)
+    return box
+}
+
+// The mirror, assigning straight into `dest` -- an arbitrary register
+// name rather than a fresh temp, so an adapter's unboxed parameter
+// appears under the EXACT `%arg.<name>` the ordinary parameter binding
+// already expects and needs no awareness it came from a queue. For text
+// the box pointer itself IS the value, so this is a no-op pointer
+// alias; the `add x, 0` beneath it is the scalar counterpart of the
+// same trick.
+void func cgThreadUnboxInto(box:text, desc:text, dest:text) {
+    text fty = cgDescFty(desc)
+    if fty == 'text' {
+        cgOut(`  ${dest} = getelementptr i8, ptr ${box}, i64 0`)
+        return
+    }
+    text lty = cgLtyOf(fty)
+    text t = cgTmp()
+    cgOut(`  ${t} = load ${lty}, ptr ${box}`)
+    if lty == 'double' {
+        cgOut(`  ${dest} = fadd double ${t}, 0.0`)
+        return
+    }
+    cgOut(`  ${dest} = add ${lty} ${t}, 0`)
+}
+
+// What the receiving side calls to release ONE payload once its handler
+// has consumed it. `@free` is right for both shapes phase one carries:
+// a plain box, and an owned text buffer (which is the payload itself,
+// never wrapped further). A compound payload will want a real release
+// cascade here, which is why this is a function and not a constant.
+text func cgThreadReleaseFn(desc:text) {
+    return '@free'
+}
+
+// Releases a postMessage argument once the box already holds an
+// independent copy of it. `val` itself was never touched by the clone,
+// so a borrowed alias is left exactly as it was; only a genuinely fresh
+// temporary this call site now owns gets freed.
+void func cgThreadPostCleanup(e:Node, v:Val, desc:text) {
+    if cgDescFty(desc) == 'text' { cgFreeTextTemp(e, v) }
+}
+
+// The argument half both send forms share: emit it, check it against
+// the declared payload type, and box it. Answers the box register, or
+// '' if the walk got stuck.
+text func cgThreadSendArg(args:arr[Node], desc:text, out:arr[Val]) {
+    if args.length != 1 {
+        cgUnported(`postMessage() with ${args.length} arguments`)
+        return ''
+    }
+    text pfty = cgDescFty(desc)
+    Val v = cgExpr(args[0])
+    if CG_STUCK { return '' }
+    if v.fty != pfty {
+        cgUnported(`postMessage() of ${v.fty} where ${pfty} is declared`)
+        return ''
+    }
+    out.push(v)
+    return cgThreadBox(v.v, desc)
+}
+
+// claude.md #208: `postMessage(x)` with no receiver, from inside a
+// thread body -- FROM this thread TO main. festina_thread_post_outbound
+// sets the queued item's sender field from the handle it is called
+// with, so there is no separate sender argument here.
+void func cgBarePostMessage(args:arr[Node]) {
+    if CG_MAIN_MSG_IN == '' {
+        cgUnported('postMessage() with no top-level on message')
+        return
+    }
+    text pfty = cgDescFty(CG_MAIN_MSG_IN)
+    if args.length != 1 {
+        cgUnported(`postMessage() with ${args.length} arguments`)
+        return
+    }
+    Val v = cgExpr(args[0])
+    if CG_STUCK { return }
+    if v.fty != pfty {
+        cgUnported(`postMessage() of ${v.fty} where ${pfty} is declared`)
+        return
+    }
+    // The handle is loaded BEFORE the box, which is the original's
+    // order and not an accident: the two calls mint temps from the same
+    // counter, so swapping them renumbers every value after this point.
+    text handle = cgTmp()
+    cgOut(`  ${handle} = load ptr, ptr ${CG_THREAD_HANDLE}`)
+    text box = cgThreadBox(v.v, CG_MAIN_MSG_IN)
+    cgOut(`  call void @festina_thread_post_outbound(ptr ${handle}, ptr ${box}, i64 0)`)
+    cgThreadPostCleanup(args[0], v, CG_MAIN_MSG_IN)
+}
+
+// `NAME.postMessage(x)` -- legal from main, and from inside ANOTHER
+// thread's body. The sender is the main singleton (claude.md #216: it
+// is never null) when this call site is main's, or the calling thread's
+// own handle when it is not.
+void func cgNamedPostMessage(tname:text, args:arr[Node]) {
+    text desc = CG_TH_IN[tname]
+    if desc == '' {
+        cgUnported(`postMessage() to ${tname}, which declares no on message`)
+        return
+    }
+    text handle = cgTmp()
+    cgOut(`  ${handle} = load ptr, ptr @__festina_thread_${tname}_handle`)
+    arr[Val] got = []
+    text box = cgThreadSendArg(args, desc, got)
+    if CG_STUCK { return }
+    text sender = cgTmp()
+    if CG_THREAD_HANDLE != '' {
+        cgOut(`  ${sender} = load ptr, ptr ${CG_THREAD_HANDLE}`)
+    } else {
+        cgOut(`  ${sender} = call ptr @festina_thread_get_main_handle()`)
+    }
+    cgOut(`  call void @festina_thread_post(ptr ${handle}, ptr ${sender}, ptr ${box}, i64 0)`)
+    cgThreadPostCleanup(args[0], got[0], desc)
+}
+
+// The `on message` parameter type a thread declares, as a descriptor --
+// '' for a thread that declares no handler at all.
+text func cgThreadInboundDesc(d:Node) {
+    arr[Node] stmts = cgBlockStmts(childOf(d, 'body'))
+    int i = 0
+    while i < stmts.length {
+        if stmts[i].kind == 'EventHandler' {
+            if rawText(stmts[i], 'name') == 'message' {
+                arr[Node] ps = listOf(stmts[i], 'params')
+                if ps.length != 2 { return '' }
+                return cgThreadDesc(resolveTypeField(ps[1], 'type_expr'))
+            }
+        }
+        i++
+    }
+    return ''
+}
+
+// A thread's private state storage, emitted in the SAME pass and the
+// same source order every other global's is -- the original registers
+// these into its one global scope as it walks the declaration, so they
+// interleave with top-level declarations rather than forming a section
+// of their own.
+void func cgThreadStateGlobals(d:Node) {
+    text tname = rawText(d, 'name')
+    arr[Node] stmts = cgBlockStmts(childOf(d, 'body'))
+    int i = 0
+    while i < stmts.length {
+        Node s = stmts[i]
+        if s.kind == 'VarDecl' {
+            text vn = rawText(s, 'name')
+            text sym = `__festina_thread_${tname}_state_${vn}`
+            text gf = cgDeclFty(s)
+            if gf == '' {
+                cgUnported('thread state of a non-scalar type')
+                return
+            }
+            text gl = cgLtyOf(gf)
+            text gz = cgZeroFor(gl)
+            if gf == 'color' { gz = cgNullValue('color') }
+            cgEmit(`@${sym} = global ${gl} ${gz}`)
+            if gf == 'text' {
+                cgEmit(`@${sym}.ap = global ptr null`)
+                cgEmit(`@${sym}.aplen = global i64 0`)
+            }
+            G_SLOT[sym] = `@${sym}`
+            G_FTY[sym] = gf
+            if gf == 'func' { G_ETY[sym] = cgFuncSig(resolveTypeField(s, 'type_expr')) }
+        }
+        i++
+    }
+}
+
+// The same names, made visible under their PLAIN spelling for the
+// duration of this thread's own bodies.
+void func cgThreadScopeOn(d:Node) {
+    map[text] slot = {}
+    map[text] fty = {}
+    map[text] ety = {}
+    map[text] sname = {}
+    T_SLOT = slot
+    T_FTY = fty
+    T_ETY = ety
+    T_SNAME = sname
+    text tname = rawText(d, 'name')
+    arr[Node] stmts = cgBlockStmts(childOf(d, 'body'))
+    int i = 0
+    while i < stmts.length {
+        if stmts[i].kind == 'VarDecl' {
+            text vn = rawText(stmts[i], 'name')
+            text sym = `__festina_thread_${tname}_state_${vn}`
+            if G_SLOT[sym] != null {
+                T_SLOT[vn] = G_SLOT[sym]
+                T_FTY[vn] = G_FTY[sym]
+                if G_ETY[sym] != null { T_ETY[vn] = G_ETY[sym] }
+                if G_SNAME[sym] != null { T_SNAME[vn] = G_SNAME[sym] }
+            }
+        }
+        i++
+    }
+}
+
+void func cgThreadScopeOff() {
+    map[text] slot = {}
+    map[text] fty = {}
+    map[text] ety = {}
+    map[text] sname = {}
+    T_SLOT = slot
+    T_FTY = fty
+    T_ETY = ety
+    T_SNAME = sname
+}
+
+// The state initializers, run once at the top of on_load. This is the
+// same "a declaration with an initializer is just another point the
+// value changes" treatment an ordinary global's own init already gets,
+// only placed on this thread's OS thread instead of main's.
+void func cgThreadStateInits(d:Node) {
+    text tname = rawText(d, 'name')
+    arr[Node] stmts = cgBlockStmts(childOf(d, 'body'))
+    int i = 0
+    while i < stmts.length {
+        Node s = stmts[i]
+        if s.kind == 'VarDecl' {
+            Node init = childOf(s, 'init')
+            if init != null {
+                text vn = rawText(s, 'name')
+                text ref = `@__festina_thread_${tname}_state_${vn}`
+                text fty = cgDeclFty(s)
+                if fty == 'text' {
+                    // A text state variable's own store goes through
+                    // the global retain/release path rather than a
+                    // plain store, and that path is not yet reached
+                    // from here. Refused rather than guessed at.
+                    cgUnported('thread state of type text with an initializer')
+                    return
+                }
+                Val v = cgExprExpecting(init, fty, '')
+                if CG_STUCK { return }
+                if v.fty != fty {
+                    cgUnported(`initializer of type ${v.fty} for ${fty}`)
+                    return
+                }
+                cgOut(`  store ${cgLtyOf(fty)} ${v.v}, ptr ${ref}`)
+            }
+        }
+        i++
+    }
+}
+
+// The prologue cgFunc runs right after the entry label. Reached only
+// for a thread adapter or main's own `on message`; `pnames` is that
+// body's own parameter names, which is all an unboxing step needs.
+void func cgAdapterPrologue(kind:text, pnames:arr[text]) {
+    Node d = CG_FN_PRE_DECL
+    if kind == 'load' {
+        cgThreadStateInits(d)
+        // The context is set only AFTER the initializers, which is the
+        // original's placement: a bare postMessage(x) inside one of
+        // them has no thread to send from.
+        CG_THREAD_HANDLE = `@__festina_thread_${rawText(d, 'name')}_handle`
+        return
+    }
+    if kind == 'exit' {
+        CG_THREAD_HANDLE = `@__festina_thread_${rawText(d, 'name')}_handle`
+        return
+    }
+    // Both `on message` shapes, thread-side and main-side. `%sender` is
+    // already the bare `ptr` a thread value is, so it needs no unboxing
+    // at all -- only a no-op alias under the register name the ordinary
+    // parameter binding expects.
+    text desc = CG_MAIN_MSG_IN
+    if CG_FN_PRE_NAME != '' { desc = CG_TH_IN[CG_FN_PRE_NAME] }
+    cgOut(`  %arg.${pnames[0]} = getelementptr i8, ptr %sender, i64 0`)
+    cgThreadUnboxInto('%payload', desc, `%arg.${pnames[1]}`)
+    if kind == 'message' {
+        CG_THREAD_HANDLE = `@__festina_thread_${CG_FN_PRE_NAME}_handle`
+    }
+}
+
+// An adapter the program never declared a handler for. A real,
+// never-called function rather than a null pointer, which is what lets
+// the C runtime read all three unconditionally.
+void func cgThreadStubAdapter(symbol:text, params:text) {
+    arr[text] stub = []
+    CUR = stub
+    cgOut(`define void ${symbol}(${params}) {`)
+    cgBlockLabel(cgLabel('entry'))
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    int i = 0
+    while i < stub.length {
+        CG_FUNCS.push(stub[i])
+        i++
+    }
+}
+
+// The declaration itself.
+void func cgThreadDecl(d:Node) {
+    text tname = rawText(d, 'name')
+    if fieldOf(d, 'pool_size').raw != 'null' {
+        cgUnported('thread pool declaration')
+        return
+    }
+    arr[Node] stmts = cgBlockStmts(childOf(d, 'body'))
+    Node onLoad = null
+    Node onMessage = null
+    Node onExit = null
+    int i = 0
+    while i < stmts.length {
+        Node s = stmts[i]
+        if s.kind == 'VarDecl' {
+            // Storage already emitted in the globals pass.
+        } else if s.kind == 'EventHandler' {
+            text hn = rawText(s, 'name')
+            if hn == 'load' { onLoad = s }
+            else if hn == 'message' { onMessage = s }
+            else if hn == 'exit' { onExit = s }
+            else {
+                cgUnported(`on ${hn} inside a thread`)
+                return
+            }
+        } else if s.kind == 'FuncDecl' {
+            cgUnported('a thread-private function')
+            return
+        } else {
+            cgUnported(`${s.kind} inside a thread`)
+            return
+        }
+        i++
+    }
+
+    CG_USES_THREADS = true
+    CG_EXTRA.push(`@__festina_thread_${tname}_handle = global ptr null`)
+    text inDesc = ''
+    if onMessage != null {
+        arr[Node] ps = listOf(onMessage, 'params')
+        if ps.length != 2 {
+            cgUnported('an on message handler without both parameters')
+            return
+        }
+        inDesc = cgThreadDesc(resolveTypeField(ps[1], 'type_expr'))
+        if inDesc == '' {
+            cgUnported('an on message parameter this port cannot clone')
+            return
+        }
+    }
+    CG_THREADS.push(tname)
+    CG_TH_IN[tname] = inDesc
+
+    cgThreadScopeOn(d)
+    // on_load first: the original emits the three in this order, and
+    // the shared counters make that order visible.
+    CG_FN_SYMBOL = `@__festina_thread_${tname}_on_load`
+    CG_FN_RET = 'void'
+    CG_FN_PRE = 'load'
+    CG_FN_PRE_NAME = tname
+    CG_FN_PRE_DECL = d
+    if onLoad != null {
+        cgFunc(onLoad)
+    } else {
+        // No handler of its own -- but the state initializers still
+        // have to run somewhere, and this adapter is where. Emitted
+        // directly rather than through cgFunc, because with no body to
+        // bind there is no parameter list and no escape analysis for
+        // cgFunc to do: entry label, the initializers, `ret void`.
+        CG_FN_SYMBOL = ''
+        CG_FN_RET = ''
+        CG_FN_PRE = ''
+        cgThreadLoadStub(d)
+    }
+    CG_THREAD_HANDLE = ''
+
+    if onMessage != null {
+        CG_FN_SYMBOL = `@__festina_thread_${tname}_on_message`
+        CG_FN_RET = 'void'
+        CG_FN_PRE = 'message'
+        CG_FN_PRE_NAME = tname
+        CG_FN_PRE_DECL = d
+        CG_FN_SIG = 'ptr %sender, ptr %payload'
+        cgFunc(onMessage)
+        CG_THREAD_HANDLE = ''
+    } else {
+        cgThreadStubAdapter(`@__festina_thread_${tname}_on_message`,
+                            'ptr %sender, ptr %payload')
+    }
+
+    if onExit != null {
+        CG_FN_SYMBOL = `@__festina_thread_${tname}_on_exit`
+        CG_FN_RET = 'void'
+        CG_FN_PRE = 'exit'
+        CG_FN_PRE_NAME = tname
+        CG_FN_PRE_DECL = d
+        cgFunc(onExit)
+        CG_THREAD_HANDLE = ''
+    } else {
+        cgThreadStubAdapter(`@__festina_thread_${tname}_on_exit`, 'i64 %arg.code')
+    }
+    cgThreadScopeOff()
+}
+
+// The on_load adapter for a thread that declared no `on load()` of its
+// own: still a real function, because the state initializers run in it.
+void func cgThreadLoadStub(d:Node) {
+    arr[text] stub = []
+    CUR = stub
+    CG_IN_FUNC = true
+    arr[text] freshLive = []
+    arr[int] freshFrames = []
+    arr[text] freshParams = []
+    CG_LIVE = freshLive
+    CG_FRAME = freshFrames
+    CG_PARAM_LIVE = freshParams
+    cgOut(`define void @__festina_thread_${rawText(d, 'name')}_on_load() {`)
+    cgBlockLabel(cgLabel('entry'))
+    cgThreadStateInits(d)
+    cgOut('  ret void')
+    cgOut('}')
+    cgOut('')
+    int i = 0
+    while i < stub.length {
+        CG_FUNCS.push(stub[i])
+        i++
+    }
+    CG_IN_FUNC = false
+}
+
+// claude.md #208: the ONE top-level `on message(worker:thread, msg:T)`
+// -- every message sent to main, from any thread. The same unboxing an
+// adapter gets, but on MAIN's own OS thread, so its body resolves
+// through the ordinary globals and there is no thread context to set:
+// a bare postMessage(x) is illegal from inside it, exactly as it is
+// anywhere else outside a thread body.
+void func cgMainOnMessage(d:Node) {
+    arr[Node] ps = listOf(d, 'params')
+    if ps.length != 2 {
+        cgUnported('an on message handler without both parameters')
+        return
+    }
+    text desc = cgThreadDesc(resolveTypeField(ps[1], 'type_expr'))
+    if desc == '' {
+        cgUnported('an on message parameter this port cannot clone')
+        return
+    }
+    CG_MAIN_MSG_IN = desc
+    CG_FN_SYMBOL = '@__festina_on_message'
+    CG_FN_RET = 'void'
+    CG_FN_PRE = 'message'
+    CG_FN_PRE_NAME = ''
+    CG_FN_PRE_DECL = null
+    CG_FN_SIG = 'ptr %sender, ptr %payload'
+    cgFunc(d)
+    if CG_STUCK { return }
+    CG_USES_THREADS = true
+    CG_MAIN_MSG_SYM = '@__festina_on_message'
+}
+
+// ---------------------------------------------------------------------
 // Functions.
 //
 // Emitted into CG_FUNCS before main is emitted at all, because the
@@ -9121,6 +9760,13 @@ void func cgFunc(d:Node) {
         symbol = CG_FN_SYMBOL
         CG_FN_SYMBOL = ''
     }
+    // claude.md #195: the thread-adapter handshake, consumed the same
+    // one-shot way the symbol just above is -- an ordinary body clears
+    // both and behaves exactly as it did before threads existed.
+    text preKind = CG_FN_PRE
+    CG_FN_PRE = ''
+    text sigOverride = CG_FN_SIG
+    CG_FN_SIG = ''
     text retF = FN_RET[name]
     if CG_FN_RET != '' {
         retF = CG_FN_RET
@@ -9231,8 +9877,15 @@ void func cgFunc(d:Node) {
     text savedRet = CG_FUNC_RET
     CG_FUNC_NAME = name
     CG_FUNC_RET = retF
+    if sigOverride != '' { joined = sigOverride }
     cgOut(`define ${retL} ${symbol}(${joined}) {`)
     cgBlockLabel(cgLabel('entry'))
+    // claude.md #195: an adapter's own prologue -- a thread's state
+    // initializers, or the `%sender`/`%payload` unboxing that makes the
+    // two queue values look like ordinary parameter registers. It runs
+    // BEFORE a single parameter is bound, because the registers the
+    // binding loop reads are exactly what it produces.
+    if preKind != '' { cgAdapterPrologue(preKind, pnames) }
 
     // A fresh live-value list per function: a frame left over from a
     // previous function would be freed inside this one. Both are reset
@@ -9531,6 +10184,12 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     int g = 0
     while g < body.length {
         Node d = body[g]
+        // claude.md #195: a thread's own private state is ordinary
+        // globals under a namespaced name, registered HERE rather than
+        // with the thread's bodies, so they interleave with top-level
+        // declarations in exactly the source order the original's one
+        // global scope gives them.
+        if d.kind == 'ThreadDecl' { cgThreadStateGlobals(d) }
         if d.kind == 'VarDecl' {
             text gn = rawText(d, 'name')
             text gf = cgDeclFty(d)
@@ -9649,6 +10308,23 @@ void func cgProgram(body:arr[Node], srcPath:text) {
         fs2++
     }
 
+    // claude.md #208: the program-wide outbound message type, resolved
+    // before any body is emitted -- a thread declared ABOVE the
+    // top-level `on message` still sends to it, so discovering this in
+    // source order would be too late for exactly one file in ten.
+    int mm0 = 0
+    while mm0 < body.length {
+        if body[mm0].kind == 'EventHandler' {
+            if rawText(body[mm0], 'name') == 'message' {
+                arr[Node] mps = listOf(body[mm0], 'params')
+                if mps.length == 2 {
+                    CG_MAIN_MSG_IN = cgThreadDesc(resolveTypeField(mps[1], 'type_expr'))
+                }
+            }
+        }
+        mm0++
+    }
+
     // Bodies next, into their own buffer, so the shared counters reach
     // them before main.
     int fb = 0
@@ -9663,9 +10339,23 @@ void func cgProgram(body:arr[Node], srcPath:text) {
         // registered as an ordinary callable. A name the runtime has
         // no event for still compiles, so a typo in one is dead code
         // rather than an error; it simply never fires.
+        if body[fb].kind == 'ThreadDecl' {
+            CG_STUCK = false
+            cgThreadDecl(body[fb])
+        }
         if body[fb].kind == 'EventHandler' {
             CG_STUCK = false
             text evName = rawText(body[fb], 'name')
+            // claude.md #208: the one top-level `on message` is not an
+            // ordinary event handler at all -- its two parameters
+            // arrive as a boxed thread-queue payload, the same shape a
+            // thread's own adapter unboxes, rather than as two already
+            // typed LLVM parameters -- so it has its own emitter.
+            if evName == 'message' {
+                cgMainOnMessage(body[fb])
+                fb++
+                continue
+            }
             text evSym = `@__festina_on_${evName}`
             CG_FN_SYMBOL = evSym
             CG_FN_RET = 'void'
@@ -9738,7 +10428,11 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // iteration, which is what makes installing a handler meaningful:
     // the gate is "a poll point is guaranteed to run soon", not
     // "timers specifically".
-    if CG_USES_TIMERS || CG_USES_WINDOW {
+    // claude.md #195: a thread-only program ends up in the timer
+    // loop below, which polls festina_shutdown_requested() the same
+    // once-per-iteration way every other loop here does, so it meets
+    // the same "a poll point is guaranteed to run soon" test.
+    if CG_USES_TIMERS || CG_USES_WINDOW || CG_USES_THREADS {
         cgOut('  call void @festina_install_shutdown_handler()')
     }
     // claude.md #101/#199: the image decoder is registered here, before
@@ -9752,6 +10446,42 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     }
     if CG_USES_GRAPHICS_CODE {
         cgOut('  call void @festina_set_image_decoder(ptr @festina_image_from_bytes)')
+    }
+    // claude.md #195: every declared thread is registered and spawned
+    // here, in main's own prologue, BEFORE __festina_main runs a single
+    // top-level statement -- so a thread is already alive and idling by
+    // the time the program's first line could name it. It comes after
+    // the two decoder hooks for the reason those moved up here: a
+    // thread's own on_load can start running the instant it is spawned,
+    // and racing it to store the same function pointer is a real data
+    // race even when the value never differs.
+    if CG_USES_THREADS {
+        cgOut('  call void @festina_register_thread_hooks()')
+        // claude.md #208: registered once, whenever ANY thread exists.
+        // A program with a thread but no top-level `on message` skips
+        // it entirely rather than passing a null the drain step would
+        // then have to check on every iteration.
+        if CG_MAIN_MSG_SYM != '' {
+            cgOut(`  call void @festina_set_global_message_handler(ptr ${CG_MAIN_MSG_SYM})`)
+        }
+        // The outbound release is the SAME program-wide message type
+        // for every thread -- there is one receiver in that direction
+        // -- so it is computed once, outside the loop.
+        text mainOutRel = '@free'
+        if CG_MAIN_MSG_IN != '' { mainOutRel = cgThreadReleaseFn(CG_MAIN_MSG_IN) }
+        int th = 0
+        while th < CG_THREADS.length {
+            text tn = CG_THREADS[th]
+            // A thread with no inbound type still gets a real
+            // (never-called) pointer here: `@free` is harmless and
+            // saves the C side a NULL check.
+            text inRel = '@free'
+            if CG_TH_IN[tn] != '' { inRel = cgThreadReleaseFn(CG_TH_IN[tn]) }
+            cgOut(`  %__thread_${tn} = call ptr @festina_thread_register(ptr @__festina_thread_${tn}_on_load, ptr @__festina_thread_${tn}_on_message, ptr @__festina_thread_${tn}_on_exit, ptr ${inRel}, ptr ${mainOutRel})`)
+            cgOut(`  store ptr %__thread_${tn}, ptr @__festina_thread_${tn}_handle`)
+            cgOut(`  call void @festina_thread_spawn(ptr %__thread_${tn})`)
+            th++
+        }
     }
     // claude.md #29-31: the database is opened and every declared table
     // synced HERE, in main's own prologue, before __festina_main runs a
@@ -9776,8 +10506,13 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // claude.md #40: a canvas only means something while a window is
     // actually open, so this blocks here -- after the entry function
     // has run and had its chance to draw.
+    // claude.md #195: `|| CG_USES_THREADS` -- a program that only ever
+    // declares a thread still needs this loop running, both to keep the
+    // process alive while that thread idles and to drain its outbound
+    // messages, which the timer loop checks once per iteration whatever
+    // it was entered for.
     if CG_USES_WINDOW { cgOut('  call void @festina_run_event_loop()') }
-    else if CG_USES_TIMERS { cgOut('  call void @festina_run_timer_loop()') }
+    else if CG_USES_TIMERS || CG_USES_THREADS { cgOut('  call void @festina_run_timer_loop()') }
     // The last thing main does, and only when there is a database to
     // close: for a program that never opens one this call would be the
     // single live reference into the runtime's SQLite code, which on

@@ -111,15 +111,15 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage: **76 of 120 corpus files emit
-  byte-identical LLVM IR, 0 differ, 33 not yet ported, 11 rejected by
-  both** — 324,882 of 340,441 file-specific IR lines. **The bootstrap
+  the fourth and last stage: **79 of 121 corpus files emit
+  byte-identical LLVM IR, 0 differ, 31 not yet ported, 11 rejected by
+  both** — 335,929 of 350,827 file-specific IR lines. **The bootstrap
   compiler reproduces its own compilation**: all ten of its files —
   `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
-  `escape.f` (22,232), `codegen.f` (59,166) and the five command-line
+  `escape.f` (22,232), `codegen.f` (92,560) and the five command-line
   drivers `lexdump.f` (4,793), `astdumpf.f` (13,356), `semdumpf.f`
-  (20,946), `escdumpf.f` (23,988) and `irdumpf.f` (59,567) — emit
-  byte-identical IR, 242,390 file-specific lines in total. **And the
+  (20,946), `escdumpf.f` (23,988) and `irdumpf.f` (92,961) — emit
+  byte-identical IR, 309,178 file-specific lines in total. **And the
   fixed point closes**: linking the IR the self-hosted compiler emits
   for `bootstrap/irdumpf.f` gives a second-generation binary
   byte-identical to the first, agreeing with it on all ten files and
@@ -206,7 +206,18 @@ round-by-round design and implementation record predating 0.1 lives in
   (`free`/`clear`), first-class function values with `.sort()` and
   `.forEach()`, and `try`/`catch`/`throw` — which changes the whole
   program, registering every tracked binding anywhere on a runtime
-  cleanup stack so a throw can unwind frames that never heard of it. `bootstrap/irdump.py` and
+  cleanup stack so a throw can unwind frames that never heard of it. And
+  the first slice of THREADS — `thread NAME { ... }` compiling to a
+  registered handle plus three real adapter functions (emitted whether
+  or not the matching handler was declared, since the C runtime reads
+  all three unconditionally), thread-private state as namespaced
+  globals whose initializers run inside `on load` on that thread's own
+  OS thread, and both directions of `postMessage`: the bare
+  context-implicit send to main, and `NAME.postMessage(x)` naming the
+  calling thread as its sender. Scalar and `text` payloads only so far;
+  a pool, `.callback()`/`.reply()`, `.kill()`/`.live()`, a compound
+  payload and a thread's own database or HTTP handlers are each refused
+  by name rather than approximated. Plus `exec(args)`. `bootstrap/irdump.py` and
   `bootstrap/irdiff.py` run the comparison; the oracle is the IR text
   itself, so it needed no canonical form of its own (decisions.md
   #289–#316).
@@ -216,7 +227,7 @@ round-by-round design and implementation record predating 0.1 lives in
   the two implementations agree; it says nothing about whether the
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
-  not. A hundred and twelve deliberate breakages, one per mechanism,
+  not. A hundred and twenty-one deliberate breakages, one per mechanism,
   re-run by `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
   no longer the whole verdict: a canary looks for TWO independent
   witnesses and reports a lone one in its own output, because

@@ -6603,3 +6603,31 @@ A small slice, and a line worth drawing carefully. **300,464 of 319,458 file-spe
 **Both halves were caught by the full corpus and neither by the file under change.** That is now three separate times in this stretch -- the self-hosting break of #321, the premature release in the img drawImage path, and this pair. The habit that matters is not "test the thing you changed" but "measure everything before committing", and the cost of skipping it is not a failing test on the file you were looking at: it is a silent regression two files away.
 
 **Verified.** Lexer 120/120, parser 120/120, semantic 120/120, codegen 76 match and 0 differ.
+
+323. THREADS, AND AN `IF` THIS PORT HAD ALWAYS GOT WRONG
+
+**335,929 of 350,827 file-specific IR lines, up from 324,882 -- 95.8% -- and 79 files match, 0 differ**, up from 76. All ten bootstrap files still self-host, now 309,178 file-specific lines between them.
+
+**`thread NAME { ... }` is a registered handle plus three real functions**, and all three are emitted whether or not the matching handler was declared. A trivial `ret void` costs nothing and saves the C runtime a NULL check at every call site that reaches for one -- so the choice is not "emit what was written" but "emit all three, always", and a canary that deletes the on_exit stub is what keeps that claim measured.
+
+**Thread-private state is ordinary NAMESPACED globals**, which is what makes every existing per-type storage decision apply to it unchanged. Only the initializer STORES are special: they run inside `on load`, on that thread's own OS thread, rather than in `__festina_main` -- the storage belongs to a thread that may not exist yet when `__festina_main` starts.
+
+**But the NAMES are a scope, not more globals.** The original nests a thread's `state_env` between a handler body's own locals and the program's globals; this port had two tiers and needed a third, so `T_SLOT`/`T_FTY`/`T_ETY`/`T_SNAME` sit between `L_` and `G_` in the four lookups and nowhere else. Writing the mangled names into the one global table instead would have compiled a program that reads and writes the WRONG storage rather than one that refuses to compile, and only a name that resolves both ways can tell those two failures apart -- which is why `cases/threads_and_messages.f` declares `total` and `scale` at the top level AND inside `adder`. Without that the canary for it was caught by the ratchet alone; with it, it is a real diff naming `@scale` against `@__festina_thread_adder_state_scale`.
+
+**The two send directions are not symmetric and the asymmetry is the point.** A bare `postMessage(x)` inside a thread body posts OUTBOUND -- the runtime fills the sender field in from the handle it is called with, so there is no sender argument at all. `NAME.postMessage(x)` posts INBOUND to a named target and must say who is asking: main's own singleton when the call site is main's, the CALLING thread's handle when it is inside another thread. Only a program where one thread messages another can see the difference, and no corpus file had one.
+
+**`cgFunc` grew a prologue hook rather than a second copy.** An `on message` adapter is reached from C as `(sender, payload)`, not as the two already-typed values its body sees, so it needs a different signature and an unboxing step before any parameter is bound. The alternative was a second parameter-binding loop, and #322 already recorded why that is not on offer: the loop's uid ordering is OBSERVABLE, and two copies drift the day one is touched and the other is not. The hook is the same one-shot handshake the symbol and return-type overrides already use.
+
+**What this slice REFUSED is most of the subsystem, by name.** A pool, `.callback()`/`.reply()`, `.kill()`/`.live()`/`.drain()`, a struct/array/map/enum payload, a thread's own `DatabaseURL` or HTTP handlers, a thread-private function. Each is a named reason in the blocker table rather than an approximation, which is the rule that makes the table's "only" column mean anything. The subset that is in reaches exactly two files, and one of them is the case file written for it -- which is the honest shape of a first slice into a large subsystem, not a disappointment.
+
+**And then there is the `if`.** An `if` whose arms BOTH end in a terminator must emit no end block: the label is still allocated, so the numbering does not shift, it simply names nothing, and the `if` terminates whatever contains it. This port had always emitted it anyway -- an unreachable `if.endN: br label %if.endM` per occurrence, plus a wrong `CG_TERM` for the enclosing statement. `int func pick(k:int) { if k == 1 { return 1 } else { return 2 } }` is enough to show it, and it had been wrong since the day `cgIf` was written.
+
+**Nothing in the corpus had the shape.** Not one of 120 files, `bootstrap/codegen.f` included, contained an `if` whose every arm returned -- until this slice wrote a chained `else if` over statement kinds where each arm returns, inside `cgThreadDecl`. The bug then presented as a SELF-HOSTING break with a 12-label drift and a 42% coverage reading, in a file 80,000 lines from anything the slice was about. `cases/control_flow.f` is where the shape now lives, since that file already exists for the one-arm case and said so in its own header comment.
+
+**That is the fourth defect in this stretch caught by the whole-corpus run and not by the file under change**, after #321's self-hosting break and both halves of #322's array-literal retain. The habit is not "test what you changed".
+
+**The witness check earned its keep twice more.** `exec-releases-an-owning-argument` reported ONE witness and that it was not a case file, exactly as #312 designed it to; `cases/drivers.f` is where `exec(['true'])` now lives, a command spawning a child process being what that file is about. `thread-send-names-the-calling-thread` and `thread-state-shadows-a-global` each have one witness and it is the case file written for them -- by design.
+
+**Ten canaries. 121 in total.**
+
+**Verified.** Lexer 121/121, parser 121/121, semantic 121/121, escape analysis 103 match and 0 differ (1,944 of 1,997 records), codegen 79 match and 0 differ. Ten canaries run: all ten caught as real diffs, 0 through the ratchet, 0 missed, 0 broken.

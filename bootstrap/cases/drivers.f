@@ -145,6 +145,14 @@ log(n)
 log(tally)
 log(sink.length)
 
+// decisions.md #323: `exec(args)` -- the one thing here that makes a
+// child process rather than reading its own. The argument is a LITERAL,
+// so the expression owns the array it just built and this call site has
+// to release it after the call; a borrowed `arr[text]` binding passed
+// the same way must be left exactly as it was. `['true']` is chosen for
+// being present and a no-op on every platform this runs on.
+log(exec(['true']))
+
 // Mechanism 2, last, so everything above still runs. A program that
 // ends this way exits 0 exactly as falling off the end would -- the
 // difference is the handler `festina_program_exit` would run first,

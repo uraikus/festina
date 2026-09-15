@@ -80,3 +80,49 @@ if done == true {
 } else {
     log(false)
 }
+
+// decisions.md #323: an `if` whose arms BOTH end in a terminator emits
+// no end block at all -- the label is still allocated, so the numbering
+// does not shift, it simply names nothing, and the `if` terminates
+// whatever contains it. The comment at the top of this file covers ONE
+// arm ending in `return`; nothing in the corpus covered both, and the
+// port emitted an unreachable `if.endN: br label %if.endM` for every
+// occurrence until a chained `else if` whose every arm returned was
+// finally written down.
+int func pick(k:int) {
+    if k == 1 {
+        return 1
+    } else {
+        return 2
+    }
+}
+
+// The chained form, nested inside a loop, which is where the extra
+// block was first seen: the inner `if` terminates, so the OUTER one's
+// own end block has to be reached from the first arm alone.
+int func chain(k:int) {
+    int i = 0
+    while i < 3 {
+        if k == 0 {
+        } else if k == 1 {
+            if i == 0 {
+                return 10
+            } else {
+                return 11
+            }
+        } else if k == 2 {
+            return 12
+        } else {
+            return 13
+        }
+        i = i + 1
+    }
+    return 14
+}
+
+log(pick(1))
+log(pick(2))
+log(chain(0))
+log(chain(1))
+log(chain(2))
+log(chain(3))
