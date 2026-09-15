@@ -2509,6 +2509,15 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
         vals.push(v.v)
         bool isOwning = cgOwnsText(elems[i], v)
         if cgElemIsRefcounted(ety) { isOwning = cgIsOwningRefcountedSource(elems[i]) }
+        // Freshness is a property of the VALUE, not only of the
+        // expression. `arr[blob] fs = ['path.txt']` has a string
+        // literal for a node -- which owns nothing -- and a value the
+        // coercion just minted, which owns everything. Only mattered
+        // once handle elements reached this path at all: a struct
+        // element is never produced by a coercion, so the node alone
+        // was a complete answer for as long as structs were the only
+        // refcounted element type here.
+        if v.fresh { isOwning = true }
         if isOwning { owned.push(1) } else { owned.push(0) }
         i++
     }
@@ -2543,7 +2552,15 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
         // No release-old here, unlike `xs[i] = v` on a built array:
         // this buffer is fresh malloc'd memory, so every slot is
         // written exactly once and there is no stale value to reclaim.
-        if SF_NAMES[ety] != null {
+        // Through the ELEMENT predicate, not a struct-name lookup: a
+        // handle (img/aud/blob/regex/ascii) and a table ROW hold a
+        // whole reference exactly as a struct element does, and the
+        // narrower test silently skipped the retain for every one of
+        // them. An `arr[img]` built from two aliased bindings is the
+        // shape that found it -- the array and the bindings shared one
+        // reference, so whichever was released first left the other
+        // dangling.
+        if cgElemIsRefcounted(ety) {
             if owned[k] == 0 { cgOut(`  call void @festina_retain(ptr ${v})`) }
         } else if ety == 'text' && owned[k] == 0 {
             text o = cgTmp()
