@@ -924,6 +924,10 @@ text func cgLtyOf(fty:text) {
     // lays out.
     if fty == 'img' { return 'ptr' }
     if fty == 'aud' { return 'ptr' }
+    // claude.md #91: a font is a pointer to a STATIC record in
+    // read-only data. Nothing allocates or frees one, so unlike every
+    // other pointer-shaped type it is never retained or released.
+    if fty == 'font' { return 'ptr' }
     return ''
 }
 
@@ -1187,6 +1191,9 @@ map[text] CG_ARR_REL = {}
 // section with a different shape.
 map[text] CG_ASTR_MAP = {}
 int CG_ASTR_N = 0
+// The font records interned so far, keyed by their RESOLVED parts.
+map[text] CG_FONTS = {}
+int CG_FONT_N = 0
 map[text] CG_ROW_REL = {}
 map[text] CG_MAP_REL = {}
 
@@ -1309,6 +1316,45 @@ bool CG_USES_GRAPHICS_CODE = false
 // only-pay-for-what-you-use gate the image one has.
 bool CG_USES_AUDIO = false
 
+// claude.md #40/#178: whether this program needs a real WINDOW, which
+// is a narrower question than whether it emits graphics code. Drawing
+// paints the offscreen canvas and needs nothing; a declared window
+// EVENT has nothing to deliver without one, and render() is the single
+// call that presents.
+bool CG_USES_WINDOW = false
+
+// The window events declared, in DECLARATION order, as
+// '<event>|<symbol>'. Order is not cosmetic: registration is emitted
+// by walking this list, so a set would produce a different prologue
+// from the original's.
+arr[text] CG_EVENTS = []
+
+// claude.md #40: the runtime registration each window event takes. A
+// name absent from here still COMPILES -- a typo'd handler is dead
+// code, not an error -- it simply never fires.
+map[text] CG_EVENT_REG = {
+    'mouseDown': 'festina_register_mouse_down_handler',
+    'mouseUp': 'festina_register_mouse_up_handler',
+    'mouse': 'festina_register_mouse_handler',
+    'mouseWheelUp': 'festina_register_mouse_wheel_up_handler',
+    'mouseWheelDown': 'festina_register_mouse_wheel_down_handler',
+    'keyDown': 'festina_register_key_down_handler',
+    'keyUp': 'festina_register_key_up_handler',
+    'resize': 'festina_register_resize_handler',
+    'close': 'festina_register_close_handler'
+}
+
+// When non-empty, the symbol and return type cgFunc emits INSTEAD of
+// the ones it would derive from the declaration's own name. An event
+// handler is an ordinary function body under a different symbol with
+// no return type, so it goes through cgFunc rather than through a
+// second copy of the parameter-binding loop -- whose uid ordering is
+// observable and would drift the day one copy was touched and the
+// other was not. Consumed once and cleared, so every other caller sees
+// exactly the behaviour it always had.
+text CG_FN_SYMBOL = ''
+text CG_FN_RET = ''
+
 // claude.md #91: every CSS colour name this language understands, and
 // the hex its components come from. Kept as DATA rather than derived,
 // because it is data -- the same 148 names the original resolves
@@ -1375,6 +1421,88 @@ map[text] CG_CSS_COLORS = {
     'tomato': 'ff6347', 'turquoise': '40e0d0', 'violet': 'ee82ee',
     'wheat': 'f5deb3', 'white': 'ffffff', 'whitesmoke': 'f5f5f5',
     'yellow': 'ffff00', 'yellowgreen': '9acd32'
+}
+
+// claude.md #91: a font LITERAL resolved to a pointer to a static
+// record holding its already-parsed parts. The whole thing lands in
+// read-only data, so declaring a font costs the compiled program
+// nothing at all and changeFont passes one pointer.
+//
+// Identical literals share a constant, cached by the RESOLVED parts
+// rather than by source text -- so 'bold 13px arial' and
+// 'arial bold 13px' collapse together, which is also why order does
+// not matter in the shorthand at all.
+text func cgFontConst(lit:text) {
+    arr[text] words = lit.split(' ')
+    int px = 0
+    bool slant = false
+    bool weight = false
+    text family = ''
+    int i = 0
+    while i < words.length {
+        text w = words[i]
+        text low = cgLowerAscii(w)
+        if low == 'italic' || low == 'oblique' {
+            slant = true
+        } else if low == 'bold' || low == 'bolder' {
+            weight = true
+        } else if low == 'normal' || low == 'regular' {
+            // Accepted and carries no information, exactly as in CSS:
+            // it names the default rather than changing anything.
+            px = px
+        } else if cgFontPx(low) >= 0 {
+            px = cgFontPx(low)
+        } else if family == '' {
+            // Kept in the source's own case: family names are matched
+            // case-insensitively by fontconfig, but preserving what
+            // was written keeps the generated IR readable.
+            family = w
+        }
+        i++
+    }
+    int sl = 0
+    if slant { sl = 1 }
+    int we = 0
+    if weight { we = 1 }
+    text key = `${px}|${sl}|${we}|${family}`
+    if CG_FONTS[key] != null { return CG_FONTS[key] }
+    text name = `@.font.${CG_FONT_N}`
+    CG_FONT_N++
+    CG_FONTS[key] = name
+    text famRef = 'null'
+    if family != '' { famRef = cgStringConst(family) }
+    CG_EXTRA.push(`${name} = private constant %struct._FestinaFont { i64 ${px}, i64 ${sl}, i64 ${we}, ptr ${famRef} }`)
+    return name
+}
+
+// The pixel size a word names, or -1 if it names none. `14px` and a
+// bare `14` both count; anything else does not.
+int func cgFontPx(w:text) {
+    text digits = w
+    if w.length > 2 {
+        text tail = ''
+        int t = w.length - 2
+        while t < w.length {
+            tail = tail + w.charCodeAt(t).toChar()
+            t++
+        }
+        if tail == 'px' {
+            digits = ''
+            int d = 0
+            while d < w.length - 2 {
+                digits = digits + w.charCodeAt(d).toChar()
+                d++
+            }
+        }
+    }
+    if digits == '' { return 0 - 1 }
+    int k = 0
+    while k < digits.length {
+        int c = digits.charCodeAt(k)
+        if c < 48 || c > 57 { return 0 - 1 }
+        k++
+    }
+    return digits.toInt()
 }
 
 // claude.md #91: a colour LITERAL resolved to the packed 0xRRGGBB
@@ -1511,7 +1639,21 @@ map[text] CG_CANVAS_OPS = {
     'fillLinearGradient': 'festina_fill_linear_gradient|i64,i64,i64,i64,i64,i64',
     'fillRadialGradient': 'festina_fill_radial_gradient|i64,i64,i64,i64,i64',
     'showCursor': 'festina_show_cursor|',
-    'hideCursor': 'festina_hide_cursor|'
+    'hideCursor': 'festina_hide_cursor|',
+    // claude.md #95/#180: the three that need a real GUI. They sit in
+    // the same table as the rest and are separated by CG_WINDOW_OPS
+    // below, because what distinguishes them is not their shape but
+    // what they do -- presenting, rather than painting.
+    'render': 'festina_render|',
+    'enterFullscreen': 'festina_enter_fullscreen|',
+    'exitFullscreen': 'festina_exit_fullscreen|'
+}
+
+// The three canvas operations that need a window rather than merely a
+// surface. Everything else in the table above paints the offscreen
+// canvas and opens nothing.
+map[int] CG_WINDOW_OPS = {
+    'render': 1, 'enterFullscreen': 1, 'exitFullscreen': 1
 }
 
 // claude.md #29-31: every declared `table`, in declaration order, and
@@ -1807,6 +1949,24 @@ Val func cgExpr(e:Node) {
                     fv.ety = FN_SIG[name]
                     return fv
                 }
+            }
+        }
+        // claude.md #39/#95: the canvas's CURRENT size, read from the
+        // runtime rather than folded -- `on resize` can change it after
+        // startup. A bare identifier, not a call, so it cannot go
+        // through the builtin dispatch. It deliberately does not open a
+        // window: the canvas has a size whether or not it is on screen,
+        // and forcing one here would defeat headless rendering for the
+        // very common case of asking how big the canvas is before
+        // drawing into it.
+        if name == 'clientWidth' || name == 'clientHeight' {
+            if slot == '' {
+                CG_USES_GRAPHICS_CODE = true
+                text cfn2 = 'festina_client_width'
+                if name == 'clientHeight' { cfn2 = 'festina_client_height' }
+                text cout2 = cgTmp()
+                cgOut(`  ${cout2} = call i64 @${cfn2}()`)
+                return cgVal(cout2, 'i64', 'int')
             }
         }
         if slot == '' || cgLtyOf(fty) == '' {
@@ -2452,6 +2612,15 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
             return none
         }
         return cgMapLit(e, ety, '')
+    }
+    // claude.md #91: a font literal resolves to a pointer to its own
+    // static record, on exactly the colour rule below -- from a
+    // literal, so the compiler resolves it once, with no runtime
+    // resolver to fall back on.
+    if fty == 'font' {
+        if e.kind == 'StringLit' {
+            return cgVal(cgFontConst(rawText(e, 'value')), 'ptr', 'font')
+        }
     }
     // claude.md #91: a colour must come from a LITERAL, so the
     // compiler resolves it once -- and there is deliberately no runtime
@@ -4920,6 +5089,7 @@ Val func cgCall(e:Node, wantValue:bool) {
             return none
         }
         CG_USES_GRAPHICS_CODE = true
+        if CG_WINDOW_OPS[name] != null { CG_USES_WINDOW = true }
         text cjoined = ''
         int cq = 0
         while cq < cargs2.length {
@@ -5089,6 +5259,33 @@ Val func cgCall(e:Node, wantValue:bool) {
         cgOut(`  ${mout} = call i64 @${mfn}(ptr ${mv.v})`)
         cgFreeTextTemp(margs2[0], mv)
         return cgVal(mout, 'i64', 'int')
+    }
+    // claude.md #91: ONE argument is a `font` value -- a pointer to its
+    // static record; three are the explicit parts, for a font whose
+    // size is chosen at runtime.
+    if name == 'changeFont' {
+        arr[Node] fargs2 = listOf(e, 'args')
+        if fargs2.length != 1 && fargs2.length != 3 {
+            cgUnported(`changeFont() with ${fargs2.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        if fargs2.length == 1 {
+            Val fv2 = cgExprExpecting(fargs2[0], 'font', '')
+            if CG_STUCK { return none }
+            cgOut(`  call void @festina_set_font_value(ptr ${fv2.v})`)
+            return cgVal('0', 'void', 'void')
+        }
+        Val fpx = cgExprExpecting(fargs2[0], 'int', '')
+        if CG_STUCK { return none }
+        Val fst = cgExprExpecting(fargs2[1], 'text', '')
+        if CG_STUCK { return none }
+        Val ffa = cgExprExpecting(fargs2[2], 'text', '')
+        if CG_STUCK { return none }
+        cgOut(`  call void @festina_set_font(i64 ${fpx.v}, ptr ${fst.v}, ptr ${ffa.v})`)
+        cgFreeTextTemp(fargs2[1], fst)
+        cgFreeTextTemp(fargs2[2], ffa)
+        return cgVal('0', 'void', 'void')
     }
     if name == 'lineWidth' {
         arr[Node] wargs = listOf(e, 'args')
@@ -5398,6 +5595,9 @@ void func cgStmt(s:Node) {
     // main's own prologue, long before __festina_main starts. Nothing
     // is owed here either way.
     if s.kind == 'TableDecl' { return }
+    // An event handler's body was emitted with the functions; nothing
+    // reaches main where the declaration stands.
+    if s.kind == 'EventHandler' { return }
     // And the DatabaseURL directive, which cgProgram already lifted:
     // it is spent in main's prologue, so there is nothing left to run
     // where it was written.
@@ -6357,6 +6557,7 @@ text func cgDeclFty(d:Node) {
     }
     if t.kind != 'prim' { return '' }
     if t.name == 'color' { return 'color' }
+    if t.name == 'font' { return 'font' }
     if t.name == 'int' { return 'int' }
     if t.name == 'float' { return 'float' }
     if t.name == 'bool' { return 'bool' }
@@ -8712,7 +8913,16 @@ void func cgReturn(s:Node) {
 
 void func cgFunc(d:Node) {
     text name = rawText(d, 'name')
+    text symbol = `@${name}`
+    if CG_FN_SYMBOL != '' {
+        symbol = CG_FN_SYMBOL
+        CG_FN_SYMBOL = ''
+    }
     text retF = FN_RET[name]
+    if CG_FN_RET != '' {
+        retF = CG_FN_RET
+        CG_FN_RET = ''
+    }
     text retL = 'void'
     if retF != 'void' { retL = cgLtyOf(retF) }
     if retF != 'void' && retL == '' { retL = 'ptr' }
@@ -8818,7 +9028,7 @@ void func cgFunc(d:Node) {
     text savedRet = CG_FUNC_RET
     CG_FUNC_NAME = name
     CG_FUNC_RET = retF
-    cgOut(`define ${retL} @${name}(${joined}) {`)
+    cgOut(`define ${retL} ${symbol}(${joined}) {`)
     cgBlockLabel(cgLabel('entry'))
 
     // A fresh live-value list per function: a frame left over from a
@@ -9244,6 +9454,26 @@ void func cgProgram(body:arr[Node], srcPath:text) {
             CG_STUCK = false
             cgFunc(body[fb])
         }
+        // claude.md #40: `on NAME(...)` compiles to a real void
+        // function, exactly like any other body -- it is a LISTENER,
+        // not something Festina code calls by name, so it is never
+        // registered as an ordinary callable. A name the runtime has
+        // no event for still compiles, so a typo in one is dead code
+        // rather than an error; it simply never fires.
+        if body[fb].kind == 'EventHandler' {
+            CG_STUCK = false
+            text evName = rawText(body[fb], 'name')
+            text evSym = `@__festina_on_${evName}`
+            CG_FN_SYMBOL = evSym
+            CG_FN_RET = 'void'
+            cgFunc(body[fb])
+            if CG_STUCK == false {
+                if CG_EVENT_REG[evName] != null {
+                    CG_USES_WINDOW = true
+                    CG_EVENTS.push(`${evName}|${evSym}`)
+                }
+            }
+        }
         fb++
     }
 
@@ -9301,7 +9531,13 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // graphics object just to wait. The shutdown handler goes with it:
     // the loop polls festina_shutdown_requested() once per iteration,
     // which is what makes installing one meaningful here.
-    if CG_USES_TIMERS { cgOut('  call void @festina_install_shutdown_handler()') }
+    // Every loop below polls festina_shutdown_requested() once per
+    // iteration, which is what makes installing a handler meaningful:
+    // the gate is "a poll point is guaranteed to run soon", not
+    // "timers specifically".
+    if CG_USES_TIMERS || CG_USES_WINDOW {
+        cgOut('  call void @festina_install_shutdown_handler()')
+    }
     // claude.md #101/#199: the image decoder is registered here, before
     // anything could decode an img column -- and before any thread is
     // spawned, so no thread's own on_load can race this store. Only for
@@ -9322,8 +9558,23 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // tracking use and free: festina_sync_table does nothing to a table
     // already shaped right.
     cgSyncTables()
+    // claude.md #178: deliberately NOT festina_graphics_init here.
+    // Registration only ever stores a function pointer, so it has no
+    // ordering dependency -- opening the window before __festina_main
+    // would force a program through a visible open-then-resize instead
+    // of opening at the size its own top-level setClientWidth chose.
+    int ev = 0
+    while ev < CG_EVENTS.length {
+        arr[text] evp = CG_EVENTS[ev].split('|')
+        cgOut(`  call void @${CG_EVENT_REG[evp[0]]}(ptr ${evp[1]})`)
+        ev++
+    }
     cgOut('  call void @__festina_main()')
-    if CG_USES_TIMERS { cgOut('  call void @festina_run_timer_loop()') }
+    // claude.md #40: a canvas only means something while a window is
+    // actually open, so this blocks here -- after the entry function
+    // has run and had its chance to draw.
+    if CG_USES_WINDOW { cgOut('  call void @festina_run_event_loop()') }
+    else if CG_USES_TIMERS { cgOut('  call void @festina_run_timer_loop()') }
     // The last thing main does, and only when there is a database to
     // close: for a program that never opens one this call would be the
     // single live reference into the runtime's SQLite code, which on
