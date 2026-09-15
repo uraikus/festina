@@ -3858,6 +3858,18 @@ typedef struct {
     int8_t global;
 } FestinaRegex;
 
+/* The byte a control escape names, or 0 for anything else. Shared by
+ * both halves of the walk below so the bracket and non-bracket cases
+ * cannot drift apart on which letters count. */
+static char festina_regex_control_escape(char n) {
+    switch (n) {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        default: return 0;
+    }
+}
+
 /* claude.md #118: a regex is REFERENCE COUNTED now, carrying the same
  * i64 header immediately before the payload that structs/arrays/maps/
  * blobs use. Two things needed it at once: `free` on an aliased regex
@@ -3879,8 +3891,20 @@ typedef struct {
  * bracket classes every implementation defines, on EVERY platform, so
  * one behavior exists and it is the one already tested. Inside a
  * bracket expression a backslash is literal per POSIX (and glibc
- * agrees), so translation applies outside brackets only; [:class:]
- * bodies are walked so their ']' does not end the bracket early.
+ * agrees), so class translation applies outside brackets only;
+ * [:class:] bodies are walked so their ']' does not end the bracket
+ * early.
+ *
+ * `\n`/`\t`/`\r` are the one exception to that bracket rule, and the
+ * reason is that they are not escaping anything: they NAME a byte that
+ * has no other spelling in a regex literal, which cannot span lines --
+ * a raw newline between the two slashes is a parse error. So they
+ * become the byte they name everywhere, brackets included, where an
+ * ordinary `\.` stays the literal pair POSIX reads it as. Untranslated
+ * they reached regcomp as two bytes and POSIX read them as an escaped
+ * literal letter, so /a\nb/ quietly matched 'anb' and missed the real
+ * newline -- silent on every platform, unlike the class escapes, whose
+ * breakage was at least confined to BSD.
  *
  * `\b` has no POSIX spelling at all. glibc supports it natively, so on
  * Linux it passes through untouched; BSD instead has the [[:<:]] and
@@ -3899,6 +3923,15 @@ static char *festina_regex_expand_gnu(const char *pattern) {
     while (i < len) {
         char c = pattern[i];
         if (in_bracket) {
+            if (c == '\\' && i + 1 < len) {
+                char b = festina_regex_control_escape(pattern[i + 1]);
+                if (b) {
+                    out[o++] = b;
+                    bracket_elems++;
+                    i += 2;
+                    continue;
+                }
+            }
             if (c == '[' && i + 1 < len &&
                     (pattern[i + 1] == ':' || pattern[i + 1] == '.' || pattern[i + 1] == '=')) {
                 char kind = pattern[i + 1];
@@ -3917,6 +3950,12 @@ static char *festina_regex_expand_gnu(const char *pattern) {
         if (c == '\\' && i + 1 < len) {
             char n = pattern[i + 1];
             const char *rep = NULL;
+            char control = festina_regex_control_escape(n);
+            if (control) {
+                out[o++] = control;
+                i += 2;
+                continue;
+            }
             switch (n) {
                 case 's': rep = "[[:space:]]"; break;
                 case 'S': rep = "[^[:space:]]"; break;

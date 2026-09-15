@@ -10710,6 +10710,49 @@ class TestRegexLiteral:
         result = compile_and_run(source)
         assert result.stdout.splitlines() == ["7", "true", "false"]
 
+    def test_control_escapes_name_the_byte_they_spell(self, compile_and_run):
+        # A regex literal cannot span lines -- a raw newline between the
+        # two slashes is a parse error -- so `\n` is the ONLY spelling a
+        # newline has in one. Left untranslated it reached regcomp as
+        # two bytes and POSIX read it as an escaped literal 'n', so
+        # /a\nb/ quietly matched 'anb' and missed the real newline.
+        source = r"""
+        log(/a\nb/.test('a\nb'))
+        log(/a\nb/.test('anb'))
+        log(/a\tb/.test('a\tb'))
+        log('one\ntwo'.replace(/\n/, ' '))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "false", "true", "one two"]
+
+    def test_control_escapes_are_translated_inside_brackets_too(self, compile_and_run):
+        # The one escape kind that DOES fire inside a bracket, and the
+        # reason is the test above: `\n` is not escaping a character
+        # that would otherwise be special, it is NAMING a byte that has
+        # no other spelling here. A bracket needs that name as much as
+        # the pattern around it does, and "a backslash or the letter n"
+        # -- what POSIX would otherwise read -- is never the intent.
+        source = r"""
+        log('a b'.replace(/[\n\t ]/, '-'))
+        log('a\tb'.replace(/[\n\t ]/, '-'))
+        log(/[\n]/.test('n'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["a-b", "a-b", "false"]
+
+    def test_an_ordinary_escape_inside_a_bracket_is_still_a_literal(
+            self, compile_and_run):
+        # The other half of the rule the two tests above split: `\.`
+        # inside a bracket really does mean "a backslash or a dot" per
+        # POSIX, and stays that way. Only the byte-naming escapes move.
+        source = r"""
+        log(/[\.]/.test('.'))
+        log(/[\.]/.test('\\'))
+        log(/[\.]/.test('x'))
+        """
+        result = compile_and_run(source)
+        assert result.stdout.splitlines() == ["true", "true", "false"]
+
     def test_match_returns_first_match(self, compile_and_run):
         result = compile_and_run("log('room 42, building 7'.match(/[0-9]+/))")
         assert result.stdout.strip() == "42"
@@ -19735,6 +19778,74 @@ class TestALocalShadowingAFunctionName:
         result = compile_and_run(source)
         assert result.returncode == 0, result.stdout + result.stderr
         assert result.stdout.strip() == "2"
+
+    def test_a_local_initialized_from_the_function_it_shadows(
+            self, compile_and_run):
+        """#298's mirror image, and the one case its fix could not
+        reach: here the local does not merely READ as the function, its
+        own INITIALIZER is the function.
+
+        `func[int,int]:int cmp = cmp` type-checks, because semantic.py
+        resolves that initializer before the local exists -- the same
+        reason `int n = n + 1` is rejected as an unknown variable and
+        this is not. Codegen defined the name first and then emitted the
+        initializer into a scope that already held it, so the local was
+        initialized from ITSELF: a load of uninitialized stack memory,
+        stored straight back into the slot it came from, and then called
+        as a function pointer.
+        """
+        source = """
+        int func cmp(a:int, b:int) { return a - b }
+
+        int func run() {
+            func[int,int]:int cmp = cmp
+            return cmp(7, 3)
+        }
+
+        log(run())
+        """
+        result = compile_and_run(source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "4"
+
+    def test_the_initializer_is_the_symbol_not_the_slot(
+            self, parser, semantic, codegen):
+        """The mechanism, since the crash above depends on what the
+        uninitialized memory happened to hold. The slot must be stored
+        the function's own symbol, and must never be loaded before it
+        is stored."""
+        source = ("int func cmp(a:int, b:int) { return a - b }\n"
+                  "int func run() {\n"
+                  "    func[int,int]:int cmp = cmp\n"
+                  "    return cmp(7, 3)\n"
+                  "}\n"
+                  "log(run())\n")
+        program = parser.parse(source, filename="main.f")
+        analyzed = semantic.analyze(program, filename="main.f")
+        ir = codegen.generate_ir(program, analyzed, filename="main.f")
+        body = ir.split("define i64 @run()")[1].split("\n}")[0]
+        alloca = next(i for i, ln in enumerate(body.splitlines())
+                      if "= alloca ptr" in ln and "%cmp." in ln)
+        store = next(i for i, ln in enumerate(body.splitlines())
+                     if "store ptr @cmp," in ln)
+        assert store > alloca, "the function's own symbol is what is stored"
+        for i, ln in enumerate(body.splitlines()):
+            if "load ptr, ptr %cmp." in ln:
+                assert i > store, (
+                    "the slot was read before anything was stored in it")
+
+    def test_a_scalar_local_still_cannot_read_itself(
+            self, parser, semantic, errors):
+        """The control that explains why the case above is codegen's to
+        fix rather than semantic.py's. With nothing for the name to
+        resolve to but the local being declared, the front end already
+        rejects it -- so moving the definition later in codegen changes
+        no diagnostic, it only stops a name that DOES resolve from being
+        shadowed one statement too early."""
+        program = parser.parse("int func run() {\n    int n = n + 1\n"
+                               "    return n\n}\nlog(run())\n")
+        with pytest.raises(errors.CompileError, match="n"):
+            semantic.analyze(program)
 
 
 class TestNonTextMapKeys:

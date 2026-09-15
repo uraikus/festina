@@ -1538,8 +1538,20 @@ error. `\w`/`\d`/`\s` (and their negations) and `\b` work as expected
 on every platform — the runtime expands them to portable POSIX classes
 before compiling, with no dependency on glibc's own GNU extensions —
 but there are no capture groups, backreferences, or non-greedy
-quantifiers (POSIX ERE's own limits). Inside `[...]` a backslash is a
-literal, per POSIX.
+quantifiers (POSIX ERE's own limits).
+
+`\n`, `\t` and `\r` match the bytes they name. A regex literal can't
+span lines — a raw newline between the two slashes is a parse error —
+so these escapes are the only spelling those bytes have here, which is
+why they're also the only ones translated **inside** `[...]`:
+
+```festina
+'one\ntwo'.replace(/\n/, ' ')   // 'one two'
+/[\n\t ]/.test(' ')             // true -- a bracket names bytes too
+```
+
+Every other backslash inside `[...]` is a literal, per POSIX: `[\.]`
+matches a backslash or a dot, not a dot alone.
 
 ### What `g` does, and what it doesn't
 

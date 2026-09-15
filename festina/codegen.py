@@ -5446,11 +5446,26 @@ class CodeGen:
             llvm_ty = _llvm_type(type_)
             slot = f"%{stmt.name}.{self._unique()}"
             lines.append(f"  {slot} = alloca {llvm_ty}")
-            env.define(stmt.name, slot, type_)
             if stmt.init is not None:
                 val, vtype = self._emit_value_for(stmt.init, env, lines, type_)
                 val = self._coerce(val, vtype, type_, lines, source_expr=stmt.init)
                 lines.append(f"  store {llvm_ty} {val}, ptr {slot}")
+            # claude.md #298's mirror image: the name is defined AFTER
+            # its own initializer is emitted, matching every refcounted
+            # branch above, because an initializer is resolved in the
+            # scope BEFORE this declaration -- which is exactly what
+            # semantic.py does, and why `int n = n + 1` is an unknown
+            # variable there rather than a read of an uninitialized
+            # local. Defining first only mattered for a name that
+            # genuinely resolves to something else: `func[int,int]:int
+            # cmp = cmp` type-checked against the global function and
+            # then initialized the local from ITSELF -- a load of
+            # uninitialized stack memory stored back into the slot it
+            # came from, and then called. The other branches were
+            # already in this order; this one, the plain-scalar tail,
+            # was the only one left, and only a func value can reach it
+            # with a shadowable initializer at all.
+            env.define(stmt.name, slot, type_)
             return
         if isinstance(stmt, ast.ExprStmt):
             val, vtype = self._emit_expr(stmt.expr, env, lines)

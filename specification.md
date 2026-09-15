@@ -1005,11 +1005,14 @@ a literal `/pattern/flags` (§7.5.5) or the builtin `regex(pattern[,
 flags])`. Flags: `i` (case-insensitive) and `g` (every match, honored
 by `.replace()` only). `\w`, `\d`, `\s`, their negations and `\b` are
 guaranteed on every platform; there are no capture groups,
-backreferences or non-greedy quantifiers; inside `[...]` a backslash is
-literal. An invalid pattern is a runtime failure. A literal is compiled
+backreferences or non-greedy quantifiers. `\n`, `\t` and `\r` match the
+bytes they name; a literal cannot span lines (§7.5.5), so these are the
+only spelling those bytes have in one, and they are the only escapes
+translated inside `[...]`, where every other backslash is literal.
+An invalid pattern is a runtime failure. A literal is compiled
 once per site for the life of the process; `regex()` is memoized per
 call site. `regex` is reference counted. Methods: `.test(text)` and,
-on `text`, `.match`, `.replace`, `.split` (§16.3). [#67, #107, #118, #122]
+on `text`, `.match`, `.replace`, `.split` (§16.3). [#67, #107, #118, #122, #317]
 
 ### 8.16 Network types: `url`, `http`, `socket`
 
@@ -1355,6 +1358,11 @@ constant must be initialized and may not be reassigned or freed;
 `const` composes with `amor` (`const amor arr[int] xs = []`) but not
 with `?`. An `amor arr[T]` variable requires an initializer. A
 `table`-row variable requires an initializer. [#21, #22, #174, #178]
+
+The initializer is resolved in the scope **before** the declaration, so
+the name being declared is not yet visible to it: `int n = n + 1` is an
+unknown variable, and `func[int,int]:int cmp = cmp` binds the function
+`cmp` rather than reading the binding under construction. [#317]
 
 A declaration whose type is `blob`, `img`, `aud`, `color`, `font` or
 `ascii` and whose initializer is `text` performs the conversion of

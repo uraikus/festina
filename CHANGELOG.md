@@ -212,6 +212,29 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **`\n`, `\t` and `\r` in a regex matched the letter, not the byte.**
+  A regex literal can't span lines — a raw newline between the two
+  slashes is a parse error — so `\n` is the only spelling a newline has
+  in one, and it reached POSIX `regcomp` as two untranslated bytes,
+  which reads that as an escaped literal `n`. `/a\nb/` therefore missed
+  a real newline and quietly matched `anb` instead. The runtime now
+  expands all three to the byte they name, on every platform, in the
+  same pass that already expands `\w`/`\d`/`\s`. They are also the only
+  escapes translated **inside** `[...]`, where every other backslash
+  stays the literal POSIX reads it as: `[\n\t ]` matches whitespace,
+  `[\.]` still matches a backslash or a dot.
+- **A local initialized from the function it shadows read itself
+  instead.** `func[int,int]:int cmp = cmp` type-checks, because
+  semantic analysis resolves that initializer in the scope *before* the
+  declaration — the same reason `int n = n + 1` is rejected as an
+  unknown variable and this is not. Codegen's plain-scalar declaration
+  path defined the name first and then emitted the initializer into a
+  scope that already held it, so the local was initialized from its own
+  uninitialized stack slot and then called as a function pointer: a
+  segfault, from a program that compiled without a warning. The name is
+  now defined after its own initializer, which is where every other
+  declaration path already defined it. decisions.md #298's mirror
+  image, and the one case its fix could not reach.
 - **A local that shadowed a function's name silently read back as that
   function.** `codegen.py` consulted its flat, program-wide function
   table before the scope chain when resolving a plain name, so any

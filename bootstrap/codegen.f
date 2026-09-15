@@ -1247,6 +1247,32 @@ int CG_REGEX_MEMOS = 0
 // in, the same "only pay for what you use" rule loadImage() follows.
 bool CG_USES_TIMERS = false
 
+// claude.md #242: whether any sqlite() call was emitted. Together with
+// a declared table it is what opens the database at all -- for a
+// program that does neither, the close call at the end of main would
+// be the ONLY live reference into the runtime's SQLite code, and on
+// wasm the one thing keeping the whole vendored engine from being
+// dropped by the linker.
+bool CG_USES_SQLITE = false
+
+// claude.md #29-31: every declared `table`, in declaration order, and
+// its columns -- names and SQL types, each '|'-joined, neither of
+// which an identifier can contain. Recorded at declaration and spent
+// in main's own prologue, where one festina_sync_table call per table
+// brings the real database's schema up to the source's.
+//
+// Declaration ORDER is what the separate array is for. A map's own
+// iteration order is not the source's, and the sync calls -- and the
+// two globals each one needs -- have to come out in the order the
+// original's own `analyzed.tables` does, which is registration order.
+arr[text] TBL_ORDER = []
+map[text] TBL_COLS = {}
+map[text] TBL_TYPES = {}
+// Kept separately rather than counted back out of the joined strings,
+// because a table with no columns at all joins to the empty text and a
+// split of that answers one, not zero.
+map[int] TBL_NCOLS = {}
+
 // The function currently being emitted, and its return type. A
 // `return null` takes its type from the signature rather than from
 // anything at the return site, which is the only thing these are for.
@@ -4131,6 +4157,40 @@ Val func cgCall(e:Node, wantValue:bool) {
         cgOut(`  call void @${cfn}(i64 ${id.v})`)
         return cgVal('0', 'void', 'void')
     }
+    // claude.md #32-34. Only the form whose result nobody captures is
+    // here: the statement is prepared, its parameters bound, and then
+    // run to completion. That is every INSERT/UPDATE/DELETE and a
+    // SELECT nobody keeps -- collecting rows into an `arr[Table]` is a
+    // different emission entirely, and asks for a row type this port
+    // does not have yet, so a captured result stops rather than
+    // quietly running the query and discarding what it returned.
+    if name == 'sqlite' {
+        if wantValue {
+            cgUnported('a captured sqlite() result')
+            return none
+        }
+        arr[Node] qargs = listOf(e, 'args')
+        if qargs.length == 0 || qargs.length > 2 {
+            cgUnported('sqlite() with an unexpected argument count')
+            return none
+        }
+        CG_USES_SQLITE = true
+        Val sql = cgExprExpecting(qargs[0], 'text', '')
+        if CG_STUCK { return none }
+        text db = cgTmp()
+        cgOut(`  ${db} = load ptr, ptr @__festina_db`)
+        text stmt = cgSqlitePrepare(qargs[0], sql.v, db)
+        // claude.md #83: prepare COMPILES the SQL rather than keeping
+        // the string, so a template built for this call is the caller's
+        // to free the moment the statement exists.
+        cgFreeTextTemp(qargs[0], sql)
+        if qargs.length == 2 {
+            cgSqliteBind(qargs[1], stmt)
+            if CG_STUCK { return none }
+        }
+        cgOut(`  call void @festina_sqlite_exec(ptr ${stmt})`)
+        return cgVal('0', 'void', 'void')
+    }
     if name == 'close' {
         arr[Node] cargs = listOf(e, 'args')
         if cargs.length != 1 {
@@ -4254,6 +4314,12 @@ void func cgStmt(s:Node) {
     // module's type section and nothing reaches main.
     if s.kind == 'StructDecl' { return }
     if s.kind == 'FuncDecl' { return }
+    // A `table` is pure schema too, but unlike a struct it reaches the
+    // program at RUN time rather than at type-check time: the columns
+    // recorded in cgProgram become a festina_sync_table call in
+    // main's own prologue, long before __festina_main starts. Nothing
+    // is owed here either way.
+    if s.kind == 'TableDecl' { return }
 
     if s.kind == 'VarDecl' {
         if fieldOf(s, 'is_const').raw == 'true' {
@@ -4477,32 +4543,29 @@ void func cgStmt(s:Node) {
         if G_SLOT[name] == null { isLocalDecl = true }
 
         bool freshLocal = false
+        text localSlot = ''
         if isLocalDecl {
-            text slot = `%${name}.${cgUid()}`
-            cgOut(`  ${slot} = alloca ${lty}`)
+            localSlot = `%${name}.${cgUid()}`
+            cgOut(`  ${localSlot} = alloca ${lty}`)
             if fty == 'text' {
                 // claude.md #243's append shadow gets storage of its
                 // own and is initialized empty. The allocas are hoisted
                 // to the entry block; these stores are not, so they run
                 // once per execution of the declaration -- which is
                 // what makes a declaration inside a loop correct.
-                cgOut(`  ${slot}.ap = alloca ptr`)
-                cgOut(`  ${slot}.aplen = alloca i64`)
-                cgOut(`  store ptr null, ptr ${slot}.ap`)
-                cgOut(`  store i64 0, ptr ${slot}.aplen`)
-                cgTrackLiveLate('text', slot, '')
+                cgOut(`  ${localSlot}.ap = alloca ptr`)
+                cgOut(`  ${localSlot}.aplen = alloca i64`)
+                cgOut(`  store ptr null, ptr ${localSlot}.ap`)
+                cgOut(`  store i64 0, ptr ${localSlot}.aplen`)
+                cgTrackLiveLate('text', localSlot, '')
             }
-            L_SLOT[name] = slot
-            L_FTY[name] = fty
-            // A func binding's signature rides in the element-type
-            // slot, the same place a container's element type does.
-            if fty == 'func' { L_ETY[name] = cgFuncSig(resolveTypeField(s, 'type_expr')) }
             freshLocal = true
         }
         Node init = childOf(s, 'init')
         if init == null {
             // No initializer: the declaration IS the whole statement,
             // so this is already "after the store" (there is none).
+            if isLocalDecl { cgBindLocalDecl(s, name, fty, localSlot) }
             if fty == 'text' {
                 if freshLocal { cgCleanupPush('text', cgSlotOf(name), '') }
             }
@@ -4514,6 +4577,14 @@ void func cgStmt(s:Node) {
             cgUnported(`initializer of type ${v.fty} for ${fty}`)
             return
         }
+        // claude.md #298's mirror image: the name becomes visible only
+        // now, AFTER its own initializer has been emitted, because an
+        // initializer is resolved in the scope BEFORE this declaration.
+        // Binding first only mattered for a name that genuinely
+        // resolves to something else -- `func[int,int]:int cmp = cmp`
+        // read the slot it was about to fill, stored that back into
+        // itself, and then called it.
+        if isLocalDecl { cgBindLocalDecl(s, name, fty, localSlot) }
         if fty == 'text' {
             // A fresh local's slot holds nothing yet, so there is no
             // old buffer to free and no stale append shadow to null --
@@ -4618,8 +4689,130 @@ void func cgEvalForEffect(ex:Node) {
     cgUnported(`expression statement ${ex.kind}`)
 }
 
+// Opens the database and brings every declared table's schema up to
+// the source's. Nothing at all for a program with no `table`, which is
+// what keeps a program that never queries free of SQLite entirely.
+//
+// The order the three string constants are interned in is observable,
+// because they are numbered: each table's column NAMES first, then its
+// column TYPES, and only then the table's own name -- which is the
+// order the original's own call site evaluates them in, the arrays
+// being built by a helper called before the name is asked for.
+// claude.md #113: a SQL string that cannot change is compiled into
+// sqlite bytecode ONCE, through a private slot of this call site's
+// own, exactly the way a regex literal's automaton is cached. Anything
+// dynamic keeps the per-call prepare, because the same site can see
+// different SQL each time.
+text func cgSqlitePrepare(sqlNode:Node, sqlVal:text, dbVal:text) {
+    text stmt = cgTmp()
+    if sqlNode.kind == 'StringLit' {
+        text slot = `@__festina_stmtcache_${cgUid()}`
+        CG_EXTRA.push(`${slot} = private global ptr null`)
+        cgOut(`  ${stmt} = call ptr @festina_sqlite_prepare_cached(ptr ${dbVal}, ptr ${sqlVal}, ptr ${slot})`)
+        return stmt
+    }
+    cgOut(`  ${stmt} = call ptr @festina_sqlite_prepare(ptr ${dbVal}, ptr ${sqlVal})`)
+    return stmt
+}
+
+// claude.md #33's own example binds [1, 'Patrick'] -- two types in one
+// list, which no arr[T] value can hold. So the parameter list is call
+// SYNTAX rather than an argument: a literal array whose elements are
+// each bound by their own compile-time type, which sidesteps the
+// conflict instead of loosening arr[T] itself.
+void func cgSqliteBind(paramsNode:Node, stmt:text) {
+    if paramsNode.kind != 'ArrayLit' {
+        cgUnported('sqlite() parameters that are not a literal array')
+        return
+    }
+    arr[Node] els = listOf(paramsNode, 'elements')
+    int i = 0
+    while i < els.length {
+        // sqlite3_bind_* parameters are 1-indexed.
+        int idx = i + 1
+        if els[i].kind == 'NullLit' {
+            cgOut(`  call void @festina_sqlite_bind_null(ptr ${stmt}, i32 ${idx})`)
+            i++
+            continue
+        }
+        Val pv = cgExpr(els[i])
+        if CG_STUCK { return }
+        if pv.fty == 'int' {
+            cgOut(`  call void @festina_sqlite_bind_int(ptr ${stmt}, i32 ${idx}, i64 ${pv.v})`)
+        } else if pv.fty == 'float' {
+            cgOut(`  call void @festina_sqlite_bind_float(ptr ${stmt}, i32 ${idx}, double ${pv.v})`)
+        } else if pv.fty == 'text' {
+            cgOut(`  call void @festina_sqlite_bind_text(ptr ${stmt}, i32 ${idx}, ptr ${pv.v})`)
+            // Bound with SQLITE_TRANSIENT, so sqlite has its own copy
+            // by the time this returns and a temporary is both safe
+            // and necessary to free right here.
+            cgFreeTextTemp(els[i], pv)
+        } else if pv.fty == 'bool' {
+            // claude.md #30: bool is a SQLite INTEGER, same as int.
+            text z = cgTmp()
+            cgOut(`  ${z} = zext i8 ${pv.v} to i64`)
+            cgOut(`  call void @festina_sqlite_bind_int(ptr ${stmt}, i32 ${idx}, i64 ${z})`)
+        } else {
+            cgUnported(`sqlite() parameter of type ${pv.fty}`)
+            return
+        }
+        i++
+    }
+}
+
+void func cgSyncTables() {
+    if TBL_ORDER.length == 0 && CG_USES_SQLITE == false { return }
+    // claude.md #70's DatabaseURL would be evaluated here, ahead of
+    // every other global's initializer. Until it is ported the default
+    // is the only path, and a program that sets one is stopped by the
+    // assignment itself rather than silently opening the wrong file.
+    text url = cgStringConst('festina.sqlite')
+    cgOut(`  %db = call ptr @festina_db_open(ptr ${url})`)
+    cgOut('  store ptr %db, ptr @__festina_db')
+    int ti = 0
+    while ti < TBL_ORDER.length {
+        text tn = TBL_ORDER[ti]
+        int n = TBL_NCOLS[tn]
+        text namesG = `@${tn}.cols`
+        text typesG = `@${tn}.types`
+        arr[text] cnames = TBL_COLS[tn].split('|')
+        arr[text] ctypes = TBL_TYPES[tn].split('|')
+        text namePtrs = ''
+        text typePtrs = ''
+        int ci = 0
+        while ci < n {
+            if ci > 0 { namePtrs = namePtrs + ', ' }
+            namePtrs = namePtrs + `ptr ${cgStringConst(cnames[ci])}`
+            ci++
+        }
+        int cj = 0
+        while cj < n {
+            if cj > 0 { typePtrs = typePtrs + ', ' }
+            typePtrs = typePtrs + `ptr ${cgStringConst(ctypes[cj])}`
+            cj++
+        }
+        CG_EXTRA.push(`${namesG} = private constant [${n} x ptr] [${namePtrs}]`)
+        CG_EXTRA.push(`${typesG} = private constant [${n} x ptr] [${typePtrs}]`)
+        text tnConst = cgStringConst(tn)
+        cgOut(`  call void @festina_sync_table(ptr %db, ptr ${tnConst}, ptr ${namesG}, ptr ${typesG}, i32 ${n})`)
+        ti++
+    }
+}
+
 void func cgPushFrame() {
     CG_FRAME.push(CG_LIVE.length)
+}
+
+// Makes a scalar local's name visible. Split out of the declaration
+// path because WHEN it is called is the whole point: everything a
+// declaration emits happens first, and only then does the name start
+// resolving to this slot. See the caller's own comment.
+void func cgBindLocalDecl(s:Node, name:text, fty:text, slot:text) {
+    L_SLOT[name] = slot
+    L_FTY[name] = fty
+    // A func binding's signature rides in the element-type slot, the
+    // same place a container's element type does.
+    if fty == 'func' { L_ETY[name] = cgFuncSig(resolveTypeField(s, 'type_expr')) }
 }
 
 // Frees every live value from `downTo` onward. A `return` passes 0, so
@@ -7369,6 +7562,47 @@ void func cgProgram(body:arr[Node], srcPath:text) {
         sd++
     }
 
+    // Every declared `table`'s columns, before anything is emitted.
+    // A table's own declaration produces no code at all -- what it
+    // produces is a line in main's prologue, which is built long after
+    // this point, so all that happens here is recording.
+    int td = 0
+    while td < body.length {
+        if body[td].kind == 'TableDecl' {
+            Node t = body[td]
+            text tn = rawText(t, 'name')
+            arr[Node] tcols = listOf(t, 'fields')
+            text cnames = ''
+            text ctypes = ''
+            int ci = 0
+            while ci < tcols.length {
+                if ci > 0 {
+                    cnames = cnames + '|'
+                    ctypes = ctypes + '|'
+                }
+                cnames = cnames + rawText(tcols[ci], 'name')
+                // The SQL type is the column's type expression SPELLED
+                // OUT, not a resolved type: festina_sync_table matches
+                // on the source's own word, and `analyzed.tables` keeps
+                // the raw type-expr string for exactly that reason. A
+                // column whose type is not a bare name has no such
+                // word (and no SQL type either), so it stops the port
+                // rather than being guessed at.
+                if fieldOf(tcols[ci], 'type_expr').tag != 'raw' {
+                    cgUnported('table column of a non-scalar type')
+                    return
+                }
+                ctypes = ctypes + rawText(tcols[ci], 'type_expr')
+                ci++
+            }
+            TBL_ORDER.push(tn)
+            TBL_COLS[tn] = cnames
+            TBL_TYPES[tn] = ctypes
+            TBL_NCOLS[tn] = tcols.length
+        }
+        td++
+    }
+
     // argv is registered with no VarDecl of its own (claude.md #150),
     // so its storage is emitted unconditionally, for every module.
     cgEmit('')
@@ -7565,8 +7799,25 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // the loop polls festina_shutdown_requested() once per iteration,
     // which is what makes installing one meaningful here.
     if CG_USES_TIMERS { cgOut('  call void @festina_install_shutdown_handler()') }
+    // claude.md #29-31: the database is opened and every declared table
+    // synced HERE, in main's own prologue, before __festina_main runs a
+    // single statement -- so a top-level query in the program's very
+    // first line already has a schema to query. Every table is synced
+    // whether or not anything queries it, which is both simpler than
+    // tracking use and free: festina_sync_table does nothing to a table
+    // already shaped right.
+    cgSyncTables()
     cgOut('  call void @__festina_main()')
     if CG_USES_TIMERS { cgOut('  call void @festina_run_timer_loop()') }
+    // The last thing main does, and only when there is a database to
+    // close: for a program that never opens one this call would be the
+    // single live reference into the runtime's SQLite code, which on
+    // wasm is the difference between linking the whole vendored engine
+    // and dropping it.
+    if TBL_ORDER.length > 0 || CG_USES_SQLITE {
+        cgOut('  %final_db = load ptr, ptr @__festina_db')
+        cgOut('  call void @festina_db_close(ptr %final_db)')
+    }
     cgOut('  ret i32 0')
     cgOut('}')
 

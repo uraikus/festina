@@ -1012,6 +1012,52 @@ CANARIES = [
     ),
 
     Canary(
+        "table-decl-syncs-its-schema", "#317",
+        "a declared table becomes a festina_sync_table call in main's "
+        "own prologue, before __festina_main runs anything",
+        """    cgSyncTables()
+""",
+        "",
+    ),
+    Canary(
+        "table-columns-before-the-table-name", "#317",
+        "a sync call interns its column names and types BEFORE the "
+        "table's own name, because constants are numbered",
+        [
+            # The name asked for FIRST, so it takes the lower number and
+            # every column shifts up by one. Nothing about the call
+            # itself changes -- only which constant each `ptr` names.
+            #
+            # The first spelling of this canary moved where the name was
+            # interned but left it after both column loops either way,
+            # so it broke nothing and reported NOT CAUGHT -- which read
+            # as a corpus failure and was a canary failure. Interning is
+            # memoized, so what decides the number is the FIRST ask, and
+            # only an ask placed before the loops changes anything.
+            ("""        arr[text] cnames = TBL_COLS[tn].split('|')""",
+             """        text tnFirst = cgStringConst(tn)
+        arr[text] cnames = TBL_COLS[tn].split('|')"""),
+            ("""        text tnConst = cgStringConst(tn)""",
+             """        text tnConst = tnFirst"""),
+        ],
+    ),
+    Canary(
+        "declaration-binds-after-its-initializer", "#317",
+        "a scalar declaration's name becomes visible only after its own "
+        "initializer is emitted",
+        [
+            ("""        if isLocalDecl { cgBindLocalDecl(s, name, fty, localSlot) }
+        if fty == 'text' {""",
+             """        if fty == 'text' {"""),
+            ("""            freshLocal = true
+        }""",
+             """            freshLocal = true
+            cgBindLocalDecl(s, name, fty, localSlot)
+        }"""),
+        ],
+    ),
+
+    Canary(
         "generated-fn-placement", "#307",
         "a generated cascade lands BEFORE the function whose body asked for it",
         [
