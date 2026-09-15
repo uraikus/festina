@@ -595,9 +595,17 @@ CANARIES = [
     Canary(
         "owned-container-receiver", "#309",
         "a container temporary with no binding is released where it is read",
-        """        cgOut(`  ${out} = load i64, ptr ${lenP}`)
+        # Anchored on the ARRAY branch's own preceding GEP, because
+        # decisions.md #320's ascii .length is a header load with the
+        # identical two lines after it -- the shorter anchor named two
+        # sites and so measured neither.
+        """        cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 0`)
+        text out = cgTmp()
+        cgOut(`  ${out} = load i64, ptr ${lenP}`)
         cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)""",
-        """        cgOut(`  ${out} = load i64, ptr ${lenP}`)""",
+        """        cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 0`)
+        text out = cgTmp()
+        cgOut(`  ${out} = load i64, ptr ${lenP}`)""",
     ),
     Canary(
         "join-element-kind", "#309",
@@ -1161,6 +1169,61 @@ CANARIES = [
         """        cgFreeTextTemp(vargs[0], pv)
         return cgVal(sout, 'i8', 'bool')""",
         """        return cgVal(sout, 'i8', 'bool')""",
+    ),
+
+    Canary(
+        "spliced-in-elements-take-their-own-reference", "#320",
+        "a splice-insert's newly written range retains (or copies) "
+        "every element, because the source array keeps managing its own",
+        """    if cgElemOwnsSomething(ety) == false { return }""",
+        """    if true { return }""",
+    ),
+    Canary(
+        "splice-reloads-the-data-pointer", "#320",
+        "splice-insert may realloc, so the array's data pointer is "
+        "read again AFTER the call rather than reused from before it",
+        [
+            # Reuse the pointer read for the INSERT argument instead.
+            # Same value in the shrinking case, stale in the growing
+            # one -- which is exactly the bug this ordering prevents.
+            ("""        text nowP = cgTmp()
+        cgOut(`  ${nowP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 1`)
+        text nowV = cgTmp()
+        cgOut(`  ${nowV} = load ptr, ptr ${nowP}`)
+        cgSpliceOwnRange(nowV, spElemLty, obj.ety, spStart.v, insLen)""",
+             """        cgSpliceOwnRange(insData, spElemLty, obj.ety, spStart.v, insLen)"""),
+        ],
+    ),
+    Canary(
+        "ascii-length-is-a-header-load", "#320",
+        "an ascii carries its length in its own header, so .length is "
+        "a load at payload-16 and not a call",
+        """        cgOut(`  ${lenP} = getelementptr i8, ptr ${obj.v}, i64 -16`)
+        text out = cgTmp()
+        cgOut(`  ${out} = load i64, ptr ${lenP}`)""",
+        """        text out = cgTmp()
+        cgOut(`  ${out} = call i64 @festina_ascii_length(ptr ${obj.v})`)""",
+    ),
+    Canary(
+        "ascii-char-code-is-inlined", "#320",
+        "charCodeAt on an ascii is emitted inline and branchless, with "
+        "no call at all",
+        """    cgOut(`  ${out} = select i1 ${oor}, i64 ${cgNullValue('int')}, i64 ${code}`)""",
+        """    cgOut(`  ${out} = add i64 ${code}, 0`)""",
+    ),
+    Canary(
+        "ascii-literal-is-immortal", "#320",
+        "an ascii literal carries the immortal refcount sentinel, so "
+        "retain, release and free on one are all no-ops",
+        r"""    CG_EXTRA.push(`${name} = private unnamed_addr constant ${ty} {i64 ${bytes - 1}, i64 -1, [${bytes} x i8] c"${cgCEscape(v)}\\00"}`)""",
+        r"""    CG_EXTRA.push(`${name} = private unnamed_addr constant ${ty} {i64 ${bytes - 1}, i64 1, [${bytes} x i8] c"${cgCEscape(v)}\\00"}`)""",
+    ),
+    Canary(
+        "ascii-declaration-does-not-retain", "#320",
+        "an ascii local binds like a scalar -- no retain at the "
+        "declaration -- while still being released at scope exit",
+        """                if managed == 'ascii' { bOwning = true }""",
+        "",
     ),
 
     Canary(

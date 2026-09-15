@@ -111,9 +111,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage: **66 of 118 corpus files emit
-  byte-identical LLVM IR, 0 differ, 41 not yet ported, 11 rejected by
-  both** — 300,464 of 319,458 file-specific IR lines. **The bootstrap
+  the fourth and last stage: **71 of 119 corpus files emit
+  byte-identical LLVM IR, 0 differ, 37 not yet ported, 11 rejected by
+  both** — 307,506 of 325,244 file-specific IR lines. **The bootstrap
   compiler reproduces its own compilation**: all ten of its files —
   `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
   `escape.f` (22,232), `codegen.f` (59,166) and the five command-line
@@ -184,7 +184,11 @@ round-by-round design and implementation record predating 0.1 lives in
   is what lets a program draw a frame and save it as a PNG with no
   display present. `render()` and the two fullscreen calls are
   deliberately not among them: they are the three that need a real GUI,
-  and needing one changes main's own shape. And what a program needs to be
+  and needing one changes main's own shape. And `.splice()` in both
+  forms, and the `ascii` type — whose whole reason for existing is
+  avoiding a call, so the port reproduces the header load, the folded
+  `.rodata` literal and the branchless inlined `charCodeAt` rather than
+  merely getting the same answers. And what a program needs to be
   a COMMAND: `argv`, `close(code)`, `.keys()`/`.values()`, and the two
   scope rules a driver is the first program to reach — a managed
   declaration inside a function is local even when a global shares its
@@ -203,7 +207,7 @@ round-by-round design and implementation record predating 0.1 lives in
   the two implementations agree; it says nothing about whether the
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
-  not. A hundred and six deliberate breakages, one per mechanism,
+  not. A hundred and twelve deliberate breakages, one per mechanism,
   re-run by `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
   no longer the whole verdict: a canary looks for TWO independent
   witnesses and reports a lone one in its own output, because

@@ -6537,3 +6537,23 @@ A small slice, and a line worth drawing carefully. **300,464 of 319,458 file-spe
 **Three new canaries. 106 in total.**
 
 **Verified.** Lexer 118/118, parser 118/118, semantic 118/118, codegen 67 match and 0 differ (66 corpus files plus this slice's own case file). Three canaries run: all caught, 0 missed, 0 broken -- the argument-type one as a ratchet in its first spelling and, after the re-aim above, as a differing line (`festina_rotate(i64 ...)` where the original emits `double`).
+
+320. SPLICE, AND THE TYPE THAT EXISTS TO AVOID A CALL
+
+**307,506 of 325,244 file-specific IR lines, up from 300,464 -- 94.5% -- and 71 files match, 0 differ**, up from 66. All ten bootstrap files still self-host.
+
+**`.splice(start, count, insertArr)` copies raw element BYTES**, which is what makes its ownership rule different from every other array operation's. push has one value with one source expression to ask about; splice-insert has a whole ARRAY, read for its bytes by a plain memcpy with no notion of a Festina type, and that array goes on managing its own elements independently of whatever this one now does with the copies. So the newly written range takes its own reference UNCONDITIONALLY, with no freshness check possible or needed: a refcounted element retained in place, a text one replaced by a fresh copy, and anything else left alone because the bytes already are a complete independent value.
+
+**And the data pointer is read again AFTER the call.** The splice may have realloc'd the buffer, so the pointer from before it is stale in exactly the growing case -- the one a shrinking test would never catch.
+
+**`ascii` exists to avoid a call, and the port had to reproduce that rather than merely get the answer right.** Its length is a LOAD from its own header at payload-16, not text's code-point walk; `charCodeAt` is emitted INLINE and BRANCHLESS, with no call and no new basic blocks, so a scan loop costs nothing per character and LLVM can hoist the loop-invariant length load without proving a guard; and a literal is folded into .rodata with the immortal refcount sentinel, so the common lexer comparison allocates nothing at all. A port that called `festina_ascii_length` instead would produce identical ANSWERS and a different compiler.
+
+**An ascii LOCAL is declared without a retain and released at scope exit anyway.** The original lists `ascii` among the types a scope exit releases and NOT among the ones the declaration branch claims a reference for, so its local binds exactly like a scalar -- alloca, store, nothing else. Reproduced rather than corrected, because this port's job is to agree; recorded because for `ascii a = b`, aliasing another binding, that is a release with no matching retain.
+
+**`.length` off an owning member chain is REFUSED rather than approximated.** Adding `ascii` took `chain_length_churn.f` from unported to a single differing line: the ordinary member read mints the field and releases the base, where #262 parks the chain's owning bases and releases them after the length with nothing minted -- the receiver type is not the one whose value escapes, so there is nothing for a mint to protect. Half the mechanism is worse than none here, and not as a matter of taste: an unported file SKIPS in the suite and a differing one FAILS, so approximating would have traded a named gap for a red test that says nothing about which line is wrong.
+
+**A canary anchor went ambiguous rather than stale**, which is the failure mode the count check exists for and the first time it has fired. `owned-container-receiver` anchored on a length load and its release; the new ascii length branch ends with the identical two lines, so the anchor named two sites and would have broken whichever came first. Re-aimed at the array branch's own preceding GEP. Stale anchors this registry has caught before; two sites is the other half of the same check, and it is worth knowing it works.
+
+**Six new canaries. 112 in total.**
+
+**Verified.** Lexer 119/119, parser 119/119, semantic 119/119, codegen 71 match and 0 differ.
