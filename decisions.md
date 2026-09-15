@@ -6560,4 +6560,4 @@ A small slice, and a line worth drawing carefully. **300,464 of 319,458 file-spe
 
 **Six new canaries. 112 in total.**
 
-**Verified.** Lexer 119/119, parser 119/119, semantic 119/119, codegen 71 match and 0 differ (72 with this slice's own case file, which matches at 100%). Seven canaries run -- the six new ones and the one this slice made ambiguous: all caught as diffs, 0 through the ratchet, 0 missed, 0 broken.
+**Verified.** Lexer 119/119, parser 119/119, semantic 119/119, codegen 71 match and 0 differ (72 with this slice's own case file, which matches at 100%). Seven canaries run -- the six new ones and the one this slice made ambiguous: all caught as diffs, 0 through the ratchet, 0 missed, 0 broken. Full suite: 2,886 passed, 36 failed -- the environment's own baseline (24 graphics tests with no window manager, 12 leak-stress tests whose ASan link cannot resolve `festina_register_tls_hooks`), unchanged from the pristine tree across all four slices of this stretch. `ascii_churn.f` and `splice_insert_churn.f` are NOT among those twelve: they pass under ASan/LSan, which is what carries the leak question the case file's own valgrind run could not.
