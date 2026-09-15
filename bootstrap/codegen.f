@@ -2360,6 +2360,25 @@ Val func cgFieldPtr(e:Node) {
     }
     Val obj = cgExpr(childOf(e, 'obj'))
     if CG_STUCK { return none }
+    // claude.md #92: img.width / img.height -- a runtime CALL rather
+    // than a field read, because an img is a pointer to a box whose
+    // Cairo surface owns the real dimensions, and resize() replaces
+    // that surface underneath it. Caching them anywhere would go stale.
+    if obj.fty == 'img' {
+        text prop = rawText(e, 'prop')
+        if prop == 'width' || prop == 'height' {
+            CG_USES_GRAPHICS_CODE = true
+            text wfn = 'festina_image_width'
+            if prop == 'height' { wfn = 'festina_image_height' }
+            text wout = cgTmp()
+            cgOut(`  ${wout} = call i64 @${wfn}(ptr ${obj.v})`)
+            // claude.md #119: the int is independent of the image, so
+            // an owning receiver -- `sheet.clip(...).width` -- is
+            // released here rather than leaked.
+            cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+            return cgVal(wout, 'i64', 'int')
+        }
+    }
     // A ROW's columns are flat 8-byte cells the runtime laid out, so
     // the address is plain byte arithmetic rather than a typed
     // getelementptr into a named struct -- there is no LLVM type here
@@ -4145,6 +4164,48 @@ Val func cgMethodCall(e:Node, callee:Node) {
     // The receiver decides: the same four names are canvas builtins
     // when called bare, so this only claims them once the receiver has
     // been emitted and turns out to be an image.
+    // claude.md #38/#99/#109: a clip's own playback. play/playLoop
+    // differ only in a flag the one runtime entry point already takes,
+    // and both RETURN the channel they were given so a caller can stop
+    // that voice specifically.
+    if m == 'play' || m == 'playLoop' || m == 'stop' || m == 'isPlaying' {
+        Val av = cgExpr(recv)
+        if CG_STUCK { return none }
+        if av.fty == 'aud' {
+            CG_USES_AUDIO = true
+            if m == 'stop' {
+                cgOut(`  call void @festina_audio_stop_clip(ptr ${av.v})`)
+                return cgVal('0', 'void', 'void')
+            }
+            if m == 'isPlaying' {
+                text iout2 = cgTmp()
+                cgOut(`  ${iout2} = call i8 @festina_audio_is_playing(ptr ${av.v})`)
+                return cgVal(iout2, 'i8', 'bool')
+            }
+            // An explicit channel, or the runtime's own choice. The
+            // constant passed when there is none is never read -- the
+            // flag beside it says so -- but a real one rather than
+            // undef keeps the IR readable and trivially verifiable.
+            text chan2 = '0'
+            text explicit = '0'
+            if args.length == 1 {
+                Val cv3 = cgExprExpecting(args[0], 'int', '')
+                if CG_STUCK { return none }
+                chan2 = cv3.v
+                explicit = '1'
+            } else if args.length != 0 {
+                cgUnported(`.${m}() with ${args.length} arguments`)
+                return none
+            }
+            text looping = '0'
+            if m == 'playLoop' { looping = '1' }
+            text plout = cgTmp()
+            cgOut(`  ${plout} = call i64 @festina_audio_play_on(ptr ${av.v}, i64 ${chan2}, i8 ${explicit}, i8 ${looping})`)
+            return cgVal(plout, 'i64', 'int')
+        }
+        cgUnported(`.${m}() on ${av.fty}`)
+        return none
+    }
     // claude.md #185: a CLIP is an independent new surface rather than
     // a view into the receiver, which is what lets an owning receiver
     // be released the moment it has been read.
@@ -5433,6 +5494,81 @@ Val func cgCall(e:Node, wantValue:bool) {
         Val lres = cgVal(lout, 'ptr', 'img')
         lres.fresh = true
         return lres
+    }
+    // claude.md #98/#99/#146: the audio builtins. Naming any of them is
+    // what makes a program USE audio, because each lives in the audio
+    // translation unit -- a program that tunes the voice limit is a
+    // program that plays sounds, and one that never touches audio never
+    // links these in at all.
+    if name == 'stopAudioPlayer' {
+        arr[Node] aargs = listOf(e, 'args')
+        if aargs.length > 1 {
+            cgUnported(`stopAudioPlayer() with ${aargs.length} arguments`)
+            return none
+        }
+        CG_USES_AUDIO = true
+        // A bare call passes -1, the runtime's own "every channel"
+        // encoding: naming no channel obviously means all of them, and
+        // there is no other way to say it.
+        text chan = '-1'
+        if aargs.length == 1 {
+            Val cvv = cgExprExpecting(aargs[0], 'int', '')
+            if CG_STUCK { return none }
+            chan = cvv.v
+        }
+        cgOut(`  call void @festina_stop_audio_player(i64 ${chan})`)
+        return cgVal('0', 'void', 'void')
+    }
+    if name == 'isAudioPlayerPlaying' {
+        arr[Node] pargs = listOf(e, 'args')
+        if pargs.length != 1 {
+            cgUnported(`isAudioPlayerPlaying() with ${pargs.length} arguments`)
+            return none
+        }
+        CG_USES_AUDIO = true
+        Val pcv = cgExprExpecting(pargs[0], 'int', '')
+        if CG_STUCK { return none }
+        text pout = cgTmp()
+        cgOut(`  ${pout} = call i8 @festina_channel_is_playing(i64 ${pcv.v})`)
+        return cgVal(pout, 'i8', 'bool')
+    }
+    if name == 'maxAudioPlayers' || name == 'setMaxAudioPlayers' {
+        arr[Node] margs = listOf(e, 'args')
+        CG_USES_AUDIO = true
+        if name == 'maxAudioPlayers' {
+            if margs.length != 0 {
+                cgUnported(`maxAudioPlayers() with ${margs.length} arguments`)
+                return none
+            }
+            text mout = cgTmp()
+            cgOut(`  ${mout} = call i64 @festina_get_max_audio_players()`)
+            return cgVal(mout, 'i64', 'int')
+        }
+        if margs.length != 1 {
+            cgUnported(`setMaxAudioPlayers() with ${margs.length} arguments`)
+            return none
+        }
+        Val mv = cgExprExpecting(margs[0], 'int', '')
+        if CG_STUCK { return none }
+        cgOut(`  call void @festina_set_max_audio_players(i64 ${mv.v})`)
+        return cgVal('0', 'void', 'void')
+    }
+    if name == 'loadAudio' {
+        arr[Node] largs2 = listOf(e, 'args')
+        if largs2.length != 1 {
+            cgUnported(`loadAudio() with ${largs2.length} arguments`)
+            return none
+        }
+        CG_USES_AUDIO = true
+        Val lpv = cgExprExpecting(largs2[0], 'text', '')
+        if CG_STUCK { return none }
+        text lout2 = cgTmp()
+        cgOut(`  ${lout2} = call ptr @festina_load_audio(ptr ${lpv.v})`)
+        // claude.md #83: the path is only fopen()'d, never kept.
+        cgFreeTextTemp(largs2[0], lpv)
+        Val lres2 = cgVal(lout2, 'ptr', 'aud')
+        lres2.fresh = true
+        return lres2
     }
     if name == 'now' && listOf(e, 'args').length == 0 {
         text nout = cgTmp()
