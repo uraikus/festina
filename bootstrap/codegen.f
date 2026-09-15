@@ -912,6 +912,10 @@ text func cgLtyOf(fty:text) {
     // A regex is a handle, like a blob: one pointer, no payload of its
     // own that codegen lays out.
     if fty == 'regex' { return 'ptr' }
+    // claude.md #256: an ascii is one pointer too, but unlike text it
+    // is REFCOUNTED -- the pointer handed around is the payload, with
+    // a {length, refcount} header sitting 16 bytes before it.
+    if fty == 'ascii' { return 'ptr' }
     return ''
 }
 
@@ -1085,6 +1089,7 @@ text func cgManagedFty(t:Ty) {
     if t.kind == 'prim' {
         if t.name == 'blob' { return 'blob' }
         if t.name == 'regex' { return 'regex' }
+        if t.name == 'ascii' { return 'ascii' }
     }
     return ''
 }
@@ -1167,6 +1172,11 @@ map[text] G_ETY = {}
 // Lazily-generated per-element-type release cascades, cached by the
 // element type so one is generated per type and not per site.
 map[text] CG_ARR_REL = {}
+// The ascii literals interned so far, and how many -- numbered
+// separately from the text constants because they are a different
+// section with a different shape.
+map[text] CG_ASTR_MAP = {}
+int CG_ASTR_N = 0
 map[text] CG_ROW_REL = {}
 map[text] CG_MAP_REL = {}
 
@@ -1741,6 +1751,46 @@ Val func cgBinOp(e:Node) {
     // freeing at the eventual binding site instead would leak one
     // buffer per `+`. Equality is the same: a bool is not a text
     // reference, so `f() == g()` has no later owner for either result.
+    // claude.md #256: an ascii on either side makes the OTHER side an
+    // ascii too, before anything is compared or joined. A text literal
+    // converts at compile time into an immortal .rodata constant, so
+    // the common lexer comparison allocates nothing at all; a
+    // non-literal text operand pays a real festina_ascii_from_text,
+    // which is the honest cost of validating that it is representable.
+    if l.fty == 'ascii' || r.fty == 'ascii' {
+        if l.fty == 'text' {
+            l = cgTextToAscii(ln, l)
+            if CG_STUCK { return none }
+        }
+        if r.fty == 'text' {
+            r = cgTextToAscii(rn, r)
+            if CG_STUCK { return none }
+        }
+        if op == '==' || op == '!=' {
+            text aeq = cgTmp()
+            cgOut(`  ${aeq} = call i8 @festina_ascii_eq(ptr ${l.v}, ptr ${r.v})`)
+            text ares2 = aeq
+            if op == '!=' {
+                text neg = cgTmp()
+                cgOut(`  ${neg} = xor i8 ${aeq}, 1`)
+                ares2 = neg
+            }
+            cgReleaseOwnedReceiver(ln, l)
+            cgReleaseOwnedReceiver(rn, r)
+            return cgVal(ares2, 'i8', 'bool')
+        }
+        if op == '+' {
+            text acat = cgTmp()
+            cgOut(`  ${acat} = call ptr @festina_ascii_concat(ptr ${l.v}, ptr ${r.v})`)
+            cgReleaseOwnedReceiver(ln, l)
+            cgReleaseOwnedReceiver(rn, r)
+            Val acr = cgVal(acat, 'ptr', 'ascii')
+            acr.fresh = true
+            return acr
+        }
+        cgUnported(`operator ${op} between ascii values`)
+        return none
+    }
     if l.fty == 'text' || r.fty == 'text' {
         if l.fty != 'text' || r.fty != 'text' {
             cgUnported(`operator ${op} between ${l.fty} and ${r.fty}`)
@@ -2237,7 +2287,56 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
         opened.fresh = true
         return opened
     }
+    // claude.md #256: a text in an ascii position. A LITERAL is folded
+    // into .rodata with its own inline header and needs no call at
+    // all; anything else is a real runtime conversion that validates
+    // and answers null for non-ascii input, the way toInt() answers
+    // null for unparseable text.
+    if fty == 'ascii' && v.fty == 'text' {
+        if e.kind == 'StringLit' {
+            return cgVal(cgAsciiConst(rawText(e, 'value')), 'ptr', 'ascii')
+        }
+        text aout = cgTmp()
+        cgOut(`  ${aout} = call ptr @festina_ascii_from_text(ptr ${v.v})`)
+        cgFreeTextTemp(e, v)
+        Val made = cgVal(aout, 'ptr', 'ascii')
+        made.fresh = true
+        return made
+    }
+    // The other direction is always a real copy, since a text is a bare
+    // char* with no header in front of it to share.
+    if fty == 'text' && v.fty == 'ascii' {
+        text tout = cgTmp()
+        cgOut(`  ${tout} = call ptr @festina_ascii_to_text(ptr ${v.v})`)
+        Val asText = cgVal(tout, 'ptr', 'text')
+        asText.fresh = true
+        return asText
+    }
     return v
+}
+
+// claude.md #256: a text literal in an ascii position, emitted
+// straight into .rodata with its own INLINE {length, refcount} header
+// -- the same `{i64 -1, T}`-plus-getelementptr shape every managed
+// global already uses. The count is the immortal sentinel, so retain,
+// release and `free` on a literal are all no-ops through the very
+// checks every other immortal value goes through, and the payload
+// pointer handed out is indistinguishable from a heap ascii's.
+//
+// That is the whole reason ascii can carry a header where text cannot:
+// every ascii in existence is built by this compiler or by
+// festina_ascii_alloc, so there are none of text's four provenances to
+// make a header invalid for.
+text func cgAsciiConst(v:text) {
+    if CG_ASTR_MAP[v] != null { return CG_ASTR_MAP[v] }
+    text name = `@.astr.${CG_ASTR_N}`
+    CG_ASTR_N++
+    int bytes = cgUtf8Bytes(v) + 1
+    text ty = `{i64, i64, [${bytes} x i8]}`
+    CG_EXTRA.push(`${name} = private unnamed_addr constant ${ty} {i64 ${bytes - 1}, i64 -1, [${bytes} x i8] c"${cgCEscape(v)}\\00"}`)
+    text ref = `getelementptr inbounds (${ty}, ptr ${name}, i32 0, i32 2)`
+    CG_ASTR_MAP[v] = ref
+    return ref
 }
 
 // ---------------------------------------------------------------------
@@ -2734,6 +2833,18 @@ Val func cgLengthOf(e:Node, obj:Val) {
         cgFreeTextTemp(childOf(e, 'obj'), obj)
         return cgVal(out, 'i64', 'int')
     }
+    // claude.md #256: an ascii's length is already sitting in its own
+    // header at payload-16 -- a LOAD, not a call, and certainly not
+    // text's code-point walk. This is the entire reason the type
+    // exists.
+    if obj.fty == 'ascii' {
+        text lenP = cgTmp()
+        cgOut(`  ${lenP} = getelementptr i8, ptr ${obj.v}, i64 -16`)
+        text out = cgTmp()
+        cgOut(`  ${out} = load i64, ptr ${lenP}`)
+        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+        return cgVal(out, 'i64', 'int')
+    }
     // A blob's length is a runtime call, not a header field: unlike an
     // array, a blob handle does not carry one.
     if obj.fty == 'blob' {
@@ -2802,6 +2913,19 @@ Val func cgIndexRead(e:Node, obj:Val) {
         if k.owned { cgOut(`  call void @free(ptr ${k.v})`) }
         return cgMintAndReleaseComputed(e, r, obj)
     }
+    // claude.md #256: one of the 128 immortal single-character
+    // singletons -- O(1) and no allocation, where text[i] both walks
+    // and mallocs. Deliberately NOT treated as an owning temporary:
+    // the result is immortal, so a release for it would be a no-op at
+    // best and misleading at worst.
+    if obj.fty == 'ascii' {
+        Val aidx2 = cgExpr(childOf(e, 'prop'))
+        if CG_STUCK { return none }
+        text aout2 = cgTmp()
+        cgOut(`  ${aout2} = call ptr @festina_ascii_char_at(ptr ${obj.v}, i64 ${aidx2.v})`)
+        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+        return cgVal(aout2, 'ptr', 'ascii')
+    }
     if obj.fty != 'arr' {
         cgUnported(`indexing a ${obj.fty}`)
         return none
@@ -2854,6 +2978,33 @@ Val func cgMemberAccess(e:Node) {
         // cgFieldPtr is shared with the assignment path and emits the
         // object itself.
         if rawText(e, 'prop') != 'length' { return cgMemberRead(e) }
+        // claude.md #262: `.length` read off a member CHAIN whose base
+        // this expression owns -- `mkInner().b.length` -- takes a
+        // different path in the original than an ordinary field read
+        // does. The chain's owning bases are PARKED and released after
+        // the length is taken, with nothing minted: the receiver type
+        // (blob/text/ascii) is not the one whose value escapes, so
+        // there is nothing for a mint to protect, and retaining the
+        // field the way a field READ does would be a reference nobody
+        // ever gives back.
+        //
+        // Refused rather than approximated. Going through the ordinary
+        // member read emits a retain where the original emits the
+        // length call itself, which is a differing line in a real
+        // program -- and half a mechanism is worse here than none,
+        // because the harness cannot tell a deliberate omission from a
+        // wrong answer.
+        Node lenObj = childOf(e, 'obj')
+        if lenObj != null {
+            if lenObj.kind == 'Member' {
+                if fieldOf(lenObj, 'computed').raw != 'true' {
+                    if cgIsOwningRefcountedSource(childOf(lenObj, 'obj')) {
+                        cgUnported('.length off an owning member chain')
+                        return none
+                    }
+                }
+            }
+        }
     }
     Val obj = cgExpr(childOf(e, 'obj'))
     if CG_STUCK { return none }
@@ -3007,6 +3158,14 @@ Val func cgToText(a:Val) {
     }
     if a.fty == 'bool' {
         cgOut(`  ${out} = call ptr @festina_str_from_bool(i8 ${a.v})`)
+        return cgVal(out, 'ptr', 'text')
+    }
+    // claude.md #256: the characters, as a fresh text buffer -- always
+    // total, since every ascii byte is a valid single-byte UTF-8 code
+    // point. This is also what ascii.toText() compiles to, and the two
+    // must not disagree.
+    if a.fty == 'ascii' {
+        cgOut(`  ${out} = call ptr @festina_ascii_to_text(ptr ${a.v})`)
         return cgVal(out, 'ptr', 'text')
     }
     // claude.md #114: a struct or container renders as JSON, through
@@ -3451,6 +3610,78 @@ Val func cgMethodCall(e:Node, callee:Node) {
     //
     // Nothing is released on REMOVAL: pop and shift hand the element
     // back, so ownership transfers rather than ending.
+    // claude.md #96/#130: `.splice(start, count)` removes a run and
+    // hands it back as a fresh array; `.splice(start, count, insertArr)`
+    // is JavaScript's splice(start, deleteCount, ...items), with the
+    // variadic items spelled as one arr[T] because this language has no
+    // variadic parameters.
+    //
+    // The removed elements are NOT released: they are handed to the
+    // returned array, so ownership transfers rather than ending --
+    // exactly what pop and shift do with the one element they remove.
+    if m == 'splice' {
+        Val obj = cgExpr(recv)
+        if CG_STUCK { return none }
+        if obj.fty != 'arr' {
+            cgUnported(`.splice() on ${obj.fty}`)
+            return none
+        }
+        if cgStorableRefcounted('arr', obj.ety) == false {
+            cgUnported(`.splice() on an array of ${obj.ety}`)
+            return none
+        }
+        if args.length != 2 && args.length != 3 {
+            cgUnported(`.splice() with ${args.length} arguments`)
+            return none
+        }
+        text spElemLty = cgElemLty(obj.ety)
+        text spSize = '8'
+        if obj.ety == 'bool' { spSize = '1' }
+        Val spStart = cgExprExpecting(args[0], 'int', '')
+        if CG_STUCK { return none }
+        Val spCount = cgExprExpecting(args[1], 'int', '')
+        if CG_STUCK { return none }
+        text dst = cgFreshHeader('%struct._FestinaArray')
+        if args.length == 2 {
+            cgOut(`  call void @festina_array_splice(ptr ${obj.v}, ptr null, i64 ${spSize}, i64 ${spStart.v}, i64 ${spCount.v}, ptr ${dst})`)
+            Val spr = cgArrVal(dst, obj.ety)
+            spr.fresh = true
+            return spr
+        }
+        Val ins = cgExprExpecting(args[2], 'arr', obj.ety)
+        if CG_STUCK { return none }
+        if ins.fty != 'arr' {
+            cgUnported(`.splice() insert of type ${ins.fty}`)
+            return none
+        }
+        text insLenP = cgTmp()
+        cgOut(`  ${insLenP} = getelementptr %struct._FestinaArray, ptr ${ins.v}, i32 0, i32 0`)
+        text insLen = cgTmp()
+        cgOut(`  ${insLen} = load i64, ptr ${insLenP}`)
+        text insDataP = cgTmp()
+        cgOut(`  ${insDataP} = getelementptr %struct._FestinaArray, ptr ${ins.v}, i32 0, i32 1`)
+        text insData = cgTmp()
+        cgOut(`  ${insData} = load ptr, ptr ${insDataP}`)
+        cgOut(`  call void @festina_array_splice_insert(ptr ${obj.v}, ptr null, i64 ${spSize}, i64 ${spStart.v}, i64 ${spCount.v}, ptr ${insData}, i64 ${insLen}, ptr ${dst})`)
+        // The call may have realloc'd this array's own data buffer, so
+        // its pointer is reloaded AFTER it rather than reused.
+        text nowP = cgTmp()
+        cgOut(`  ${nowP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 1`)
+        text nowV = cgTmp()
+        cgOut(`  ${nowV} = load ptr, ptr ${nowP}`)
+        cgSpliceOwnRange(nowV, spElemLty, obj.ety, spStart.v, insLen)
+        // The inserted array is read only for its raw BYTES and goes on
+        // managing its own elements, so a receiver this expression owns
+        // -- a literal, a call result -- is released here.
+        if cgIsRefcounted('arr') {
+            if cgIsOwningRefcountedSource(args[2]) {
+                cgOut(`  call void ${cgReleaseFnFor('arr', obj.ety)}(ptr ${ins.v})`)
+            }
+        }
+        Val spr2 = cgArrVal(dst, obj.ety)
+        spr2.fresh = true
+        return spr2
+    }
     if m == 'push' || m == 'unshift' || m == 'pop' || m == 'shift' {
         Val obj = cgExpr(recv)
         if CG_STUCK { return none }
@@ -3568,9 +3799,21 @@ Val func cgMethodCall(e:Node, callee:Node) {
         if m == 'slice' {
             Val first = cgExpr(recv)
             if CG_STUCK { return none }
+            // claude.md #256: clamped at both ends by the runtime, so
+            // nothing here checks. Answered before the blob path below
+            // rather than falling through it, because an ascii
+            // receiver has already been emitted by this point.
             if first.fty == 'ascii' {
-                cgUnported('.slice() on ascii')
-                return none
+                Val sa = cgExprExpecting(args[0], 'int', '')
+                if CG_STUCK { return none }
+                Val sb = cgExprExpecting(args[1], 'int', '')
+                if CG_STUCK { return none }
+                text sout = cgTmp()
+                cgOut(`  ${sout} = call ptr @festina_ascii_slice(ptr ${first.v}, i64 ${sa.v}, i64 ${sb.v})`)
+                cgReleaseOwnedReceiver(recv, first)
+                Val sres = cgVal(sout, 'ptr', 'ascii')
+                sres.fresh = true
+                return sres
             }
             cgReleaseOwnedReceiver(recv, first)
             cgFreeTextTemp(recv, first)
@@ -3954,6 +4197,7 @@ Val func cgMethodCall(e:Node, callee:Node) {
     if m == 'toChar' && args.length == 0 { known = true }
     if m == 'toText' && args.length == 0 { known = true }
     if m == 'charCodeAt' && args.length == 1 { known = true }
+    if m == 'toAscii' && args.length == 0 { known = true }
     if known == false {
         cgUnported(`method .${m}()`)
         return none
@@ -3991,7 +4235,36 @@ Val func cgMethodCall(e:Node, callee:Node) {
         cgFreeTextTemp(recv, r)
         return cgVal(out, 'ptr', 'text')
     }
+    if m == 'toAscii' {
+        if r.fty != 'text' {
+            cgUnported(`.toAscii() on ${r.fty}`)
+            return none
+        }
+        // claude.md #256: validating, and null for anything not
+        // representable one byte per character. Unlike the COERCION of
+        // a literal, this is always a real call -- the receiver is an
+        // arbitrary expression whose bytes are not known here.
+        text aout = cgTmp()
+        cgOut(`  ${aout} = call ptr @festina_ascii_from_text(ptr ${r.v})`)
+        cgFreeTextTemp(recv, r)
+        Val ares = cgVal(aout, 'ptr', 'ascii')
+        ares.fresh = true
+        return ares
+    }
     if m == 'charCodeAt' {
+        // claude.md #258: on an ASCII this is emitted INLINE, with no
+        // call at all. One byte per character means the byte at offset
+        // i IS the code point, so the whole operation is a bounds check
+        // and a load -- and a scan loop is the only place it is ever
+        // hot, which is exactly where a call per character showed up in
+        // the char_scan benchmark.
+        if r.fty == 'ascii' {
+            Val aidx = cgExpr(args[0])
+            if CG_STUCK { return none }
+            text acode = cgAsciiCharCodeAt(r.v, aidx.v)
+            cgReleaseOwnedReceiver(recv, r)
+            return cgVal(acode, 'i64', 'int')
+        }
         if r.fty != 'text' {
             cgUnported(`.charCodeAt() on ${r.fty}`)
             return none
@@ -4033,6 +4306,15 @@ Val func cgMethodCall(e:Node, callee:Node) {
         if CG_STUCK { return none }
         cgReleaseOwnedReceiver(recv, r)
         return t
+    }
+    // claude.md #256: the characters, through that same path -- which
+    // is what keeps `${a}`, `log(a)` and `a.toText()` from ever
+    // disagreeing about what an ascii looks like.
+    if r.fty == 'ascii' {
+        Val at = cgToText(r)
+        if CG_STUCK { return none }
+        cgReleaseOwnedReceiver(recv, r)
+        return at
     }
     if r.fty != 'int' && r.fty != 'float' && r.fty != 'bool' {
         cgUnported(`.toText() on ${r.fty}`)
@@ -4617,6 +4899,18 @@ void func cgLog(args:arr[Node]) {
         cgFreeTextTemp(args[0], a)
         return
     }
+    // claude.md #256: an ascii is logged as its characters, through
+    // the same rendering path ascii.toText() uses -- so the two can
+    // never disagree, exactly as for blob and the containers. The
+    // rendering is a fresh buffer this call owns and frees.
+    if a.fty == 'ascii' {
+        Val rendered = cgToText(a)
+        if CG_STUCK { return }
+        cgOut(`  call void @festina_log_text(ptr ${rendered.v})`)
+        cgOut(`  call void @free(ptr ${rendered.v})`)
+        cgReleaseOwnedReceiver(args[0], a)
+        return
+    }
     cgUnported(`log(${a.fty})`)
 }
 
@@ -4713,7 +5007,8 @@ void func cgStmt(s:Node) {
             // A regex is the same shape for the same reason -- and so
             // is a ROW, whose storage the runtime laid out and whose
             // local is therefore one pointer to it and nothing more.
-            if managed == 'blob' || managed == 'regex' || managed == 'table' {
+            if managed == 'blob' || managed == 'regex' || managed == 'table'
+                    || managed == 'ascii' {
                 Node binit = childOf(s, 'init')
                 if binit == null {
                     cgUnported(`${managed} declaration with no initializer`)
@@ -4729,6 +5024,14 @@ void func cgStmt(s:Node) {
                 cgOut(`  ${bslot} = alloca ptr`)
                 bool bOwning = cgIsOwningRefcountedSource(binit)
                 if bv.fresh { bOwning = true }
+                // claude.md #256: an ascii DECLARATION never retains,
+                // and that asymmetry is the original's rather than a
+                // slip here. `ascii` is listed among the types a scope
+                // exit releases but NOT among the ones the declaration
+                // branch claims a reference for, so its local is bound
+                // exactly like a scalar -- alloca, store, nothing else
+                // -- while still being released on the way out.
+                if managed == 'ascii' { bOwning = true }
                 if bOwning == false {
                     cgOut(`  call void @festina_retain(ptr ${bv.v})`)
                 }
@@ -5996,6 +6299,10 @@ void func cgAssign(e:Node) {
 // worth of off-by-sixteen temp numbers to notice.
 bool func cgStorableRefcounted(fty:text, ety:text) {
     if fty == 'struct' || fty == 'blob' || fty == 'regex' { return true }
+    // A handle or a row: one pointer, and nothing to say about
+    // elements, so there is no element type for the question below to
+    // be about.
+    if fty == 'ascii' || fty == 'table' { return true }
     if ety == '' { return false }
     if ety == 'int' || ety == 'float' || ety == 'bool' { return true }
     return cgElemOwnsSomething(ety)
@@ -6053,6 +6360,10 @@ text func cgReleaseFn(fty:text) {
     // /pattern/ literal is immortal and no-ops through here, which is
     // what lets `free` on a binding that aliases one be safe.
     if fty == 'regex' { return '@festina_regex_free' }
+    // claude.md #256: frees at payload-16, the base of the
+    // {length, refcount} header -- never at the payload the rest of
+    // the program sees.
+    if fty == 'ascii' { return '@festina_ascii_release' }
     return '@festina_release'
 }
 
@@ -6060,6 +6371,7 @@ text func cgReleaseFn(fty:text) {
 // release. A scalar element owns nothing; a `text` one owns a buffer.
 bool func cgIsRefcounted(fty:text) {
     if fty == 'regex' { return true }
+    if fty == 'ascii' { return true }
     // claude.md #265: a row is reference counted, so a row an array
     // gave out survives the array it came from.
     if fty == 'table' { return true }
@@ -6176,6 +6488,116 @@ text func cgElemReleaseFn(ety:text) {
     // holds once that pointer is gone.
     if cgIsRefcounted(ety) { return cgReleaseFn(ety) }
     return '@free'
+}
+
+// A text operand beside an ascii one. Split out because the coercion
+// has two completely different costs: a LITERAL is folded into an
+// immortal .rodata constant with no call and no allocation, and
+// anything else is a real validating conversion whose own temporary
+// this expression then owns.
+Val func cgTextToAscii(e:Node, v:Val) {
+    if e != null {
+        if e.kind == 'StringLit' {
+            return cgVal(cgAsciiConst(rawText(e, 'value')), 'ptr', 'ascii')
+        }
+    }
+    text out = cgTmp()
+    cgOut(`  ${out} = call ptr @festina_ascii_from_text(ptr ${v.v})`)
+    cgFreeTextTemp(e, v)
+    Val made = cgVal(out, 'ptr', 'ascii')
+    made.fresh = true
+    return made
+}
+
+// claude.md #258: `s.charCodeAt(i)` on an ascii, emitted inline. There
+// is no runtime function for it -- the one that used to exist was
+// deleted, because this was its only caller and nothing about the
+// operation needs a call.
+//
+// BRANCHLESS, deliberately: no new basic blocks, so the expression
+// stays a straight-line value the surrounding emitter can keep treating
+// as one, and so LLVM can hoist the loop-invariant length load without
+// having to prove a guard. A null receiver is redirected to the empty
+// literal -- whose one NUL byte makes even an empty ascii safe to load
+// at 0 -- and the loaded byte is then discarded by the final select,
+// which is also what answers null for an out-of-range index.
+text func cgAsciiCharCodeAt(payload:text, idx:text) {
+    text empty = cgAsciiConst('')
+    text isNull = cgTmp()
+    cgOut(`  ${isNull} = icmp eq ptr ${payload}, null`)
+    text safeP = cgTmp()
+    cgOut(`  ${safeP} = select i1 ${isNull}, ptr ${empty}, ptr ${payload}`)
+    text lenP = cgTmp()
+    cgOut(`  ${lenP} = getelementptr i8, ptr ${safeP}, i64 -16`)
+    text len = cgTmp()
+    cgOut(`  ${len} = load i64, ptr ${lenP}`)
+    text low = cgTmp()
+    cgOut(`  ${low} = icmp slt i64 ${idx}, 0`)
+    text high = cgTmp()
+    cgOut(`  ${high} = icmp sge i64 ${idx}, ${len}`)
+    text oor = cgTmp()
+    cgOut(`  ${oor} = or i1 ${low}, ${high}`)
+    text safeI = cgTmp()
+    cgOut(`  ${safeI} = select i1 ${oor}, i64 0, i64 ${idx}`)
+    text byteP = cgTmp()
+    cgOut(`  ${byteP} = getelementptr i8, ptr ${safeP}, i64 ${safeI}`)
+    text byte = cgTmp()
+    cgOut(`  ${byte} = load i8, ptr ${byteP}`)
+    text code = cgTmp()
+    cgOut(`  ${code} = zext i8 ${byte} to i64`)
+    text out = cgTmp()
+    cgOut(`  ${out} = select i1 ${oor}, i64 ${cgNullValue('int')}, i64 ${code}`)
+    return out
+}
+
+// claude.md #130: `.splice(start, count, insertArr)` copies raw element
+// BYTES out of a SEPARATE array's buffer -- a plain memcpy with no
+// notion of a Festina type. Unlike push, whose single value has one
+// source expression to ask about, there is no source expression here:
+// the source is a whole array, read for its bytes, which goes on
+// managing its own elements independently of what this array now does
+// with the copies.
+//
+// So the newly-written range always takes its own reference,
+// unconditionally and with no freshness check possible: a refcounted
+// element is retained in place, a text one is REPLACED by a fresh copy
+// (text has no shared representation to retain), and anything else
+// needs nothing -- the bytes the runtime copied are already a complete
+// independent value.
+void func cgSpliceOwnRange(dataV:text, elemLty:text, ety:text, startV:text, countV:text) {
+    if cgElemOwnsSomething(ety) == false { return }
+    text idx = cgTmp()
+    cgOut(`  ${idx} = alloca i64`)
+    cgOut(`  store i64 0, ptr ${idx}`)
+    text condL = cgLabel('spliceretain.loopcond')
+    text bodyL = cgLabel('spliceretain.loopbody')
+    text endL = cgLabel('spliceretain.loopend')
+    cgOut(`  br label %${condL}`)
+    cgBlockLabel(condL)
+    text i = cgTmp()
+    cgOut(`  ${i} = load i64, ptr ${idx}`)
+    text go = cgTmp()
+    cgOut(`  ${go} = icmp slt i64 ${i}, ${countV}`)
+    cgOut(`  br i1 ${go}, label %${bodyL}, label %${endL}`)
+    cgBlockLabel(bodyL)
+    text abs = cgTmp()
+    cgOut(`  ${abs} = add i64 ${startV}, ${i}`)
+    text ep = cgTmp()
+    cgOut(`  ${ep} = getelementptr ${elemLty}, ptr ${dataV}, i64 ${abs}`)
+    text ev = cgTmp()
+    cgOut(`  ${ev} = load ${elemLty}, ptr ${ep}`)
+    if ety == 'text' {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${ev})`)
+        cgOut(`  store ptr ${owned}, ptr ${ep}`)
+    } else {
+        cgOut(`  call void @festina_retain(ptr ${ev})`)
+    }
+    text nx = cgTmp()
+    cgOut(`  ${nx} = add i64 ${i}, 1`)
+    cgOut(`  store i64 ${nx}, ptr ${idx}`)
+    cgOut(`  br label %${condL}`)
+    cgBlockLabel(endL)
 }
 
 // The counted loop both cascades share: the generated wrapper for a
@@ -8245,7 +8667,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 // a scalar global takes, not the {refcount, payload}
                 // one every other refcounted global has.
                 text handleG = cgManagedFty(gt)
-                if handleG == 'blob' || handleG == 'regex' {
+                if handleG == 'blob' || handleG == 'regex' || handleG == 'ascii' {
                     cgEmit(`@${gn} = global ptr null`)
                     G_SLOT[gn] = `@${gn}`
                     G_FTY[gn] = handleG
