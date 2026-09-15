@@ -81,58 +81,78 @@ larger than they look.
   exactly as `img`/`aud` already gate theirs. That conditional-linking
   property is the point: a program with no `vid` in it must not grow a
   video decoder.
-- **A built-in test suite: `test` blocks and `festina test`.** Named
+- **A built-in test suite: a `test` type and `festina test`.** Named
   groups of assertions, run by a CLI verb of their own, so a Festina
   program can be tested without a second language in the loop.
 
   ```festina
-  test 'basic math test' {
-      test(2 + 2, 4)
-      test(3 - 1, 2)
-      test(2 - 2, 4)
-  }
+  test basicMath = 'basic math test'
+  basicMath(2 + 2, 4)
+  basicMath(3 - 1, 2)
+  basicMath(2 - 2, 4)
 
-  test 'string interpolation' {
-      text name = 'Patrick'
-      text greeting = `Hello, ${name}!`
-      test(greeting, 'Hello, Patrick!')
-  }
+  test stringInterpolation = 'string interpolation'
+  text name = 'Patrick'
+  text greeting = `Hello, ${name}!`
+  stringInterpolation(greeting, 'Hello, Patrick!')
   ```
 
   ```
   $ festina test ./test-example.f
   basic math test: 2 pass, 1 fail. 66%
-   | - fail: test(2-2, 4) // 0
+   | - fail: basicMath(2-2, 4) // 0
   string interpolation: 1 pass. 100%
   Overall: 3 pass, 1 fail. 75%
   ```
 
-  The shape is settled; five things about it are not, and each is a
-  decision rather than an implementation detail.
+  **`test` is a TYPE**, which is what makes this fit the language
+  rather than bolt onto it. It joins `blob`/`img`/`aud`/`regex`/
+  `ascii`/`color`/`font`/`http`/`url`/`socket`/`thread` in the type
+  namespace — a list this language already extends by adding to — and
+  the group's NAME is an ordinary binding, so nothing about `test` has
+  to be contextual on what follows it. A `test` value being CALLABLE
+  also has precedent: `func[T]:R` values already are (decisions.md
+  #141), so the call syntax needs no new machinery, only a new callee
+  type. And "methods on the type" is then the natural home for every
+  assertion that isn't plain equality — `.throws()`, `.near()`,
+  `.contains()` — instead of a growing set of global names.
 
-  **`test` is both a block keyword and a callable**, which is a
-  collision this language has no precedent for. A program that
-  declares its own `func test(...)` or a `test` binding has to keep
-  working, or this is a breaking change dressed as an addition — and
-  decisions.md #298 and #317 are two separate rounds of exactly that
-  kind of name confusion already. Contextual on the following token
-  (`test 'name' {` is a declaration, `test(` is a call) is the
-  cheapest answer, and needs checking against the real grammar rather
-  than assumed.
+  An earlier sketch made `test` both a block keyword and a callable.
+  That is the version this replaces, and the reason is recorded rather
+  than dropped: a name that is a declaration in one position and a call
+  in another has no precedent here, and decisions.md #298 and #317 are
+  two separate rounds of exactly that kind of name confusion already.
+
+  What is still open:
+
+  **Grouping is by the binding CALLED, not by position.** `basicMath(…)`
+  belongs to `basicMath` wherever it appears, which is better than a
+  block's brace-scoping — but it means a call can precede its own
+  declaration, and it leaves open what happens to an assertion whose
+  group was never declared (a compile error, presumably, since the
+  callee would be an unknown name anyway).
+
+  **What a `test` call ANSWERS.** Nothing (a statement), or a `bool` so
+  a failing assertion can be branched on? The sketch only ever uses it
+  as a statement, and `bool` is the choice that costs nothing and
+  allows more.
 
   **What `test(actual, expected)` means for a non-scalar.** Scalars and
   `text` are obvious. `struct == struct` is currently *unsettled* — it
   emits invalid LLVM and nothing rejects it (see the entry below), and
   decisions.md #54's ambiguity rule is why neither identity nor deep
-  equality was ever picked. A test assertion wants deep equality and would be the
-  first thing in the language to need it, so this either forces that
-  decision or restricts `test()` to the types that already have `==`.
+  equality was ever picked. A test assertion wants deep equality and
+  would be the first thing in the language to need it, so this either
+  forces that decision or restricts the call to types that already have
+  `==`.
 
-  **The failure line quotes the assertion's own SOURCE.** `test(2-2,
-  4)` appears in the output spelled as it was written, not
-  reconstructed from the AST — note the sketch's own `2-2` against the
-  `2 - 2` in the block. That needs the source span carried to wherever
-  the report is produced, which today only error messages do.
+  **The failure line quotes the assertion's own SOURCE.** `basicMath(2-2,
+  4)` appears spelled as it was written, not reconstructed from the AST
+  — note the `2-2` against the `2 - 2` in the source. That needs the
+  source span carried to wherever the report is produced, which today
+  only error messages do. (The sample output writes `test(2-2, 4)` on
+  that line, which is the older spelling; quoting the real callee is
+  what the rest of the format implies.)
 
   **The percentages are truncated, not rounded** (2 of 3 is 66%, not
   67%), and a group with no failures omits the fail count entirely
@@ -145,15 +165,12 @@ larger than they look.
   makes `festina test` usable in a pipeline.
 
   Also open: whether `festina test` runs the file's ordinary top-level
-  code as well as its `test` blocks, and whether `test` blocks are
-  stripped from a normal `festina compile` (they should be — a test
-  block in a shipped binary is dead weight, and that is a codegen
-  change, which by the caution above means porting it twice).
-
-  (The sketch's `test(greeting, 'Hello, Patrick')` against a greeting
-  of `Hello, Patrick!` is a typo in the sketch, not a third case: as
-  written it would fail, while the sample output reports the group
-  passing. Corrected above.)
+  code as well as its assertions (here it must — `name` and `greeting`
+  are ordinary declarations between the test calls), and whether `test`
+  bindings and their calls are stripped from a normal `festina compile`
+  (they should be — a test in a shipped binary is dead weight, and that
+  is a codegen change, which by the caution above means porting it
+  twice).
 
 - **Research a `gguf` type, for talking to a model directly.** The
   open questions are what the value actually owns (a memory-mapped
