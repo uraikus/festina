@@ -6561,3 +6561,23 @@ A small slice, and a line worth drawing carefully. **300,464 of 319,458 file-spe
 **Six new canaries. 112 in total.**
 
 **Verified.** Lexer 119/119, parser 119/119, semantic 119/119, codegen 71 match and 0 differ (72 with this slice's own case file, which matches at 100%). Seven canaries run -- the six new ones and the one this slice made ambiguous: all caught as diffs, 0 through the ratchet, 0 missed, 0 broken. Full suite: 2,886 passed, 36 failed -- the environment's own baseline (24 graphics tests with no window manager, 12 leak-stress tests whose ASan link cannot resolve `festina_register_tls_hooks`), unchanged from the pristine tree across all four slices of this stretch. `ascii_churn.f` and `splice_insert_churn.f` are NOT among those twelve: they pass under ASan/LSan, which is what carries the leak question the case file's own valgrind run could not.
+
+321. COLOUR, IMAGE, AND A RULE THIS FILE IS SUBJECT TO
+
+**318,939 of 336,247 file-specific IR lines, up from 307,506 -- 94.9% -- and 73 files match, 0 differ**, up from 71. All ten bootstrap files still self-host.
+
+**A `color` is a PACKED 0xRRGGBB integer**, which is what makes it cost one register instead of three and makes `a == b` one integer compare. The 148-name CSS table is ported as DATA, generated from the compiler's own table rather than transcribed by hand, because a port that recognized a different set of names would compile a different LANGUAGE rather than merely being a different compiler. The pack is spelled as arithmetic -- `r * 65536 + g * 256 + b` -- because Festina has no bitwise operators; it is the same number `(r << 16) | (g << 8) | b` names.
+
+**An unset colour is -1, not 0**, and the port got that wrong first. Zero is opaque black, so the wrong default paints silently instead of doing nothing. The colour GLOBAL's storage was the site: `cgZeroFor` keys on the LLVM type, and by then a colour and an int are both `i64`. The FTY is what still knows.
+
+**And this file is subject to the language it defines.** The first version of the colour resolver used `s[0]` and `v[i]` -- text indexing, which this port does not implement. `bootstrap/codegen.f` is compiled by the compiler it defines, so it may only use the subset that compiler already supports, and the module stopped self-hosting. What makes it worth an entry is HOW IT PRESENTED: not a syntax error, not a failure in the file being worked on, but a **160,000-line coverage collapse** -- 307,506 down to 147,262, with `codegen.f` and `irdumpf.f` both silently unported. The file the change was aimed at matched perfectly throughout. Rewritten through `charCodeAt`/`toChar`, with the constraint noted at the site so the shorter spelling cannot creep back in.
+
+**`img` and `aud` are blob's own shape**, which is the whole reason they cost so little: one pointer carrying the same refcount header, a `text` coercing into a load, and a real destructor rather than a plain free -- an img owns a Cairo surface, its bytes and its path; an aud stops every channel still playing the clip before releasing its PCM. Loading sets only the CODE flag, never the window one: decoding a PNG is Cairo's own in-memory decoder, and `blankImage` creates a surface rather than drawing on one.
+
+**The drawing METHODS are the canvas builtins retargeted at a receiver image**, dispatched purely by argument count exactly as the canvas forms are. Two defects here were found by measurement rather than by reading, and neither was visible in the source: the snake-case helper already turns `drawRect` into `draw_rect`, so a `festina_image_draw_` prefix produced `festina_image_draw_draw_rect`; and an owning source passed straight into `drawImage` was released INSIDE the argument loop, putting the free before the call that reads it.
+
+**Four builtins were waiting on a TYPE rather than on themselves.** The free-function `drawImage` in its three arity forms, `fillStyle`/`borderColor`'s one-argument packed-colour form, `saveCanvas()` with no path answering a fresh img snapshot (a different return type, so its own branch rather than an optional argument), and `getPixelColor`. Adding the two types turned all four into a few lines each.
+
+**The blocker table's "only" column earned its keep again.** `call to drawImage` stood at one file alone before this slice and converted exactly that one. It is the second time the two-column reading -- what a construct BLOCKS versus what it alone holds back -- picked the work correctly.
+
+**Verified.** Lexer 120/120, parser 120/120, semantic 120/120, codegen 73 match and 0 differ.
