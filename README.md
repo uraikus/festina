@@ -257,7 +257,7 @@ emit LLVM IR byte-identical to what the Python compiler emits for
 them, and the second-generation binary built from that IR is identical
 to the first. It is checked continuously rather than claimed once:
 five differential harnesses compare the two implementations over every
-`.f` file in the repository on each run, and a hundred and twenty-nine
+`.f` file in the repository on each run, and a hundred and thirty-five
 deliberate breakages ask whether that corpus could still tell them
 apart.
 

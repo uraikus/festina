@@ -1361,13 +1361,17 @@ CANARIES = [
         CG_USES_ASYNC_IO = true
         cgBarePostMessageTxn(pmArgs, txn)
     } else {
-        cgNamedPostMessageTxn(tname, handle, pmArgs, txn)
+        cgNamedPostMessageTxn(sendDesc, handle, pmArgs, txn)
+        if CG_STUCK { return }
+        cgThreadCloseBounds(endL)
     }""",
              """    if bare {
         CG_USES_ASYNC_IO = true
         cgBarePostMessageTxn(pmArgs, txn)
     } else {
-        cgNamedPostMessageTxn(tname, handle, pmArgs, txn)
+        cgNamedPostMessageTxn(sendDesc, handle, pmArgs, txn)
+        if CG_STUCK { return }
+        cgThreadCloseBounds(endL)
     }
     cgOut(`  call void @festina_thread_register_callback(ptr ${selfH}, i64 ${txn}, ptr ${tramp}, ptr ${fn.v}, i8 ${onMain})`)"""),
         ],
@@ -1405,8 +1409,71 @@ CANARIES = [
         if r.fty == 'color' { rOk = true }""",
         "",
     ),
-]
 
+    # --- decisions.md #325: thread pools ------------------------------
+    Canary(
+        "pool-instances-are-independent", "#325",
+        "a pool is N independent threads, each with its own state and queues",
+        """    int i = 0
+    while i < n {
+        cgThreadDeclNamed(d, `${base}$${i}`)
+        if CG_STUCK { return }
+        i++
+    }""",
+        """    int i = 0
+    while i < n {
+        cgThreadDeclNamed(d, `${base}$0`)
+        if CG_STUCK { return }
+        i = n
+    }""",
+    ),
+    Canary(
+        "pool-index-is-bounds-checked", "#325",
+        "an out-of-range pool index is a silent no-op rather than a wild load",
+        """        CG_TGT_OOB = CG_BLOCK
+        text okL = cgLabel('pool.inrange')
+        text endL = cgLabel('pool.end')
+        cgOut(`  br i1 ${inRange}, label %${okL}, label %${endL}`)
+        cgBlockLabel(okL)""",
+        """        CG_TGT_OOB = CG_BLOCK
+        text okL = cgLabel('pool.inrange')
+        text endL = cgLabel('pool.end')
+        cgOut(`  br label %${okL}`)
+        cgBlockLabel(okL)""",
+    ),
+    Canary(
+        "pool-index-takes-two-loads", "#325",
+        "a pool slot names a handle global, which then names the handle itself",
+        """        text hg = cgTmp()
+        cgOut(`  ${hg} = load ptr, ptr ${slot}`)
+        text h2 = cgTmp()
+        cgOut(`  ${h2} = load ptr, ptr ${hg}`)""",
+        """        text hg = cgTmp()
+        cgOut(`  ${hg} = load ptr, ptr ${slot}`)
+        text h2 = hg""",
+    ),
+    Canary(
+        "bare-pool-send-round-robins", "#325",
+        "a bare pool send moves its starting point so an idle pool spreads load",
+        """        text rrOld = cgTmp()
+        cgOut(`  ${rrOld} = atomicrmw add ptr @__festina_thread_pool_${rname}_rr, i64 1 monotonic`)
+        text start = cgTmp()
+        cgOut(`  ${start} = urem i64 ${rrOld}, ${n}`)""",
+        """        text start = '0'""",
+    ),
+    Canary(
+        "kill-and-drain-are-different-calls", "#325",
+        "kill stops a worker where drain waits for its queue to empty",
+        """        cgOut(`  call void @festina_thread_wait_drained(ptr ${handle})`)""",
+        """        cgOut(`  call void @festina_thread_kill(ptr ${handle})`)""",
+    ),
+    Canary(
+        "a-missing-pool-instance-is-not-alive", "#325",
+        "isAlive answers false for an index that names no instance",
+        """    cgOut(`  ${phi} = phi i8 [ ${out}, %${pred} ], [ 0, %${oob} ]`)""",
+        """    cgOut(`  ${phi} = phi i8 [ ${out}, %${pred} ], [ 1, %${oob} ]`)""",
+    ),
+]
 BY_NAME = {c.name: c for c in CANARIES}
 
 

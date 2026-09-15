@@ -111,9 +111,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage: **82 of 121 corpus files emit
-  byte-identical LLVM IR, 0 differ, 28 not yet ported, 11 rejected by
-  both** — 340,577 of 354,765 file-specific IR lines. **The bootstrap
+  the fourth and last stage: **85 of 122 corpus files emit
+  byte-identical LLVM IR, 0 differ, 26 not yet ported, 11 rejected by
+  both** — 344,865 of 358,351 file-specific IR lines. **The bootstrap
   compiler reproduces its own compilation**: all ten of its files —
   `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
   `escape.f` (22,232), `codegen.f` (94,459) and the five command-line
@@ -227,7 +227,13 @@ round-by-round design and implementation record predating 0.1 lives in
   derives each target's reply type from the callback side rather than
   the `.reply()` side, since the original infers it during semantic
   analysis and this port has no access to that answer. Plus
-  `exec(args)` and `==`/`!=` on `color`. `bootstrap/irdump.py` and
+  `exec(args)` and `==`/`!=` on `color`. And thread POOLS — N ordinary
+  threads under mangled names sharing one declared body, reached
+  through a constant array of handle-global addresses at a runtime
+  index or round-robined when no index is given, with an out-of-range
+  index a silent no-op — plus `.kill()`, `.live()`, `.isAlive()` and
+  `.drain()`, which cost one line each once resolving a receiver
+  existed. `bootstrap/irdump.py` and
   `bootstrap/irdiff.py` run the comparison; the oracle is the IR text
   itself, so it needed no canonical form of its own (decisions.md
   #289–#316).
@@ -237,7 +243,7 @@ round-by-round design and implementation record predating 0.1 lives in
   the two implementations agree; it says nothing about whether the
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
-  not. A hundred and twenty-nine deliberate breakages, one per mechanism,
+  not. A hundred and thirty-five deliberate breakages, one per mechanism,
   re-run by `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
   no longer the whole verdict: a canary looks for TWO independent
   witnesses and reports a lone one in its own output, because

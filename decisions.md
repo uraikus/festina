@@ -6655,3 +6655,21 @@ A small slice, and a line worth drawing carefully. **300,464 of 319,458 file-spe
 **Eight new canaries. 129 in total.**
 
 **Verified.** Lexer 121/121, parser 121/121, semantic 121/121, codegen 82 match and 0 differ. Nine canaries run for this slice plus the one it made stale again: 8 caught as diffs, 1 through the ratchet, 0 missed, 0 broken; all 129 anchors resolve.
+
+325. THREAD POOLS, AND FIVE METHODS THAT SHARE ONE RESOLUTION
+
+**344,865 of 358,351 file-specific IR lines, up from 340,577 -- 96.2% -- and 85 files match, 0 differ**, up from 82. All ten bootstrap files still self-host.
+
+**A pool is N ordinary threads with one body between them**, so it is emitted as N ordinary thread declarations under mangled names rather than as a mechanism of its own. Every global and symbol the singleton path derives from a thread's name comes out correctly namespaced per instance with no other change anywhere -- which is the whole reason the name became a parameter of the emitter instead of something read back off the declaration node.
+
+**The two globals a pool needs that a singleton does not** are a genuinely constant `[N x ptr]` of the instances' own handle-global ADDRESSES, and one round-robin counter. The array costs an extra indirection at every use site -- slot, then which handle global that slot names, then that instance's actual handle -- and buys never emitting an N-way branch. The counter only ever chooses where a scan STARTS, so an all-idle pool spreads across instances instead of favouring index 0 forever.
+
+**An out-of-range pool index is a silent no-op**, this language's own "test, don't fail" convention, which makes the bounds check part of target RESOLUTION rather than part of each operation: the handle is only ever loaded, and the operation only ever runs, inside the checked block. `isAlive` is the one of the five that answers a value, so it cannot simply skip -- the two paths meet in a phi, and an instance that does not exist is not alive.
+
+**`.kill()`, `.live()`, `.isAlive()` and `.drain()` came along for one line each** once that resolution existed, which is the real shape of this slice: the work was in resolving a receiver, not in any of the five things a receiver answers to.
+
+**An auto-sized pool is refused by name.** `thread NAME[]` asks the COMPILER to size the pool from its own machine's CPU count, so the answer is a property of where the compiler ran. The original resolves that during semantic analysis; this port's analyzer does not, and a port that picked a different number would compile a different program. No corpus file uses the form.
+
+**Six canaries, and the registry made this file bigger than it meant to be.** One of the six -- `isAlive` on an index that names no instance -- was NOT CAUGHT, and two more had a single witness that was not a case file. That is the harness working: a mechanism the corpus cannot see is a failing test of the CORPUS, and the fix is a case file. `cases/thread_pools.f` is it, and all six are caught with two witnesses now.
+
+**Verified.** Codegen 85 match and 0 differ. Six canaries: 6 caught as diffs, 0 through the ratchet, 0 missed, 0 broken; all 135 anchors resolve. Full suite 2,899 passed, 36 failed -- the environment's own baseline, unchanged.

@@ -55,16 +55,16 @@ python bootstrap/canary.py                          # can the corpus still TELL?
 python bootstrap/canary.py --list
 ```
 
-Over the 121-file repository corpus:
+Over the 122-file repository corpus:
 
-- **lexer: 121 match, 0 differ.**
-- **parser: 121 match, 0 differ, 0 unported.**
-- **semantic: 121 match, 0 differ, 0 unported.**
+- **lexer: 122 match, 0 differ.**
+- **parser: 122 match, 0 differ, 0 unported.**
+- **semantic: 122 match, 0 differ, 0 unported.**
 - **escape analysis: 103 match, 0 differ, 7 unported, 11 rejected by
   both** — 1,944 of 1,997 records.
-- **codegen: 82 match, 0 differ, 28 unported, 11 rejected by both** —
-  340,577 of 354,765 file-specific IR lines.
-- **canaries: 129 registered, 0 missed.**
+- **codegen: 85 match, 0 differ, 26 unported, 11 rejected by both** —
+  344,865 of 358,351 file-specific IR lines.
+- **canaries: 135 registered, 0 missed.**
 
 **The bootstrap compiler reproduces its own compilation.** All ten of
 its files — the five passes and the five command-line drivers — emit
@@ -92,7 +92,7 @@ figure.
 the two implementations agree; it says nothing about whether the corpus
 could tell them apart if they stopped agreeing — and for four
 consecutive slices of the codegen port, the honest answer was that it
-could not. `bootstrap/canary.py` holds a hundred and twenty-nine
+could not. `bootstrap/canary.py` holds a hundred and thirty-five
 deliberate breakages, one per mechanism, and asks the corpus whether it
 notices:
 **0 not caught.** A failure
