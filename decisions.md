@@ -6536,4 +6536,4 @@ A small slice, and a line worth drawing carefully. **300,464 of 319,458 file-spe
 
 **Three new canaries. 106 in total.**
 
-**Verified.** Lexer 118/118, parser 118/118, semantic 118/118, codegen 67 match and 0 differ (66 corpus files plus this slice's own case file). Three canaries run: all caught, 0 missed, 0 broken -- the argument-type one as a ratchet in its first spelling and, after the re-aim above, as a differing line.
+**Verified.** Lexer 118/118, parser 118/118, semantic 118/118, codegen 67 match and 0 differ (66 corpus files plus this slice's own case file). Three canaries run: all caught, 0 missed, 0 broken -- the argument-type one as a ratchet in its first spelling and, after the re-aim above, as a differing line (`festina_rotate(i64 ...)` where the original emits `double`).

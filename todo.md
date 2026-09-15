@@ -59,7 +59,7 @@ reason for the queue is gone. Each of these now costs its own
 implementation plus a port of that implementation, which is the
 ordinary price of a language change from here on.
 
-A caution that applies to all five: `bootstrap/` is a second
+A caution that applies to all six: `bootstrap/` is a second
 implementation of the compiler, and a capability that changes codegen
 has to land in both or the differential test goes red. That is the
 point of the test, not a problem with it — but it does mean these are
@@ -81,12 +81,86 @@ larger than they look.
   exactly as `img`/`aud` already gate theirs. That conditional-linking
   property is the point: a program with no `vid` in it must not grow a
   video decoder.
+- **A built-in test suite: `test` blocks and `festina test`.** Named
+  groups of assertions, run by a CLI verb of their own, so a Festina
+  program can be tested without a second language in the loop.
+
+  ```festina
+  test 'basic math test' {
+      test(2 + 2, 4)
+      test(3 - 1, 2)
+      test(2 - 2, 4)
+  }
+
+  test 'string interpolation' {
+      text name = 'Patrick'
+      text greeting = `Hello, ${name}!`
+      test(greeting, 'Hello, Patrick!')
+  }
+  ```
+
+  ```
+  $ festina test ./test-example.f
+  basic math test: 2 pass, 1 fail. 66%
+   | - fail: test(2-2, 4) // 0
+  string interpolation: 1 pass. 100%
+  Overall: 3 pass, 1 fail. 75%
+  ```
+
+  The shape is settled; five things about it are not, and each is a
+  decision rather than an implementation detail.
+
+  **`test` is both a block keyword and a callable**, which is a
+  collision this language has no precedent for. A program that
+  declares its own `func test(...)` or a `test` binding has to keep
+  working, or this is a breaking change dressed as an addition — and
+  decisions.md #298 and #317 are two separate rounds of exactly that
+  kind of name confusion already. Contextual on the following token
+  (`test 'name' {` is a declaration, `test(` is a call) is the
+  cheapest answer, and needs checking against the real grammar rather
+  than assumed.
+
+  **What `test(actual, expected)` means for a non-scalar.** Scalars and
+  `text` are obvious. `struct == struct` is currently *unsettled* — it
+  emits invalid LLVM and nothing rejects it (see the entry below), and
+  decisions.md #54's ambiguity rule is why neither identity nor deep
+  equality was ever picked. A test assertion wants deep equality and would be the
+  first thing in the language to need it, so this either forces that
+  decision or restricts `test()` to the types that already have `==`.
+
+  **The failure line quotes the assertion's own SOURCE.** `test(2-2,
+  4)` appears in the output spelled as it was written, not
+  reconstructed from the AST — note the sketch's own `2-2` against the
+  `2 - 2` in the block. That needs the source span carried to wherever
+  the report is produced, which today only error messages do.
+
+  **The percentages are truncated, not rounded** (2 of 3 is 66%, not
+  67%), and a group with no failures omits the fail count entirely
+  (`1 pass. 100%`, not `1 pass, 0 fail`). Both are worth pinning in
+  tests, since both are the kind of detail a reimplementation gets
+  subtly wrong.
+
+  **The exit code is what makes it usable in CI**, and the sketch does
+  not say what it is. Non-zero on any failure is the only answer that
+  makes `festina test` usable in a pipeline.
+
+  Also open: whether `festina test` runs the file's ordinary top-level
+  code as well as its `test` blocks, and whether `test` blocks are
+  stripped from a normal `festina compile` (they should be — a test
+  block in a shipped binary is dead weight, and that is a codegen
+  change, which by the caution above means porting it twice).
+
+  (The sketch's `test(greeting, 'Hello, Patrick')` against a greeting
+  of `Hello, Patrick!` is a typo in the sketch, not a third case: as
+  written it would fail, while the sample output reports the group
+  passing. Corrected above.)
+
 - **Research a `gguf` type, for talking to a model directly.** The
   open questions are what the value actually owns (a memory-mapped
   file? a loaded context?), what the call surface is, and whether the
   dependency can be gated the way `vid`'s would be. Research first —
-  this is the only one of the five whose *design* is unsettled, not
-  just its implementation.
+  the test suite above has open decisions of its own, but its shape is
+  given; this one's is not.
 
 ## Memory model
 
