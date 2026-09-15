@@ -4943,11 +4943,23 @@ Val func cgCall(e:Node, wantValue:bool) {
     // `color`; three are raw channels, for a colour chosen at runtime.
     if name == 'fillStyle' || name == 'borderColor' {
         arr[Node] sargs = listOf(e, 'args')
-        if sargs.length != 3 {
+        if sargs.length != 1 && sargs.length != 3 {
             cgUnported(`${name}() with ${sargs.length} arguments`)
             return none
         }
         CG_USES_GRAPHICS_CODE = true
+        // claude.md #91: ONE argument is an already-packed `color`,
+        // whether it came from a declaration's own literal or from
+        // another colour-typed binding. Three are raw channels, for a
+        // colour chosen at runtime.
+        if sargs.length == 1 {
+            text cfn = 'festina_set_fill_color'
+            if name == 'borderColor' { cfn = 'festina_set_border_color' }
+            Val cv2 = cgExprExpecting(sargs[0], 'color', '')
+            if CG_STUCK { return none }
+            cgOut(`  call void @${cfn}(i64 ${cv2.v})`)
+            return cgVal('0', 'void', 'void')
+        }
         text sfn = 'festina_set_fill_rgb'
         if name == 'borderColor' { sfn = 'festina_set_border_rgb' }
         arr[text] schan = []
@@ -5000,6 +5012,49 @@ Val func cgCall(e:Node, wantValue:bool) {
         }
         cgOut(`  call void @${dfn}(${djoined})`)
         return cgVal('0', 'void', 'void')
+    }
+    // claude.md #185: three shapes, picked by argument count --
+    // semantic analysis has already confirmed exactly one matches.
+    if name == 'drawImage' {
+        arr[Node] iargs = listOf(e, 'args')
+        text ifn = ''
+        if iargs.length == 3 { ifn = 'festina_draw_image' }
+        else if iargs.length == 5 { ifn = 'festina_draw_image_scaled' }
+        else if iargs.length == 9 { ifn = 'festina_draw_image_region' }
+        else {
+            cgUnported(`drawImage() with ${iargs.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        Val iv = cgExprExpecting(iargs[0], 'img', '')
+        if CG_STUCK { return none }
+        text ijoined = ''
+        int iq = 1
+        while iq < iargs.length {
+            Val nv = cgExprExpecting(iargs[iq], 'int', '')
+            if CG_STUCK { return none }
+            ijoined = ijoined + `, i64 ${nv.v}`
+            iq++
+        }
+        cgOut(`  call void @${ifn}(ptr ${iv.v}${ijoined})`)
+        return cgVal('0', 'void', 'void')
+    }
+    // claude.md #189: reads the canvas's own backing store directly,
+    // so it needs no window either -- only Cairo.
+    if name == 'getPixelColor' {
+        arr[Node] gargs = listOf(e, 'args')
+        if gargs.length != 2 {
+            cgUnported(`getPixelColor() with ${gargs.length} arguments`)
+            return none
+        }
+        CG_USES_GRAPHICS_CODE = true
+        Val gx = cgExprExpecting(gargs[0], 'int', '')
+        if CG_STUCK { return none }
+        Val gy = cgExprExpecting(gargs[1], 'int', '')
+        if CG_STUCK { return none }
+        text gout = cgTmp()
+        cgOut(`  ${gout} = call i64 @festina_get_pixel_color(i64 ${gx.v}, i64 ${gy.v})`)
+        return cgVal(gout, 'i64', 'color')
     }
     if name == 'drawText' {
         arr[Node] targs2 = listOf(e, 'args')
@@ -5054,11 +5109,22 @@ Val func cgCall(e:Node, wantValue:bool) {
     // different port.
     if name == 'saveCanvas' {
         arr[Node] vargs = listOf(e, 'args')
-        if vargs.length != 1 {
+        if vargs.length > 1 {
             cgUnported(`saveCanvas() with ${vargs.length} arguments`)
             return none
         }
         CG_USES_GRAPHICS_CODE = true
+        // claude.md #135: with no path it answers a fresh img SNAPSHOT
+        // of the canvas instead of writing a file -- a different return
+        // TYPE, which is why it is its own branch rather than an
+        // optional argument on the one below.
+        if vargs.length == 0 {
+            text snap = cgTmp()
+            cgOut(`  ${snap} = call ptr @festina_canvas_to_image()`)
+            Val snapv = cgVal(snap, 'ptr', 'img')
+            snapv.fresh = true
+            return snapv
+        }
         Val pv = cgExprExpecting(vargs[0], 'text', '')
         if CG_STUCK { return none }
         text sout = cgTmp()
