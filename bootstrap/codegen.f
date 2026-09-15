@@ -4128,6 +4128,55 @@ Val func cgMethodCall(e:Node, callee:Node) {
     // The receiver decides: the same four names are canvas builtins
     // when called bare, so this only claims them once the receiver has
     // been emitted and turns out to be an image.
+    // claude.md #185: a CLIP is an independent new surface rather than
+    // a view into the receiver, which is what lets an owning receiver
+    // be released the moment it has been read.
+    if m == 'clip' || m == 'resize' || m == 'getPixelColor' {
+        Val cimg = cgExpr(recv)
+        if CG_STUCK { return none }
+        if cimg.fty == 'img' {
+            arr[text] cvals = []
+            int ci2 = 0
+            while ci2 < args.length {
+                Val cav = cgExprExpecting(args[ci2], 'int', '')
+                if CG_STUCK { return none }
+                cvals.push(cav.v)
+                ci2++
+            }
+            CG_USES_GRAPHICS_CODE = true
+            if m == 'clip' {
+                if args.length != 4 {
+                    cgUnported(`.clip() with ${args.length} arguments`)
+                    return none
+                }
+                text clout = cgTmp()
+                cgOut(`  ${clout} = call ptr @festina_image_clip(ptr ${cimg.v}, i64 ${cvals[0]}, i64 ${cvals[1]}, i64 ${cvals[2]}, i64 ${cvals[3]})`)
+                cgReleaseOwnedReceiver(recv, cimg)
+                Val clres = cgVal(clout, 'ptr', 'img')
+                clres.fresh = true
+                return clres
+            }
+            if m == 'getPixelColor' {
+                if args.length != 2 {
+                    cgUnported(`.getPixelColor() with ${args.length} arguments`)
+                    return none
+                }
+                text gpout = cgTmp()
+                cgOut(`  ${gpout} = call i64 @festina_image_get_pixel_color(ptr ${cimg.v}, i64 ${cvals[0]}, i64 ${cvals[1]})`)
+                cgReleaseOwnedReceiver(recv, cimg)
+                return cgVal(gpout, 'i64', 'color')
+            }
+            if args.length != 2 {
+                cgUnported(`.resize() with ${args.length} arguments`)
+                return none
+            }
+            cgOut(`  call void @festina_image_resize(ptr ${cimg.v}, i64 ${cvals[0]}, i64 ${cvals[1]})`)
+            cgReleaseOwnedReceiver(recv, cimg)
+            return cgVal('0', 'void', 'void')
+        }
+        cgUnported(`.${m}() on ${cimg.fty}`)
+        return none
+    }
     if CG_IMAGE_OPS[m] != null || m == 'drawRect' || m == 'drawPixel'
             || m == 'drawCircle' || m == 'drawText' {
         Val imgRecv = cgExpr(recv)
@@ -5616,10 +5665,11 @@ void func cgStmt(s:Node) {
     }
 
     if s.kind == 'VarDecl' {
-        if fieldOf(s, 'is_const').raw == 'true' {
-            cgUnported('const declaration')
-            return
-        }
+        // `const` is a SEMANTIC rule and nothing else: it forbids
+        // reassignment and freeing, both of which semantic analysis has
+        // already enforced by the time anything reaches here. Codegen
+        // never consults the flag at all, so a const declaration emits
+        // exactly what the same declaration without it would.
         if fieldOf(s, 'manually_managed').raw == 'true' {
             cgUnported('manually-managed declaration')
             return
