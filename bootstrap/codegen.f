@@ -2063,6 +2063,12 @@ map[int] TBL_NCOLS = {}
 // declaration order, so the index IS the offset divided by eight --
 // unlike a struct, whose fields are laid out by LLVM.
 map[int] TBL_ARRAYS = {}
+// claude.md #112: the query-column globals already emitted for a
+// STRUCT, and the row converters already generated. Separate from the
+// table ones because a struct and a table may share a name in neither
+// direction here -- they are different namespaces of globals.
+map[int] CG_QARRAYS = {}
+map[int] CG_ROWCONV = {}
 // claude.md #70: the `DatabaseURL = <expr>` directive's own value
 // expression, or null. Not a statement the program runs: it is lifted
 // out of the body and evaluated in main's prologue instead, ahead of
@@ -3002,7 +3008,14 @@ Val func cgLoadFieldValue(fp:Val) {
     if payload == '' {
         text plain = cgTmp()
         cgOut(`  ${plain} = load ${fp.lty}, ptr ${fp.v}`)
-        return cgVal(plain, fp.lty, fp.fty)
+        Val pv3 = cgVal(plain, fp.lty, fp.fty)
+        // claude.md #141: a `func` field's SIGNATURE travels in the
+        // element-type slot and has to survive the load -- a call
+        // through the field has nothing else to spell its argument and
+        // return types with.
+        pv3.ety = fp.ety
+        pv3.sname = fp.sname
+        return pv3
     }
 
 
@@ -3308,6 +3321,19 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
     // expression's own shape is not enough to emit it.
     if e.kind == 'Call' {
         if fty == 'arr' {
+            // claude.md #112: the same collection into a STRUCT rather
+            // than a row -- which is what gives an aliased or computed
+            // column a declared landing spot.
+            if SF_NAMES[ety] != null {
+                Node ssc = childOf(e, 'callee')
+                if ssc != null {
+                    if ssc.kind == 'Identifier' {
+                        if rawText(ssc, 'name') == 'sqlite' {
+                            return cgSqliteCollectStruct(e, ety)
+                        }
+                    }
+                }
+            }
             if TBL_COLS[ety] != null {
                 Node scal = childOf(e, 'callee')
                 if scal != null {
@@ -3567,6 +3593,13 @@ Val func cgMapGet(objV:text, vty:text, keyV:text) {
     // value whose fty was 'People' -- a type nothing downstream knows
     // -- instead of a row that remembers which table it came from.
     if TBL_COLS[vty] != null { return cgTableVal(out, vty) }
+    // claude.md #141: a function value out of a map, on the same terms
+    // -- its SIGNATURE has to survive the read, or a call through the
+    // entry has nothing to spell its types with.
+    if cgIsFuncElem(vty) { return cgFuncVal(out, cgFuncElemSig(vty)) }
+    // And a nested container, whose own element type is the second
+    // half of the key rather than the whole of it.
+    if cgIsNestedElem(vty) { return cgElemVal(out, vty) }
     return cgVal(out, vlty, vty)
 }
 
@@ -3869,6 +3902,78 @@ void func cgThrow(s:Node) {
     cgOut(`  call void @festina_throw(ptr ${val})`)
 }
 
+// `delete s.field` / `delete row.column`. The field pointer is
+// resolved through the shared path, so the object is emitted exactly
+// once -- by the caller, which already did.
+//
+// claude.md #120: the NULL is stored BEFORE the old value is released.
+// A cycle trial run by that release must never find the field still
+// pointing at the value whose count it has just dropped, which is the
+// same ordering a field reassignment already uses.
+void func cgDeleteField(s:Node, target:Node, obj:Val) {
+    if fieldOf(target, 'computed').raw == 'true' {
+        cgUnported(`delete of a computed member on a ${obj.fty}`)
+        return
+    }
+    text prop = rawText(target, 'prop')
+    text fty = ''
+    text fkey = ''
+    text fp = ''
+    if obj.fty == 'struct' {
+        text key = `${obj.sname}.${prop}`
+        if SF_LTY[key] == null {
+            cgUnported(`field ${prop} of ${obj.sname}`)
+            return
+        }
+        fty = SF_FTY[key]
+        if fty == 'struct' { fkey = SF_SNAME[key] }
+        else if SF_ETY[key] != null { fkey = SF_ETY[key] }
+        fp = cgTmp()
+        cgOut(`  ${fp} = getelementptr %struct.${obj.sname}, ptr ${obj.v}, i32 0, i32 ${SF_IDX[key]}`)
+    } else {
+        text ckey = `${obj.sname}.${prop}`
+        if TB_FTY[ckey] == null {
+            cgUnported(`column ${prop} of ${obj.sname}`)
+            return
+        }
+        fty = TB_FTY[ckey]
+        fp = cgTmp()
+        cgOut(`  ${fp} = getelementptr i8, ptr ${obj.v}, i64 ${TB_IDX[ckey] * 8}`)
+    }
+    text lty = cgLtyOf(fty)
+    if lty == '' {
+        cgUnported(`delete of a ${fty} field`)
+        return
+    }
+    text old = ''
+    if lty == 'ptr' {
+        old = cgTmp()
+        cgOut(`  ${old} = load ptr, ptr ${fp}`)
+    }
+    cgOut(`  store ${lty} ${cgNullValue(fty)}, ptr ${fp}`)
+    if cgIsRefcounted(fty) {
+        cgOut(`  call void ${cgReleaseFnFor(fty, fkey)}(ptr ${old})`)
+    } else if fty == 'text' {
+        cgOut(`  call void @free(ptr ${old})`)
+    }
+    if obj.fty == 'table' {
+        // claude.md #111: the presence bit, one slot past the columns.
+        // A table past its sixty-fourth column has no bit to clear.
+        int idx = TB_IDX[`${obj.sname}.${prop}`]
+        if idx < 64 {
+            text maskP = cgTmp()
+            cgOut(`  ${maskP} = getelementptr i8, ptr ${obj.v}, i64 ${TBL_NCOLS[obj.sname] * 8}`)
+            text mask = cgTmp()
+            cgOut(`  ${mask} = load i64, ptr ${maskP}`)
+            text cleared = cgTmp()
+            // Signed decimal, which is what LLVM's own i64 literal
+            // grammar takes: the complement of a set bit is negative.
+            cgOut(`  ${cleared} = and i64 ${mask}, ${~(1 << idx)}`)
+            cgOut(`  store i64 ${cleared}, ptr ${maskP}`)
+        }
+    }
+}
+
 void func cgDelete(s:Node) {
     Node target = childOf(s, 'target')
     if target == null || target.kind != 'Member' {
@@ -3877,6 +3982,15 @@ void func cgDelete(s:Node) {
     }
     Val obj = cgExpr(childOf(target, 'obj'))
     if CG_STUCK { return }
+    // claude.md #111: `delete s.field` on a STRUCT or a table ROW --
+    // the field is released and reads null afterwards, which is a
+    // reassignment to null with one extra effect on a row (its presence
+    // bit clears, so undefined() reports it exactly like a column the
+    // query never selected).
+    if obj.fty == 'struct' || obj.fty == 'table' {
+        cgDeleteField(s, target, obj)
+        return
+    }
     if obj.fty != 'map' {
         cgUnported(`delete through a ${obj.fty}`)
         return
@@ -5316,6 +5430,52 @@ Val func cgMethodCall(e:Node, callee:Node) {
         spr2.fresh = true
         return spr2
     }
+    // claude.md #97: `xs.indexOf(needle)`. The needle is handed over BY
+    // ADDRESS, so one runtime helper serves every element type: it
+    // compares the raw eight-byte cell, which is right for a scalar and
+    // is IDENTITY for a struct or a container, since aliases share a
+    // pointer. Text is the exception the flag exists for -- two equal
+    // strings are usually two different buffers, so the runtime
+    // switches to a real comparison.
+    //
+    // No ownership work in either direction: the needle is only read,
+    // and an index is not a reference.
+    if m == 'indexOf' && args.length == 1 {
+        Val ixObj = cgExpr(recv)
+        if CG_STUCK { return none }
+        if ixObj.fty == 'arr' {
+            if cgStorableRefcounted('arr', ixObj.ety) == false {
+                cgUnported(`.indexOf() on an array of ${ixObj.ety}`)
+                return none
+            }
+            text ixLty = cgElemLty(ixObj.ety)
+            text ixSize = '8'
+            if ixObj.ety == 'bool' { ixSize = '1' }
+            Val needle = cgExprExpectingElem(args[0], ixObj.ety)
+            if CG_STUCK { return none }
+            text ixSlot = cgTmp()
+            cgOut(`  ${ixSlot} = alloca ${ixLty}`)
+            cgOut(`  store ${ixLty} ${needle.v}, ptr ${ixSlot}`)
+            text isText = '0'
+            if ixObj.ety == 'text' { isText = '1' }
+            text ixOut = cgTmp()
+            cgOut(`  ${ixOut} = call i64 @festina_array_index_of(ptr ${ixObj.v}, i64 ${ixSize}, ptr ${ixSlot}, i8 ${isText})`)
+            // A needle COERCED from a text into a handle is a fresh
+            // reference the search only borrows, so it is given back
+            // here; the text free below covers a genuine text needle
+            // and no-ops on a handle, which is why both are needed.
+            if cgIsRefcounted(needle.fty) && needle.fresh {
+                cgOut(`  call void ${cgReleaseFnFor(needle.fty, cgRelKeyVal(needle))}(ptr ${needle.v})`)
+            }
+            cgFreeTextTemp(args[0], needle)
+            return cgVal(ixOut, 'i64', 'int')
+        }
+        if ixObj.fty == 'text' && TEXT_M_FN[m] != null {
+            return cgTextMethodCall(m, recv, ixObj, args)
+        }
+        cgUnported(`.indexOf() on ${ixObj.fty}`)
+        return none
+    }
     if m == 'push' || m == 'unshift' || m == 'pop' || m == 'shift' {
         Val obj = cgExpr(recv)
         if CG_STUCK { return none }
@@ -5862,6 +6022,16 @@ Val func cgMethodCall(e:Node, callee:Node) {
     // slice/toFloat it is gated rather than reached from a branch above.
     if m == 'indexOf' && args.length >= 1 && args.length <= 2 { known = true }
     if known == false {
+        // claude.md #141: a call through a stored FUNCTION VALUE
+        // reached by member access -- a struct field, an array element,
+        // a map value. Checked LAST, after every recognized method name
+        // above, so an established one is never shadowed by it; and the
+        // callee is read through the ORDINARY expression path, because
+        // reading `h.cb` in order to call it is the same read as
+        // binding it.
+        Val cvv = cgExpr(callee)
+        if CG_STUCK { return none }
+        if cvv.fty == 'func' { return cgCallFuncValue(e, cvv) }
         cgUnported(`method .${m}()`)
         return none
     }
@@ -6078,11 +6248,65 @@ void func cgFreeCallArgs(args:arr[Node], vals:arr[Val]) {
     }
 }
 
-// claude.md #141: calling through a function VALUE. The pointer is
-// loaded from the binding, every argument is emitted against the
-// signature's own parameter type, and the call spells each argument's
-// LLVM type explicitly -- an indirect callee carries none of that
-// itself.
+// claude.md #141: calling through a function value already in hand,
+// which is what a member-access callee gives -- a struct field, an
+// array element, a map value.
+//
+// Deliberately NOT sharing cgIndirectCall's body: this form emits no
+// cleanup-stack guard around the call at all, which is the original's
+// shape and is visible in the IR.
+Val func cgCallFuncValue(e:Node, fnv:Val) {
+    Val none
+    text sig = fnv.ety
+    if sig == '' {
+        cgUnported('call through a computed member')
+        return none
+    }
+    arr[text] ptys = cgSigParams(sig)
+    arr[Node] args = listOf(e, 'args')
+    if args.length != ptys.length {
+        cgUnported(`call through a member with ${args.length} arguments`)
+        return none
+    }
+    arr[text] parts = []
+    arr[Val] argVals = []
+    int i = 0
+    while i < args.length {
+        text pf = cgSigFty(ptys[i])
+        Val a = cgExprExpecting(args[i], pf, cgSigKey(ptys[i]))
+        if CG_STUCK { return none }
+        parts.push(`${cgLtyOf(pf)} ${a.v}`)
+        argVals.push(a)
+        i++
+    }
+    text joined = ''
+    int j = 0
+    while j < parts.length {
+        if j > 0 { joined = joined + ', ' }
+        joined = joined + parts[j]
+        j++
+    }
+    text rf = cgSigFty(cgSigRet(sig))
+    if rf == 'void' {
+        cgOut(`  call void ${fnv.v}(${joined})`)
+        cgFreeCallArgs(args, argVals)
+        return cgVal('', 'void', 'void')
+    }
+    text out = cgTmp()
+    cgOut(`  ${out} = call ${cgLtyOf(rf)} ${fnv.v}(${joined})`)
+    cgFreeCallArgs(args, argVals)
+    text rkey = cgSigKey(cgSigRet(sig))
+    if rf == 'struct' { return cgStructVal(out, rkey) }
+    if rf == 'arr' { return cgArrVal(out, rkey) }
+    if rf == 'map' { return cgMapVal(out, rkey) }
+    return cgVal(out, cgLtyOf(rf), rf)
+}
+
+// claude.md #141: calling through a function VALUE held by a BINDING.
+// The pointer is loaded from the slot, every argument is emitted
+// against the signature's own parameter type, and the call spells each
+// argument's LLVM type explicitly -- an indirect callee carries none of
+// that itself.
 Val func cgIndirectCall(e:Node, name:text) {
     Val none
     text sig = cgEtyOf(name)
@@ -6140,7 +6364,15 @@ Val func cgCall(e:Node, wantValue:bool) {
     Node callee = childOf(e, 'callee')
     if callee != null && callee.kind == 'Member' {
         if fieldOf(callee, 'computed').raw == 'true' {
-            cgUnported('call through a computed member')
+            // claude.md #141: every method branch below is spelled for
+            // a NAMED property, so a computed callee -- `fns[0](x)`,
+            // `handlers[key](x)` -- can only be a stored function
+            // VALUE. Read it the way any other expression position
+            // would and call through it.
+            Val ccv = cgExpr(callee)
+            if CG_STUCK { return none }
+            if ccv.fty == 'func' { return cgCallFuncValue(e, ccv) }
+            cgUnported(`call through a computed member on ${ccv.fty}`)
             return none
         }
         Node recv = childOf(callee, 'obj')
@@ -6936,7 +7168,22 @@ void func cgStmt(s:Node) {
     // Pure type information: the definition was emitted with the
     // module's type section and nothing reaches main.
     if s.kind == 'StructDecl' { return }
-    if s.kind == 'FuncDecl' { return }
+    // claude.md #140: a function declared INSIDE another function's
+    // body is an ordinary global declaration that happens to be written
+    // there -- the analyzer already treats it that way, and its
+    // signature was registered by the same recursive pre-pass every
+    // other one goes through. It is emitted HERE, where the statement
+    // stands, which is what puts its definition ahead of the enclosing
+    // function's in the module: the enclosing body is still being built
+    // in a buffer of its own and is appended only at the end.
+    //
+    // Only when there IS an enclosing function. At the top level the
+    // declarations pass has already emitted every one of them, and
+    // emitting again here would define each twice.
+    if s.kind == 'FuncDecl' {
+        if CG_IN_FUNC { cgFunc(s) }
+        return
+    }
     // A `table` is pure schema too, but unlike a struct it reaches the
     // program at RUN time rather than at type-check time: the columns
     // recorded in cgProgram become a festina_sync_table call in
@@ -7448,6 +7695,174 @@ text func cgSqliteStmt(e:Node) {
 //
 // The result is FRESH in the strongest sense: nothing else references
 // it yet, the same way an array literal's own header is fresh.
+// claude.md #112: the STRUCT counterpart of cgTableArrays -- column
+// name and type globals derived from a struct's own fields, so the
+// collection can match result columns to them by name exactly as it
+// does for a table. That is what gives an aliased or computed column a
+// declared landing spot: `SELECT count(*) AS total` matches a field
+// named `total`, where a table's declared columns can never be renamed
+// to chase a query's aliases.
+//
+// Field types are restricted to what a query can actually produce. A
+// struct with an arr/map/struct field can hold one in ordinary code but
+// cannot receive one from sqlite, and the refusal says which field.
+bool func cgQueryStructArrays(sname:text) {
+    if CG_QARRAYS[sname] != null { return true }
+    arr[text] fnames = []
+    if SF_NAMES[sname] != '' { fnames = SF_NAMES[sname].split('|') }
+    text namePtrs = ''
+    text typePtrs = ''
+    int i = 0
+    while i < fnames.length {
+        text fk = `${sname}.${fnames[i]}`
+        text ffty = SF_FTY[fk]
+        if ffty == 'img' { CG_USES_GRAPHICS_CODE = true }
+        if ffty == 'aud' { CG_USES_AUDIO = true }
+        if ffty != 'int' && ffty != 'float' && ffty != 'bool'
+                && ffty != 'text' && ffty != 'blob'
+                && ffty != 'img' && ffty != 'aud' {
+            cgUnported(`a sqlite() result into a ${ffty} field`)
+            return false
+        }
+        if i > 0 {
+            namePtrs = namePtrs + ', '
+            typePtrs = typePtrs + ', '
+        }
+        namePtrs = namePtrs + `ptr ${cgStringConst(fnames[i])}`
+        typePtrs = typePtrs + `ptr ${cgStringConst(ffty)}`
+        i++
+    }
+    CG_QARRAYS[sname] = 1
+    CG_EXTRA.push(`@${sname}.qcols = private constant [${fnames.length} x ptr] [${namePtrs}]`)
+    CG_EXTRA.push(`@${sname}.qtypes = private constant [${fnames.length} x ptr] [${typePtrs}]`)
+    return true
+}
+
+// One flat row turned into a real, refcounted struct instance --
+// generated once per struct type.
+//
+// A collected row is `ncols` eight-byte cells; a struct is a named LLVM
+// type with natural offsets and a refcount header in front. Rather than
+// teach every downstream reader a second layout, the row is converted
+// ONCE, right after collection: each cell is loaded at the field's own
+// LLVM type -- the raw eight bytes hold an i64, a double's bits or a
+// pointer, and little-endian is what lets an i8 bool read its low byte,
+// the same read a table row's own member access does -- and stored at
+// the field's real offset.
+//
+// A pointer field TRANSFERS ownership: the struct owns it now, and only
+// the row buffer itself is freed. This is the row's only freer other
+// than the release cascade -- a struct-query row is converted here
+// exactly once and never enters the refcounted world at all, so nothing
+// can alias it before this runs.
+//
+// The presence mask is dropped on purpose. `undefined()` is a TABLE-ROW
+// question, and an instance built from a query is an ordinary struct,
+// indistinguishable from one built by hand: an unmatched column simply
+// reads null.
+text func cgRowToStructFn(sname:text) {
+    text fn = `@__festina_rowtostruct_${sname}`
+    if CG_ROWCONV[sname] != null { return fn }
+    CG_ROWCONV[sname] = 1
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define ptr ${fn}(ptr %row) {`)
+    cgBlockLabel('entry')
+    text payload = cgFreshHeader(`%struct.${sname}`)
+    arr[text] fnames = []
+    if SF_NAMES[sname] != '' { fnames = SF_NAMES[sname].split('|') }
+    int i = 0
+    while i < fnames.length {
+        text fk = `${sname}.${fnames[i]}`
+        text flty = SF_LTY[fk]
+        text slot = cgTmp()
+        cgOut(`  ${slot} = getelementptr i8, ptr %row, i64 ${i * 8}`)
+        text v = cgTmp()
+        cgOut(`  ${v} = load ${flty}, ptr ${slot}`)
+        text fp = cgTmp()
+        cgOut(`  ${fp} = getelementptr %struct.${sname}, ptr ${payload}, i32 0, i32 ${SF_IDX[fk]}`)
+        cgOut(`  store ${flty} ${v}, ptr ${fp}`)
+        i++
+    }
+    // claude.md #265: the row buffer starts one word before the payload
+    // pointer, because every row carries a refcount header now.
+    text base = cgTmp()
+    cgOut(`  ${base} = getelementptr i8, ptr %row, i64 -8`)
+    cgOut(`  call void @free(ptr ${base})`)
+    cgOut(`  ret ptr ${payload}`)
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return fn
+}
+
+// `arr[SomeStruct] q = sqlite(...)`. The whole table pipeline --
+// prepare, bind, name-matched collection -- and one extra step at the
+// end, where each flat row becomes a struct in place.
+Val func cgSqliteCollectStruct(e:Node, sname:text) {
+    Val none
+    text stmt = cgSqliteStmt(e)
+    if CG_STUCK { return none }
+    if cgQueryStructArrays(sname) == false { return none }
+    arr[text] fnames = []
+    if SF_NAMES[sname] != '' { fnames = SF_NAMES[sname].split('|') }
+    text nSlot = cgTmp()
+    cgOut(`  ${nSlot} = alloca i64`)
+    text dataSlot = cgTmp()
+    cgOut(`  ${dataSlot} = alloca ptr`)
+    // claude.md #188: want_rowid is 0 -- a struct query result is not a
+    // table row and has no `.rowid` cell for the conversion to read.
+    cgOut(`  call void @festina_sqlite_collect_rows(ptr ${stmt}, i32 ${fnames.length}, ptr @${sname}.qtypes, ptr @${sname}.qcols, ptr ${nSlot}, ptr ${dataSlot}, i8 0)`)
+    text nv = cgTmp()
+    cgOut(`  ${nv} = load i64, ptr ${nSlot}`)
+    text dv = cgTmp()
+    cgOut(`  ${dv} = load ptr, ptr ${dataSlot}`)
+
+    text conv = cgRowToStructFn(sname)
+    int uid = cgUid()
+    text iSlot = cgTmp()
+    cgOut(`  ${iSlot} = alloca i64`)
+    cgOut(`  store i64 0, ptr ${iSlot}`)
+    text condL = cgLabel(`rowconv.cond${uid}`)
+    text bodyL = cgLabel(`rowconv.body${uid}`)
+    text endL = cgLabel(`rowconv.end${uid}`)
+    cgOut(`  br label %${condL}`)
+    cgBlockLabel(condL)
+    text iv = cgTmp()
+    cgOut(`  ${iv} = load i64, ptr ${iSlot}`)
+    text more = cgTmp()
+    cgOut(`  ${more} = icmp slt i64 ${iv}, ${nv}`)
+    cgOut(`  br i1 ${more}, label %${bodyL}, label %${endL}`)
+    cgBlockLabel(bodyL)
+    text slotP = cgTmp()
+    cgOut(`  ${slotP} = getelementptr ptr, ptr ${dv}, i64 ${iv}`)
+    text rowV = cgTmp()
+    cgOut(`  ${rowV} = load ptr, ptr ${slotP}`)
+    text conv2 = cgTmp()
+    cgOut(`  ${conv2} = call ptr ${conv}(ptr ${rowV})`)
+    cgOut(`  store ptr ${conv2}, ptr ${slotP}`)
+    text nxt = cgTmp()
+    cgOut(`  ${nxt} = add i64 ${iv}, 1`)
+    cgOut(`  store i64 ${nxt}, ptr ${iSlot}`)
+    cgOut(`  br label %${condL}`)
+    cgBlockLabel(endL)
+
+    text header = cgFreshHeader('%struct._FestinaArray')
+    text lenP = cgTmp()
+    cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${header}, i32 0, i32 0`)
+    cgOut(`  store i64 ${nv}, ptr ${lenP}`)
+    text dataP = cgTmp()
+    cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr ${header}, i32 0, i32 1`)
+    cgOut(`  store ptr ${dv}, ptr ${dataP}`)
+    Val r = cgArrVal(header, sname)
+    r.fresh = true
+    return r
+}
+
 Val func cgSqliteCollect(e:Node, tname:text) {
     Val none
     text stmt = cgSqliteStmt(e)
@@ -8451,6 +8866,7 @@ void func cgAssign(e:Node) {
 // the original hands to whatever comes next. It cost an afternoon's
 // worth of off-by-sixteen temp numbers to notice.
 bool func cgStorableRefcounted(fty:text, ety:text) {
+    if cgIsFuncElem(ety) { return true }
     if fty == 'struct' || fty == 'blob' || fty == 'regex' { return true }
     // A handle or a row: one pointer, and nothing to say about
     // elements, so there is no element type for the question below to
@@ -8466,6 +8882,7 @@ bool func cgStorableRefcounted(fty:text, ety:text) {
 // needs its own fty and its own element type rather than the scalar
 // shape every other element read has.
 Val func cgElemVal(v:text, ety:text) {
+    if cgIsFuncElem(ety) { return cgFuncVal(v, cgFuncElemSig(ety)) }
     if SF_NAMES[ety] != null { return cgStructVal(v, ety) }
     if TBL_COLS[ety] != null { return cgTableVal(v, ety) }
     if cgIsNestedElem(ety) {
@@ -8554,6 +8971,9 @@ bool func cgIsRefcounted(fty:text) {
 // release. A scalar element owns nothing; a `text` one owns a buffer;
 // a STRUCT one owns a whole reference, whatever its own fields are.
 bool func cgElemOwnsSomething(ety:text) {
+    // A function value owns nothing: a declared function is immortal
+    // for the process, so a container of them has no cascade at all.
+    if cgIsFuncElem(ety) { return false }
     if ety == 'text' { return true }
     // A NESTED container element owns a whole reference, whatever it
     // holds -- an `arr[arr[int]]`'s slots are counted values even
@@ -8581,7 +9001,30 @@ bool func cgElemOwnsSomething(ety:text) {
 // a scalar is a bare word, so neither can be mistaken for one.
 bool func cgIsNestedElem(ety:text) {
     if ety == '' { return false }
+    // A FUNCTION element carries its whole signature, which has colons
+    // of its own -- and a zero-argument one has exactly the two parts
+    // this test looks for. Checked first, so the two spellings cannot
+    // be mistaken for each other.
+    if cgIsFuncElem(ety) { return false }
     return ety.split(':').length == 2
+}
+
+// claude.md #141: `arr[func[int]:int]` and `map[func[T]:U]`. A function
+// value is scalar-shaped and IMMORTAL -- one pointer, never retained,
+// tracked or released -- so it rides every generic element path
+// unchanged. What it does need is its own SIGNATURE, because an element
+// read has nowhere else to get one from and a call through it has
+// nothing to spell its argument and return types with.
+//
+// Spelled `func!<sig>`: `!` appears in no signature, unlike the colon
+// the `arr:T` nested-container key already uses.
+bool func cgIsFuncElem(ety:text) {
+    if ety == '' { return false }
+    return ety.startsWith('func!')
+}
+
+text func cgFuncElemSig(ety:text) {
+    return ety.slice(5, ety.length)
 }
 
 // The LLVM type of one element. Every non-scalar is a pointer to its
@@ -8590,6 +9033,7 @@ bool func cgIsNestedElem(ety:text) {
 // own `fty` is the tag `struct` while an element type is the struct's
 // NAME, so the two are never directly comparable.
 bool func cgValIsElem(v:Val, ety:text) {
+    if cgIsFuncElem(ety) { return v.fty == 'func' }
     if SF_NAMES[ety] != null { return v.fty == 'struct' && v.sname == ety }
     // A row's element type is its TABLE name, so the value's own fty
     // ('table') never equals it -- the name is in `sname`, exactly as
@@ -8626,6 +9070,7 @@ Val func cgExprExpectingElem(e:Node, ety:text) {
 // (a scalar). What separates them is which ownership question a store
 // into the slot has to ask.
 bool func cgElemIsRefcounted(ety:text) {
+    if cgIsFuncElem(ety) { return false }
     if SF_NAMES[ety] != null { return true }
     if TBL_COLS[ety] != null { return true }
     if cgIsNestedElem(ety) { return true }
@@ -8635,6 +9080,7 @@ bool func cgElemIsRefcounted(ety:text) {
 }
 
 text func cgElemLty(ety:text) {
+    if cgIsFuncElem(ety) { return 'ptr' }
     if SF_NAMES[ety] != null { return 'ptr' }
     if TBL_COLS[ety] != null { return 'ptr' }
     if cgIsNestedElem(ety) { return 'ptr' }
@@ -8941,6 +9387,13 @@ text func cgEtyOfTy(t:Ty) {
     // telling a NESTED container from a named type, and a row is not
     // one.
     if t.elem.kind == 'table' { return t.elem.name }
+    // claude.md #141: a function element, spelled with its whole
+    // signature -- see cgIsFuncElem.
+    if t.elem.kind == 'func' {
+        text fsig = cgFuncSig(t.elem)
+        if fsig == '' { return '' }
+        return `func!${fsig}`
+    }
     if t.elem.kind == 'arr' || t.elem.kind == 'map' {
         text inner = cgEtyOfTy(t.elem)
         if inner == '' { return '' }
@@ -12129,6 +12582,48 @@ void func cgRegisterFuncSignature(d:Node) {
     cgRegisterFuncSignatureAs(d, rawText(d, 'name'))
 }
 
+// claude.md #140: every function reachable anywhere in the program,
+// registered before a single body is emitted -- which is what makes
+// declaration ORDER stop mattering. The walk has to descend into
+// exactly the shapes the analyzer's own mirror of it descends into: a
+// function declared inside an `if` arm, a loop body or another
+// function is still an ordinary global declaration, and one this pass
+// missed would be reachable at analysis time and absent here, leaving
+// the call with nothing to look up.
+//
+// A thread body is deliberately NOT walked: its functions are private
+// to it, registered under mangled names by the thread declaration
+// itself.
+void func cgRegisterFuncSignaturesIn(stmts:arr[Node]) {
+    int i = 0
+    while i < stmts.length {
+        Node s = stmts[i]
+        if s.kind == 'FuncDecl' {
+            cgRegisterFuncSignature(s)
+            cgRegisterFuncSignaturesIn(cgBlockStmts(childOf(s, 'body')))
+        } else if s.kind == 'EventHandler' {
+            cgRegisterFuncSignaturesIn(cgBlockStmts(childOf(s, 'body')))
+        } else if s.kind == 'Block' {
+            cgRegisterFuncSignaturesIn(listOf(s, 'body'))
+        } else if s.kind == 'IfStmt' {
+            cgRegisterFuncSignaturesIn(cgBlockStmts(childOf(s, 'then')))
+            Node orelse = childOf(s, 'orelse')
+            if orelse != null {
+                if orelse.kind == 'IfStmt' {
+                    arr[Node] chain = []
+                    chain.push(orelse)
+                    cgRegisterFuncSignaturesIn(chain)
+                } else {
+                    cgRegisterFuncSignaturesIn(cgBlockStmts(orelse))
+                }
+            }
+        } else if s.kind == 'WhileStmt' || s.kind == 'ForStmt' {
+            cgRegisterFuncSignaturesIn(cgBlockStmts(childOf(s, 'body')))
+        }
+        i++
+    }
+}
+
 // claude.md #210: the same registration under a chosen KEY, which a
 // thread-private function needs -- two threads may each declare a
 // `helper`, and a top-level one may exist besides, so the tables cannot
@@ -12616,6 +13111,12 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                         SF_ETY[key] = cgEtyOfTy(ft)
                     }
                 }
+                // claude.md #141: a `func` field carries its SIGNATURE
+                // in the element-type slot, exactly as a func local and
+                // a func parameter do -- without it a call through the
+                // field has nothing to spell its argument and return
+                // types with.
+                if ffty == 'func' { SF_ETY[key] = cgFuncSig(ft) }
                 if ft != null {
                     if ft.amortized { SF_AMOR[key] = 1 }
                 }
@@ -12811,11 +13312,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // Function signatures are registered before any body is emitted,
     // so a call can precede its declaration -- function hoisting
     // (claude.md #58) is a language rule, not an ordering accident.
-    int fs2 = 0
-    while fs2 < body.length {
-        if body[fs2].kind == 'FuncDecl' { cgRegisterFuncSignature(body[fs2]) }
-        fs2++
-    }
+    cgRegisterFuncSignaturesIn(body)
 
     // claude.md #208: the program-wide outbound message type, resolved
     // before any body is emitted -- a thread declared ABOVE the
