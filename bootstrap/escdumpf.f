@@ -103,34 +103,6 @@ void func addRecord(kind:text, name:text, names:map[int]) {
     SEQ++
 }
 
-// An arrow function is emitted where its expression is reached, so its
-// own analysis lands AFTER the enclosing body's rather than in source
-// order -- measured: a top-level `func[int]:void p = void (v:int) =>
-// ...` produces its record after the TOPLEVEL one, not before. That
-// interleaving, and the synthesized `__festina_arrow_N` name it is
-// keyed by, are both real work rather than a detail, so a program
-// containing one is reported unported instead of guessed at.
-bool func hasArrow(n:Node) {
-    if n == null { return false }
-    if n.kind == 'ArrowFuncExpr' { return true }
-    int i = 0
-    while i < n.fields.length {
-        Field f = n.fields[i]
-        if f.tag == 'node' {
-            if hasArrow(f.node) { return true }
-        }
-        if f.tag == 'list' {
-            int k = 0
-            while k < f.list.length {
-                if hasArrow(f.list[k]) { return true }
-                k++
-            }
-        }
-        i++
-    }
-    return false
-}
-
 // `match` is pure sugar that festina/semantic.py DESUGARS AWAY, in
 // place, into a right-nested IfStmt/TypeofExpr chain before codegen --
 // and therefore before escape analysis -- ever runs. bootstrap/
@@ -162,21 +134,97 @@ bool func hasKind(n:Node, want:text) {
 
 int ai = 0
 while ai < merged.length {
-    if hasArrow(merged[ai]) {
-        UNPORTED = true
-        WHYNOT = 'arrow function'
-    }
     if hasKind(merged[ai], 'MatchStmt') {
+        // Only reachable if the analyzer's own desugaring (claude.md
+        // #252) somehow left one behind: it rewrites every `match` in
+        // place, before this walk ever runs. Kept as a guard rather
+        // than deleted, because a MatchStmt reaching here would be
+        // skipped silently and would read as an escape-analysis
+        // disagreement rather than as the missing rewrite it is.
         UNPORTED = true
         WHYNOT = 'match statement'
     }
     ai++
 }
 
+// claude.md #142: an arrow function is analyzed where its EXPRESSION
+// is reached, not where the enclosing declaration stands -- so its
+// record lands immediately after the body that contains it, and an
+// arrow inside another arrow's body after that one's. A plain
+// pre-order walk over the statements in emission order is exactly that
+// interleaving.
+//
+// The body it is analyzed over is the synthesized one codegen builds:
+// a void arrow discards its value, so its body is an ExprStmt, and a
+// non-void one returns it. That asymmetry is the language's own --
+// `return <expr>` inside a void function is already an error.
+void func escAnalyzeArrow(a:Node) {
+    arr[Node] stmts = []
+    Node bodyExpr = childOf(a, 'body')
+    if rawText(a, 'return_type') == 'void' {
+        Node es = mk('ExprStmt')
+        addNode(es, 'expr', bodyExpr)
+        stmts.push(es)
+    } else {
+        Node rs = mk('Return')
+        addNode(rs, 'value', bodyExpr)
+        stmts.push(rs)
+    }
+    map[int] escSet = findEscapingNames(stmts)
+    text nm = rawText(a, 'arrow_name')
+    addRecord('FUNC', nm, escSet)
+    escRegisterParams(nm, listOf(a, 'params'), escSet)
+}
+
+// Every body reachable from `n` that is emitted WHERE IT STANDS rather
+// than where its enclosing declaration does: an arrow function
+// (claude.md #142) and a function declared inside another body
+// (claude.md #140). Both are analyzed at the point the enclosing body
+// reaches them, so both land after that body's own record and before
+// the next declaration's.
+//
+// Field order is the order the emitter reaches them in, because a
+// node's fields are stored the way the parser wrote them. Each is
+// recorded and THEN descended into, so anything nested inside one
+// follows it.
+void func analyzeNestedIn(n:Node) {
+    if n == null { return }
+    if n.kind == 'FuncDecl' {
+        // analyzeFunc records it and walks its own body, so descending
+        // into the declaration's fields here as well would record
+        // everything inside it twice.
+        analyzeFunc(n)
+        return
+    }
+    if n.kind == 'ArrowFuncExpr' { escAnalyzeArrow(n) }
+    int i = 0
+    while i < n.fields.length {
+        Field f = n.fields[i]
+        if f.tag == 'node' { analyzeNestedIn(f.node) }
+        if f.tag == 'list' {
+            int k = 0
+            while k < f.list.length {
+                analyzeNestedIn(f.list[k])
+                k++
+            }
+        }
+        i++
+    }
+}
+
+void func analyzeNestedInList(stmts:arr[Node]) {
+    int i = 0
+    while i < stmts.length {
+        analyzeNestedIn(stmts[i])
+        i++
+    }
+}
+
 void func analyzeFunc(s:Node) {
     map[int] escSet = findEscapingNames(escBodyStmts(s))
     addRecord('FUNC', rawText(s, 'name'), escSet)
     escRegisterParams(rawText(s, 'name'), listOf(s, 'params'), escSet)
+    analyzeNestedInList(escBodyStmts(s))
 }
 
 void func analyzeHandler(s:Node) {
@@ -184,6 +232,7 @@ void func analyzeHandler(s:Node) {
     // No registration: nothing ever calls a handler by name, so it
     // never needs an entry for a later analysis to consult.
     addRecord('HANDLER', rawText(s, 'name'), escSet)
+    analyzeNestedInList(escBodyStmts(s))
 }
 
 // The first `on NAME` in a thread body, or null.
@@ -307,6 +356,10 @@ while ei < merged.length {
 }
 map[int] topEsc = findEscapingNames(entryStmts)
 addRecord('TOPLEVEL', '', topEsc)
+// And then main's own arrows and nested declarations, reached while
+// its body is emitted -- after its analysis, exactly as for any other
+// body.
+analyzeNestedInList(entryStmts)
 
 if ESC_UNKNOWN {
     UNPORTED = true

@@ -277,19 +277,28 @@ open:
 
 ## The bootstrap compiler
 
-The port reached its target: **all ten of the bootstrap's own files
-reproduce their own compilation byte for byte, and the second-
-generation binary built from that IR is identical to the first**
-(decisions.md #313). What remains open is below; none of it stands
-between the compiler and compiling itself.
+**The port is complete.** Every pass agrees with its original on every
+file of the corpus, the bootstrap's own 122,000-line-of-IR source
+included:
 
-- **What remains unported is the SUBSYSTEMS**, and they are being
-  worked through: graphics, audio, HTTP, threads, sqlite, tables,
-  regex, timers and the JSON conversions — 59 corpus files. The
-  language-level work is done (the manual escape hatch, first-class
-  function values, and `try`/`catch`/`throw` landed in decisions.md
-  #314), so what is left is genuinely per-subsystem rather than
-  per-mechanism.
+| | |
+|---|---|
+| lexer | 124 match, 0 differ |
+| parser | 124 match, 0 differ, 0 unported |
+| semantic | 124 match, 0 differ, 0 unported |
+| escape analysis | 113 match, 0 differ, 0 unported — 2,221 of 2,221 records |
+| codegen | 113 match, 0 differ, 0 unported — 418,845 of 418,845 IR lines |
+
+All ten of the bootstrap's own files reproduce their own compilation
+byte for byte, and the second-generation binary built from that IR is
+identical to the first. The eleven files neither side compiles are
+deliberately ill-formed sources the corpus keeps so that both
+implementations are checked on the rejection too.
+
+What is left below is not the port. An empty blocker table is a
+statement about this corpus, not about the language: a construct no
+file exercises is unmeasured however carefully both sides were
+written, which is what `bootstrap/canary.py` exists to say out loud.
 
 - **`bootstrap/lexer.f` does not follow Python's `repr()` into
   scientific notation.** The canonical token dump renders a float with

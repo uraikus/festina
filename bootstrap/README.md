@@ -1,10 +1,10 @@
 # bootstrap/
 
 Festina's own compiler, written in Festina — every pass complete and
-agreeing with its original over the whole corpus, and the whole thing
-far enough along that it reproduces its own compilation: all ten files
-here emit byte-identical IR, and the second-generation binary built
-from that IR is identical to the first.
+agreeing with its original on **every file of the corpus**, its own
+122,000-line source included, and the whole thing reproducing its own
+compilation: all ten files here emit byte-identical IR, and the
+second-generation binary built from that IR is identical to the first.
 
 Nothing in the shipped compiler depends on this directory. It exists to
 be a demanding real program in the language, and to be checked against
@@ -55,28 +55,35 @@ python bootstrap/canary.py                          # can the corpus still TELL?
 python bootstrap/canary.py --list
 ```
 
-Over the 124-file repository corpus:
+Over the 124-file repository corpus, **every pass reproduces every
+file**:
 
 - **lexer: 124 match, 0 differ.**
 - **parser: 124 match, 0 differ, 0 unported.**
 - **semantic: 124 match, 0 differ, 0 unported.**
-- **escape analysis: 106 match, 0 differ, 7 unported, 11 rejected by
-  both** — 2,048 of 2,101 records.
-- **codegen: 87 match, 0 differ, 26 unported, 11 rejected by both** —
-  356,619 of 370,313 file-specific IR lines.
+- **escape analysis: 113 match, 0 differ, 0 unported, 11 rejected by
+  both** — 2,221 of 2,221 records.
+- **codegen: 113 match, 0 differ, 0 unported, 11 rejected by both** —
+  418,845 of 418,845 file-specific IR lines.
 - **canaries: 145 registered, 0 missed.**
+
+The eleven "rejected by both" are programs the front end refuses —
+deliberately ill-formed sources the corpus keeps so that both
+implementations are checked on the rejection as well as on the
+acceptance. There is nothing left that one implementation compiles and
+the other declines to.
 
 **The bootstrap compiler reproduces its own compilation.** All ten of
 its files — the five passes and the five command-line drivers — emit
-byte-identical IR, 312,976 file-specific lines in total:
+byte-identical IR, 375,131 file-specific lines in total:
 
 | file | file-specific IR lines | | file | file-specific IR lines |
 | --- | --- | --- | --- | --- |
-| `lexer.f` | 4,552 | | `lexdump.f` | 4,793 |
-| `parser.f` | 13,139 | | `astdumpf.f` | 13,356 |
-| `semantic.f` | 20,651 | | `semdumpf.f` | 20,946 |
-| `escape.f` | 22,232 | | `escdumpf.f` | 23,988 |
-| `codegen.f` | 94,459 | | `irdumpf.f` | 94,860 |
+| `lexer.f` | 4,929 | | `lexdump.f` | 5,170 |
+| `parser.f` | 13,742 | | `astdumpf.f` | 13,958 |
+| `semantic.f` | 21,966 | | `semdumpf.f` | 22,261 |
+| `escape.f` | 23,547 | | `escdumpf.f` | 25,431 |
+| `codegen.f` | 121,863 | | `irdumpf.f` | 122,264 |
 
 **And the fixed point closes.** Linking the IR the self-hosted compiler
 emits for `bootstrap/irdumpf.f` gives a second-generation binary that
@@ -216,14 +223,14 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Escape analysis: 1,715 of 1,768 records
+## Escape analysis: 2,221 of 2,221 records
 
 `escape_analysis.py` answers one purely syntactic question per function
 body — which names appear anywhere other than as the immediate base of
 a field or element access — and codegen turns that answer into a
 stack-versus-heap decision for every container and struct local. The
-codegen port is blocked on it: it cannot emit a single such declaration
-without agreeing here first.
+codegen port was blocked on it: it could not emit a single such
+declaration without agreeing here first.
 
 **It gets its own harness rather than being checked through the IR**
 because a disagreement surfaces there as a wholly different allocation
@@ -261,12 +268,15 @@ instance, so the record count would differ between machines. No corpus
 file uses one; `escdumpf.f` refuses such a file rather than answering,
 and a pytest case asserts that refusal is currently unreachable.
 
-Not in: arrow functions (6 files), and `match` (1 file) — which
-`semantic.analyze()` desugars away in place before codegen ever runs,
-so escape analysis never sees a MatchStmt, while `bootstrap/semantic.f`
-mutates nothing and leaves the node standing.
+Nothing is left out. Arrow functions and functions declared inside
+another body are analyzed where their expression or statement is
+REACHED, so their records land after the enclosing body's rather than
+in source order — the interleaving, and the synthesized
+`__festina_arrow_N` names, are part of what the dump compares. And
+`match` is gone before this walk ever runs: `bootstrap/semantic.f`
+desugars it in place, exactly where the original does.
 
-## Semantic analysis: 103 match, 0 differ, 0 unported
+## Semantic analysis: 124 match, 0 differ, 0 unported
 
 All three stages of the front end agree with their originals over the
 whole corpus. `semantic.f` resolves declarations, merges imports,
@@ -316,12 +326,14 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 287,128 of 308,018 file-specific IR lines
+## Codegen: 418,845 of 418,845 file-specific IR lines
 
-About 14,500 lines of Python, more than everything ported so far
-combined, and begun rather than finished. It depends on no language
-change: the ports use no `T?`, no `free` and no `delete`, so automatic
-reclamation handles the whole compiler unassisted.
+About 14,500 lines of Python, more than everything else ported put
+together — and now complete. Every compilable file in the corpus has
+its IR reproduced byte for byte, including the port's own
+122,000-line-of-IR source. It depends on no language change: the ports
+use no `T?`, no `free` and no `delete`, so automatic reclamation
+handles the whole compiler unassisted.
 
 **The oracle needed no design at all.** The other three stages required
 a canonical form to be invented for them, because their outputs are
@@ -385,10 +397,10 @@ times and so could not have varied either way.
 
 **The proportion turned over, and then kept going.** Four slices ago it
 was 3,715 of 4,849 — three quarters from `cases/` files written for the
-slices that claimed them. It is now **12,144 of 340,577, about three and a half per
-cent**, because the bootstrap's own ten files contribute 312,976 lines
-between them of programs written to be a compiler rather than to be
-measured.
+slices that claimed them. It is now **12,144 of 418,845, under three
+per cent**, because the bootstrap's own ten files contribute 375,131
+lines between them of programs written to be a compiler rather than to
+be measured.
 
 That is a ratio to read carefully rather than to be pleased by. A
 corpus dominated by one enormous file measures whatever that file
@@ -493,7 +505,7 @@ are the ones worth knowing about.
 
 The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
-**312,976 of the 354,765 file-specific IR lines**, and they need none
+**375,131 of the 418,845 file-specific IR lines**, and they need none
 of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the
@@ -562,9 +574,10 @@ Twenty-two pieces are subtler than they look:
   claude.md #97: a field of struct/`arr[T]`/`map[T]` type starts null,
   so reaching through an unassigned one emits a null check, a calloc
   with refcount 1, a store back through the same slot, and a phi. Every
-  struct here is untagged, which is safe only because `EnumDecl` is
-  itself unported — a member of a pure-struct enum needs the wider
-  `{tag, refcount}` header of claude.md #176.
+  struct that is a member of a pure-struct enum takes the wider
+  `{tag, refcount}` header of claude.md #176 instead — tag first, so
+  the refcount word stays at exactly `payload - 8` either way and
+  retain and release never have to know which shape they were handed.
 - **A phi's predecessor is the block its value was computed in**, not
   the label it branched to. The two coincide until an arm contains
   control flow of its own, which nested field access is the first
@@ -687,48 +700,39 @@ sanitizer for this stage rather than needing it alongside.
 
 ### What is not in
 
-|blocks|only|construct|
-|---:|---:|---|
-|20|0|a declaration of a non-scalar type (`img`, `regex`, …)|
-|19|0|`EventHandler`|
-|18|0|`ThreadDecl`|
-|15|**2**|`free`|
-|12|0|`.postMessage()`|
-|10|**2**|`table` declarations|
-|8|0|`sqlite()`|
-|8|0|an `arr[T]` local of a non-scalar element type|
-|7|0|`openPort()`|
-|5|0|a parameter of a non-scalar type|
+Nothing. Every construct the corpus reaches is emitted, and the
+blocker table the last twenty slices were steered by is empty.
 
-`blocks` counts every file a construct appears in; `only` counts the
-files where it is the last thing in the way, and so the number that
-would actually become matches.
+The port finished subsystem by subsystem rather than expression by
+expression: graphics, audio, sqlite and tables, then threads and their
+message payloads, then HTTP, then the manual-memory escape hatch,
+amortized arrays, background loads, and enums with both of their
+runtime representations. The last three files to fall were the two
+enum stress tests and the thread churn that sends a struct, an array,
+a map, a blob, an img, an aud, a url and an enum across a thread
+boundary in one program.
 
-**The `only` column is five files** — `table` declarations for two,
-`free` for two and `try`/`catch` for one, all features rather than
-expression-level work.
+**What that leaves is the corpus itself.** A construct no file
+exercises is still unmeasured however carefully both implementations
+were written, which is what `canary.py` exists to say out loud — see
+"Canaries" above. An empty blocker table is a statement about this
+corpus, not about the language.
 
-**Everything left is a SUBSYSTEM**, which is the shape of the
-remainder now: graphics, audio, HTTP, threads, sqlite, tables, and the
-manual-memory escape hatch. None of it is needed to compile the
-compiler, and none of it is the kind of expression-level work the last
-twenty slices were.
+**The table that got the port here is worth keeping a note of, now
+that it is empty.** It was read with care, because it lied twice. It
+said `bootstrap/lexer.f` was one construct away and lexer.f needed
+five: `cgFunc` refuses a function whose PARAMETERS it cannot emit and
+returns at once, so the body is never walked and none of its own
+constructs are counted — the table showed what the port REACHED, not
+what the file needed. That was decisions.md #297's own flaw one level
+up, first-blocker-per-expression become first-blocker-per-function;
+before that fix the walk stopped at the first reason inside an
+expression, so `examples/ascii_scan.f` claimed a single blocker while
+calling a method on every line of its loop. Method calls alone went
+from 21 files to 50 once it was corrected, and indexing did not appear
+at all beforehand.
 
-**And read that column with care.** It said `bootstrap/lexer.f` was one
-construct away, and lexer.f needed five. `cgFunc` refuses a function
-whose PARAMETERS it cannot emit and returns at once, so the body is
-never walked and none of its constructs are counted — the table shows
-what the port REACHED, not what the file needs. That is decisions.md
-#297's own flaw one level up: first-blocker-per-expression became
-first-blocker-per-function. Nothing else in this
-corpus is one construct from matching, and the earlier tables that
-implied otherwise were measuring wrong: the walk stopped at the first
-reason inside an expression, so `examples/ascii_scan.f` claimed a
-single blocker while calling a method on every line of its loop
-(decisions.md #297). Method calls alone went from 21 files to 50 once
-that was fixed, and indexing did not appear at all before.
-
-Read the first column for where the volume is and the second for what
+The first column said where the volume was and the second what
 finishing one thing would buy.
 
 **That table is itself a result.** `a call through a non-identifier
@@ -745,13 +749,18 @@ counted in the 14,500-line codegen.py figure above. `bootstrap/
 escape.f` ports it and `escdiff.py` checks it name by name, in order;
 locals of a scalar element type followed.
 
-The structural obstacles are unchanged:
+The structural obstacles were the same for every pass, and every one
+of them is now behind the port rather than ahead of it:
 
 - **Festina structs have no methods.** 227 class methods and 77 AST and
-  type classes become free functions over explicit state, the shape
-  `parser.f` already uses.
-- **`isinstance` dispatch**, 480 sites, becomes the generic node's kind
+  type classes became free functions over explicit state, the shape
+  `parser.f` already used.
+- **`isinstance` dispatch**, 480 sites, became the generic node's kind
   string.
 - **`map[T]` keys are `text`.** Three side tables keyed by node identity
-  become a field on the node itself.
-- **One return value per function**, so 259 tuple returns become structs.
+  became a field on the node itself — and, where identity really was
+  the question, a `==` between two node references, which §8.9.1 makes
+  exactly that.
+- **One return value per function**, so 259 tuple returns became
+  structs, or a global consumed one-shot where the second value is an
+  answer about the first rather than part of it.
