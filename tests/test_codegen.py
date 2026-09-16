@@ -601,6 +601,151 @@ class TestReturnTextToHandleConversion:
         assert result.stdout.strip() == "false"
 
 
+class TestTextMethods:
+    """specification.md §16.3 [#328]: the eight `text` methods that were
+    missing.
+
+    Requested by uraikus/archtelos-browser, whose `src/util/text.f` is
+    334 lines of string primitives that exist only because the language
+    lacked them.
+
+    The property that has to hold across all of them is that every index
+    counts CODE POINTS, matching `s[i]`, `.length` and `.charCodeAt` --
+    otherwise they cannot be composed with each other or with indexing,
+    and `slice` could split a character in half.
+    """
+
+    def test_slice_clamps_both_ends(self, compile_and_run):
+        result = compile_and_run(
+            "text s = 'Hello, World'\n"
+            "log(s.slice(0, 5))\n"
+            "log(s.slice(7, 99))\n"
+            "log(s.slice(0 - 4, 2))\n"
+            "log(s.slice(5, 2) == '')\n"
+            "log(s.slice(99, 99) == '')")
+        assert result.returncode == 0
+        assert result.stdout.split("\n")[:5] == [
+            "Hello", "World", "He", "true", "true"]
+
+    def test_index_of_with_and_without_a_start(self, compile_and_run):
+        result = compile_and_run(
+            "text s = 'Hello, World'\n"
+            "log(s.indexOf('World'))\n"
+            "log(s.indexOf('o'))\n"
+            "log(s.indexOf('o', 5))\n"
+            "log(s.indexOf('zzz'))\n"
+            "log(s.indexOf(''))")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["7", "4", "8", "-1", "0"]
+
+    def test_starts_and_ends_with(self, compile_and_run):
+        result = compile_and_run(
+            "text s = 'Hello'\n"
+            "log(s.startsWith('Hell'))\n"
+            "log(s.startsWith('hell'))\n"
+            "log(s.endsWith('llo'))\n"
+            "log(s.endsWith('Hello!'))\n"
+            "log(s.startsWith(''))\n"
+            "log(s.endsWith(''))")
+        assert result.returncode == 0
+        assert result.stdout.split() == [
+            "true", "false", "true", "false", "true", "true"]
+
+    def test_case_conversion_is_ascii_only(self, compile_and_run):
+        """§16.3: ASCII letters only, every other byte copied unchanged
+        -- so UTF-8 survives and no locale is consulted."""
+        result = compile_and_run(
+            "text s = 'Héllo, Wörld 42'\n"
+            "log(s.toLowerCase())\n"
+            "log(s.toUpperCase())")
+        assert result.returncode == 0
+        assert result.stdout.split("\n")[:2] == [
+            "héllo, wörld 42", "HéLLO, WöRLD 42"]
+
+    def test_repeat(self, compile_and_run):
+        result = compile_and_run(
+            "log('ab'.repeat(3))\n"
+            "log('ab'.repeat(1))\n"
+            "log('ab'.repeat(0) == '')\n"
+            "log('ab'.repeat(0 - 5) == '')")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["ababab", "ab", "true", "true"]
+
+    def test_to_float_matches_its_clause_exactly(self, compile_and_run):
+        """strtod accepts `inf`, `nan` and hexadecimal float forms;
+        §16.3 accepts none of them, so the runtime scans its own valid
+        prefix rather than handing the whole string over."""
+        result = compile_and_run(
+            "log('12'.toFloat())\n"
+            "log('  -2.5xyz'.toFloat())\n"
+            "log('.5'.toFloat())\n"
+            "log('1e3'.toFloat())\n"
+            "log('1e'.toFloat())\n"
+            "log('inf'.toFloat())\n"
+            "log('nan'.toFloat())\n"
+            "log('0x10'.toFloat())\n"
+            "log('abc'.toFloat())")
+        assert result.returncode == 0
+        assert result.stdout.split() == [
+            "12", "-2.5", "0.5", "1000", "1", "nan", "nan", "0", "nan"]
+
+    def test_every_index_counts_code_points(self, compile_and_run):
+        """The property the whole set turns on. `slice` must never split
+        a character, and `indexOf`'s answer must be an index `slice` can
+        take."""
+        result = compile_and_run(
+            "text s = 'héllo wörld'\n"
+            "log(s.length)\n"
+            "log(s.slice(0, 5))\n"
+            "log(s.indexOf('wörld'))\n"
+            "log(s.slice(s.indexOf('wörld'), s.length))\n"
+            "log(s.slice(1, 2))")
+        assert result.returncode == 0
+        assert result.stdout.split("\n")[:5] == [
+            "11", "héllo", "6", "wörld", "é"]
+
+    def test_the_methods_compose(self, compile_and_run):
+        result = compile_and_run(
+            "text path = '/Some/Dir/File.TXT'\n"
+            "text ext = path.slice(path.indexOf('.') + 1, path.length)\n"
+            "log(ext.toLowerCase())\n"
+            "log(path.toLowerCase().endsWith('.txt'))\n"
+            "log('-'.repeat(ext.length))")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["txt", "true", "---"]
+
+    def test_wrong_arity_and_argument_types_are_compile_errors(
+            self, parser, semantic, errors):
+        for source in [
+            "log('a'.slice(1))",
+            "log('a'.slice(1, 2, 3))",
+            "log('a'.indexOf())",
+            "log('a'.indexOf('b', 1, 2))",
+            "log('a'.toLowerCase(1))",
+            "log('a'.repeat())",
+            "log('a'.slice('x', 2))",
+            "log('a'.indexOf(1))",
+            "log('a'.repeat('x'))",
+            "log('a'.startsWith(1))",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+    def test_an_ascii_receiver_is_not_accepted(self, parser, semantic, errors):
+        """§16.3 draws the same line `.trim()` already draws: `ascii`
+        has its own O(1) `.slice`, and the rest would each need a second
+        runtime function answering an `ascii`."""
+        for source in [
+            "ascii a = 'abc'\nlog(a.indexOf('b'))",
+            "ascii a = 'abc'\nlog(a.toUpperCase())",
+            "ascii a = 'abc'\nlog(a.repeat(2))",
+        ]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
 class TestBitwiseOperators:
     """specification.md §8.3 and §9.13 [#327]: `&`, `|`, `^`, `~`, `<<`
     and `>>` on `int`.

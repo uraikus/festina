@@ -2081,7 +2081,17 @@ A user declaration may not reuse any of these names (§6.7).
 `0x10FFFF` or a surrogate). **`float`**, **`bool`**: `.toText()`.
 [#55, #249]
 
-**`text`** [#68, #116, #150, #159, #249, #251]
+**`text`** [#68, #116, #150, #159, #249, #251, #328]
+
+Every index and length here counts CODE POINTS, never bytes (§8.4), so
+`.slice` and `.indexOf` agree with `s[i]` and `.length` and can never
+split a character. That costs a walk per call, which is the trade §8.5
+offers `ascii` as the alternative to.
+
+Case conversion is ASCII-only and deliberately so: full Unicode case
+mapping is locale-dependent and one-to-many (`ß`, `İ`), and a `text`
+method that silently did some of it would be worse than one that
+clearly does none. `.trim()` already draws the same line.
 
 | Method | Result | Notes |
 |---|---|---|
@@ -2094,6 +2104,12 @@ A user declaration may not reuse any of these names (§6.7).
 | `.split(sep)` | `arr[text]` | `sep` is `text` or `regex`; empty pieces kept; an empty separator splits per code point |
 | `.match(re)` | `text` | first match or `null`; `g` ignored |
 | `.replace(search, repl)` | `text` | `search` is `text` (first occurrence) or `regex` (first match, or every match with `g`) |
+| `.slice(start, end)` | `text` | code-point indices; both clamped to `0`..`.length`, and an `end` below `start` yields the empty string |
+| `.indexOf(needle)`, `.indexOf(needle, from)` | `int` | first code-point index at or after `from` (default `0`), or `-1`; an empty needle is found at `from`, clamped |
+| `.startsWith(prefix)`, `.endsWith(suffix)` | `bool` | an empty argument is always found |
+| `.toLowerCase()`, `.toUpperCase()` | `text` | ASCII letters only — every other byte is copied unchanged, so UTF-8 survives and no locale is consulted |
+| `.repeat(n)` | `text` | `n` at or below `0` yields the empty string |
+| `.toFloat()` | `float` | leading whitespace, optional sign, digits with an optional fractional part, an optional complete decimal exponent, trailing garbage ignored; `null` if no digits. `inf`, `nan` and hexadecimal float forms are **not** accepted |
 | `.toStruct(T)`, `.toArr(T)` | `T`, `arr[T]` | JSON parsing (§16.4) |
 | `.callback(fn)` | `blob`/`img`/`aud` | background load (§12.5) |
 

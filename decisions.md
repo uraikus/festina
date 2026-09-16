@@ -6715,3 +6715,21 @@ uraikus/archtelos-browser is a browser engine written in Festina, and it exists 
 **Four modules, not one.** A language addition costs the lexer (a hex form that must beat the decimal scan, and `&&`/`||` that must keep beating `&`/`|`), the parser (four new precedence levels), the analyzer (int-only, with a float operand refused rather than truncated) and codegen (three instructions, a complement that LLVM spells as xor, and the two shift forms) -- in BOTH implementations. Eight files.
 
 **And a case file, because otherwise nothing measured any of it.** No corpus file used these operators, so every canary written for them would have reported the corpus unable to see the mechanism -- which is the registry's way of saying "write a case file", and it is right. `cases/bitwise.f` exercises each operator, both shift forms, all three precedence departures, and the packed-triple round trip the operators exist for.
+
+328. THE TEXT METHODS, AND A RECEIVER EMITTED TWICE
+
+**`slice`, `indexOf`, `startsWith`, `endsWith`, `toLowerCase`, `toUpperCase`, `repeat` and `toFloat` on `text`** -- eight methods requested by uraikus/archtelos-browser, whose `src/util/text.f` is 334 lines of string primitives that exist only because the language lacked them.
+
+**Every index counts CODE POINTS**, which is the property the whole set turns on rather than a detail of it. `s[i]`, `.length`, `.charCodeAt` and `.split('')` already count code points, so anything else would leave `slice` unable to take `indexOf`'s answer and able to cut a character in half. The search inside `indexOf` is still byte-exact, and that is correct rather than a shortcut: UTF-8 is self-synchronizing, so a byte match is always a character match -- only the two INDICES need converting, on the way in and on the way out.
+
+**Case conversion is ASCII-only, deliberately.** Full Unicode case mapping is locale-dependent and one-to-many, and a `text` method that silently did some of it would be worse than one that clearly does none. `.trim()` already drew that line. Every byte of a multi-byte sequence has its high bit set, so testing for `a`..`z` byte-wise can never touch one -- which is what makes "ASCII letters only, everything else copied unchanged" safe without decoding at all.
+
+**`toFloat` scans its own valid prefix rather than handing the string to `strtod`.** `strtod` accepts `inf`, `nan` and the C99 hexadecimal float form, and none of those is an answer this method should give. Writing the clause first made that visible: the implementation had to be narrowed to match what the specification said, not the other way round.
+
+**And then the receiver was emitted twice.** Three of the eight names -- `slice`, `indexOf`, `toFloat` -- already had a branch for a DIFFERENT receiver type, and each of those branches emits the receiver before testing it. A new branch placed ahead of them that also emitted the receiver produced two evaluations of the same expression, which is not a subtle wrongness: a blob slice, an ascii slice, `bootstrap/codegen.f` and `bootstrap/astdumpf.f` all differed immediately.
+
+**The port had already written down why that was a hazard**, in a comment on its own ascii-slice branch: "answered before the blob path below rather than falling through it, because an ascii receiver has already been emitted by this point." The port was right and the new code in the original was wrong -- so the fix was to give the original the port's shape: one emitter, called from four places, each of which has already emitted the receiver itself and never emits it again.
+
+**Five of the eight names have no other receiver to compete with** (`startsWith`, `endsWith`, `toLowerCase`, `toUpperCase`, `repeat`), so those may emit the receiver before knowing its type. The other three cannot, and the set is named in the code rather than left to be re-derived.
+
+**Verified.** All four harnesses green; codegen 0 differ. Every method clean under valgrind at 2,000 iterations, receiver and arguments both. `cases/text_methods.f` puts every one of them, and a multi-byte version of each index question, in the corpus -- without it nothing measured any of this.

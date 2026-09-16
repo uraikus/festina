@@ -234,6 +234,21 @@ void *festina_ls(const char *path);
  * call here already does. */
 int64_t festina_text_to_int(const char *s);
 char *festina_text_trim(const char *s);
+/* claude.md #328: the text methods a text-processing program needs.
+ * Every index counts CODE POINTS, matching s[i]/.length/.charCodeAt --
+ * the search inside indexOf is byte-exact (UTF-8 is self-synchronizing,
+ * so a byte match is always a character match), and only the indices
+ * are converted. Case conversion is ASCII-only, deliberately: full
+ * Unicode case mapping is locale-dependent and one-to-many, and doing
+ * part of it silently would be worse than doing none of it clearly. */
+char *festina_text_slice(const char *s, int64_t start, int64_t end);
+int64_t festina_text_index_of(const char *s, const char *needle, int64_t from);
+int8_t festina_text_starts_with(const char *s, const char *prefix);
+int8_t festina_text_ends_with(const char *s, const char *suffix);
+char *festina_text_to_lower(const char *s);
+char *festina_text_to_upper(const char *s);
+char *festina_text_repeat(const char *s, int64_t n);
+double festina_text_to_float(const char *s);
 char *festina_text_char_at(const char *s, int64_t index);
 
 /* claude.md #249: text.charCodeAt(i) -> int (the Unicode CODE POINT at

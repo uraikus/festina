@@ -1545,8 +1545,37 @@ CANARIES = [
         ],
         path=os.path.join(REPO_ROOT, "bootstrap", "parser.f"),
     ),
-]
 
+    # --- decisions.md #328: the text methods ---------------------------
+    Canary(
+        "a-text-method-frees-nothing-before-its-own-call", "#328",
+        "a text method's receiver is still live when the call reads it",
+        # The order of the two frees AFTER the call is not meaningful --
+        # both happen once the call has returned, so swapping them
+        # changes nothing and a canary that swapped them would be
+        # measuring nothing. What matters is that neither free is
+        # emitted BEFORE the call, which is what this moves.
+        """        text mout = cgTmp()
+        cgOut(`  ${mout} = call ${spec[1]} @${spec[0]}(ptr ${r.v}${joined})`)""",
+        """        cgFreeTextTemp(recv, r)
+        text mout = cgTmp()
+        cgOut(`  ${mout} = call ${spec[1]} @${spec[0]}(ptr ${r.v}${joined})`)""",
+    ),
+    Canary(
+        "index-of-takes-its-optional-start", "#328",
+        "indexOf's second argument is passed when written and defaulted when not",
+        """                joined = joined + `, ${kind} 0`""",
+        """                joined = joined + `, ${kind} 1`""",
+    ),
+    Canary(
+        "each-text-method-calls-its-own-runtime-function", "#328",
+        "each text method is a distinct runtime call, not one standing in for another",
+        """    'toLowerCase': 'festina_text_to_lower|ptr||text',
+    'toUpperCase': 'festina_text_to_upper|ptr||text',""",
+        """    'toLowerCase': 'festina_text_to_lower|ptr||text',
+    'toUpperCase': 'festina_text_to_lower|ptr||text',""",
+    ),
+]
 BY_NAME = {c.name: c for c in CANARIES}
 
 

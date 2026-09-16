@@ -14,6 +14,23 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Added
 
+- **Eight `text` methods that were missing:** `.slice(start, end)`,
+  `.indexOf(needle[, from])`, `.startsWith(prefix)`,
+  `.endsWith(suffix)`, `.toLowerCase()`, `.toUpperCase()`,
+  `.repeat(n)` and `.toFloat()`. Every index counts **code points**,
+  matching `s[i]`/`.length`/`.charCodeAt`, so they compose with each
+  other and with indexing and `slice` can never cut a character in
+  half; the search inside `indexOf` is byte-exact, which is correct
+  rather than a shortcut, since UTF-8 is self-synchronizing. Case
+  conversion is ASCII-only and deliberately so — full Unicode case
+  mapping is locale-dependent and one-to-many, and doing part of it
+  silently would be worse than doing none of it clearly. `.toFloat()`
+  accepts exactly what the specification describes and refuses `inf`,
+  `nan` and hexadecimal float forms, which C's `strtod` would
+  otherwise have taken. Requested by
+  [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser),
+  whose `src/util/text.f` is 334 lines of string primitives that exist
+  only because the language lacked these.
 - **Bitwise operators and hexadecimal literals.** `&`, `|`, `^`
   (binary), `~` (unary) and `<<` / `>>` on `int`, plus `0x` literals.
   `int` is signed and 64-bit, so `>>` is an **arithmetic** shift and
@@ -146,9 +163,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage: **86 of 123 corpus files emit
+  the fourth and last stage: **87 of 124 corpus files emit
   byte-identical LLVM IR, 0 differ, 26 not yet ported, 11 rejected by
-  both** — 353,231 of 366,717 file-specific IR lines. **The bootstrap
+  both** — 356,619 of 370,313 file-specific IR lines. **The bootstrap
   compiler reproduces its own compilation**: all ten of its files —
   `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
   `escape.f` (22,232), `codegen.f` (94,459) and the five command-line
@@ -278,7 +295,7 @@ round-by-round design and implementation record predating 0.1 lives in
   the two implementations agree; it says nothing about whether the
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
-  not. A hundred and forty-two deliberate breakages, one per mechanism,
+  not. A hundred and forty-five deliberate breakages, one per mechanism,
   re-run by `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
   no longer the whole verdict: a canary looks for TWO independent
   witnesses and reports a lone one in its own output, because

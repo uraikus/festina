@@ -740,6 +740,8 @@ Ty func inferArith(op:text, l:Ty, r:Ty) {
 map[bool] COMPARISONS = {}
 map[bool] TEXT_METHODS_TEXT = {}
 map[bool] TEXT_METHODS_INT = {}
+map[bool] TEXT_METHODS_BOOL = {}
+map[bool] TEXT_METHODS_FLOAT = {}
 
 void func initInference() {
     arr[text] cmps = '== != < > <= >='.split(' ')
@@ -752,18 +754,29 @@ void func initInference() {
     // Deliberately not the whole surface (16.3): a method missing from
     // these tables infers null, which checks nothing, and that is the
     // conservative direction.
-    arr[text] tt = 'match replace trim toText toAscii'.split(' ')
+    // claude.md #328 adds slice/toLowerCase/toUpperCase/repeat here and
+    // indexOf below; startsWith/endsWith answer bool and toFloat float,
+    // so they get their own two tables rather than being squeezed into
+    // these.
+    arr[text] tt = 'match replace trim toText toAscii slice toLowerCase toUpperCase repeat'.split(' ')
     i = 0
     while i < tt.length {
         TEXT_METHODS_TEXT[tt[i]] = true
         i++
     }
-    arr[text] ti = 'length charCodeAt toInt'.split(' ')
+    arr[text] ti = 'length charCodeAt toInt indexOf'.split(' ')
     i = 0
     while i < ti.length {
         TEXT_METHODS_INT[ti[i]] = true
         i++
     }
+    arr[text] tb = 'startsWith endsWith'.split(' ')
+    i = 0
+    while i < tb.length {
+        TEXT_METHODS_BOOL[tb[i]] = true
+        i++
+    }
+    TEXT_METHODS_FLOAT['toFloat'] = true
 }
 
 // The property name of a Member node, however the parser stored it.
@@ -778,6 +791,8 @@ Ty func inferMember(s:Scope, e:Node) {
     if recv.kind == 'prim' && recv.name == 'text' {
         if TEXT_METHODS_TEXT[prop] != null { return tyPrim('text') }
         if TEXT_METHODS_INT[prop] != null { return tyPrim('int') }
+        if TEXT_METHODS_BOOL[prop] != null { return tyPrim('bool') }
+        if TEXT_METHODS_FLOAT[prop] != null { return tyPrim('float') }
         if prop == 'split' { return tyArr(tyPrim('text'), false) }
         return null
     }

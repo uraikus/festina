@@ -642,6 +642,29 @@ FESTINA_ENUM_BOX_LLVM_TYPE = "%struct._FestinaEnumBox"
 # bit pattern in a plain i64/double, so it's a reserved sentinel instead
 # (see the module docstring's "Null for int/float" note).
 INT_NULL_CONST = "-9223372036854775808"  # i64 minimum
+
+# claude.md #328: the eight text methods, as
+# name -> (runtime function, result LLVM type, result Festina type,
+#          argument LLVM kinds).
+# The argument kinds drive both the call's own spelling and which
+# arguments are text temporaries needing a free afterwards -- a `ptr`
+# argument is text, an `i64` one is not.
+# The five names no other receiver type claims, so the receiver may be
+# emitted before the type is known. `slice`, `indexOf` and `toFloat`
+# each have a branch for another receiver further down which emits the
+# receiver itself and hands a TEXT one to the same emitter from there.
+_TEXT_METHOD_UNAMBIGUOUS = frozenset({
+    "startsWith", "endsWith", "toLowerCase", "toUpperCase", "repeat"})
+_TEXT_METHOD_RUNTIME = {
+    "slice": ("festina_text_slice", "ptr", TEXT, ("i64", "i64")),
+    "indexOf": ("festina_text_index_of", "i64", INT, ("ptr", "i64")),
+    "startsWith": ("festina_text_starts_with", "i8", BOOL, ("ptr",)),
+    "endsWith": ("festina_text_ends_with", "i8", BOOL, ("ptr",)),
+    "toLowerCase": ("festina_text_to_lower", "ptr", TEXT, ()),
+    "toUpperCase": ("festina_text_to_upper", "ptr", TEXT, ()),
+    "repeat": ("festina_text_repeat", "ptr", TEXT, ("i64",)),
+    "toFloat": ("festina_text_to_float", "double", FLOAT, ()),
+}
 FLOAT_NULL_CONST = "0x7FF8000000000000"  # a quiet NaN, as a raw double bit pattern
 # See the module docstring's "Null for bool" note: bool widened from i1
 # to i8 specifically to make room for this -- 2 is neither 0 (false) nor
@@ -1919,6 +1942,15 @@ class CodeGen:
             "declare i8 @festina_str_eq(ptr, ptr)",
             # claude.md #150: text.toInt()/text[i], argv, exec().
             "declare i64 @festina_text_to_int(ptr)",
+            # claude.md #328: the eight text methods.
+            "declare ptr @festina_text_slice(ptr, i64, i64)",
+            "declare i64 @festina_text_index_of(ptr, ptr, i64)",
+            "declare i8 @festina_text_starts_with(ptr, ptr)",
+            "declare i8 @festina_text_ends_with(ptr, ptr)",
+            "declare ptr @festina_text_to_lower(ptr)",
+            "declare ptr @festina_text_to_upper(ptr)",
+            "declare ptr @festina_text_repeat(ptr, i64)",
+            "declare double @festina_text_to_float(ptr)",
             "declare ptr @festina_text_trim(ptr)",
             "declare ptr @festina_text_char_at(ptr, i64)",
             # claude.md #249: text.charCodeAt(i)/int.toChar().
@@ -11533,6 +11565,51 @@ class CodeGen:
                      f"[ {INT_NULL_CONST}, %{bad_pred} ]")
         return out
 
+    def _emit_text_method(self, name, recv_node, val, vtype, expr, env, lines):
+        """claude.md #328: one emitter for all eight text methods.
+
+        Emit the arguments, call, then free exactly what this call site
+        allocated. `text` is copy-managed rather than refcounted
+        (claude.md #83), so the receiver and every text argument go
+        through _free_text_temp, which frees only what the expression
+        itself owned and leaves a borrowed binding alone.
+
+        The receiver is freed AFTER the arguments are emitted, not
+        before: an argument expression can be arbitrary, and freeing
+        the receiver first would leave the call reading a buffer this
+        site had already released -- the mistake claude.md #321 made
+        for drawImage and had to fix.
+
+        The RECEIVER is emitted by the caller, never here, and that is
+        the whole reason this is a separate function. Three of the
+        eight names (`slice`, `indexOf`, `toFloat`) already have a
+        branch for another receiver type which emits the receiver
+        first; a second emission would evaluate it twice. Getting that
+        wrong is not hypothetical -- it produced four differing corpus
+        files, including a blob slice and self-hosting, the moment it
+        was written the other way.
+        """
+        fn, ret_llvm, ret_type, arg_kinds = _TEXT_METHOD_RUNTIME[name]
+        arg_vals = []
+        arg_temps = []
+        for i, kind in enumerate(arg_kinds):
+            if i < len(expr.args):
+                a_val, a_type = self._emit_expr(expr.args[i], env, lines)
+                if kind == "ptr":
+                    arg_temps.append((expr.args[i], a_val, a_type))
+                arg_vals.append(f"{kind} {a_val}")
+            else:
+                # The one optional argument in the set -- indexOf's
+                # `from`, defaulting to 0.
+                arg_vals.append(f"{kind} 0")
+        joined = "".join(f", {a}" for a in arg_vals)
+        out = self.tmp()
+        lines.append(f"  {out} = call {ret_llvm} @{fn}(ptr {val}{joined})")
+        for node, a_val, a_type in arg_temps:
+            self._free_text_temp(node, a_val, a_type, lines)
+        self._free_text_temp(recv_node, val, vtype, lines)
+        return out, ret_type
+
     def _emit_divmod(self, op, left_val, right_val, is_float, lines):
         """claude.md #57: division/modulo by zero returns null instead of
         crashing. For int specifically, `sdiv`/`srem` by zero is undefined
@@ -12505,6 +12582,29 @@ class CodeGen:
                     out = self.tmp()
                     lines.append(f"  {out} = sitofp i64 {val} to double")
                     return out, FLOAT
+                if vtype == TEXT:
+                    return self._emit_text_method("toFloat", callee.obj, val,
+                                                  vtype, expr, env, lines)
+            # claude.md #328: the eight text methods, all sharing one
+            # shape -- emit the receiver, emit the arguments, call, then
+            # release exactly what this call site allocated. `text` is
+            # copy-managed rather than refcounted (claude.md #83), so
+            # the receiver and every text argument go through
+            # _free_text_temp, which frees only what the expression
+            # itself owned and leaves a borrowed binding alone.
+            #
+            # The receiver is freed AFTER the arguments are emitted, not
+            # before: an argument expression can be arbitrary, and
+            # freeing the receiver first would leave the call reading a
+            # buffer this site had already released. That ordering is
+            # the same one claude.md #321 got wrong for drawImage and
+            # had to fix, so it is written down here rather than
+            # rediscovered.
+            if callee.prop in _TEXT_METHOD_UNAMBIGUOUS:
+                val, vtype = self._emit_expr(callee.obj, env, lines)
+                if vtype == TEXT:
+                    return self._emit_text_method(callee.prop, callee.obj, val,
+                                                  vtype, expr, env, lines)
             # claude.md #150: text.toInt() -> int. A literal receiver
             # (`'42'.toInt()`) is parsed once, in Python, at compile
             # time -- offloading work out of the compiled program
@@ -12602,6 +12702,9 @@ class CodeGen:
                     self._release_owned_receiver(callee.obj, val, vtype, lines)
                     self._minted_values.add(id(expr))
                     return out, ASCII
+                if vtype == TEXT:
+                    return self._emit_text_method("slice", callee.obj, val,
+                                                  vtype, expr, env, lines)
                 self._release_owned_receiver(callee.obj, val, vtype, lines)
             # claude.md #256: text.toAscii() -- validating, and null for
             # anything not representable one byte per character.
@@ -12804,6 +12907,9 @@ class CodeGen:
                     # array before this release could cascade to them.
                     self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return result
+                if callee.prop == "indexOf" and obj_type == TEXT:
+                    return self._emit_text_method("indexOf", callee.obj, obj_val,
+                                                  obj_type, expr, env, lines)
             # claude.md #92: sheet.clip(x, y, w, h) -> img (a new image,
             # leaving the sheet untouched) and image.resize(w, h) -> void
             # (in place, so every binding holding it sees the new size).

@@ -229,6 +229,30 @@ _BOOL = types_mod.PrimitiveType("bool")
 # handled on its own, beside `!`.
 _BITWISE_BINARY_OPS = frozenset({"&", "|", "^", "<<", ">>"})
 
+# claude.md #328: the text methods added alongside the ones that were
+# already here, as (min args, max args, result type). `indexOf` is the
+# only one with an optional argument; the rest are fixed.
+_TEXT_METHOD_ARITY = {
+    "slice": (2, 2, _TEXT),
+    "indexOf": (1, 2, _INT),
+    "startsWith": (1, 1, _BOOL),
+    "endsWith": (1, 1, _BOOL),
+    "toLowerCase": (0, 0, _TEXT),
+    "toUpperCase": (0, 0, _TEXT),
+    "repeat": (1, 1, _TEXT),
+    "toFloat": (0, 0, _FLOAT),
+}
+_TEXT_METHOD_ARG_TYPES = {
+    "slice": (_INT, _INT),
+    "indexOf": (_TEXT, _INT),
+    "startsWith": (_TEXT,),
+    "endsWith": (_TEXT,),
+    "toLowerCase": (),
+    "toUpperCase": (),
+    "repeat": (_INT,),
+    "toFloat": (),
+}
+
 
 def _is_blob_type(t):
     """claude.md #202: `t == _BLOB` breaks for a manually-managed
@@ -3673,6 +3697,37 @@ def analyze(program, filename="<string>"):
                     infer(callee.obj, scope) == _TEXT
                     or _is_ascii_type(infer(callee.obj, scope))):
                 return _INT
+            # claude.md #328: the eight text methods a text-processing
+            # program needs, none of which existed. Every index counts
+            # CODE POINTS, matching s[i]/.length/.charCodeAt, so they
+            # compose with each other and with indexing (§16.3).
+            #
+            # An `ascii` receiver is deliberately not accepted for any
+            # of them: `ascii` already has its own O(1) `.slice`, and
+            # the rest would each need a second runtime function
+            # answering an `ascii`, which nothing has asked for. The
+            # same line `.trim()` already draws just below.
+            if callee.prop in _TEXT_METHOD_ARITY and infer(callee.obj, scope) == _TEXT:
+                low, high, result = _TEXT_METHOD_ARITY[callee.prop]
+                if not (low <= len(expr.args) <= high):
+                    want = f"{low}" if low == high else f"{low} or {high}"
+                    raise CompileError(
+                        f"{callee.prop}() takes {want} argument"
+                        f"{'' if high == 1 and low == 1 else 's'}, "
+                        f"got {len(expr.args)}",
+                        file=filename, line=expr.line, column=expr.column,
+                        category="wrong argument count")
+                for i, arg in enumerate(expr.args):
+                    want_type = _TEXT_METHOD_ARG_TYPES[callee.prop][i]
+                    got = infer(arg, scope)
+                    if got is not None and got is not NULL and got != want_type:
+                        raise CompileError(
+                            f"{callee.prop}() argument {i + 1} must be "
+                            f"{types_mod.type_name(want_type)}, found "
+                            f"{types_mod.type_name(got)}",
+                            file=filename, line=expr.line, column=expr.column,
+                            category="invalid operand type")
+                return result
             # claude.md #272: text.trim() -> text -- leading and
             # trailing ASCII whitespace removed. An `ascii` receiver is
             # deliberately NOT accepted here: it would have to answer an

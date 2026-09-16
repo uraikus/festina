@@ -1815,6 +1815,186 @@ int64_t festina_text_to_int(const char *s) {
     return (int64_t)v;
 }
 
+/* claude.md #328: the byte offset of code-point index `i`, clamped to
+ * the end of the string. One helper behind slice/indexOf, because
+ * every index `text` exposes counts code points (§8.4) and every
+ * operation on the bytes needs the offset instead -- doing that
+ * conversion in one place is what keeps `.slice` and `.indexOf`
+ * agreeing with `s[i]` and `.length`.
+ *
+ * A continuation byte is `10xxxxxx`, so skipping to the next code
+ * point is "advance one, then skip continuations" -- the same walk
+ * festina_text_char_code_at already does. Malformed UTF-8 cannot make
+ * this run off the end: the loop's own condition is the NUL. */
+static size_t festina_text_byte_offset(const char *s, int64_t index) {
+    if (index <= 0) return 0;
+    const unsigned char *c = (const unsigned char *)s;
+    int64_t seen = 0;
+    while (*c && seen < index) {
+        c++;
+        while ((*c & 0xC0) == 0x80) c++;
+        seen++;
+    }
+    return (size_t)((const char *)c - s);
+}
+
+/* The inverse: how many code points lie before byte offset `off`. */
+static int64_t festina_text_code_point_index(const char *s, size_t off) {
+    const unsigned char *c = (const unsigned char *)s;
+    int64_t seen = 0;
+    size_t at = 0;
+    while (at < off && c[at]) {
+        at++;
+        while ((c[at] & 0xC0) == 0x80) at++;
+        seen++;
+    }
+    return seen;
+}
+
+static char *festina_text_copy_range(const char *s, size_t from, size_t to) {
+    size_t n = to > from ? to - from : 0;
+    char *out = malloc(n + 1);
+    if (!out) festina_fail("out of memory in a text method");
+    if (n) memcpy(out, s + from, n);
+    out[n] = '\0';
+    return out;
+}
+
+/* claude.md #328: text.slice(start, end) -- code-point indices, both
+ * clamped, `end` below `start` yielding the empty string. The same
+ * clamping festina_ascii_slice already does, so the two types answer
+ * the same shape of question the same way; only the index unit differs,
+ * and only because `text` is variable width. */
+char *festina_text_slice(const char *s, int64_t start, int64_t end) {
+    if (!s) s = "";
+    if (start < 0) start = 0;
+    if (end < start) end = start;
+    size_t from = festina_text_byte_offset(s, start);
+    size_t to = festina_text_byte_offset(s, end);
+    return festina_text_copy_range(s, from, to);
+}
+
+/* claude.md #328: text.indexOf(needle[, from]) -- the first CODE-POINT
+ * index at or after `from`, or -1.
+ *
+ * The search itself is byte-exact, which is correct rather than a
+ * shortcut: UTF-8 is self-synchronizing, so a byte sequence can only
+ * match at a character boundary and a substring match is never a
+ * partial character. Only the two INDICES need converting, on the way
+ * in and on the way out. */
+int64_t festina_text_index_of(const char *s, const char *needle, int64_t from) {
+    if (!s) s = "";
+    if (!needle) needle = "";
+    size_t start = festina_text_byte_offset(s, from < 0 ? 0 : from);
+    const char *hit = strstr(s + start, needle);
+    if (!hit) return -1;
+    return festina_text_code_point_index(s, (size_t)(hit - s));
+}
+
+int8_t festina_text_starts_with(const char *s, const char *prefix) {
+    if (!s) s = "";
+    if (!prefix) prefix = "";
+    size_t n = strlen(prefix);
+    return (int8_t)(strncmp(s, prefix, n) == 0);
+}
+
+int8_t festina_text_ends_with(const char *s, const char *suffix) {
+    if (!s) s = "";
+    if (!suffix) suffix = "";
+    size_t sl = strlen(s), fl = strlen(suffix);
+    if (fl > sl) return 0;
+    return (int8_t)(memcmp(s + sl - fl, suffix, fl) == 0);
+}
+
+/* claude.md #328: ASCII-only case conversion, deliberately (§16.3).
+ * Every byte of a multi-byte UTF-8 sequence has its high bit set, so
+ * testing for 'a'..'z' byte-wise can never touch one -- which is what
+ * makes "ASCII letters only, everything else copied unchanged" a safe
+ * thing to do without decoding at all. */
+static char *festina_text_map_case(const char *s, int to_upper) {
+    if (!s) s = "";
+    size_t len = strlen(s);
+    char *out = malloc(len + 1);
+    if (!out) festina_fail("out of memory in a text case conversion");
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (to_upper) out[i] = (char)(c >= 'a' && c <= 'z' ? c - 32 : c);
+        else out[i] = (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    }
+    out[len] = '\0';
+    return out;
+}
+
+char *festina_text_to_lower(const char *s) { return festina_text_map_case(s, 0); }
+char *festina_text_to_upper(const char *s) { return festina_text_map_case(s, 1); }
+
+/* claude.md #328: text.repeat(n). A count at or below zero answers the
+ * empty string rather than failing -- the same "test, don't fail" shape
+ * every other out-of-range argument in this file takes. The overflow
+ * check is not decoration: `'x'.repeat(huge)` would otherwise compute a
+ * wrapped size and memcpy past a far smaller allocation. */
+char *festina_text_repeat(const char *s, int64_t n) {
+    if (!s) s = "";
+    if (n <= 0) n = 0;
+    size_t len = strlen(s);
+    if (len && (size_t)n > (SIZE_MAX - 1) / len) {
+        festina_fail("text.repeat() result is too large");
+    }
+    size_t total = len * (size_t)n;
+    char *out = malloc(total + 1);
+    if (!out) festina_fail("out of memory in text.repeat()");
+    for (int64_t i = 0; i < n; i++) memcpy(out + (size_t)i * len, s, len);
+    out[total] = '\0';
+    return out;
+}
+
+/* claude.md #328: text.toFloat() -- toInt()'s sibling, with the
+ * identical "null when nothing parseable was found" rule. float's null
+ * is a quiet NaN (§8.2), not a sentinel integer, so this answers
+ * festina_null_float() rather than any particular value. */
+double festina_text_to_float(const char *s) {
+    if (!s) s = "";
+    /* The valid prefix is scanned HERE rather than handed straight to
+     * strtod, because strtod accepts more than §16.3 describes: "inf",
+     * "nan" and the C99 hexadecimal float form ("0x1p3") are all
+     * strtod input and none of them is a number this method should
+     * answer. Scanning first makes the clause exact -- optional
+     * whitespace, an optional sign, digits with an optional fractional
+     * part and an optional decimal exponent -- and leaves strtod doing
+     * only the part it is genuinely better at, which is the rounding. */
+    const char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'
+           || *p == '\v' || *p == '\f') p++;
+    const char *num = p;
+    if (*p == '+' || *p == '-') p++;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9') { p++; digits++; }
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') { p++; digits++; }
+    }
+    if (!digits) return festina_null_float();
+    /* An exponent counts only when it is complete: `2.5e` is the
+     * number 2.5 followed by a stray letter, not an error. */
+    if (*p == 'e' || *p == 'E') {
+        const char *exp = p + 1;
+        if (*exp == '+' || *exp == '-') exp++;
+        if (*exp >= '0' && *exp <= '9') {
+            while (*exp >= '0' && *exp <= '9') exp++;
+            p = exp;
+        }
+    }
+    char stack_buf[64];
+    size_t span = (size_t)(p - num);
+    char *buf = span < sizeof(stack_buf) ? stack_buf : malloc(span + 1);
+    if (!buf) festina_fail("out of memory in text.toFloat()");
+    memcpy(buf, num, span);
+    buf[span] = '\0';
+    double v = strtod(buf, NULL);
+    if (buf != stack_buf) free(buf);
+    return v;
+}
+
 /* claude.md #272: text.trim() -- leading and trailing whitespace
  * removed, as a fresh owned copy (never a pointer into `s`, which may
  * be a .rodata literal -- claude.md #83's four provenances mean a text

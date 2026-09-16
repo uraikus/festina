@@ -307,6 +307,14 @@ arr[text] CG_PRE = [
     'declare ptr @festina_ls(ptr)',
     'declare i8 @festina_str_eq(ptr, ptr)',
     'declare i64 @festina_text_to_int(ptr)',
+    'declare ptr @festina_text_slice(ptr, i64, i64)',
+    'declare i64 @festina_text_index_of(ptr, ptr, i64)',
+    'declare i8 @festina_text_starts_with(ptr, ptr)',
+    'declare i8 @festina_text_ends_with(ptr, ptr)',
+    'declare ptr @festina_text_to_lower(ptr)',
+    'declare ptr @festina_text_to_upper(ptr)',
+    'declare ptr @festina_text_repeat(ptr, i64)',
+    'declare double @festina_text_to_float(ptr)',
     'declare ptr @festina_text_trim(ptr)',
     'declare ptr @festina_text_char_at(ptr, i64)',
     'declare i64 @festina_text_char_code_at(ptr, i64)',
@@ -1455,6 +1463,22 @@ text CG_FN_SIG = ''
 //
 // The table is the whole of it: `resolve` below is a case fold, a
 // `none` check, a hex branch and a lookup.
+// claude.md #328: the eight text methods, as
+// '<runtime function>|<result LLVM type>|<argument kinds>|<result fty>'.
+// The argument kinds are one character each -- 'p' for a text pointer,
+// 'i' for an int -- which is both the call's own spelling and the test
+// for which arguments are text temporaries needing a free afterwards.
+map[text] TEXT_M_FN = {
+    'slice': 'festina_text_slice|ptr|ii|text',
+    'indexOf': 'festina_text_index_of|i64|pi|int',
+    'startsWith': 'festina_text_starts_with|i8|p|bool',
+    'endsWith': 'festina_text_ends_with|i8|p|bool',
+    'toLowerCase': 'festina_text_to_lower|ptr||text',
+    'toUpperCase': 'festina_text_to_upper|ptr||text',
+    'repeat': 'festina_text_repeat|ptr|i|text',
+    'toFloat': 'festina_text_to_float|double||float'
+}
+
 map[text] CG_CSS_COLORS = {
     'aliceblue': 'f0f8ff', 'antiquewhite': 'faebd7', 'aqua': '00ffff',
     'aquamarine': '7fffd4', 'azure': 'f0ffff', 'beige': 'f5f5dc',
@@ -4352,6 +4376,59 @@ text func cgSnakeOf(m:text) {
     return out
 }
 
+    // claude.md #328: the eight text methods, all one shape -- emit
+    // the receiver, emit the arguments, call, then free exactly what
+    // this call site allocated. `text` is copy-managed rather than
+    // refcounted, so the receiver and every text argument go through
+    // cgFreeTextTemp, which frees only what the expression itself owned
+    // and leaves a borrowed binding alone.
+    //
+    // The receiver is freed AFTER the arguments are emitted. An
+    // argument expression can be arbitrary, and freeing the receiver
+    // first would leave the call reading a buffer this site had already
+    // released -- the mistake decisions.md #321 made for drawImage and
+    // had to fix, so it is written down rather than rediscovered.
+Val func cgTextMethodCall(m:text, recv:Node, r:Val, args:arr[Node]) {
+    Val none
+        arr[text] spec = TEXT_M_FN[m].split('|')
+        text kinds = spec[2]
+        text joined = ''
+        arr[Node] tArgNodes = []
+        arr[Val] tArgVals = []
+        int ai = 0
+        while ai < kinds.length {
+            text kind = 'i64'
+            if kinds.charCodeAt(ai) == 112 { kind = 'ptr' }
+            if ai < args.length {
+                Val av = cgExpr(args[ai])
+                if CG_STUCK { return none }
+                if kind == 'ptr' {
+                    if av.fty != 'text' {
+                        cgUnported(`.${m}() argument of type ${av.fty}`)
+                        return none
+                    }
+                    tArgNodes.push(args[ai])
+                    tArgVals.push(av)
+                }
+                joined = joined + `, ${kind} ${av.v}`
+            } else {
+                // The one optional argument in the set -- indexOf's
+                // `from`, defaulting to 0.
+                joined = joined + `, ${kind} 0`
+            }
+            ai++
+        }
+        text mout = cgTmp()
+        cgOut(`  ${mout} = call ${spec[1]} @${spec[0]}(ptr ${r.v}${joined})`)
+        int fi = 0
+        while fi < tArgNodes.length {
+            cgFreeTextTemp(tArgNodes[fi], tArgVals[fi])
+            fi++
+        }
+        cgFreeTextTemp(recv, r)
+        return cgVal(mout, spec[1], spec[3])
+    }
+
 Val func cgMethodCall(e:Node, callee:Node) {
     Val none
     text m = rawText(callee, 'prop')
@@ -4672,6 +4749,12 @@ Val func cgMethodCall(e:Node, callee:Node) {
             // nothing here checks. Answered before the blob path below
             // rather than falling through it, because an ascii
             // receiver has already been emitted by this point.
+            // claude.md #328: a TEXT receiver, answered here because
+            // the receiver has already been emitted by this point and
+            // re-emitting it below would evaluate it twice.
+            if first.fty == 'text' {
+                return cgTextMethodCall(m, recv, first, args)
+            }
             if first.fty == 'ascii' {
                 Val sa = cgExprExpecting(args[0], 'int', '')
                 if CG_STUCK { return none }
@@ -5067,6 +5150,18 @@ Val func cgMethodCall(e:Node, callee:Node) {
     if m == 'toText' && args.length == 0 { known = true }
     if m == 'charCodeAt' && args.length == 1 { known = true }
     if m == 'toAscii' && args.length == 0 { known = true }
+    // claude.md #328: the text methods with no other receiver type to
+    // compete with. `slice`, `indexOf` and `toFloat` are not here --
+    // each already has a branch above for another receiver, and each
+    // hands a TEXT receiver to the same helper from inside it.
+    if m == 'startsWith' && args.length == 1 { known = true }
+    if m == 'endsWith' && args.length == 1 { known = true }
+    if m == 'toLowerCase' && args.length == 0 { known = true }
+    if m == 'toUpperCase' && args.length == 0 { known = true }
+    if m == 'repeat' && args.length == 1 { known = true }
+    // `indexOf` has no other receiver implemented here yet, so unlike
+    // slice/toFloat it is gated rather than reached from a branch above.
+    if m == 'indexOf' && args.length >= 1 && args.length <= 2 { known = true }
     if known == false {
         cgUnported(`method .${m}()`)
         return none
@@ -5074,6 +5169,10 @@ Val func cgMethodCall(e:Node, callee:Node) {
 
     Val r = cgExpr(recv)
     if CG_STUCK { return none }
+
+    if r.fty == 'text' && TEXT_M_FN[m] != null {
+        return cgTextMethodCall(m, recv, r, args)
+    }
 
     if m == 'toFloat' {
         if r.fty != 'int' {
