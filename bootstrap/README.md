@@ -55,17 +55,19 @@ python bootstrap/canary.py                          # can the corpus still TELL?
 python bootstrap/canary.py --list
 ```
 
-Over the 124-file repository corpus, **every pass reproduces every
+Over the 125-file repository corpus, **every pass reproduces every
 file**:
 
-- **lexer: 124 match, 0 differ.**
-- **parser: 124 match, 0 differ, 0 unported.**
-- **semantic: 124 match, 0 differ, 0 unported.**
-- **escape analysis: 113 match, 0 differ, 0 unported, 11 rejected by
-  both** — 2,221 of 2,221 records.
-- **codegen: 113 match, 0 differ, 0 unported, 11 rejected by both** —
-  418,845 of 418,845 file-specific IR lines.
-- **canaries: 145 registered, 0 missed.**
+- **lexer: 125 match, 0 differ.**
+- **parser: 125 match, 0 differ, 0 unported.**
+- **semantic: 125 match, 0 differ, 0 unported.**
+- **escape analysis: 114 match, 0 differ, 0 unported, 11 rejected by
+  both** — 2,224 of 2,224 records.
+- **codegen: 114 match, 0 differ, 0 unported, 11 rejected by both** —
+  419,389 of 419,389 file-specific IR lines.
+- **canaries: 147 registered**; the 16 re-aimed after this port and the
+  2 written for it re-measured, all 18 caught. A full-registry sweep is
+  what turns that into "0 missed", and it has not finished yet.
 
 The eleven "rejected by both" are programs the front end refuses —
 deliberately ill-formed sources the corpus keeps so that both
@@ -99,7 +101,7 @@ figure.
 the two implementations agree; it says nothing about whether the corpus
 could tell them apart if they stopped agreeing — and for four
 consecutive slices of the codegen port, the honest answer was that it
-could not. `bootstrap/canary.py` holds a hundred and forty-five
+could not. `bootstrap/canary.py` holds a hundred and forty-seven
 deliberate breakages, one per mechanism, and asks the corpus whether it
 notices:
 **0 not caught.** A failure
@@ -223,7 +225,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Escape analysis: 2,221 of 2,221 records
+## Escape analysis: 2,224 of 2,224 records
 
 `escape_analysis.py` answers one purely syntactic question per function
 body — which names appear anywhere other than as the immediate base of
@@ -276,7 +278,7 @@ in source order — the interleaving, and the synthesized
 `match` is gone before this walk ever runs: `bootstrap/semantic.f`
 desugars it in place, exactly where the original does.
 
-## Semantic analysis: 124 match, 0 differ, 0 unported
+## Semantic analysis: 125 match, 0 differ, 0 unported
 
 All three stages of the front end agree with their originals over the
 whole corpus. `semantic.f` resolves declarations, merges imports,
@@ -326,7 +328,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 418,845 of 418,845 file-specific IR lines
+## Codegen: 419,389 of 419,389 file-specific IR lines
 
 About 14,500 lines of Python, more than everything else ported put
 together — and now complete. Every compilable file in the corpus has
@@ -397,10 +399,10 @@ times and so could not have varied either way.
 
 **The proportion turned over, and then kept going.** Four slices ago it
 was 3,715 of 4,849 — three quarters from `cases/` files written for the
-slices that claimed them. It is now **12,144 of 418,845, under three
-per cent**, because the bootstrap's own ten files contribute 375,131
-lines between them of programs written to be a compiler rather than to
-be measured.
+slices that claimed them. It is now **13,722 of 419,389, a little over
+three per cent**, because the bootstrap's own ten files contribute
+375,131 lines between them of programs written to be a compiler rather
+than to be measured.
 
 That is a ratio to read carefully rather than to be pleased by. A
 corpus dominated by one enormous file measures whatever that file
@@ -409,12 +411,13 @@ mechanism with one witness. The `cases/` files are small precisely so
 that each one's coverage is deliberate; see the canary note above for
 what happened when a slice's mechanisms were left to `codegen.f` alone.
 
-The twelve largest case files are `json_and_choices.f` (1,561),
-`escape_hatch.f` (1,017), `owning_containers.f` (889),
-`handles_and_nesting.f` (789), `owning_elements.f` (652),
-`blobs_and_scopes.f` (597), `drivers.f` (565), `escape_locals.f`
-(538), `maps.f` (521), `text_building.f` (418), `nulls.f` (393) and
-`array_literals.f` (379). Non-scalar parameters were the one slice
+The twelve largest case files are `json_and_choices.f` (1,569),
+`escape_hatch.f` (1,025), `owning_containers.f` (897),
+`splice_and_ascii.f` (897), `handles_and_nesting.f` (797),
+`rows_and_handles.f` (690), `owning_elements.f` (660),
+`blobs_and_scopes.f` (605), `drivers.f` (594), `escape_locals.f`
+(546), `owning_field_reads.f` (544) and `maps.f` (529).
+Non-scalar parameters were the one slice
 so far to bring in pre-existing files instead: `examples/geometry.f`
 and `examples/multifile.f`, the two the blocker table listed as one
 construct away. Struct fields and container globals
@@ -505,7 +508,7 @@ are the ones worth knowing about.
 
 The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
-**375,131 of the 418,845 file-specific IR lines**, and they need none
+**375,131 of the 419,389 file-specific IR lines**, and they need none
 of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the

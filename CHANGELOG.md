@@ -59,10 +59,10 @@ round-by-round design and implementation record predating 0.1 lives in
 - **The bootstrap compiler is complete.** `bootstrap/` holds Festina's
   own compiler, written in Festina, and every one of its five passes
   now agrees with the Python implementation it mirrors on **every file
-  of the 124-file corpus** — including its own source, which is
-  122,000 lines of IR on its own. Lexer, parser and analyzer: 124
-  match, 0 differ each. Escape analysis: 2,221 of 2,221 records.
-  Codegen: 418,845 of 418,845 file-specific IR lines, byte for byte.
+  of the 125-file corpus** — including its own source, which is
+  122,000 lines of IR on its own. Lexer, parser and analyzer: 125
+  match, 0 differ each. Escape analysis: 2,224 of 2,224 records.
+  Codegen: 419,389 of 419,389 file-specific IR lines, byte for byte.
   The eleven files neither side compiles are deliberately ill-formed
   sources the corpus keeps so that both implementations are checked on
   the rejection as well as the acceptance.
@@ -72,7 +72,7 @@ round-by-round design and implementation record predating 0.1 lives in
   against its original. Reaching the end of the blocker table is a
   statement about this corpus rather than about the language — a
   construct no file exercises is unmeasured however carefully both
-  sides were written, which is what `bootstrap/canary.py`'s 145
+  sides were written, which is what `bootstrap/canary.py`'s 147
   deliberate breakages exist to say out loud.
 
 - **`==`/`!=` between two values of a reference type now means

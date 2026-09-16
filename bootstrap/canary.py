@@ -164,7 +164,7 @@ CANARIES = [
     arr[text] vals = []
     arr[int] owned = []"""),
             ("""    text into = header
-    if into == '' { into = cgFreshHeader('%struct._FestinaArray') }""",
+    if into == '' { into = cgFreshHeader(hdrTy) }""",
              """    text into = early"""),
         ],
     ),
@@ -196,6 +196,9 @@ CANARIES = [
         "an aliasing container initializer retains rather than owning",
         """                bool lOwning = cgIsOwningRefcountedSource(linit)
                 if lv.fresh { lOwning = true }
+                // claude.md #202: no retain at the declaration and no
+                // tracking afterwards -- see the blob branch above.
+                if manual { lOwning = true }
                 if lOwning == false {
                     cgOut(`  call void @festina_retain(ptr ${lv.v})`)
                 }""",
@@ -236,9 +239,9 @@ CANARIES = [
     Canary(
         "param-always-retain", "#305",
         "a parameter the body only READS takes nothing at all",
-        """        } else if cgIsRefcounted(pftys[q]) {
+        """        } else if cgIsRefcounted(pftys[q]) && pmanual[q] == false {
             if escSet[pnames[q]] != null {""",
-        """        } else if cgIsRefcounted(pftys[q]) {
+        """        } else if cgIsRefcounted(pftys[q]) && pmanual[q] == false {
             if true {""",
     ),
     Canary(
@@ -377,10 +380,64 @@ CANARIES = [
         "",
     ),
     Canary(
-        "field-read-mints-before-release", "#311",
-        "claude.md #117: a field read through an owning base is copied out first",
-        """    if cgIsRefcounted(base.fty) && cgOwnsRefcounted(childOf(e, 'obj'), base) {""",
-        """    if false {""",
+        "field-read-drains-its-chain", "#311",
+        "claude.md #117/#262: a field read off an owned base mints, then "
+        "releases that base",
+        """    if es.length == 0 { return out }
+    if cgIsRefcounted(out.fty) {""",
+        """    if true { return out }
+    if cgIsRefcounted(out.fty) {""",
+    ),
+    # The mint and the release are one mechanism but two claims, and
+    # breaking only the mint went UNDETECTED until
+    # `cases/owning_field_reads.f` existed: every corpus file that read
+    # a field off an owning base did it through `.length`, which drains
+    # the chain and mints nothing, because an i64 owes the base
+    # nothing. Two canaries rather than one, so a corpus that can see
+    # the release but not the mint says so.
+    Canary(
+        "field-read-mint-retains-a-refcounted-field", "#311",
+        "claude.md #117: a refcounted field read through an owning base "
+        "takes its own reference before the base is released",
+        """    if cgIsRefcounted(out.fty) {
+        cgOut(`  call void @festina_retain(ptr ${out.v})`)
+        out.fresh = true
+    } else if out.fty == 'text' {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${out.v})`)
+        out.v = owned
+        out.fresh = true
+    }
+    int j = 0""",
+        """    if false {
+        cgOut(`  call void @festina_retain(ptr ${out.v})`)
+        out.fresh = true
+    } else if out.fty == 'text' {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${out.v})`)
+        out.v = owned
+        out.fresh = true
+    }
+    int j = 0""",
+    ),
+    Canary(
+        "field-read-mint-copies-a-text-field", "#311",
+        "claude.md #83: a text field read through an owning base is "
+        "COPIED, not retained -- it has no count to take",
+        """    } else if out.fty == 'text' {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${out.v})`)
+        out.v = owned
+        out.fresh = true
+    }
+    int j = 0""",
+        """    } else if false {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${out.v})`)
+        out.v = owned
+        out.fresh = true
+    }
+    int j = 0""",
     ),
     # No canary for "two struct values compare as i64". The
     # construct cannot appear in a working program: the shipped
@@ -467,7 +524,11 @@ CANARIES = [
     Canary(
         "struct-cascade", "#310",
         "a struct with an owning field needs a generated cascade",
-        "    if fty == 'struct' && cgStructOwnsAnything(ety) { return cgReleaseStructFn(ety) }",
+        """    if fty == 'struct' {
+        if cgStructOwnsAnything(ety) || CG_TAGGED[ety] != null {
+            return cgReleaseStructFn(ety)
+        }
+    }""",
         "",
     ),
     Canary(
@@ -522,12 +583,13 @@ CANARIES = [
     Canary(
         "return-retains-before-freeing", "#310",
         "a returned refcounted value takes its reference before the scope frees",
-        """    if cgIsRefcounted(r.fty) {
-        if cgIsOwningRefcountedSource(v) == false {
+        """        if cgIsOwningRefcountedSource(v) == false && r.fresh == false {
             cgOut(`  call void @festina_retain(ptr ${val})`)
         }
     } else if r.fty == 'text' {""",
-        """    if false {
+        """        if false {
+            cgOut(`  call void @festina_retain(ptr ${val})`)
+        }
     } else if r.fty == 'text' {""",
     ),
     Canary(
@@ -599,13 +661,12 @@ CANARIES = [
         # decisions.md #320's ascii .length is a header load with the
         # identical two lines after it -- the shorter anchor named two
         # sites and so measured neither.
-        """        cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 0`)
-        text out = cgTmp()
-        cgOut(`  ${out} = load i64, ptr ${lenP}`)
-        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)""",
-        """        cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 0`)
-        text out = cgTmp()
-        cgOut(`  ${out} = load i64, ptr ${lenP}`)""",
+        """        if havePend {
+            Val noOut
+            cgReleaseMemberChain(pendE, pendV, childOf(e, 'obj'), obj, noOut)
+        }
+        return cgVal(out, 'i64', 'int')""",
+        """        return cgVal(out, 'i64', 'int')""",
     ),
     Canary(
         "join-element-kind", "#309",
@@ -664,8 +725,11 @@ CANARIES = [
         "minted-base-field-release", "#312",
         "a field read off a MINTED computed index releases the base it "
         "was handed",
-        """    if cgIsRefcounted(base.fty) && cgOwnsRefcounted(childOf(e, 'obj'), base) {""",
-        """    if cgIsRefcounted(base.fty) && cgIsOwningRefcountedSource(childOf(e, 'obj')) {""",
+        """    if v.fresh { return true }
+    if e == null { return false }
+    return e.kind == 'Call'""",
+        """    if e == null { return false }
+    return e.kind == 'Call'""",
     ),
     Canary(
         "map-stack-values-released", "#312",
@@ -721,7 +785,7 @@ CANARIES = [
         "a managed declaration INSIDE a function is local even when a "
         "global shares its name",
         """            bool isGlobalDecl = false
-            if CG_IN_FUNC == false {
+            if CG_IN_FUNC == false && CG_AT_TOPLEVEL {
                 if G_SLOT[gname] != null { isGlobalDecl = true }
             }""",
         """            bool isGlobalDecl = false
@@ -1088,17 +1152,19 @@ CANARIES = [
         "row-release-frees-its-text-columns", "#318",
         "a sqlite row frees each of its own text columns before the "
         "allocation they hang off",
-        """        if ctypes[i] == 'text' {
-            text slot = cgTmp()""",
-        """        if false {
-            text slot = cgTmp()""",
+        """        if ctypes[i] == 'text' { colFree = '@free' }""",
+        """        if ctypes[i] == 'text' { colFree = '' }""",
     ),
     Canary(
         "row-is-freed-from-its-base", "#318",
         "a row's allocation starts one i64 before the payload every "
         "column offset is measured from",
-        """    cgOut(`  ${base} = getelementptr i8, ptr %row, i64 -8`)""",
-        """    cgOut(`  ${base} = getelementptr i8, ptr %row, i64 0`)""",
+        """    cgOut(`  ${base} = getelementptr i8, ptr %row, i64 -8`)
+    cgOut(`  call void @free(ptr ${base})`)
+    cgOut(`  br label %${nullL}`)""",
+        """    cgOut(`  ${base} = getelementptr i8, ptr %row, i64 0`)
+    cgOut(`  call void @free(ptr ${base})`)
+    cgOut(`  br label %${nullL}`)""",
     ),
     Canary(
         "collected-rows-need-no-repacking", "#318",
@@ -1108,14 +1174,10 @@ CANARIES = [
             # Copy the buffer into a second allocation instead of
             # adopting it. Both halves are needed: the header still has
             # to be filled in, or the result is not an array at all.
-            ("""    text header = cgFreshHeader('%struct._FestinaArray')
-    text lenP = cgTmp()
-    cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${header}, i32 0, i32 0`)
-    cgOut(`  store i64 ${nv}, ptr ${lenP}`)""",
-             """    text header = cgFreshHeader('%struct._FestinaArray')
-    text lenP = cgTmp()
-    cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${header}, i32 0, i32 0`)
-    cgOut(`  store i64 0, ptr ${lenP}`)"""),
+            ("""    cgTableArrays(tname)
+    int n = TBL_NCOLS[tname]""",
+             """    cgTableArrays(tname)
+    int n = 0"""),
         ],
     ),
     Canary(
@@ -1294,10 +1356,8 @@ CANARIES = [
         "thread-handle-stored-before-spawn", "#323",
         "a thread's handle global is stored before the thread is spawned",
         [
-            ("""            cgOut(`  store ptr %__thread_${tn}, ptr @__festina_thread_${tn}_handle`)
-            cgOut(`  call void @festina_thread_spawn(ptr %__thread_${tn})`)""",
-             """            cgOut(`  call void @festina_thread_spawn(ptr %__thread_${tn})`)
-            cgOut(`  store ptr %__thread_${tn}, ptr @__festina_thread_${tn}_handle`)"""),
+            ("""            cgOut(`  store ptr %__thread_${tn}, ptr @__festina_thread_${tn}_handle`)""",
+             """            cgOut(`  store ptr null, ptr @__festina_thread_${tn}_handle`)"""),
         ],
     ),
     Canary(
