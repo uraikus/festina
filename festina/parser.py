@@ -213,11 +213,39 @@ class Parser:
                 raise self.err(self.peek(), "invalid syntax",
                                 f"field '{name_tok.value}' requires a type, e.g. '{name_tok.value}:int'")
             self.eat_op(":")
+            weak = self._eat_weak_modifier()
             type_expr = self.parse_type()
-            fields.append(ast.FieldDecl(name_tok.value, type_expr))
+            fields.append(ast.FieldDecl(name_tok.value, type_expr, weak=weak))
             if self.at_op(","):
                 self.eat()
         return fields
+
+    def _eat_weak_modifier(self):
+        """claude.md #332: the `weak` in `parent:weak Node`.
+
+        NOT a reserved word. It is recognised in exactly one position --
+        straight after a field's ':' -- so every program that already
+        uses `weak` as an ordinary identifier keeps working, which a new
+        keyword would have broken for no benefit (`amor`, which IS
+        reserved, is the cautionary precedent: it costs every program
+        the name forever to buy one modifier).
+
+        Paid for with one token of lookahead. `x:weak Node` has a type
+        after it; a field simply named `weak` is followed by its own
+        ':', as in `weak:int`. Testing for that ':' is what separates
+        the two, and it is the only shape that could be confused --
+        `weak` alone at the end of a field list is not a legal field
+        either way, since a field always has a type."""
+        t = self.peek()
+        if not (t.type == "IDENT" and t.value == "weak"):
+            return False
+        after = self.peek(1)
+        if after.type == "OP" and after.value == ":":
+            return False      # a field actually named `weak`
+        if after.type == "RBRACE" or (after.type == "OP" and after.value == ","):
+            return False      # `weak` used as the type name itself
+        self.eat("IDENT")
+        return True
 
     # ---- statements ----
     def parse_statement(self):

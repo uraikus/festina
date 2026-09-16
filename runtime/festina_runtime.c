@@ -5800,6 +5800,158 @@ void festina_release_text_map(void *payload) {
     festina_free_z((char *)payload - sizeof(int64_t));
 }
 
+/* ---- weak fields -- claude.md #332 ----
+ *
+ * `name:weak T` refers to a value without keeping it alive, and its
+ * READ is checked: it answers the value while something else still
+ * holds it, and null once nothing does. That rules out the dangling
+ * pointer an uncounted raw reference would allow, and it is why this
+ * needs runtime support at all rather than being purely a codegen
+ * matter.
+ *
+ * The indirection is a small control block, shared by every weak field
+ * aimed at one object:
+ *
+ *     {refs, payload}   payload becomes NULL when the object is freed
+ *
+ * A weak FIELD stores the block, never the object -- so the object's
+ * own representation is untouched, which is the whole design
+ * constraint here. Widening the managed header instead (a second count
+ * beside the refcount) would have moved every payload from -8 to -16,
+ * disturbed the bits the cycle collector packs its colours into, and
+ * made every managed value in every program 8 bytes larger to pay for
+ * a feature most programs never use. specification.md 13.5's last line
+ * is explicit that a program declaring no weak field must pay nothing,
+ * and an object layout change cannot honour that.
+ *
+ * Finding an object's block on free is what the table below is for.
+ * Only types that are the TARGET of some declared weak field ever
+ * consult it -- codegen knows which those are and emits the call for
+ * no others -- so the cost lands exactly on the programs that asked
+ * for it.
+ *
+ * Reusing a freed address is handled by removing the entry in
+ * festina_weak_died: a later object allocated at the same address gets
+ * a fresh block, and the stale weak fields keep pointing at the old
+ * one, which reads NULL forever. */
+
+typedef struct {
+    int64_t refs;     /* weak fields holding this block */
+    void *payload;    /* the object, or NULL once it has been freed */
+} FestinaWeakBlock;
+
+typedef struct {
+    void *key;                /* object payload, NULL for an empty slot */
+    FestinaWeakBlock *block;
+} FestinaWeakSlot;
+
+static FestinaWeakSlot *g_weak_slots = NULL;
+static size_t g_weak_cap = 0;
+static size_t g_weak_count = 0;
+
+static size_t festina_weak_hash(void *p) {
+    uint64_t x = (uint64_t)(uintptr_t)p;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return (size_t)x;
+}
+
+static void festina_weak_grow(void) {
+    size_t new_cap = g_weak_cap ? g_weak_cap * 2 : 16;
+    FestinaWeakSlot *slots = calloc(new_cap, sizeof(FestinaWeakSlot));
+    if (!slots) festina_fail("out of memory tracking a weak reference");
+    for (size_t i = 0; i < g_weak_cap; i++) {
+        if (!g_weak_slots[i].key) continue;
+        size_t j = festina_weak_hash(g_weak_slots[i].key) & (new_cap - 1);
+        while (slots[j].key) j = (j + 1) & (new_cap - 1);
+        slots[j] = g_weak_slots[i];
+    }
+    free(g_weak_slots);
+    g_weak_slots = slots;
+    g_weak_cap = new_cap;
+}
+
+/* The block for `payload`, created on first use, with one more
+ * reference taken for the field that is about to store it. */
+void *festina_weak_ref(void *payload) {
+    if (!payload) return NULL;
+    if (g_weak_count * 2 >= g_weak_cap) festina_weak_grow();
+    size_t mask = g_weak_cap - 1;
+    size_t i = festina_weak_hash(payload) & mask;
+    while (g_weak_slots[i].key) {
+        if (g_weak_slots[i].key == payload) {
+            g_weak_slots[i].block->refs++;
+            return g_weak_slots[i].block;
+        }
+        i = (i + 1) & mask;
+    }
+    FestinaWeakBlock *b = malloc(sizeof(FestinaWeakBlock));
+    if (!b) festina_fail("out of memory tracking a weak reference");
+    b->refs = 1;
+    b->payload = payload;
+    g_weak_slots[i].key = payload;
+    g_weak_slots[i].block = b;
+    g_weak_count++;
+    return b;
+}
+
+/* Upgrade: the object, or NULL if it is gone.
+ *
+ * Handed back BORROWED, with no reference taken, because that is what
+ * every other field read in this compiler does -- a binding that keeps
+ * the value retains it at the binding, and one that only tests it
+ * (`if n.parent == null`) must not leak a reference it never stored.
+ * Returning +1 here instead would have been safe in a different way
+ * and wrong in this codebase's terms: the caller cannot tell a weak
+ * read from an ordinary one, so the two have to agree. */
+void *festina_weak_get(void *block) {
+    FestinaWeakBlock *b = (FestinaWeakBlock *)block;
+    if (!b) return NULL;
+    return b->payload;
+}
+
+void festina_weak_drop(void *block) {
+    FestinaWeakBlock *b = (FestinaWeakBlock *)block;
+    if (!b) return;
+    if (--b->refs <= 0 && !b->payload) free(b);
+}
+
+/* Called from the free path of any type some weak field can target.
+ * Marks every weak reference to this object dead at once, and drops
+ * the table entry so the address can be reused cleanly. */
+void festina_weak_died(void *payload) {
+    if (!payload || !g_weak_cap) return;
+    size_t mask = g_weak_cap - 1;
+    size_t i = festina_weak_hash(payload) & mask;
+    while (g_weak_slots[i].key) {
+        if (g_weak_slots[i].key == payload) {
+            FestinaWeakBlock *b = g_weak_slots[i].block;
+            b->payload = NULL;
+            if (b->refs <= 0) free(b);
+            /* Backward-shift deletion: open addressing cannot leave a
+             * hole behind without cutting the probe chain that runs
+             * through it. */
+            size_t j = i;
+            for (;;) {
+                g_weak_slots[j].key = NULL;
+                g_weak_slots[j].block = NULL;
+                size_t k = j;
+                for (;;) {
+                    k = (k + 1) & mask;
+                    if (!g_weak_slots[k].key) { g_weak_count--; return; }
+                    size_t home = festina_weak_hash(g_weak_slots[k].key) & mask;
+                    /* Does `home` lie outside (j, k]? Then k may move. */
+                    if (j <= k ? (home <= j || home > k) : (home <= j && home > k)) break;
+                }
+                g_weak_slots[j] = g_weak_slots[k];
+                j = k;
+            }
+        }
+        i = (i + 1) & mask;
+    }
+}
+
 /* ---- cycle collection -- claude.md #120 ----
  *
  * Reference counting cannot free a cycle (`a.next = a` holds itself at

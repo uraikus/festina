@@ -1004,6 +1004,9 @@ class CodeGen:
         self.target = target
         self.pointer_bits = 32 if target == "wasm32-wasi" else 64
         self.structs = analyzed.structs       # name -> {field: Type}
+        # claude.md #332: name -> frozenset of `weak` field names.
+        self.weak_fields = getattr(analyzed, "weak_fields", {}) or {}
+        self._weak_target_cache = None     # struct names some weak field targets
         self.struct_order = list(analyzed.structs.keys())
         self.tables = analyzed.tables          # name -> {field: festina-type-name}
         self.enums = analyzed.enums            # claude.md #176: name -> semantic._EnumInfo
@@ -2379,6 +2382,27 @@ class CodeGen:
             "declare double @llvm.ceil.f64(double)",
             "declare double @llvm.round.f64(double)",
             "declare double @llvm.trunc.f64(double)",
+        ] + self._weak_decls()
+
+    def _weak_decls(self):
+        """claude.md #332: the weak helpers, declared ONLY when the
+        program actually has a weak field.
+
+        Emitting them unconditionally costs nothing at runtime -- a
+        `declare` with no call site lowers to nothing at all -- and it
+        still breaks specification.md 13.5's last line as this project
+        measures it, because the contract here is byte-exact IR: four
+        extra lines in every module turned all 114 matching corpus files
+        into 114 differing ones. Caught by the differential harness, and
+        by nothing else; it is exactly the kind of "free" that is only
+        free until something is actually checking."""
+        if not any(self.weak_fields.values()):
+            return []
+        return [
+            "declare ptr @festina_weak_ref(ptr)",
+            "declare ptr @festina_weak_get(ptr)",
+            "declare void @festina_weak_drop(ptr)",
+            "declare void @festina_weak_died(ptr)",
         ]
 
     def _struct_type_defs(self):
@@ -6380,7 +6404,8 @@ class CodeGen:
                 # above rather than emitting expr.obj a second time,
                 # which would run any side effects in it twice.
                 ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
-                return self._load_field_value(ptr, ftype, lines)
+                return self._load_field_value(
+                    ptr, ftype, lines, weak=self._is_weak_field(obj_type, expr))
             if not expr.computed and expr.prop in ("port", "method", "path", "headers", "state"):
                 obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
                 result = self._emit_http_socket_field(expr, obj_val, obj_type, lines)
@@ -6390,7 +6415,8 @@ class CodeGen:
                 # perfectly legal (mirroring img.width/.height's own
                 # fallthrough just above) -- resolves the ordinary way.
                 ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
-                return self._load_field_value(ptr, ftype, lines)
+                return self._load_field_value(
+                    ptr, ftype, lines, weak=self._is_weak_field(obj_type, expr))
             if not expr.computed and expr.prop == "length":
                 # claude.md #79: an arr[T] value is a `ptr` to its own
                 # {i64, ptr} storage now, so .length is a GEP+load of
@@ -8731,7 +8757,8 @@ class CodeGen:
                 out, ftype = handled
             else:
                 ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
-                out, ftype = self._load_field_value(ptr, ftype, lines)
+                out, ftype = self._load_field_value(
+                    ptr, ftype, lines, weak=self._is_weak_field(obj_type, expr))
         finally:
             pending = self._end_member_chain(state)
         if handled is not None:
@@ -8939,7 +8966,35 @@ class CodeGen:
         if self._is_owning_refcounted_source(obj_expr) or isinstance(obj_expr, ast.MapLit):
             lines.append(f"  call void @festina_release_http(ptr {obj_val})")
 
-    def _load_field_value(self, ptr, ftype, lines):
+    def _is_weak_target(self, name):
+        """claude.md #332: whether any declared `weak` field anywhere in
+        the program points AT struct `name`. Only such a type pays the
+        free-time notification -- the point of gating it is
+        specification.md 13.5's last line, that a program declaring no
+        weak field pays nothing."""
+        cached = self._weak_target_cache
+        if cached is None:
+            cached = set()
+            for owner, fnames in self.weak_fields.items():
+                for fname in fnames:
+                    ftype = self.structs.get(owner, {}).get(fname)
+                    if isinstance(ftype, types_mod.StructType):
+                        cached.add(ftype.name)
+            self._weak_target_cache = cached
+        return name in cached
+
+    def _is_weak_field(self, obj_type, expr):
+        """claude.md #332: whether `expr` names a `weak` field of
+        `obj_type`. Computed from the OWNER's name and the property,
+        because weakness lives on the field rather than on the type it
+        holds -- `ftype` alone cannot answer it."""
+        if getattr(expr, "computed", False):
+            return False
+        if not isinstance(obj_type, types_mod.StructType):
+            return False
+        return expr.prop in self.weak_fields.get(obj_type.name, frozenset())
+
+    def _load_field_value(self, ptr, ftype, lines, weak=False):
         """Loads one field, giving a struct/arr[T]/map[T]-typed one real
         storage the first time it is reached.
 
@@ -8965,6 +9020,19 @@ class CodeGen:
         is created once and every later read sees the same one; freeing
         the parent releases it through the field walk #78 already does.
         """
+        if weak:
+            # claude.md #332: the slot holds the weak BLOCK, not the
+            # object, so the read is a load plus an upgrade -- and
+            # deliberately NOT the auto-vivify path below. Creating a
+            # value here would mean creating one nothing owns, which
+            # would be freed immediately and read back as null anyway;
+            # specification.md 8.9.2 names this as its one exception.
+            blk = self.tmp()
+            lines.append(f"  {blk} = load ptr, ptr {ptr}")
+            out = self.tmp()
+            lines.append(f"  {out} = call ptr @festina_weak_get(ptr {blk})")
+            return out, ftype
+
         if not isinstance(ftype, (types_mod.StructType, types_mod.ArrayType,
                                    types_mod.MapType)):
             out = self.tmp()
@@ -10030,7 +10098,15 @@ class CodeGen:
         # (which always frees at payload-8) would free the wrong
         # address entirely.
         tagged = type_.name in self._tagged_structs
-        if not self._struct_has_own_managed_field(type_.name) and not tagged:
+        # claude.md #332: a struct some weak field targets needs a
+        # wrapper even when it owns nothing at all, for the same reason
+        # a tagged one does -- the wrapper is the only place that knows
+        # this type's free is the moment every weak reference to it has
+        # to start reading null. Without it the generic @festina_release
+        # frees the value and nothing tells the weak blocks, which is
+        # precisely the dangling read `weak` exists to prevent.
+        if (not self._struct_has_own_managed_field(type_.name) and not tagged
+                and not self._is_weak_target(type_.name)):
             return "@festina_release"
         if type_.name in self._struct_release_fns:
             return self._struct_release_fns[type_.name]
@@ -10068,6 +10144,11 @@ class CodeGen:
         # _emit_fresh_heap_header's own comment); every other struct
         # keeps the original 8-byte (refcount-only) offset.
         header_offset = -16 if tagged else -8
+        if self._is_weak_target(type_.name):
+            # claude.md #332: every weak reference aimed here reads null
+            # from now on. Emitted only for a type some weak field
+            # actually targets, so no other program pays for it.
+            body.append("  call void @festina_weak_died(ptr %payload)")
         header = self.tmp()
         body.append(f"  {header} = getelementptr i8, ptr %payload, i64 {header_offset}")
         body.append(f"  call void @festina_free_z(ptr {header})")
@@ -10095,7 +10176,20 @@ class CodeGen:
         responsibility, since the two callers need different things
         done with it (free it outright, or nothing at all)."""
         struct_ty = self.struct_llvm_name(type_.name)
-        for i, (_, ftype) in enumerate(self.struct_fields(type_.name)):
+        weak = self.weak_fields.get(type_.name, frozenset())
+        for i, (fname, ftype) in enumerate(self.struct_fields(type_.name)):
+            if fname in weak:
+                # claude.md #332: a weak field owns its BLOCK and not
+                # the object, so freeing this struct drops the
+                # indirection and leaves the target's own lifetime
+                # exactly where it was. This is the line that makes
+                # `weak` mean what specification.md 13.5 says.
+                fptr = self.tmp()
+                lines.append(f"  {fptr} = getelementptr {struct_ty}, ptr {obj_ptr}, i32 0, i32 {i}")
+                fval = self.tmp()
+                lines.append(f"  {fval} = load ptr, ptr {fptr}")
+                lines.append(f"  call void @festina_weak_drop(ptr {fval})")
+                continue
             if _is_refcounted(ftype):
                 field_release_fn = self._release_fn_for(ftype)
                 fptr = self.tmp()
@@ -10680,8 +10774,16 @@ class CodeGen:
         outgoing edges here."""
         kinds = (types_mod.StructType, types_mod.ArrayType, types_mod.MapType)
         if isinstance(t, types_mod.StructType):
-            return [ft for _, ft in self.struct_fields(t.name)
-                    if isinstance(ft, kinds)]
+            # claude.md #332: a `weak` field is not an edge here. It
+            # holds its target without keeping it alive, so it can never
+            # be the reference that keeps a cycle afloat -- which is the
+            # whole question this walk asks. Excluding it is what lets a
+            # parent pointer stop making its own type cyclic, and with
+            # it the detector, the traversal functions and the
+            # per-release trial all disappear (specification.md 13.3).
+            weak = self.weak_fields.get(t.name, frozenset())
+            return [ft for fname, ft in self.struct_fields(t.name)
+                    if isinstance(ft, kinds) and fname not in weak]
         if isinstance(t, types_mod.ArrayType):
             return [t.element] if isinstance(t.element, kinds) else []
         if isinstance(t, types_mod.MapType):
@@ -10741,10 +10843,21 @@ class CodeGen:
         (text buffers, blobs, acyclic containers, ...) is handled by
         `white`'s disposal instead, released through the ordinary
         machinery, because it provably is not part of any cycle and
-        its counts were never touched by the trial."""
+        its counts were never touched by the trial.
+
+        claude.md #332: a `weak` field is skipped here too, and this is
+        the half that actually costs the time. Dropping it from
+        _managed_type_children alone changes only whether the type reads
+        as cyclic -- for a type that still reaches itself some other way
+        (a `Node` with both `parent:weak Node` and `kids:arr[Node]`) the
+        detector is still generated, and a traversal that still walked
+        `parent` would still climb to the root and back down over the
+        whole document on every release. Excluding it HERE is what turns
+        that walk into the released node's own subtree."""
+        weak = self.weak_fields.get(type_.name, frozenset())
         return [(i, ftype)
-                for i, (_, ftype) in enumerate(self.struct_fields(type_.name))
-                if self._is_cyclic_type(ftype)]
+                for i, (fname, ftype) in enumerate(self.struct_fields(type_.name))
+                if self._is_cyclic_type(ftype) and fname not in weak]
 
     def _cycle_struct_body(self, op, type_, fn_name):
         struct_ty = self.struct_llvm_name(type_.name)
@@ -10984,6 +11097,7 @@ class CodeGen:
             lines.append(f"  store {_llvm_type(ttype)} {val}, ptr {ref}")
             return val, ttype
         if isinstance(expr.target, ast.Member):
+            weak_target = False
             if expr.target.computed:
                 # claude.md #72: npcHealths['npc1'] = 30 / npcHealths[key] = 30
                 # claude.md #79: expr.target.obj is emitted exactly
@@ -11033,9 +11147,30 @@ class CodeGen:
                 idx_val, _ = self._emit_expr(expr.target.prop, env, lines)
                 ptr, ftype = self._array_elem_ptr(obj_val, obj_type, idx_val, lines)
             else:
-                ptr, ftype = self._member_ptr(expr.target, env, lines)
+                # claude.md #332: _member_ptr's body, inlined, purely so
+                # the owner's TYPE survives the call -- weakness is a
+                # property of the field and `ftype` alone cannot report
+                # it. expr.target.obj is still emitted exactly once.
+                tobj_val, tobj_type = self._emit_expr(expr.target.obj, env, lines)
+                ptr, ftype = self._member_ptr_from(tobj_val, tobj_type,
+                                                   expr.target, lines)
+                weak_target = self._is_weak_field(tobj_type, expr.target)
             val, vtype = self._emit_value_for(expr.value, env, lines, ftype)
             val = self._coerce(val, vtype, ftype, lines, source_expr=expr.value)
+            if not expr.target.computed and weak_target:
+                # claude.md #332: the slot holds the weak BLOCK. No
+                # retain -- that is the whole meaning of the modifier --
+                # so this stores an indirection and drops whatever
+                # indirection was there before. Storing before dropping,
+                # for the same reason the refcounted path below does it
+                # in that order.
+                blk = self.tmp()
+                lines.append(f"  {blk} = call ptr @festina_weak_ref(ptr {val})")
+                old_blk = self.tmp()
+                lines.append(f"  {old_blk} = load ptr, ptr {ptr}")
+                lines.append(f"  store ptr {blk}, ptr {ptr}")
+                lines.append(f"  call void @festina_weak_drop(ptr {old_blk})")
+                return val, ftype
             if _is_refcounted(ftype):
                 # claude.md #78 (widened by claude.md #79 to arr[T]/
                 # map[T]-typed fields, and claude.md #80 to arr[T]

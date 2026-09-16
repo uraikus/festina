@@ -1268,9 +1268,11 @@ class _ThreadInfo:
 
 class AnalyzedProgram:
     def __init__(self, symbols, structs, tables, enums, imports, threads=None,
-                 main_message_type=None, main_reply_type=None):
+                 main_message_type=None, main_reply_type=None, weak_fields=None):
         self.symbols = symbols
         self.structs = structs
+        # claude.md #332: struct name -> frozenset of weak field names.
+        self.weak_fields = weak_fields if weak_fields is not None else {}
         self.tables = tables
         self.enums = enums
         self.imports = imports
@@ -1522,6 +1524,12 @@ def analyze(program, filename="<string>"):
     # inside it.
     functions_scope = Scope(None)
     structs = {}
+    # claude.md #332: struct name -> frozenset of its `weak` field
+    # names. Kept BESIDE `structs` rather than folded into the field
+    # type, because weakness is a property of the field and not of the
+    # type it holds -- there is no `weak Node` type, only a field
+    # declared to hold one weakly (specification.md 13.5).
+    weak_fields = {}
     tables = {}
     enums = {}  # claude.md #176: name -> _EnumInfo
     threads = {}  # claude.md #195: name -> _ThreadInfo
@@ -4728,12 +4736,32 @@ def analyze(program, filename="<string>"):
         structs[decl.name] = {}
         try:
             field_types = {}
+            weak = set()
             for f in decl.fields:
-                field_types[f.name] = resolve(f.type_expr, decl)
+                ftype = resolve(f.type_expr, decl)
+                field_types[f.name] = ftype
+                if getattr(f, "weak", False):
+                    # specification.md 13.5: struct types only. A weak
+                    # edge exists to be skipped by cycle collection and
+                    # to read back as null once its target is gone, and
+                    # both of those are defined in terms of a struct
+                    # reference. Narrowing here rather than half-
+                    # supporting arr/map/handles follows this project's
+                    # own convention of erroring on a documented gap.
+                    if not isinstance(ftype, types_mod.StructType):
+                        raise CompileError(
+                            f"field '{f.name}' cannot be weak: `weak` applies "
+                            f"only to a field of struct type, not "
+                            f"'{types_mod.type_name(ftype)}'",
+                            file=filename, line=decl.line, column=decl.column,
+                            category="invalid declaration",
+                        )
+                    weak.add(f.name)
         except Exception:
             del structs[decl.name]   # leave no half-registered name behind
             raise
         structs[decl.name] = field_types
+        weak_fields[decl.name] = frozenset(weak)
 
     def analyze_table(decl):
         # claude.md #106: see analyze_struct's own note on why this
@@ -4751,6 +4779,18 @@ def analyze(program, filename="<string>"):
         try:
             columns = {}
             for f in decl.fields:
+                if getattr(f, "weak", False):
+                    # specification.md 13.5: a table field is a database
+                    # COLUMN, whose value is read back out of sqlite
+                    # rather than referred to in memory. There is
+                    # nothing for a weak reference to point at.
+                    raise CompileError(
+                        f"column '{f.name}' cannot be weak: `weak` applies "
+                        f"only to a struct field, and a table field is a "
+                        f"database column",
+                        file=filename, line=decl.line, column=decl.column,
+                        category="invalid declaration",
+                    )
                 resolve(f.type_expr, decl)  # validates the type is known
                 columns[f.name] = f.type_expr
         except Exception:
@@ -5963,4 +6003,5 @@ def analyze(program, filename="<string>"):
 
     return AnalyzedProgram(global_scope.vars, structs, tables, enums, imports, threads,
                             main_message_type=_main_message_type[0],
-                            main_reply_type=_main_reply_type[0])
+                            main_reply_type=_main_reply_type[0],
+                            weak_fields=weak_fields)

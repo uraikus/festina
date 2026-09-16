@@ -426,6 +426,22 @@ arr[Node] func parseTypedParams() {
     return params
 }
 
+// claude.md #332: the `weak` in `parent:weak Node`. Recognised in this
+// one position only, so it stays an ordinary identifier everywhere
+// else -- one token of lookahead separates a modifier from a field
+// actually named `weak`, which is followed by its own ':'.
+bool func eatWeakModifier() {
+    Tok t = peek()
+    if t.kind != 'IDENT' { return false }
+    if t.val != 'weak' { return false }
+    Tok after = peekAt(1)
+    if after.kind == 'OP' && after.val == ':' { return false }
+    if after.kind == 'RBRACE' { return false }
+    if after.kind == 'OP' && after.val == ',' { return false }
+    advance()
+    return true
+}
+
 arr[Node] func parseFields() {
     arr[Node] fields = []
     while at('RBRACE') == false && FAILED == false {
@@ -436,10 +452,12 @@ arr[Node] func parseFields() {
             return fields
         }
         eatOp(':')
+        bool wk = eatWeakModifier()
         Node ty = parseType()
         Node fd = mk('FieldDecl')
         addStr(fd, 'name', nameTok.val)
         addType(fd, 'type_expr', ty)
+        addBool(fd, 'weak', wk)
         fields.push(fd)
         if atOp(',') { advance() }
     }

@@ -76,9 +76,26 @@ class Param(Node):
 
 
 class FieldDecl(Node):
-    def __init__(self, name, type_expr):
+    def __init__(self, name, type_expr, weak=False):
         self.name = name
         self.type_expr = type_expr
+        # claude.md #332: `name:weak T` -- this field refers to its
+        # target without keeping it alive, and cycle collection does not
+        # walk it. Consumed by parse_fields straight after the ':', so
+        # it is a property of the FIELD rather than of the type -- there
+        # is no such thing as a `weak T` local, element or return type
+        # (specification.md 13.5), and keeping it off the type is what
+        # makes that true by construction rather than by a check.
+        #
+        # No line/column here, deliberately. Every node's attributes are
+        # what the canonical AST dump prints, so adding two more would
+        # have grown the dump for every struct field in the corpus to
+        # buy a marginally better error position -- and a field's
+        # declaration is inside its struct's, whose position the errors
+        # already use. `weak` itself has to be in the dump: it is real
+        # syntax, and a parser that dropped it would be agreeing with
+        # the original only by leaving something out.
+        self.weak = weak
 
 
 class VarDecl(Node):

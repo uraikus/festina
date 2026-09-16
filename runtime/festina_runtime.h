@@ -84,6 +84,14 @@ char *festina_url_hostname(void *payload);
 int64_t festina_url_port(void *payload);
 char *festina_url_pathname(void *payload);
 char *festina_url_hash(void *payload);
+
+/* claude.md #332: `name:weak T`. A weak field stores the BLOCK, never
+ * the object, so no managed value's own layout changes. See the weak
+ * block comment in festina_runtime.c. */
+void *festina_weak_ref(void *payload);   /* block for payload, +1 ref  */
+void *festina_weak_get(void *block);     /* payload (+1) or NULL       */
+void festina_weak_drop(void *block);     /* -1 ref                     */
+void festina_weak_died(void *payload);   /* object freed: kill its block */
 /* The raw query, '?' included, or "" -- what an outbound request
  * target appends verbatim. Runtime-internal: no Festina field
  * exposes it (specification.md 19.6). [#330] */

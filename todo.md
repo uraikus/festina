@@ -18,18 +18,20 @@ struct references, `ascii.toInt()`). The dropped query string is fixed
 in decisions.md #330, which also fixed a `Host` header that omitted a
 non-default port and a leak on a repeated query key, both found while
 verifying it; the thirty-second read is fixed in #331, where the cause
-turned out not to be the one reported. These are what is left, most
-damaging first.
+turned out not to be the one reported; the quadratic cycle-collector
+walk is fixed in #332, by `weak` fields — checked on read rather than
+the uncounted raw pointer the report proposed, so they cannot dangle.
+These are what is left, most damaging first.
 
-- **Releasing a live alias walks everything reachable from it.** A
-  value whose TYPE can participate in a cycle runs a synchronous trial
-  deletion on release, so binding a child to a local inside a loop
-  costs a walk of the whole subtree per iteration. With a parent
-  pointer that is the whole document, and tree code becomes quadratic:
-  8,421 nodes took 1,645 ms instead of 1 ms. A `weak` field modifier
-  (`parent:weak Node`) is the cheapest fix and a compile-time concept
-  with no runtime machinery; the deferred-root buffer below is the
-  other.
+- **`weak` is ported to `bootstrap/` only as far as the parser.**
+  decisions.md #332 landed the feature in the shipped compiler and in
+  `bootstrap/parser.f` (without which the AST dumps disagree), but not
+  in `bootstrap/semantic.f` or `bootstrap/codegen.f` — so the
+  self-hosted compiler parses a weak field and cannot compile one. No
+  corpus file declares one, which is what keeps every harness green and
+  is also why nothing measures the feature: a `cases/weak_fields.f` is
+  the other half, and it cannot be added until the port is done or it
+  would land as the corpus's first unported file.
 - **A struct-typed field can never read as `null`.** A struct, array or
   map field is created empty the first time it is *reached*, including
   by `== null`, so `if node.next != null` is always true and
@@ -271,8 +273,8 @@ included:
 | lexer | 125 match, 0 differ |
 | parser | 125 match, 0 differ, 0 unported |
 | semantic | 125 match, 0 differ, 0 unported |
-| escape analysis | 114 match, 0 differ, 0 unported — 2,224 of 2,224 records |
-| codegen | 114 match, 0 differ, 0 unported — 419,389 of 419,389 IR lines |
+| escape analysis | 114 match, 0 differ, 0 unported — 2,232 of 2,232 records |
+| codegen | 114 match, 0 differ, 0 unported — 420,357 of 420,357 IR lines |
 | canaries | 147 registered, 0 missed — 140 caught, 7 via the ratchet |
 
 All ten of the bootstrap's own files reproduce their own compilation

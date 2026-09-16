@@ -14,6 +14,22 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Added
 
+- **`weak` struct fields.** `parent:weak Node` refers to a value without
+  keeping it alive, and **its read is checked**: it yields the value
+  while something else still holds it and `null` once nothing does, so
+  it cannot produce a dangling pointer. Cycle collection does not walk a
+  weak edge and does not count it when deciding whether a type can form
+  a cycle at all — which is the point. A parent pointer was making every
+  release of any node walk the entire document: 8,000 nodes took 2.694s
+  where 2,000 took 0.161s, four times the work per doubling. With the
+  parent declared `weak` that is 0.003s and linear, and where the weak
+  edge is a type graph's only way back the detector is not generated at
+  all. A weak field is never auto-vivified, the one exception to §8.9.2.
+  `weak` is not a reserved word: it is recognised only straight after a
+  field's `:`, so programs already using the name are unaffected.
+  Reported by
+  [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser).
+  (decisions.md #332)
 - **Eight `text` methods that were missing:** `.slice(start, end)`,
   `.indexOf(needle[, from])`, `.startsWith(prefix)`,
   `.endsWith(suffix)`, `.toLowerCase()`, `.toUpperCase()`,
@@ -61,8 +77,8 @@ round-by-round design and implementation record predating 0.1 lives in
   now agrees with the Python implementation it mirrors on **every file
   of the 125-file corpus** — including its own source, which is
   122,000 lines of IR on its own. Lexer, parser and analyzer: 125
-  match, 0 differ each. Escape analysis: 2,224 of 2,224 records.
-  Codegen: 419,389 of 419,389 file-specific IR lines, byte for byte.
+  match, 0 differ each. Escape analysis: 2,232 of 2,232 records.
+  Codegen: 420,357 of 420,357 file-specific IR lines, byte for byte.
   The eleven files neither side compiles are deliberately ill-formed
   sources the corpus keeps so that both implementations are checked on
   the rejection as well as the acceptance.

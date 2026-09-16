@@ -810,11 +810,13 @@ rather than a shorthand.
 
 #### 8.9.1 Declaration and instances
 
-*StructDeclaration* ::= `struct` *Identifier* `{` { *Identifier* `:` *Type* } `}`
+*StructDeclaration* ::= `struct` *Identifier* `{` { *Identifier* `:` [ `weak` ] *Type* } `}`
 
 A struct is a record type declared at the top level; its fields are
 statically typed. A field may be of the struct's own
 type or of any struct or table declared anywhere in the program. A
+field of struct type may be declared `weak` (§13.5), which holds its
+target without keeping it alive. A
 declaration `User u` creates a fresh instance whose fields hold their
 zero values (§8.9.2); fields are populated by assignment, or by a
 struct literal (§8.9.4). [#27, #78, #106, #288]
@@ -851,7 +853,8 @@ A never-assigned field reads as its type's zero value (§8.2). A field,
 local or global whose type is a struct, array or map is created empty
 on first reach — read or write — once, and keeps its identity
 afterwards, so `b.inner.n` and `b.xs.push(1)` work with nothing assigned
-first. [#97]
+first. A `weak` field is the one exception: it is never vivified, and
+reads as `null` until something is assigned to it (§13.5). [#97, #332]
 
 #### 8.9.3 Structs as query targets
 
@@ -1812,6 +1815,7 @@ reclaim a value it has not proven unreachable.
 | `ascii`, `blob`, `img`, `aud`, `regex`, `http`, `socket`, `url`, `enum`, struct, table row, `arr[T]`, `map[T]` | `b` and `a` share one value (one reference each) | reference counted; freed when the last reference drops |
 | `/pattern/` literal | shares an immortal compilation | never freed; release is a no-op |
 | `T?` | shares without counting | never automatic (§13.4) |
+| `weak T` field | shares without counting | nothing to reclaim; the field reads `null` once the target goes (§13.5) |
 
 Because `text` is copied on every binding, two text bindings never
 observe each other; because everything else aliases, a write through
@@ -1826,7 +1830,10 @@ the runtime determines whether only the cycle itself holds it and frees
 the cycle if so. A cycle anything outside still reaches is never
 touched. Types that cannot form cycles pay nothing. Edges through an
 enum-typed field are not walked; a cycle closed only through an enum
-field is not collected. [#120, #176]
+field is not collected. Edges through a `weak` field are not walked
+either, and do not count when deciding whether a type can form a cycle
+at all: a type whose only path back to itself runs through `weak`
+fields carries no detector and pays nothing (§13.5). [#120, #176, #332]
 
 ### 13.4 Manually-managed values
 
@@ -1838,6 +1845,57 @@ heap-allocated. A `T?` value posted to a thread is shared by reference,
 not cloned (§20.4); both sides then hold one uncounted reference, and
 exactly one of them must free it. `const T?` is a compile error, as is
 `?` on a field, element or return type. [#202–#205]
+
+### 13.5 Weak fields
+
+A struct field declared `name:weak T` **refers to a value without
+keeping it alive**. Assigning to it takes no reference and releasing
+the struct releases no weak field, so a weak field never contributes to
+its target's lifetime.
+
+```festina
+struct Node {
+    parent:weak Node
+    kids:arr[Node]
+    tag:int
+}
+```
+
+`weak` is available **only on a struct field**, and only where `T` is a
+struct type. It is a compile error on a `table` field, on a local,
+global, parameter, element, map value or return type, and on any `T`
+that is not a struct type. `const` and `weak` on one field is a compile
+error, as is `weak T?`.
+
+**Reading a weak field yields `T` or `null`, and the read is
+checked.** It reads as `null` before anything is assigned to it and
+once its target's last ordinary reference is released — never as a
+reference to a freed value. Reading it therefore cannot produce a
+dangling pointer, which is what distinguishes `weak` from `T?`: `T?`
+moves the lifetime decision to the program, `weak` keeps the guarantee
+and answers `null` instead. Unlike every other struct, array or map
+field, a weak field is **never auto-vivified** (§8.9.2); reaching one
+that holds nothing yields `null` rather than creating a value nothing
+would own.
+
+A read that yields non-`null` yields an ordinary counted reference,
+alive for as long as the binding that received it, so
+
+```festina
+Node p = child.parent
+if p != null { log(p.tag) }
+```
+
+cannot observe `p` being freed between the test and the use.
+
+**Weak edges are invisible to cycle collection** (§13.3), which is the
+point of the feature: a parent pointer declared `weak` breaks the cycle
+the collector would otherwise have to prove absent on every release,
+and a release rooted anywhere in a tree walks that node's own subtree
+instead of the whole document.
+
+An implementation must not make a program that declares no weak field
+pay for the feature. [#332]
 
 ### 13.5 `free` and `delete`
 

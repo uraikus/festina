@@ -62,9 +62,9 @@ file**:
 - **parser: 125 match, 0 differ, 0 unported.**
 - **semantic: 125 match, 0 differ, 0 unported.**
 - **escape analysis: 114 match, 0 differ, 0 unported, 11 rejected by
-  both** — 2,224 of 2,224 records.
+  both** — 2,232 of 2,232 records.
 - **codegen: 114 match, 0 differ, 0 unported, 11 rejected by both** —
-  419,389 of 419,389 file-specific IR lines.
+  420,357 of 420,357 file-specific IR lines.
 - **canaries: 147 registered, 0 missed** — 140 caught outright, 7 via
   the ratchet. The sweep found one that had stopped being a breakage
   rather than one the corpus could not see; the note below says which
@@ -78,15 +78,15 @@ the other declines to.
 
 **The bootstrap compiler reproduces its own compilation.** All ten of
 its files — the five passes and the five command-line drivers — emit
-byte-identical IR, 375,131 file-specific lines in total:
+byte-identical IR, 376,099 file-specific lines in total:
 
 | file | file-specific IR lines | | file | file-specific IR lines |
 | --- | --- | --- | --- | --- |
 | `lexer.f` | 4,929 | | `lexdump.f` | 5,170 |
-| `parser.f` | 13,742 | | `astdumpf.f` | 13,958 |
-| `semantic.f` | 21,966 | | `semdumpf.f` | 22,261 |
-| `escape.f` | 23,547 | | `escdumpf.f` | 25,431 |
-| `codegen.f` | 121,863 | | `irdumpf.f` | 122,264 |
+| `parser.f` | 13,863 | | `astdumpf.f` | 14,079 |
+| `semantic.f` | 22,087 | | `semdumpf.f` | 22,382 |
+| `escape.f` | 23,668 | | `escdumpf.f` | 25,552 |
+| `codegen.f` | 121,984 | | `irdumpf.f` | 122,385 |
 
 **And the fixed point closes.** Linking the IR the self-hosted compiler
 emits for `bootstrap/irdumpf.f` gives a second-generation binary that
@@ -226,7 +226,7 @@ makes the numbering testable at all.
 genuinely cannot be fixed, so the decision lives next to the test
 rather than in a commit message. It is empty.
 
-## Escape analysis: 2,224 of 2,224 records
+## Escape analysis: 2,232 of 2,232 records
 
 `escape_analysis.py` answers one purely syntactic question per function
 body — which names appear anywhere other than as the immediate base of
@@ -329,7 +329,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 419,389 of 419,389 file-specific IR lines
+## Codegen: 420,357 of 420,357 file-specific IR lines
 
 About 14,500 lines of Python, more than everything else ported put
 together — and now complete. Every compilable file in the corpus has
@@ -400,9 +400,9 @@ times and so could not have varied either way.
 
 **The proportion turned over, and then kept going.** Four slices ago it
 was 3,715 of 4,849 — three quarters from `cases/` files written for the
-slices that claimed them. It is now **13,722 of 419,389, a little over
+slices that claimed them. It is now **13,722 of 420,357, a little over
 three per cent**, because the bootstrap's own ten files contribute
-375,131 lines between them of programs written to be a compiler rather
+376,099 lines between them of programs written to be a compiler rather
 than to be measured.
 
 That is a ratio to read carefully rather than to be pleased by. A
@@ -530,7 +530,7 @@ are the ones worth knowing about.
 
 The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
-**375,131 of the 419,389 file-specific IR lines**, and they need none
+**376,099 of the 420,357 file-specific IR lines**, and they need none
 of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the

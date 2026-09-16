@@ -6877,3 +6877,99 @@ change with the message it was written to give. All 101 tests in
 tests/test_http.py pass, chunked transfer included -- that path set its
 offset in the same iteration the pointer was still valid, so it was
 never affected.
+
+332. WEAK FIELDS, AND THE HEADER THEY DID NOT WIDEN
+
+**`name:weak T` refers to a value without keeping it alive.** todo.md
+carried it as the cheapest fix for a reported quadratic: releasing a
+live alias runs a cycle trial, the trial walks everything reachable,
+and with a parent pointer everything reachable is the whole document,
+so binding a child inside a loop costs a walk per iteration. Measured
+here before touching anything, with the root as a function local:
+1,000 nodes 0.040s, 2,000 0.161s, 4,000 0.646s, 8,000 2.694s -- four
+times the work per doubling. Without the up-edge, 0.001/0.001/0.002/
+0.003s.
+
+**The first reproduction was wrong and is worth recording.** With the
+tree root as a top-level GLOBAL the same program is linear and fast,
+because a global is immortal and an immortal value is never coloured,
+decremented or traversed -- the walk stops dead at the parent edge.
+The quadratic only exists once the root is a local. Anyone
+benchmarking this needs to know, and it is incidentally a real
+workaround: hoisting the root to a global truncates every walk.
+
+**Reads are checked, which is the whole design choice.** An uncounted
+raw pointer would have been a smaller change and is what the todo
+entry proposed, but it would have introduced the first way to get a
+dangling pointer in this language outside `T?`. A weak read instead
+answers the value while something else holds it and `null` once
+nothing does. `T?` moves the lifetime decision to the program; `weak`
+keeps the guarantee and answers `null`.
+
+**The object's own representation does not change, and that was the
+binding constraint.** The obvious implementation of a checked weak
+reference is a second count beside the refcount, which here would have
+moved every managed payload from -8 to -16, disturbed the bits the
+cycle collector packs its colours into, made every managed value in
+every program 8 bytes larger, and forced `bootstrap/codegen.f` to
+change in lockstep to keep its byte-exact match over 419,389 lines of
+IR. specification.md 13.5's last line -- a program that declares no
+weak field must not pay for the feature -- cannot be honoured by an
+object layout change. So the indirection lives outside the object: a
+`{refs, payload}` control block, shared by every weak field aimed at
+one object, with the field storing the block and never the object. A
+small address-keyed table finds an object's block when it is freed,
+and only types some weak field actually TARGETS ever consult it.
+
+**Two separate places had to stop walking the edge, and only one of
+them is the obvious one.** Dropping weak fields from
+`_managed_type_children` changes whether a type reads as cyclic at
+all -- enough for `Doc`/`Child`, where the weak parent pointer is the
+type graph's only way back, and where the detector, the traversal
+functions and the per-release trial then disappear completely (14
+generated functions and 3 candidate calls become 0 and 0). It is NOT
+enough for a `Node` with both `parent:weak Node` and `kids:arr[Node]`,
+which still reaches itself through `kids` and still gets a detector.
+There the fix is dropping the field from `_cycle_struct_children` too,
+so the generated traversal stops climbing to the root. Getting only
+the first one produced a program that measured as broken as before,
+which is how the second was found.
+
+**A weak-targeted struct needs a release wrapper even owning
+nothing.** A struct with no managed fields releases through the
+generic `@festina_release`, and the free is then the one moment
+nothing type-specific runs -- so nothing told the weak blocks their
+object was gone and the read still answered a freed pointer. The same
+exception a tagged struct already needs, for the same reason.
+
+**Verified.** 16 tests in tests/test_weak_fields.py, written before the
+implementation and each failing first: grammar, four rejections, an
+unset field reading null, a live field reading back, a field going
+null when its target does, an ordinary field in the identical program
+NOT going null (so the difference is pinned rather than half of it),
+an upgraded read surviving the last other reference being dropped, and
+the three cycle-collection claims. The quadratic test asserts a RATIO
+rather than a wall-clock bound, so it answers "did the quadratic go
+away" rather than "is this machine fast". Clean under valgrind over a
+weak-reference churn, 0 bytes lost. Every differential harness
+unchanged, which is the real proof of the last spec line: no corpus
+file declares a weak field, and every one of them still emits
+byte-identical IR.
+
+**`weak` is not a reserved word.** It is recognised in exactly one
+position, straight after a field's ':', at the cost of one token of
+lookahead. `amor` is the cautionary precedent: reserving a common
+noun costs every program that name forever to buy one modifier.
+
+**What is NOT done, stated plainly.** `weak` is implemented in the
+shipped compiler and, in `bootstrap/`, in the PARSER only -- enough for
+the AST dump to agree, since a parser that silently dropped real syntax
+would be matching its original by leaving something out. The
+bootstrap's semantic analysis and codegen do not implement it, so the
+self-hosted compiler parses a weak field and cannot yet compile one.
+Nothing measures the feature differentially either: no corpus file
+declares a weak field, which is exactly the condition that makes the
+"pays nothing" claim testable and also the condition that leaves the
+mechanism itself unmeasured by every harness. A `cases/weak_fields.f`
+plus the semantic/codegen port is the follow-up, and until it lands the
+16 tests in `tests/test_weak_fields.py` are the whole of the evidence.
