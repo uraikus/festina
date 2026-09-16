@@ -1204,6 +1204,102 @@ Val CG_FIELD_BASE
 // emitted a wild read that happened to typecheck.
 bool CG_FIELD_DIRECT = false
 
+// ---------------------------------------------------------------------
+// claude.md #108/#117/#262: the member CHAIN.
+//
+// `mkOuter().inner.b.length` is three member loads over one owned call
+// result, and exactly one release is owed for it. Deciding that release
+// link by link gets it wrong in both directions at once: the base call
+// is released by the innermost link, and the intermediate `.inner` --
+// an alias INTO that base's graph, which the base's own cascade already
+// frees -- is released a second time on the way out.
+//
+// So an INNER link parks its receiver instead of releasing it, and the
+// OUTERMOST frame drains the park: it mints the escaping value's own
+// ownership first (a refcounted one retains, a text one copies), then
+// releases only the receivers whose emission actually minted something
+// -- a call's fresh result, or a computed index this compiler already
+// retained. An intermediate link is never in that set, which is the
+// whole point of the filter.
+//
+// "Inner" is decided by AST node IDENTITY, not by "a chain is in
+// flight": a member load reached while emitting a call ARGUMENT --
+// `make(other.field).inner.n` -- belongs to no chain of its own, and
+// treating it as one would move its release to a point that may never
+// come. A struct is a reference in Festina, so `==` on two Node values
+// is exactly the identity test the original spells `is`.
+//
+// CG_CHAIN_RECV holds nought or one node -- the receiver about to be
+// emitted -- because Festina has no null struct binding to hold "none"
+// in. Its EMPTY state is the "no chain" state.
+arr[Node] CG_CHAIN_RECV = []
+arr[Node] CG_PEND_E = []
+arr[Val] CG_PEND_V = []
+
+// Whether a parked receiver is one this expression may release: a
+// call's own fresh result, or a value some earlier mint already handed
+// a reference to. Everything else in a chain is borrowed.
+bool func cgIsChainOwner(e:Node, v:Val) {
+    if cgIsRefcounted(v.fty) == false { return false }
+    if v.fresh { return true }
+    if e == null { return false }
+    return e.kind == 'Call'
+}
+
+// The `.length` drain: the parked bases and NOTHING else. The receiver
+// type here (blob/text/ascii) is not the one whose value escapes, so
+// there is nothing to mint -- and a non-empty park means the direct
+// receiver is itself a member load, an alias into the parked graph,
+// which the graph's own cascade already frees.
+void func cgReleaseChainBases(pendE:arr[Node], pendV:arr[Val]) {
+    int i = 0
+    while i < pendE.length {
+        Val pv = pendV[i]
+        if cgIsChainOwner(pendE[i], pv) {
+            cgOut(`  call void ${cgReleaseFnFor(pv.fty, cgRelKeyVal(pv))}(ptr ${pv.v})`)
+        }
+        i++
+    }
+}
+
+// The full drain, for a frame that has a value escaping the chain.
+// `out.fty == ''` means there is none -- a `.length` off an array,
+// whose i64 owes the array nothing -- and then only the releases run.
+Val func cgReleaseMemberChain(pendE:arr[Node], pendV:arr[Val],
+                              objE:Node, objV:Val, out:Val) {
+    arr[Node] es = []
+    arr[Val] vs = []
+    int i = 0
+    while i < pendE.length {
+        if cgIsChainOwner(pendE[i], pendV[i]) {
+            es.push(pendE[i])
+            vs.push(pendV[i])
+        }
+        i++
+    }
+    if cgIsChainOwner(objE, objV) {
+        es.push(objE)
+        vs.push(objV)
+    }
+    if es.length == 0 { return out }
+    if cgIsRefcounted(out.fty) {
+        cgOut(`  call void @festina_retain(ptr ${out.v})`)
+        out.fresh = true
+    } else if out.fty == 'text' {
+        text owned = cgTmp()
+        cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${out.v})`)
+        out.v = owned
+        out.fresh = true
+    }
+    int j = 0
+    while j < vs.length {
+        Val rv = vs[j]
+        cgOut(`  call void ${cgReleaseFnFor(rv.fty, cgRelKeyVal(rv))}(ptr ${rv.v})`)
+        j++
+    }
+    return out
+}
+
 // A thread's own state names, visible under their PLAIN spelling only
 // while that thread's own bodies are being emitted. This is the tier
 // the original's `state_env` occupies: between a body's own locals and
@@ -3501,21 +3597,63 @@ void func cgDelete(s:Node) {
 
 Val func cgMemberRead(e:Node) {
     Val none
+    // --- the chain frame opens. See CG_CHAIN_RECV's own note above.
+    Node recvNode = childOf(e, 'obj')
+    bool nested = false
+    if CG_CHAIN_RECV.length > 0 { nested = CG_CHAIN_RECV[0] == e }
+    arr[Node] savedRecv = CG_CHAIN_RECV
+    arr[Node] savedPendE = CG_PEND_E
+    arr[Val] savedPendV = CG_PEND_V
+    if nested == false {
+        CG_PEND_E = []
+        CG_PEND_V = []
+    }
+    arr[Node] hold = []
+    hold.push(recvNode)
+    CG_CHAIN_RECV = hold
+
     Val fp = cgFieldPtr(e)
-    if CG_STUCK { return none }
+    Val base = CG_FIELD_BASE
+    bool direct = CG_FIELD_DIRECT
+    Val out
+    bool ok = CG_STUCK == false
+    if ok && direct == false {
+        if cgLtyOf(fp.fty) == '' {
+            cgUnported(`read of a ${fp.fty} field`)
+            ok = false
+        } else {
+            out = cgLoadFieldValue(fp)
+            if CG_STUCK { ok = false }
+        }
+    }
+
+    // --- and closes, whatever happened inside it.
+    CG_CHAIN_RECV = savedRecv
+    arr[Node] pendE = []
+    arr[Val] pendV = []
+    if nested == false {
+        pendE = CG_PEND_E
+        pendV = CG_PEND_V
+    }
+    CG_PEND_E = savedPendE
+    CG_PEND_V = savedPendV
+
+    if ok == false { return none }
     // Already a value, with its receiver already released -- there is
-    // nothing left for this function to load or to own.
-    if CG_FIELD_DIRECT {
+    // nothing left for this function to load or to own, and nothing
+    // for the chain to decide either.
+    if direct {
         CG_FIELD_DIRECT = false
         return fp
     }
-    Val base = CG_FIELD_BASE
-    if cgLtyOf(fp.fty) == '' {
-        cgUnported(`read of a ${fp.fty} field`)
-        return none
+    // An INNER link: park the receiver and hand the field value back
+    // untouched. Whether that receiver is releasable depends on a type
+    // this frame cannot see yet -- the one the whole chain ends in.
+    if nested {
+        CG_PEND_E.push(recvNode)
+        CG_PEND_V.push(base)
+        return out
     }
-    Val out = cgLoadFieldValue(fp)
-    if CG_STUCK { return none }
     // claude.md #117: the field's value points INTO a base this
     // expression owns and is about to release, so its own ownership is
     // minted first -- a refcounted field retains, a text one copies --
@@ -3523,33 +3661,31 @@ Val func cgMemberRead(e:Node) {
     // the just-retained value back to exactly the one reference this
     // expression holds. A scalar needs no minting: its loaded value
     // survives the base by copy.
-    if cgIsRefcounted(base.fty) && cgOwnsRefcounted(childOf(e, 'obj'), base) {
-        if cgIsRefcounted(out.fty) {
-            cgOut(`  call void @festina_retain(ptr ${out.v})`)
-            out.fresh = true
-        } else if out.fty == 'text' {
-            text owned = cgTmp()
-            cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${out.v})`)
-            out.v = owned
-            out.fresh = true
-        }
-        cgOut(`  call void ${cgReleaseFnFor(base.fty, cgRelKeyVal(base))}(ptr ${base.v})`)
-    }
-    return out
+    return cgReleaseMemberChain(pendE, pendV, recvNode, base, out)
 }
 
 // `.length` on a `text` or an `arr[T]`. Two different mechanisms behind
 // one spelling: a text length is a runtime call (a UTF-8 code-point
 // walk -- claude.md #253's own reason for `ascii` existing), while an
 // array's is a field of the header it already has.
-Val func cgLengthOf(e:Node, obj:Val) {
+// claude.md #262: all four branches end the same way. `pendE`/`pendV`
+// are the chain's parked owning bases, and DROPPING them (which all
+// four used to do) is a leak of the whole object the field came from.
+// When the park is non-empty the direct receiver is necessarily a
+// member load, an alias into a parked base's graph -- so only the base
+// may be released, and releasing the alias as well is a double free.
+Val func cgLengthOf(e:Node, obj:Val, pendE:arr[Node], pendV:arr[Val],
+                    havePend:bool) {
     Val none
     if obj.fty == 'text' {
         text out = cgTmp()
         cgOut(`  ${out} = call i64 @festina_text_length(ptr ${obj.v})`)
         // A receiver this expression allocated -- `f().length` -- has
-        // no owner left once the length is taken.
-        cgFreeTextTemp(childOf(e, 'obj'), obj)
+        // no owner left once the length is taken. text is not in the
+        // refcounted family (claude.md #83), so this is a direct free
+        // rather than the chain's own release.
+        if pendE.length > 0 { cgReleaseChainBases(pendE, pendV) }
+        else { cgFreeTextTemp(childOf(e, 'obj'), obj) }
         return cgVal(out, 'i64', 'int')
     }
     // claude.md #256: an ascii's length is already sitting in its own
@@ -3561,7 +3697,8 @@ Val func cgLengthOf(e:Node, obj:Val) {
         cgOut(`  ${lenP} = getelementptr i8, ptr ${obj.v}, i64 -16`)
         text out = cgTmp()
         cgOut(`  ${out} = load i64, ptr ${lenP}`)
-        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+        if pendE.length > 0 { cgReleaseChainBases(pendE, pendV) }
+        else { cgReleaseOwnedReceiver(childOf(e, 'obj'), obj) }
         return cgVal(out, 'i64', 'int')
     }
     // A blob's length is a runtime call, not a header field: unlike an
@@ -3569,7 +3706,8 @@ Val func cgLengthOf(e:Node, obj:Val) {
     if obj.fty == 'blob' {
         text out = cgTmp()
         cgOut(`  ${out} = call i64 @festina_blob_length(ptr ${obj.v})`)
-        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+        if pendE.length > 0 { cgReleaseChainBases(pendE, pendV) }
+        else { cgReleaseOwnedReceiver(childOf(e, 'obj'), obj) }
         return cgVal(out, 'i64', 'int')
     }
     if obj.fty == 'arr' {
@@ -3577,7 +3715,15 @@ Val func cgLengthOf(e:Node, obj:Val) {
         cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${obj.v}, i32 0, i32 0`)
         text out = cgTmp()
         cgOut(`  ${out} = load i64, ptr ${lenP}`)
-        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+        // An array's length is an i64 copy that owes the array nothing,
+        // so the direct receiver is releasable here alongside the park
+        // -- the one branch of the four that drains both. `noOut` has
+        // no type, which is how the drain is told there is no escaping
+        // value to mint for.
+        if havePend {
+            Val noOut
+            cgReleaseMemberChain(pendE, pendV, childOf(e, 'obj'), obj, noOut)
+        }
         return cgVal(out, 'i64', 'int')
     }
     cgUnported(`.length on ${obj.fty}`)
@@ -3697,38 +3843,45 @@ Val func cgMemberAccess(e:Node) {
         // cgFieldPtr is shared with the assignment path and emits the
         // object itself.
         if rawText(e, 'prop') != 'length' { return cgMemberRead(e) }
-        // claude.md #262: `.length` read off a member CHAIN whose base
-        // this expression owns -- `mkInner().b.length` -- takes a
-        // different path in the original than an ordinary field read
-        // does. The chain's owning bases are PARKED and released after
-        // the length is taken, with nothing minted: the receiver type
-        // (blob/text/ascii) is not the one whose value escapes, so
-        // there is nothing for a mint to protect, and retaining the
-        // field the way a field READ does would be a reference nobody
-        // ever gives back.
-        //
-        // Refused rather than approximated. Going through the ordinary
-        // member read emits a retain where the original emits the
-        // length call itself, which is a differing line in a real
-        // program -- and half a mechanism is worse here than none,
-        // because the harness cannot tell a deliberate omission from a
-        // wrong answer.
-        Node lenObj = childOf(e, 'obj')
-        if lenObj != null {
-            if lenObj.kind == 'Member' {
-                if fieldOf(lenObj, 'computed').raw != 'true' {
-                    if cgIsOwningRefcountedSource(childOf(lenObj, 'obj')) {
-                        cgUnported('.length off an owning member chain')
-                        return none
-                    }
-                }
-            }
+        // claude.md #108/#262: `.length` takes part in the member chain
+        // like any other member load -- `mkOuter().inner.b.length` owes
+        // exactly one release, for the call at the bottom. The frame
+        // opens here, around the receiver's own emission, and cgLengthOf
+        // drains it.
+        Node lenRecv = childOf(e, 'obj')
+        bool lnested = false
+        if CG_CHAIN_RECV.length > 0 { lnested = CG_CHAIN_RECV[0] == e }
+        arr[Node] lsavedRecv = CG_CHAIN_RECV
+        arr[Node] lsavedE = CG_PEND_E
+        arr[Val] lsavedV = CG_PEND_V
+        if lnested == false {
+            CG_PEND_E = []
+            CG_PEND_V = []
         }
+        arr[Node] lhold = []
+        lhold.push(lenRecv)
+        CG_CHAIN_RECV = lhold
+
+        Val lobj = cgExpr(lenRecv)
+
+        CG_CHAIN_RECV = lsavedRecv
+        arr[Node] lpendE = []
+        arr[Val] lpendV = []
+        if lnested == false {
+            lpendE = CG_PEND_E
+            lpendV = CG_PEND_V
+        }
+        CG_PEND_E = lsavedE
+        CG_PEND_V = lsavedV
+        if CG_STUCK { return none }
+        // A NESTED `.length` frame has no decision to make and makes
+        // none -- it releases nothing at all, exactly as the original
+        // does when its own park comes back as "not mine".
+        return cgLengthOf(e, lobj, lpendE, lpendV, lnested == false)
     }
     Val obj = cgExpr(childOf(e, 'obj'))
     if CG_STUCK { return none }
-    if computed { return cgIndexRead(e, obj) }
-    return cgLengthOf(e, obj)
+    return cgIndexRead(e, obj)
 }
 
 // The one reader of the process environment. The result is NOT an
