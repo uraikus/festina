@@ -3773,6 +3773,7 @@ void festina_http_send_client(void *payload) {
     char *protocol = festina_url_protocol(url);
     char *hostname = festina_url_hostname(url);
     char *pathname = festina_url_pathname(url);
+    char *search = festina_url_search(url);
     int64_t port_field = festina_url_port(url);
     int is_tls = strcmp(protocol, "https:") == 0;
     int port = (port_field != FESTINA_NULL_INT) ? (int)port_field : (is_tls ? 443 : 80);
@@ -3817,7 +3818,7 @@ void festina_http_send_client(void *payload) {
             if (gai_rc != 0 || !addr_result) {
                 char msg[300];
                 snprintf(msg, sizeof(msg), "fetch: could not resolve '%s'", hostname);
-                free(protocol); free(hostname); free(pathname);
+                free(protocol); free(hostname); free(pathname); free(search);
                 festina_release_url(url);
                 festina_throw(festina_text_own(msg));
                 return; /* unreachable */
@@ -3833,7 +3834,7 @@ void festina_http_send_client(void *payload) {
             if (fd == FESTINA_INVALID_SOCKET) {
                 char msg[300];
                 snprintf(msg, sizeof(msg), "fetch: could not connect to '%s:%d'", hostname, port);
-                free(protocol); free(hostname); free(pathname);
+                free(protocol); free(hostname); free(pathname); free(search);
                 festina_release_url(url);
                 festina_throw(festina_text_own(msg));
                 return; /* unreachable */
@@ -3866,7 +3867,7 @@ void festina_http_send_client(void *payload) {
         if (is_tls) {
             if (!g_tls_client_connect) {
                 festina_close_fd(fd);
-                free(protocol); free(hostname); free(pathname);
+                free(protocol); free(hostname); free(pathname); free(search);
                 festina_release_url(url);
                 festina_throw(festina_text_own(
                     "fetch: this program was not compiled with TLS support "
@@ -3878,7 +3879,7 @@ void festina_http_send_client(void *payload) {
                 festina_close_fd(fd);
                 char msg[300];
                 snprintf(msg, sizeof(msg), "fetch: TLS handshake with '%s' failed", hostname);
-                free(protocol); free(hostname); free(pathname);
+                free(protocol); free(hostname); free(pathname); free(search);
                 festina_release_url(url);
                 festina_throw(festina_text_own(msg));
                 return; /* unreachable */
@@ -3891,8 +3892,23 @@ void festina_http_send_client(void *payload) {
         festina_sendbuf_append(&buf, v->method, strlen(v->method));
         FESTINA_APPEND_LIT(&buf, " ");
         festina_sendbuf_append(&buf, pathname, strlen(pathname));
+        /* specification.md 19.5: the request goes to `req.url`, which
+         * means the query too. Appended RAW rather than rebuilt from
+         * the parsed search_params -- see FestinaUrlValue.search for
+         * why that map cannot reconstruct it. Empty when the URL had
+         * no query, so the common case appends nothing. [#330] */
+        festina_sendbuf_append(&buf, search, strlen(search));
         FESTINA_APPEND_LIT(&buf, " HTTP/1.1\r\nHost: ");
         festina_sendbuf_append(&buf, hostname, strlen(hostname));
+        /* RFC 7230 5.4: Host carries the port unless it is the scheme's
+         * default. Built from the same `port` the connect used, so a
+         * URL naming 80 explicitly on http:// still sends a bare host
+         * -- that is the same authority, not a different one. [#330] */
+        if (port != (is_tls ? 443 : 80)) {
+            char host_port[16];
+            int hp_len = snprintf(host_port, sizeof(host_port), ":%d", port);
+            festina_sendbuf_append(&buf, host_port, (size_t)hp_len);
+        }
         FESTINA_APPEND_LIT(&buf, "\r\n");
         FestinaMapBlock *hblock = (FestinaMapBlock *)((char *)v->headers - sizeof(int64_t));
         g_http_send_header_buf = &buf;
@@ -3935,7 +3951,7 @@ void festina_http_send_client(void *payload) {
             }
             char msg[300];
             snprintf(msg, sizeof(msg), "fetch: writing the request to '%s' failed", hostname);
-            free(protocol); free(hostname); free(pathname);
+            free(protocol); free(hostname); free(pathname); free(search);
             festina_release_url(url);
             festina_throw(festina_text_own(msg));
             return; /* unreachable */
@@ -3964,7 +3980,7 @@ void festina_http_send_client(void *payload) {
             if (transport.tls) g_tls_client_close(transport.tls);
             festina_close_fd(fd);
         }
-        free(protocol); free(hostname); free(pathname);
+        free(protocol); free(hostname); free(pathname); free(search);
         festina_release_url(url);
 
         int64_t new_code;

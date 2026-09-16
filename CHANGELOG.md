@@ -346,6 +346,30 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **The query string was dropped from every outbound request.**
+  `req.send()` built its request line from the URL's path alone, so
+  `http://host/page?a=1` went out as `GET /page`. The specification
+  already said the request goes to `req.url`; the implementation
+  disagreed with it. The failure had no outward sign at all — `req.code`
+  came back 200 and `req.url` still read as the URL asked for, so a
+  caller got a real answer to a different question with every indicator
+  reading normal. The query is now sent **verbatim**, not re-encoded
+  from `searchParams`: that map cannot hold a repeated key, remember the
+  order keys were written in, or tell `+` from `%20` once both have
+  decoded to a space. Reported by
+  [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser).
+  (decisions.md #330)
+- **`Host` omitted a non-default port** on outbound requests, built from
+  the hostname alone, so a request to `127.0.0.1:8080` announced
+  `Host: 127.0.0.1` — the wrong authority for a name-based virtual host
+  or any server that rebuilds the absolute URL from it. RFC 7230 §5.4.
+  Found while fixing the query string above. (decisions.md #330)
+- **A repeated query key leaked the value it displaced.** `?b=2&b=3`
+  stores over a slot in `searchParams` whose existing value is owned
+  text the map alone holds, and it was dropped rather than freed — one
+  allocation per duplicate, present since `searchParams` was introduced
+  and unmeasured because no URL in the corpus repeated a key. One now
+  does. (decisions.md #330)
 - **`ascii b = a` freed the buffer while `a` was still using it.** An
   `ascii` local was scheduled for release at scope exit but never
   claimed a reference at its declaration, so an alias dropped one it

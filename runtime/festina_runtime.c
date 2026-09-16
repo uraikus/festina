@@ -1071,6 +1071,19 @@ typedef struct {
                          * what that default is) */
     char *pathname;     /* always starts with '/' */
     char *hash;         /* includes the leading '#' if present, else "" */
+    char *search;       /* the RAW query, including the leading '?' if
+                         * present, else "" -- same convention as hash
+                         * and protocol. Kept alongside the decoded
+                         * search_params below rather than instead of
+                         * it, because the two answer different
+                         * questions and neither reconstructs the other:
+                         * a map cannot preserve duplicate keys, their
+                         * order, or the difference between '+' and
+                         * '%20'. An outbound request has to reproduce
+                         * the query it was given byte for byte, so it
+                         * reads this one. Not exposed to Festina --
+                         * specification.md §19.6's field list is
+                         * unchanged. [#330] */
     void *search_params; /* map[text] payload (see festina_runtime_http.c's
                           * own festina_new_empty_text_map for the identical
                           * {refcount, count, entries} shape) -- percent-
@@ -1179,6 +1192,17 @@ static void *festina_parse_search_params(const char *query, size_t len) {
             value = festina_text_own("");
         }
         if (key[0] != '\0') {
+            /* A repeated key overwrites, and the value it displaces is
+             * owned text this map is the only holder of -- storing over
+             * the slot without freeing it leaks one decoded value per
+             * duplicate. `?b=2&b=3` is ordinary rather than a
+             * can't-happen path: any multi-select form posts exactly
+             * that shape. Found under valgrind while checking that the
+             * raw-query field above added no leak of its own; it had
+             * been here since search_params was introduced, unseen
+             * because no corpus URL repeated a key. [#330] */
+            int64_t prior = festina_map_get(block->entries, block->capacity, key, 0);
+            if (prior) free((char *)(intptr_t)prior);
             festina_map_set(&block->count, &block->entries, &block->capacity,
                             &block->tombstones, key, (int64_t)(intptr_t)value);
         } else {
@@ -1254,8 +1278,9 @@ void *festina_parse_url(const char *text) {
                  * #157), so this path can run repeatedly in a retry loop --
                  * free the half-built value first rather than leaking ~5
                  * allocations per bad port. protocol/username/password/
-                 * hostname are set by here; pathname/hash/search_params are
-                 * still NULL from calloc (free(NULL) is a no-op). */
+                 * hostname are set by here; pathname/hash/search/
+                 * search_params are still NULL from calloc (free(NULL)
+                 * is a no-op). */
                 free(u->protocol);
                 free(u->username);
                 free(u->password);
@@ -1277,12 +1302,18 @@ void *festina_parse_url(const char *text) {
     u->pathname = (p > path_start) ? festina_url_slice(path_start, p) : festina_text_own("/");
 
     if (*p == '?') {
+        const char *question = p;
         p++;
         const char *query_start = p;
         while (*p && *p != '#') p++;
         u->search_params = festina_parse_search_params(query_start, (size_t)(p - query_start));
+        /* From the '?' so the slice is what an outbound request target
+         * appends verbatim; an empty query keeps its bare '?', which is
+         * a different request target from no query at all. */
+        u->search = festina_url_slice(question, p);
     } else {
         u->search_params = festina_new_empty_text_map();
+        u->search = festina_text_own("");
     }
 
     if (*p == '#') {
@@ -1304,6 +1335,7 @@ char *festina_url_hostname(void *payload) { return festina_text_own(FESTINA_URL_
 int64_t festina_url_port(void *payload) { return FESTINA_URL_FROM_PAYLOAD(payload)->port; }
 char *festina_url_pathname(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->pathname); }
 char *festina_url_hash(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->hash); }
+char *festina_url_search(void *payload) { return festina_text_own(FESTINA_URL_FROM_PAYLOAD(payload)->search); }
 void *festina_url_search_params(void *payload) {
     void *sp = FESTINA_URL_FROM_PAYLOAD(payload)->search_params;
     festina_retain(sp);
@@ -1319,6 +1351,7 @@ void festina_release_url(void *payload) {
     free(u->hostname);
     free(u->pathname);
     free(u->hash);
+    free(u->search);
     /* claude.md #167: festina_release_text_map, not the generic
      * festina_release_map -- search_params' own values are owned text
      * (festina_parse_search_params builds each one via
@@ -1355,8 +1388,9 @@ void *festina_url_clone(void *payload) {
     clone->port = u->port;
     clone->pathname = strdup(u->pathname ? u->pathname : "");
     clone->hash = strdup(u->hash ? u->hash : "");
+    clone->search = strdup(u->search ? u->search : "");
     if (!clone->protocol || !clone->username || !clone->password || !clone->hostname
-            || !clone->pathname || !clone->hash) {
+            || !clone->pathname || !clone->hash || !clone->search) {
         festina_fail("out of memory cloning a url");
     }
     FestinaMapBlockCore *src_block =

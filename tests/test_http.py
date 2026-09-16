@@ -170,6 +170,21 @@ class TestHttpFieldsAndMethods:
         """
         semantic.analyze(parser.parse(source))
 
+    def test_a_repeated_query_key_keeps_the_last_value(self, compile_and_run):
+        # `searchParams` is a map, so a repeated key can only keep one
+        # of its values and the last is the useful choice. Pinned
+        # because the overwrite is also where the value it displaced was
+        # being leaked -- owned text dropped on the floor, one
+        # allocation per duplicate, invisible to every corpus URL
+        # because none of them repeated a key.
+        result = compile_and_run("""
+        url u = parseURL('http://h/p?b=first&a=only&b=last')
+        log(u.searchParams['b'])
+        log(u.searchParams['a'])
+        """)
+        assert result.returncode == 0, result.stdout
+        assert result.stdout.strip().splitlines() == ["last", "only"]
+
     def test_url_fields_are_read_only(self, parser, semantic, errors):
         program = parser.parse("url u = parseURL('http://example.com/')\nu.hostname = 'x'")
         with pytest.raises(errors.CompileError, match="read-only"):
@@ -810,6 +825,98 @@ class TestHttpClient:
         """)
         assert result.returncode == 0, result.stdout
         assert "bearer example" in result.stdout
+
+    def test_the_server_sees_a_query_string_on_the_request_target(
+            self, compile_and_run_server):
+        # The observation channel for the two client tests below, checked
+        # on its own first: `req.url` on the SERVER side is rebuilt from
+        # the request target, so it can only report a query the client
+        # actually sent if it preserves one that arrives. Established
+        # with a raw http_get, which writes the request line itself and
+        # so does not depend on the client path under test.
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) {
+            req.send({'body': req.url})
+        }
+        """)
+        status, _, body = server.http_get("/some/path?a=1&b=two")
+        assert status == 200
+        assert body.decode() == (
+            f"http://127.0.0.1:{server.port}/some/path?a=1&b=two")
+
+    def test_client_send_keeps_the_query_string(
+            self, compile_and_run_server, compile_and_run):
+        # specification.md §19.5: `req.send()` sends req "to `req.url`".
+        # It was sending to the pathname alone, so `/page?a=1` went out
+        # as `GET /page` -- a different URL, answered with a 200 and a
+        # `req.url` still reading as the one asked for, which is the
+        # worst shape a wrong answer can take. Reported by
+        # uraikus/archtelos-browser.
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) {
+            req.send({'body': req.url})
+        }
+        """)
+        result = compile_and_run(f"""
+        http req = {{'url': 'http://127.0.0.1:{server.port}/page?a=1&b=two',
+                      'method': 'GET'}}
+        req.send()
+        log(req.toText())
+        """)
+        assert result.returncode == 0, result.stdout
+        # The target only. Whether the Host header carries the port is a
+        # separate question with its own test below, and asserting the
+        # whole URL here would make this fail for either reason.
+        assert "/page?a=1&b=two" in result.stdout
+
+    def test_client_send_keeps_a_query_it_cannot_round_trip_through_a_map(
+            self, compile_and_run_server, compile_and_run):
+        # The query goes out RAW, not re-rendered from `searchParams`.
+        # Re-serializing that map would lose duplicate keys, ordering,
+        # and the difference between `+` and `%20` -- all three are here,
+        # plus a bare valueless key, so a fix that rebuilds the query
+        # from the parsed map fails this even though it passes the test
+        # above.
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) {
+            req.send({'body': req.url})
+        }
+        """)
+        query = "?b=2&a=1&b=3&c=x+y&d=x%20y&e"
+        result = compile_and_run(f"""
+        http req = {{'url': 'http://127.0.0.1:{server.port}/p{query}',
+                      'method': 'GET'}}
+        req.send()
+        log(req.toText())
+        """)
+        assert result.returncode == 0, result.stdout
+        assert f"/p{query}" in result.stdout
+
+    def test_client_send_puts_a_non_default_port_in_the_host_header(
+            self, compile_and_run_server, compile_and_run):
+        # RFC 7230 §5.4: Host carries the port whenever it is not the
+        # scheme's default. The send built it from the hostname alone,
+        # so a request to 127.0.0.1:8080 announced `Host: 127.0.0.1` --
+        # which a name-based virtual host and any server that rebuilds
+        # the absolute URL from Host both get wrong. Found while fixing
+        # the dropped query string, from a server echoing `req.url` back
+        # as `http://127.0.0.1/p` with no port in it.
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) {
+            req.send({'body': req.headers['host']})
+        }
+        """)
+        result = compile_and_run(f"""
+        http req = {{'url': 'http://127.0.0.1:{server.port}/', 'method': 'GET'}}
+        req.send()
+        log(req.toText())
+        """)
+        assert result.returncode == 0, result.stdout
+        assert f"127.0.0.1:{server.port}" in result.stdout
 
     def test_client_send_to_an_unreachable_host_throws(self, compile_and_run):
         # claude.md #162: a genuine network failure -- DNS/connect/TLS --

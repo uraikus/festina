@@ -2440,9 +2440,13 @@ with code 1002, an oversize message with 1009. [#151, #168, #208]
 to `req.url` (`http://` or `https://`) and, in blocking mode, waits for
 the whole response and overwrites `req.code`, `req.headers` and the
 body in place; `req.url` and `req.method` are untouched, so a value may
-be re-sent. A network or protocol failure **throws**. Same-host plain
+be re-sent. The request target is the URL's path **and its query,
+byte for byte as written** — not re-encoded from `searchParams`, so a
+repeated key, a key's order, and the difference between `+` and `%20`
+all survive. `Host` carries the port whenever it is not the scheme's
+default. A network or protocol failure **throws**. Same-host plain
 HTTP requests reuse a keep-alive connection per OS thread on POSIX.
-There is no `fetch()`. [#162, #248]
+There is no `fetch()`. [#162, #248, #330]
 
 With a non-null `callback`, `req.send()` returns immediately, the
 request runs in the background, and `callback(req)` later runs on the
@@ -2459,7 +2463,11 @@ initializer, and the statement `http {...}` for an anonymous send.
 `protocol` (with its trailing colon), `username`, `password`,
 `hostname`, `port:int` (`null` if absent), `pathname`,
 `searchParams:map[text]` (percent-decoded) and `hash`; it throws when
-`t` has no `://` or a non-numeric port. [#162]
+`t` has no `://` or a non-numeric port. A key repeated in the query
+keeps its **last** value, `searchParams` being a map. The raw query is
+retained internally so an outbound request can reproduce it (§19.5),
+but it is not a field: the list above is the whole of `url`. [#162,
+#330]
 
 ### 19.7 Combining with graphics and timers
 

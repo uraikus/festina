@@ -6747,3 +6747,72 @@ uraikus/archtelos-browser is a browser engine written in Festina, and it exists 
 **Two smaller gaps fell out of the same file.** A `func` PARAMETER never recorded its signature, only a func LOCAL did -- so a call through the parameter had nothing to spell its argument and return types with and was refused. Nothing had ever passed a function as an argument before an arrow existed. And a `func` struct FIELD could not be assigned, because the field-store path allowed only int/float/bool; `func`, `font` and `color` are all scalar-shaped and immortal, with no reference to claim and no old value to release, so they belong on the plain store with them.
 
 **Verified.** Codegen 89 match and 0 differ. `cases/arrow_numbering.f` -- three arrows, one nested inside another's body, which is the file that found every one of these -- matches at 100%.
+
+330. A QUERY STRING THAT NEVER LEFT, AND TWO BUGS BEHIND IT
+
+**`http://host/page?a=1` was sent as `GET /page`.** Reported by
+uraikus/archtelos-browser and reproduced here. specification.md §19.5
+already said `send()` sends `req` "to `req.url`", so this was an
+implementation that disagreed with its own specification rather than a
+gap in it -- the send built its request line from `festina_url_pathname`
+alone, and the query, parsed into `searchParams` at the top of the
+function, was never read again.
+
+**The worst part is what it looked like from the program.** `req.code`
+came back 200, `req.url` still read as the URL that was asked for, and
+the body was a real answer -- to a different question. Nothing anywhere
+said the request had been altered. A throw would have been better than
+this; answering a substituted URL with every indicator reading normal
+is the one failure shape a caller cannot defend against.
+
+**The raw query is kept, not rebuilt from `searchParams`.** Rebuilding
+looks equivalent and is not: a map cannot hold a repeated key, cannot
+remember the order keys were written in, and cannot distinguish `+`
+from `%20` once both have decoded to a space. `FestinaUrlValue` gains a
+`search` field holding the query verbatim, `?` included, on the same
+convention `protocol` and `hash` already use. It is runtime-internal --
+§19.6's field list is unchanged, so this adds nothing to the language.
+The test that would pass either way is there beside the one that would
+not: a query with a duplicate key, a reordering, a `+`, a `%20` and a
+bare valueless key fails against any implementation that round-trips
+through the map.
+
+**`Host` was missing the port.** Found while fixing the above, from a
+server echoing `req.url` back as `http://127.0.0.1/p` with no port in
+it: the header was built from the hostname alone, so every request to a
+non-default port announced the wrong authority. RFC 7230 §5.4 wants the
+port unless it is the scheme's default, and that is what it now sends.
+A URL naming 80 explicitly on `http://` still sends a bare host, which
+is the same authority rather than a different one.
+
+**And a leak, in the overwrite the first fix's test walked into.** A
+duplicate query key makes `festina_parse_search_params` store over a
+slot whose existing value is owned text the map is the only holder of,
+and it was dropping it -- one allocation per duplicate, since
+`searchParams` was introduced. No URL in the corpus repeated a key, so
+nothing measured it. `tests/stress/thread_churn.f`'s URL now does, and
+the leak harness covers it from here -- checked the way a canary is
+checked, by putting the bug back: with the free removed,
+LeakSanitizer reports "Direct leak of 2 byte(s) in 1 object(s)", the
+displaced `a=1`. Coverage that has not been seen to fail is not
+coverage.
+
+**Verified.** Four new tests in `tests/test_http.py`, each failing
+before its own fix: the query survives, a query that cannot round-trip
+through a map survives, `Host` carries the port, and a repeated key
+keeps its last value. The observation channel is checked on its own
+first -- a raw `http_get` proving the server reports a query it
+receives -- so a client test cannot pass by both sides being wrong.
+Clean under valgrind at 200 iterations over four URL shapes, 0 bytes
+lost against 400 before, and the whole leak-stress suite green. All
+five differential harnesses green on the edited corpus: 125/125 on the
+front three, 2,224 of 2,224 escape records, 419,389 of 419,389 IR
+lines.
+
+**One existing test changed, and it is worth saying which.**
+`TestOutboundHeaderForwarding` asserted `host=127.0.0.1 ` with a
+comment explaining that it matched "a `:18310` this runtime never
+actually writes" -- it had pinned the bug, deliberately and in
+writing, while testing something else. Its own subject, that a
+caller's hand-built `host` loses to the runtime's, is unchanged and
+still asserted; only the spelling it incidentally recorded moved.

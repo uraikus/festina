@@ -19958,11 +19958,14 @@ class TestOutboundHeaderForwarding:
         result = compile_and_run(source)
         assert result.returncode == 0, result.stdout + result.stderr
         assert "200" in result.stdout
-        # festina_http_send_client's own Host header is just the
-        # hostname (no :port) -- unrelated to this test's own subject,
-        # matched as-is rather than asserting a :18310 this runtime
-        # never actually writes.
-        assert "host=127.0.0.1 " in result.stdout
+        # claude.md #330: the runtime's own Host now carries the port
+        # whenever it is not the scheme's default (RFC 7230 5.4). This
+        # assertion used to read `host=127.0.0.1 ` with a comment saying
+        # it matched "a :18310 this runtime never actually writes" --
+        # true at the time, and the thing #330 fixed. The subject here
+        # is unchanged either way: whatever the runtime sends, it is the
+        # runtime's and not the caller's.
+        assert "host=127.0.0.1:18310 " in result.stdout
         # claude.md #248: poolable (plain HTTP, POSIX) always asks for
         # keep-alive now -- a hand-built 'connection': 'close' in the
         # caller's own map is exactly the kind of override this test

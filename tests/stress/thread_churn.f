@@ -403,7 +403,12 @@ while au < AUD_TOTAL {
     audWorker.postMessage(audSrc)
     au = au + 1
 }
-url urlSrc = parseURL('https://example.com/path?a=1')
+// The repeated `a` is deliberate: a duplicate query key is what makes
+// parseURL overwrite a slot in searchParams, and the value it displaces
+// is owned text only this map holds. Dropping it leaked one allocation
+// per duplicate, and no URL anywhere in this corpus repeated a key, so
+// nothing measured it.
+url urlSrc = parseURL('https://example.com/path?a=1&b=2&a=3')
 int u = 0
 while u < URL_TOTAL {
     urlWorker.postMessage(urlSrc)

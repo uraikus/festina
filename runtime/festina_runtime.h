@@ -84,6 +84,10 @@ char *festina_url_hostname(void *payload);
 int64_t festina_url_port(void *payload);
 char *festina_url_pathname(void *payload);
 char *festina_url_hash(void *payload);
+/* The raw query, '?' included, or "" -- what an outbound request
+ * target appends verbatim. Runtime-internal: no Festina field
+ * exposes it (specification.md 19.6). [#330] */
+char *festina_url_search(void *payload);
 void *festina_url_search_params(void *payload);  /* fresh reference --
                                                    * caller owns it, same
                                                    * "retain on the way out"

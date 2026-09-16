@@ -14,20 +14,11 @@ before being listed. Four of its reports were already fixed and are not
 listed (mutual recursion across a file, a parameter or local shadowing a
 function, and `\n` in a regex literal); three more are fixed in
 decisions.md #326 (the `ascii` aliasing use-after-free, `==` on two
-struct references, `ascii.toInt()`). These are what is left, most
-damaging first.
+struct references, `ascii.toInt()`). The dropped query string is fixed
+in decisions.md #330, which also fixed a `Host` header that omitted a
+non-default port and a leak on a repeated query key, both found while
+verifying it. These are what is left, most damaging first.
 
-- **The query string is dropped from every outbound request.**
-  `req.send()` builds its request line from the URL's path alone, so
-  `http://host/page?a=1` is sent as `GET /page`. The query is parsed
-  into the URL value and then never used. Nothing observable says the
-  request was altered: `req.code` is 200 and `req.url` is unchanged.
-  Silently answering a different URL is the worst of the available
-  behaviours — appending the query to the request target is the fix,
-  and throwing would be better than what happens now. Confirmed in
-  `runtime/festina_runtime_http.c`, where the send builds
-  `method + " " + pathname + " HTTP/1.1"` and `FestinaUrlValue` keeps
-  only a decoded `search_params` map, never the raw query.
 - **A response over 64 KiB takes thirty seconds.** The client read loop
   ends at EOF; a keep-alive server never sends one, so the 30-second
   `SO_RCVTIMEO` is what actually ends the read. A 640 KB page that
