@@ -5,6 +5,65 @@ item lives in [decisions.md](decisions.md) (the numbered decision log,
 cited as `claude.md #N` throughout the repository) and
 [tests/CONTRACT.md](tests/CONTRACT.md) (what is verified, and how).
 
+## Open bugs
+
+Reported by [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser)
+— a browser engine written in Festina, whose `FINDINGS.md` and
+`festina.md` record where the language ran out — and **reproduced here**
+before being listed. Four of its reports were already fixed and are not
+listed (mutual recursion across a file, a parameter or local shadowing a
+function, and `\n` in a regex literal); three more are fixed in
+decisions.md #326 (the `ascii` aliasing use-after-free, `==` on two
+struct references, `ascii.toInt()`). These are what is left, most
+damaging first.
+
+- **The query string is dropped from every outbound request.**
+  `req.send()` builds its request line from the URL's path alone, so
+  `http://host/page?a=1` is sent as `GET /page`. The query is parsed
+  into the URL value and then never used. Nothing observable says the
+  request was altered: `req.code` is 200 and `req.url` is unchanged.
+  Silently answering a different URL is the worst of the available
+  behaviours — appending the query to the request target is the fix,
+  and throwing would be better than what happens now. Confirmed in
+  `runtime/festina_runtime_http.c`, where the send builds
+  `method + " " + pathname + " HTTP/1.1"` and `FestinaUrlValue` keeps
+  only a decoded `search_params` map, never the raw query.
+- **A response over 64 KiB takes thirty seconds.** The client read loop
+  ends at EOF; a keep-alive server never sends one, so the 30-second
+  `SO_RCVTIMEO` is what actually ends the read. A 640 KB page that
+  `curl` fetches in 53 ms costs 30.8 s. End the read at
+  `Content-Length` when the response declares one, and at the
+  terminating zero-length chunk when it is chunked — both are already
+  parsed in the same file. Keep the timeout as the backstop it was
+  meant to be.
+- **Releasing a live alias walks everything reachable from it.** A
+  value whose TYPE can participate in a cycle runs a synchronous trial
+  deletion on release, so binding a child to a local inside a loop
+  costs a walk of the whole subtree per iteration. With a parent
+  pointer that is the whole document, and tree code becomes quadratic:
+  8,421 nodes took 1,645 ms instead of 1 ms. A `weak` field modifier
+  (`parent:weak Node`) is the cheapest fix and a compile-time concept
+  with no runtime machinery; the deferred-root buffer below is the
+  other.
+- **A struct-typed field can never read as `null`.** A struct, array or
+  map field is created empty the first time it is *reached*, including
+  by `== null`, so `if node.next != null` is always true and
+  `x.field = null` followed by `x.field == null` is `false`. Vivify on
+  write and on member access, not on a null test. Every workaround for
+  it is a parallel boolean or an id that is 0 when absent.
+- **`'' == null` is `true`,** in a local, a struct field, an array
+  element and a map value — a NUL-terminated `char *` with no header
+  cannot tell them apart. It matters immediately for HTML, where
+  `<input checked>` has an attribute whose value is the empty string.
+  Either a static empty-string sentinel the runtime recognizes, or say
+  so in the specification next to "`null` reads 0"; it is currently
+  undocumented and surprising.
+- **Compiled binaries target the host CPU's exact feature set.** On an
+  AVX-512 machine every valgrind run dies with SIGILL before `main`,
+  and valgrind is the tool that found two of the bugs above. A
+  `FESTINA_TARGET_CPU=generic` escape hatch is what the reporter had to
+  monkeypatch the compiler to get.
+
 ## Platforms
 
 Linux is the primary, fully verified target. macOS and Windows builds
