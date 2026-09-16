@@ -213,6 +213,20 @@ arr[Node] func parseImported(path:text) {
 // its own imports before those again -- the dependency order
 // imports.build_program produces.
 arr[Node] func expandImports(stmts:arr[Node]) {
+    // An already-merged list is handed back UNCHANGED rather than
+    // copied. That is not an optimization: claude.md #252's match
+    // desugaring rewrites statements in place, and codegen re-walks the
+    // very list this returns -- so a copy here would quietly hide every
+    // top-level rewrite from the stage that needs to see it.
+    bool anyImport = false
+    int p = 0
+    while p < stmts.length {
+        if stmts[p] != null {
+            if stmts[p].kind == 'ImportDecl' { anyImport = true }
+        }
+        p++
+    }
+    if anyImport == false { return stmts }
     arr[Node] out = []
     int i = 0
     while i < stmts.length {
@@ -979,10 +993,80 @@ void func analyzeBlock(s:Scope, b:Node) {
 void func analyzeStmts(s:Scope, stmts:arr[Node]) {
     int i = 0
     while i < stmts.length {
+        // claude.md #252: an indexed write-back, not a plain walk. A
+        // `match` comes back as its own desugared if-chain, and codegen
+        // -- which re-walks this same list afterwards -- has no match
+        // handling at all, by design: the sugar is gone before any
+        // later stage could need to know it existed.
+        if stmts[i] != null {
+            if stmts[i].kind == 'MatchStmt' { stmts[i] = desugarMatch(stmts[i]) }
+        }
         analyzeStmt(s, stmts[i])
         if SEM_FAILED { return }
         i++
     }
+}
+
+// claude.md #252: `match subject { 'Tag' { ... } default { ... } }`
+// rewritten into exactly the `if typeof(subject) == 'Tag' { ... } else
+// ...` chain a hand-written one would have produced.
+//
+// The SAME subject node is reused in every typeof, which is safe only
+// because the grammar already restricts a subject to a plain name or a
+// dotted field -- re-evaluating one has no effect to repeat.
+//
+// Built tail first, so each earlier arm's `else` is the chain built so
+// far. That is the shape an `else if` parses into, which is what makes
+// the desugared form indistinguishable from the written-out one.
+Node func desugarMatch(n:Node) {
+    Node subject = childOf(n, 'subject')
+    arr[Node] arms = listOf(n, 'arms')
+    Node orelse = childOf(n, 'default')
+    int line = rawInt(n, 'line')
+    int col = rawInt(n, 'column')
+    int a = arms.length - 1
+    while a >= 0 {
+        Node tagNode = arms[a].fields[0].node
+        Node body = arms[a].fields[1].node
+        Node tof = mk('TypeofExpr')
+        addNode(tof, 'operand', subject)
+        addInt(tof, 'line', line)
+        addInt(tof, 'column', col)
+        Node lit = mk('StringLit')
+        addRaw(lit, 'value', tagNode.fields[0].raw)
+        Node test = mk('BinOp')
+        addStr(test, 'op', '==')
+        addNode(test, 'left', tof)
+        addNode(test, 'right', lit)
+        addInt(test, 'line', line)
+        addInt(test, 'column', col)
+        Node iff = mk('IfStmt')
+        addNode(iff, 'test', test)
+        addNode(iff, 'then', body)
+        if orelse == null { addNull(iff, 'orelse') }
+        else { addNode(iff, 'orelse', orelse) }
+        addInt(iff, 'line', line)
+        addInt(iff, 'column', col)
+        orelse = iff
+        a--
+    }
+    if orelse == null {
+        // A match with no arms and no default covers nothing, and a
+        // statement that does nothing is the honest answer to that.
+        Node empty = mk('IfStmt')
+        Node f = mk('BoolLit')
+        addBool(f, 'value', false)
+        addNode(empty, 'test', f)
+        Node blk = mk('Block')
+        arr[Node] none = []
+        addList(blk, 'body', none)
+        addNode(empty, 'then', blk)
+        addNull(empty, 'orelse')
+        addInt(empty, 'line', line)
+        addInt(empty, 'column', col)
+        return empty
+    }
+    return orelse
 }
 
 void func analyzeStmt(s:Scope, n:Node) {

@@ -957,6 +957,9 @@ text func cgLtyOf(fty:text) {
     if fty == 'http' { return 'ptr' }
     if fty == 'socket' { return 'ptr' }
     if fty == 'url' { return 'ptr' }
+    // claude.md #176: an enum value is one pointer either way -- to the
+    // member struct it currently holds, or to its own {tag, value} box.
+    if fty == 'enum' { return 'ptr' }
     return ''
 }
 
@@ -1107,6 +1110,34 @@ text func cgSigRet(sig:text) {
 // ignore here only because EnumDecl is itself unported, so no program
 // reaching this code has an enum at all.
 text func cgFreshHeader(payload:text) {
+    return cgFreshHeaderTagged(payload, '')
+}
+
+// claude.md #176: the same block, widened to sixteen extra bytes for a
+// struct that is a member of a pure-struct enum -- TAG first, refcount
+// second. In that order deliberately: the refcount word stays at
+// exactly payload-8 whichever shape a given struct has, so retain and
+// release, which only ever look there, need to know nothing about
+// tagging at all. The tag sits one further word back, read only by
+// `typeof` and by the field-access check.
+text func cgFreshHeaderTagged(payload:text, tag:text) {
+    if tag != '' {
+        text tsz = cgTmp()
+        cgOut(`  ${tsz} = getelementptr ${payload}, ptr null, i64 1`)
+        text tszi = cgTmp()
+        cgOut(`  ${tszi} = ptrtoint ptr ${tsz} to i64`)
+        text ttotal = cgTmp()
+        cgOut(`  ${ttotal} = add i64 ${tszi}, 16`)
+        text traw = cgTmp()
+        cgOut(`  ${traw} = call ptr @calloc(i64 1, i64 ${ttotal})`)
+        cgOut(`  store ptr ${tag}, ptr ${traw}`)
+        text rcP = cgTmp()
+        cgOut(`  ${rcP} = getelementptr i8, ptr ${traw}, i64 8`)
+        cgOut(`  store i64 1, ptr ${rcP}`)
+        text tmade = cgTmp()
+        cgOut(`  ${tmade} = getelementptr i8, ptr ${traw}, i64 16`)
+        return tmade
+    }
     text sz = cgTmp()
     cgOut(`  ${sz} = getelementptr ${payload}, ptr null, i64 1`)
     text szi = cgTmp()
@@ -1142,6 +1173,7 @@ text func cgManagedFty(t:Ty) {
     if t.kind == 'map' { return 'map' }
     if t.kind == 'struct' { return 'struct' }
     if t.kind == 'table' { return 'table' }
+    if t.kind == 'enum' { return 'enum' }
     // claude.md #109: a blob carries the ordinary refcount header, so
     // the only thing the generic release cannot do for it is free the
     // path and byte buffer hanging off the payload -- exactly the shape
@@ -1211,6 +1243,16 @@ map[int] SF_IDX = {}
 map[text] SF_LTY = {}
 map[text] SF_FTY = {}
 map[text] SF_SNAME = {}
+// Each enum's members, joined by `|`, in declaration order.
+map[text] EN_MEMBERS = {}
+// Whether every member is a struct.
+map[int] EN_PURE = {}
+// The structs that are a member of at least one pure-struct enum, and
+// so carry the widened header at every construction site.
+map[int] CG_TAGGED = {}
+// The release wrappers generated so far, by enum name.
+map[int] CG_ENUM_REL = {}
+
 map[text] SF_ETY = {}
 // claude.md #174: which struct fields hold an AMORTIZED array. Its own
 // table for the same reason the binding one is: the element type
@@ -1250,6 +1292,12 @@ Val CG_FIELD_BASE
 // caller that loaded from the returned i64 as though it were an address
 // emitted a wild read that happened to typecheck.
 bool CG_FIELD_DIRECT = false
+
+// Whether the statement being emitted stands DIRECTLY in the program
+// body rather than inside a block. Only a declaration there is a
+// global; one inside a loop or an `if` at the top level is a local in
+// main, even when the two share a name.
+bool CG_AT_TOPLEVEL = false
 
 // ---------------------------------------------------------------------
 // claude.md #108/#117/#262: the member CHAIN.
@@ -2323,6 +2371,9 @@ Val func cgExpr(e:Node) {
         return cgVal('null', 'ptr', 'null')
     }
 
+    // claude.md #176: `typeof x`.
+    if e.kind == 'TypeofExpr' { return cgTypeof(e) }
+
     if e.kind == 'Identifier' {
         text name = rawText(e, 'name')
         text slot = cgSlotOf(name)
@@ -2369,6 +2420,11 @@ Val func cgExpr(e:Node) {
         cgOut(`  ${t} = load ${lty}, ptr ${slot}`)
         if fty == 'struct' { return cgStructVal(t, cgSnameOf(name)) }
         if fty == 'table' { return cgTableVal(t, cgSnameOf(name)) }
+        if fty == 'enum' {
+            Val ev = cgVal(t, 'ptr', 'enum')
+            ev.sname = cgSnameOf(name)
+            return ev
+        }
         if fty == 'arr' {
             Val av3 = cgArrVal(t, cgEtyOf(name))
             av3.isAmor = cgAmorOf(name)
@@ -2949,6 +3005,10 @@ Val func cgFieldPtr(e:Node) {
         CG_FIELD_BASE = obj
         return cr
     }
+    // claude.md #176: an enum's own field access has a runtime tag
+    // check in front of it, which is the whole reason it is not an
+    // ordinary struct field read.
+    if obj.fty == 'enum' { return cgEnumFieldPtr(e, obj) }
     if obj.fty != 'struct' {
         cgUnported(`member access on ${obj.fty}`)
         return none
@@ -2961,7 +3021,7 @@ Val func cgFieldPtr(e:Node) {
     text fp = cgTmp()
     cgOut(`  ${fp} = getelementptr %struct.${obj.sname}, ptr ${obj.v}, i32 0, i32 ${SF_IDX[key]}`)
     Val r = cgVal(fp, SF_LTY[key], SF_FTY[key])
-    if SF_FTY[key] == 'struct' { r.sname = SF_SNAME[key] }
+    if SF_FTY[key] == 'struct' || SF_FTY[key] == 'enum' { r.sname = SF_SNAME[key] }
     if SF_ETY[key] != null { r.ety = SF_ETY[key] }
     if SF_AMOR[key] != null { r.isAmor = true }
     // The base travels with the pointer, because a READ through a base
@@ -3221,7 +3281,12 @@ Val func cgStructLit(e:Node, sname:text) {
         cgUnported(`struct literal of ${sname}`)
         return none
     }
-    text into = cgFreshHeader(`%struct.${sname}`)
+    // claude.md #176: the widened header when this struct is a member
+    // of a pure-struct enum. Getting it wrong here is #267's own
+    // record of what happens: the struct comes out untagged, crashes
+    // the moment it is used as its enum, and its release frees
+    // payload-8 where the tagged layout allocated from payload-16.
+    text into = cgFreshHeaderTagged(`%struct.${sname}`, cgStructTag(sname))
     arr[Node] entries = listOf(e, 'entries')
     int i = 0
     while i < entries.length {
@@ -3457,6 +3522,14 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
         made.fresh = true
         return made
     }
+    // claude.md #176: a member value in an enum-typed position.
+    if fty == 'enum' && v.fty != 'enum' {
+        if EN_MEMBERS[ety] == null {
+            cgUnported(`a value in a ${ety} position`)
+            return v
+        }
+        return cgEnumCoerce(e, v, ety)
+    }
     // The other direction is always a real copy, since a text is a bare
     // char* with no header in front of it to share.
     if fty == 'text' && v.fty == 'ascii' {
@@ -3491,6 +3564,387 @@ text func cgAsciiConst(v:text) {
     text ref = `getelementptr inbounds (${ty}, ptr ${name}, i32 0, i32 2)`
     CG_ASTR_MAP[v] = ref
     return ref
+}
+
+// ---------------------------------------------------------------------
+// claude.md #176: enums.
+//
+// An enum has TWO runtime representations, picked by what its members
+// are.
+//
+//   - **Pure struct** (every member a struct): the value simply IS
+//     whichever member struct's own pointer it currently holds,
+//     SELF-TAGGED in that struct's own widened `{tag, refcount}`
+//     header. No box, no allocation of its own, no unwrapping anywhere.
+//     The tag word sits at payload-16 and the refcount stays at
+//     payload-8, so every generic retain and release works unchanged.
+//   - **Mixed** (at least one non-struct member): a small,
+//     independently refcounted `{ptr tag, i64 value}` box, with the
+//     value marshaled through the same i64 reinterpretation a map's
+//     values already use. ONE universal shape for every mixed enum,
+//     whatever its members -- the same "one fixed-size slot, type
+//     agnostic" convention a map entry has.
+//
+// The tag is never a small integer needing a lookup table: it is a
+// pointer straight to the interned type-name constant, so reading it
+// back is already reading a valid `text`.
+
+text func cgEnumTagConst(name:text) {
+    return cgStringConst(name)
+}
+
+// The declaration itself: the member list, whether every member is a
+// struct, and -- when it is -- which structs now need the widened
+// header at every one of their construction sites.
+void func cgEnumDecl(d:Node) {
+    text ename = rawText(d, 'name')
+    arr[Node] ms = listOf(d, 'members')
+    text joined = ''
+    bool pure = true
+    int i = 0
+    while i < ms.length {
+        Ty mt = resolveTypeNode(ms[i])
+        text mname = cgEnumMemberName(mt)
+        if mname == '' {
+            cgUnported(`an enum member this port cannot spell`)
+            return
+        }
+        if i > 0 { joined = joined + '|' }
+        joined = joined + mname
+        if mt.kind != 'struct' { pure = false }
+        i++
+    }
+    EN_MEMBERS[ename] = joined
+    if pure {
+        EN_PURE[ename] = 1
+        arr[text] names = joined.split('|')
+        int j = 0
+        while j < names.length {
+            CG_TAGGED[names[j]] = 1
+            j++
+        }
+    }
+}
+
+// A member type as the TAG spells it, which is the same formatter the
+// analyzer's match desugaring compares against and the same one `typeof`
+// hands back at run time.
+text func cgEnumMemberName(t:Ty) {
+    if t == null { return '' }
+    if t.kind == 'struct' { return t.name }
+    if t.kind == 'prim' { return t.name }
+    if t.kind == 'arr' || t.kind == 'map' {
+        if t.elem == null { return '' }
+        text inner = cgEnumMemberName(t.elem)
+        if inner == '' { return '' }
+        return `${t.kind}[${inner}]`
+    }
+    return ''
+}
+
+// The tag operand a struct's construction site passes, or '' for an
+// ordinary struct.
+text func cgStructTag(sname:text) {
+    if CG_TAGGED[sname] == null { return '' }
+    return cgEnumTagConst(sname)
+}
+
+// claude.md #176: `typeof x`.
+//
+// For a non-enum operand the runtime type IS the static type -- Festina
+// has no other source of runtime polymorphism -- so this is a compile
+// time constant and no runtime work at all. That is what makes
+// `typeof name == 'text'` free.
+//
+// For an enum operand it reads the tag, which is already the answer.
+// And it is always the CONCRETE member's own name: `Shape` is never a
+// typeof result, `Circle` and `Square` are.
+Val func cgTypeof(e:Node) {
+    Val none
+    Val v = cgExpr(childOf(e, 'operand'))
+    if CG_STUCK { return none }
+    if v.fty != 'enum' {
+        text tn = v.fty
+        if v.fty == 'struct' || v.fty == 'table' { tn = v.sname }
+        else if v.fty == 'arr' { tn = `arr[${v.ety}]` }
+        else if v.fty == 'map' { tn = `map[${v.ety}]` }
+        return cgVal(cgStringConst(tn), 'ptr', 'text')
+    }
+    // An enum-typed value reads null until it is assigned -- there is
+    // no auto-vivify -- and both representations read the tag at a
+    // fixed offset from the pointer, which is exactly what is unsafe on
+    // a null one. `typeof x == 'Circle'` is the documented guard to
+    // write BEFORE a field access, so typeof failing loudly here is
+    // what keeps that guard worth writing.
+    text isNull = cgTmp()
+    cgOut(`  ${isNull} = icmp eq ptr ${v.v}, null`)
+    text nullL = cgLabel('typeof.null')
+    text okL = cgLabel('typeof.nonnull')
+    cgOut(`  br i1 ${isNull}, label %${nullL}, label %${okL}`)
+    cgBlockLabel(nullL)
+    text nullMsg = cgStringConst(`typeof applied to a null ${v.sname} value`)
+    cgOut(`  call void @festina_fail(ptr ${nullMsg})`)
+    cgOut('  unreachable')
+    cgBlockLabel(okL)
+    text tagP = cgTmp()
+    if EN_PURE[v.sname] != null {
+        cgOut(`  ${tagP} = getelementptr i8, ptr ${v.v}, i64 -16`)
+    } else {
+        cgOut(`  ${tagP} = getelementptr %struct._FestinaEnumBox, ptr ${v.v}, i32 0, i32 0`)
+    }
+    text tag = cgTmp()
+    cgOut(`  ${tag} = load ptr, ptr ${tagP}`)
+    return cgVal(tag, 'ptr', 'text')
+}
+
+// The member of a pure-struct enum that declares a given field. The
+// analyzer has already checked exactly one does.
+text func cgEnumFieldOwner(ename:text, prop:text) {
+    arr[text] ms = EN_MEMBERS[ename].split('|')
+    int i = 0
+    while i < ms.length {
+        if SF_LTY[`${ms[i]}.${prop}`] != null { return ms[i] }
+        i++
+    }
+    return ''
+}
+
+// claude.md #176: `shape.radius`.
+//
+// Only ever reached for a PURE-STRUCT enum -- a mixed one's field
+// access is already a compile error -- so the value IS the member
+// struct's own pointer and there is nothing to unwrap. What is left is
+// a runtime CHECK that it really holds the member the field was
+// resolved against, which fails loudly rather than reading whatever
+// bytes happen to sit at that offset inside a different member.
+Val func cgEnumFieldPtr(e:Node, obj:Val) {
+    Val none
+    text prop = rawText(e, 'prop')
+    if EN_PURE[obj.sname] == null {
+        cgUnported(`field ${prop} of a mixed enum`)
+        return none
+    }
+    text owner = cgEnumFieldOwner(obj.sname, prop)
+    if owner == '' {
+        cgUnported(`field ${prop} of ${obj.sname}`)
+        return none
+    }
+    text isNull = cgTmp()
+    cgOut(`  ${isNull} = icmp eq ptr ${obj.v}, null`)
+    text nullL = cgLabel('enumfield.null')
+    text okL = cgLabel('enumfield.nonnull')
+    cgOut(`  br i1 ${isNull}, label %${nullL}, label %${okL}`)
+    cgBlockLabel(nullL)
+    text nullMsg = cgStringConst(`field '${prop}' accessed on a null ${obj.sname} value`)
+    cgOut(`  call void @festina_fail(ptr ${nullMsg})`)
+    cgOut('  unreachable')
+    cgBlockLabel(okL)
+    text tagP = cgTmp()
+    cgOut(`  ${tagP} = getelementptr i8, ptr ${obj.v}, i64 -16`)
+    text tag = cgTmp()
+    cgOut(`  ${tag} = load ptr, ptr ${tagP}`)
+    text matches = cgTmp()
+    cgOut(`  ${matches} = icmp eq ptr ${tag}, ${cgEnumTagConst(owner)}`)
+    text goodL = cgLabel('enumfield.ok')
+    text badL = cgLabel('enumfield.mismatch')
+    cgOut(`  br i1 ${matches}, label %${goodL}, label %${badL}`)
+    cgBlockLabel(badL)
+    text badMsg = cgStringConst(`field '${prop}' is only valid when this ${obj.sname} value is a ${owner}`)
+    cgOut(`  call void @festina_fail(ptr ${badMsg})`)
+    cgOut('  unreachable')
+    cgBlockLabel(goodL)
+    text key = `${owner}.${prop}`
+    text fp = cgTmp()
+    cgOut(`  ${fp} = getelementptr %struct.${owner}, ptr ${obj.v}, i32 0, i32 ${SF_IDX[key]}`)
+    Val r = cgVal(fp, SF_LTY[key], SF_FTY[key])
+    if SF_FTY[key] == 'struct' || SF_FTY[key] == 'enum' { r.sname = SF_SNAME[key] }
+    if SF_ETY[key] != null { r.ety = SF_ETY[key] }
+    if SF_AMOR[key] != null { r.isAmor = true }
+    CG_FIELD_BASE = obj
+    return r
+}
+
+// claude.md #176: a member value in an enum-typed position.
+//
+// A pure-struct enum needs nothing: the value already IS the pointer,
+// self-tagged at construction. A mixed one builds a fresh, independently
+// refcounted box, which is a genuinely NEW owner of what it holds -- so
+// the inner value takes the same "retain unless already fresh, copy
+// unless already owned" treatment every other fresh construction site
+// performs.
+Val func cgEnumCoerce(e:Node, v:Val, ename:text) {
+    if EN_PURE[ename] != null {
+        // Identity: the value already IS the pointer, self-tagged at
+        // construction. A FRESH Val rather than the same one, because
+        // the caller still holds the pre-coercion value and asks the
+        // cleanup about it -- mutating this one in place would change
+        // the answer under it.
+        Val pv = cgVal(v.v, 'ptr', 'enum')
+        pv.sname = ename
+        pv.fresh = v.fresh
+        return pv
+    }
+    text memberName = v.fty
+    if v.fty == 'struct' { memberName = v.sname }
+    else if v.fty == 'arr' { memberName = `arr[${v.ety}]` }
+    else if v.fty == 'map' { memberName = `map[${v.ety}]` }
+    text stored = v.v
+    if cgIsRefcounted(v.fty) {
+        bool fresh = cgIsOwningRefcountedSource(e)
+        if v.fresh { fresh = true }
+        if fresh == false { cgOut(`  call void @festina_retain(ptr ${stored})`) }
+    } else if v.fty == 'text' {
+        if cgOwnsText(e, v) == false {
+            text owned = cgTmp()
+            cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${stored})`)
+            stored = owned
+        }
+    }
+    text tagConst = cgEnumTagConst(memberName)
+    text box = cgFreshHeaderTagged('%struct._FestinaEnumBox', '')
+    text tagP = cgTmp()
+    cgOut(`  ${tagP} = getelementptr %struct._FestinaEnumBox, ptr ${box}, i32 0, i32 0`)
+    cgOut(`  store ptr ${tagConst}, ptr ${tagP}`)
+    text valP = cgTmp()
+    cgOut(`  ${valP} = getelementptr %struct._FestinaEnumBox, ptr ${box}, i32 0, i32 1`)
+    text raw = cgMapToI64(stored, cgLtyOf(v.fty))
+    cgOut(`  store i64 ${raw}, ptr ${valP}`)
+    Val r = cgVal(box, 'ptr', 'enum')
+    r.sname = ename
+    r.fresh = true
+    return r
+}
+
+// The per-enum release wrapper, generated once.
+//
+// PURE STRUCT: the value is its current member's own struct pointer,
+// with no allocation of its own, so there is nothing for THIS function
+// to free. It reads the tag and dispatches straight to that member's
+// own release, which already does its own check, field cascade and free
+// at the right offset. No duplicate check is needed or even possible:
+// this function's job is "which member is this", not "should this go".
+//
+// MIXED: the value is its own heap allocation, so this is a real
+// check-then-free. The inner value is released first, dispatched by the
+// same tag match, and only then is the box freed.
+text func cgReleaseEnumFn(ename:text) {
+    text fn = `@__festina_release_enum_${ename}`
+    if CG_ENUM_REL[ename] != null { return fn }
+    CG_ENUM_REL[ename] = 1
+    arr[text] ms = EN_MEMBERS[ename].split('|')
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define void ${fn}(ptr %payload) {`)
+    cgBlockLabel('entry')
+    if EN_PURE[ename] != null {
+        // An enum-typed value reads null until assigned, and this
+        // wrapper is called unconditionally at every release site --
+        // so, exactly like the generic release check itself, it has to
+        // test for null BEFORE reading payload-16, not just before
+        // freeing. The mixed branch needs no matching guard: its only
+        // dereferences are already behind a release check, which is
+        // null-safe on its own.
+        text isNull = cgTmp()
+        cgOut(`  ${isNull} = icmp eq ptr %payload, null`)
+        text nullL = cgLabel('relenum.null')
+        text okL = cgLabel('relenum.nonnull')
+        cgOut(`  br i1 ${isNull}, label %${nullL}, label %${okL}`)
+        cgBlockLabel(nullL)
+        cgOut('  ret void')
+        cgBlockLabel(okL)
+        text tagP = cgTmp()
+        cgOut(`  ${tagP} = getelementptr i8, ptr %payload, i64 -16`)
+        text tag = cgTmp()
+        cgOut(`  ${tag} = load ptr, ptr ${tagP}`)
+        int i = 0
+        while i < ms.length {
+            text matchL = cgLabel(`relenum.match${i}`)
+            text contL = cgLabel(`relenum.cont${i}`)
+            text cmp = cgTmp()
+            cgOut(`  ${cmp} = icmp eq ptr ${tag}, ${cgEnumTagConst(ms[i])}`)
+            cgOut(`  br i1 ${cmp}, label %${matchL}, label %${contL}`)
+            cgBlockLabel(matchL)
+            cgOut(`  call void ${cgReleaseFnFor('struct', ms[i])}(ptr %payload)`)
+            cgOut('  ret void')
+            cgBlockLabel(contL)
+            i++
+        }
+        // Unreachable in a correct program: construction always writes
+        // a valid member tag, and the member list never changes after
+        // the declaration is resolved.
+        cgOut('  unreachable')
+    } else {
+        text chk = cgTmp()
+        cgOut(`  ${chk} = call i8 @festina_release_check(ptr %payload)`)
+        text cond = cgTmp()
+        cgOut(`  ${cond} = icmp ne i8 ${chk}, 0`)
+        text freeL = cgLabel('relenum.free')
+        text doneL = cgLabel('relenum.done')
+        cgOut(`  br i1 ${cond}, label %${freeL}, label %${doneL}`)
+        cgBlockLabel(freeL)
+        text tagP = cgTmp()
+        cgOut(`  ${tagP} = getelementptr %struct._FestinaEnumBox, ptr %payload, i32 0, i32 0`)
+        text tag = cgTmp()
+        cgOut(`  ${tag} = load ptr, ptr ${tagP}`)
+        text valP = cgTmp()
+        cgOut(`  ${valP} = getelementptr %struct._FestinaEnumBox, ptr %payload, i32 0, i32 1`)
+        text raw = cgTmp()
+        cgOut(`  ${raw} = load i64, ptr ${valP}`)
+        int j = 0
+        while j < ms.length {
+            text mfty = cgEnumMemberFty(ms[j])
+            if mfty == 'text' || cgIsRefcounted(mfty) {
+                text matchL = cgLabel(`relenum.vmatch${j}`)
+                text contL = cgLabel(`relenum.vcont${j}`)
+                text cmp = cgTmp()
+                cgOut(`  ${cmp} = icmp eq ptr ${tag}, ${cgEnumTagConst(ms[j])}`)
+                cgOut(`  br i1 ${cmp}, label %${matchL}, label %${contL}`)
+                cgBlockLabel(matchL)
+                text inner = cgMapFromI64(raw, cgLtyOf(mfty))
+                if mfty == 'text' {
+                    cgOut(`  call void @free(ptr ${inner})`)
+                } else {
+                    cgOut(`  call void ${cgReleaseFnFor(mfty, cgEnumMemberKey(ms[j]))}(ptr ${inner})`)
+                }
+                cgOut(`  br label %${contL}`)
+                cgBlockLabel(contL)
+            }
+            j++
+        }
+        text header = cgTmp()
+        cgOut(`  ${header} = getelementptr i8, ptr %payload, i64 -8`)
+        cgOut(`  call void @festina_free_z(ptr ${header})`)
+        cgOut(`  br label %${doneL}`)
+        cgBlockLabel(doneL)
+        cgOut('  ret void')
+    }
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return fn
+}
+
+// A member's own fty, from the name the declaration recorded. A struct
+// member is spelled by its NAME, which is what distinguishes it from a
+// primitive.
+text func cgEnumMemberFty(m:text) {
+    if SF_NAMES[m] != null { return 'struct' }
+    if m.startsWith('arr[') { return 'arr' }
+    if m.startsWith('map[') { return 'map' }
+    return m
+}
+
+// And the second half of its release key -- a struct's own name, or a
+// container's element type.
+text func cgEnumMemberKey(m:text) {
+    if SF_NAMES[m] != null { return m }
+    if m.startsWith('arr[') { return m.slice(4, m.length - 1) }
+    if m.startsWith('map[') { return m.slice(4, m.length - 1) }
+    return ''
 }
 
 // ---------------------------------------------------------------------
@@ -7168,6 +7622,10 @@ void func cgStmt(s:Node) {
     // Pure type information: the definition was emitted with the
     // module's type section and nothing reaches main.
     if s.kind == 'StructDecl' { return }
+    // Pure type information too: the member list and the tagging it
+    // implies were recorded with the module's own declarations, and
+    // nothing reaches main where the declaration stands.
+    if s.kind == 'EnumDecl' { return }
     // claude.md #140: a function declared INSIDE another function's
     // body is an ordinary global declaration that happens to be written
     // there -- the analyzer already treats it that way, and its
@@ -7251,7 +7709,7 @@ void func cgStmt(s:Node) {
             // global. Found by porting the drivers, where a local and
             // a top-level binding first share a name.
             bool isGlobalDecl = false
-            if CG_IN_FUNC == false {
+            if CG_IN_FUNC == false && CG_AT_TOPLEVEL {
                 if G_SLOT[gname] != null { isGlobalDecl = true }
             }
             if isGlobalDecl {
@@ -7293,13 +7751,30 @@ void func cgStmt(s:Node) {
             // local is therefore one pointer to it and nothing more.
             if managed == 'blob' || managed == 'regex' || managed == 'table'
                     || managed == 'ascii' || managed == 'img' || managed == 'aud'
-                    || managed == 'http' || managed == 'socket' || managed == 'url' {
+                    || managed == 'http' || managed == 'socket' || managed == 'url'
+                    || managed == 'enum' {
                 Node binit = childOf(s, 'init')
+                // The key a coercion into this position needs: an enum
+                // member value has to know WHICH enum it is becoming,
+                // and the declaration is the only place that says.
+                text bekey = ''
+                if managed == 'enum' || managed == 'table' { bekey = dt.name }
+                // claude.md #176: no initializer is legal and means
+                // exactly null -- there is no auto-vivify for any of
+                // these, unlike a struct or a container.
                 if binit == null {
-                    cgUnported(`${managed} declaration with no initializer`)
+                    text nslot = `%${gname}.${cgUid()}`
+                    cgOut(`  ${nslot} = alloca ptr`)
+                    cgOut(`  store ptr null, ptr ${nslot}`)
+                    if manual { CG_MANUAL[nslot] = 1 }
+                    else { cgTrackLive(managed, nslot, bekey) }
+                    cgScopeRecord(gname)
+                    L_SLOT[gname] = nslot
+                    L_FTY[gname] = managed
+                    if bekey != '' { L_SNAME[gname] = bekey }
                     return
                 }
-                Val bv = cgExprExpecting(binit, managed, '')
+                Val bv = cgExprExpecting(binit, managed, bekey)
                 if CG_STUCK { return }
                 if bv.fty != managed {
                     cgUnported(`initializer of type ${bv.fty} for ${managed}`)
@@ -7335,14 +7810,15 @@ void func cgStmt(s:Node) {
                 // entry -- the slot a struct binding uses for the same
                 // purpose.
                 text bkey = ''
-                if managed == 'table' { bkey = dt.name }
+                if managed == 'table' || managed == 'enum' { bkey = dt.name }
                 // claude.md #202: and it is never tracked, so scope
                 // exit walks straight past it.
                 if manual { CG_MANUAL[bslot] = 1 }
                 else { cgTrackLive(managed, bslot, bkey) }
+                cgScopeRecord(gname)
                 L_SLOT[gname] = bslot
                 L_FTY[gname] = managed
-                if managed == 'table' { L_SNAME[gname] = dt.name }
+                if managed == 'table' || managed == 'enum' { L_SNAME[gname] = dt.name }
                 return
             }
             text declEty = ''
@@ -7468,12 +7944,15 @@ void func cgStmt(s:Node) {
                 if managed == 'arr' { cgTrackLive('arr.stack', slot, declEty) }
                 if managed == 'map' { cgTrackLive('map.stack', slot, declEty) }
             } else {
-                text made = cgFreshHeader(payload)
+                text tagOp = ''
+                if managed == 'struct' { tagOp = cgStructTag(declEty) }
+                text made = cgFreshHeaderTagged(payload, tagOp)
                 cgOut(`  ${slot} = alloca ptr`)
                 cgOut(`  store ptr ${made}, ptr ${slot}`)
                 if manual { CG_MANUAL[slot] = 1 }
                 else { cgTrackLive(managed, slot, declEty) }
             }
+            cgScopeRecord(gname)
             L_SLOT[gname] = slot
             L_FTY[gname] = managed
             if managed == 'struct' { L_SNAME[gname] = dt.name }
@@ -7495,6 +7974,7 @@ void func cgStmt(s:Node) {
         // directly in the program body. Inside a function every
         // declaration is local, even one shadowing a global name.
         bool isLocalDecl = CG_IN_FUNC
+        if CG_AT_TOPLEVEL == false { isLocalDecl = true }
         if G_SLOT[name] == null { isLocalDecl = true }
 
         bool freshLocal = false
@@ -7770,6 +8250,10 @@ text func cgRowToStructFn(sname:text) {
     CUR = gen
     cgOut(`define ptr ${fn}(ptr %row) {`)
     cgBlockLabel('entry')
+    // Untagged, which is the original's own shape here: a struct built
+    // from a query row is never a pure-struct enum member in any
+    // program that can reach this path, and the conversion writes the
+    // plain header by hand.
     text payload = cgFreshHeader(`%struct.${sname}`)
     arr[text] fnames = []
     if SF_NAMES[sname] != '' { fnames = SF_NAMES[sname].split('|') }
@@ -8050,7 +8534,74 @@ void func cgPushFrame() {
 // path because WHEN it is called is the whole point: everything a
 // declaration emits happens first, and only then does the name start
 // resolving to this slot. See the caller's own comment.
+// ---------------------------------------------------------------------
+// Block scope.
+//
+// A local declared inside a block stops existing where the block does.
+// That used to be approximated by never removing one at all, which is
+// right for every program where a nested name is unique -- and wrong
+// the moment one shadows something. `Box b` inside a loop, under a
+// top-level `Shape b`, read as a Box for the rest of the program.
+//
+// So each declaration records what the name meant BEFORE it, and the
+// block puts every one of them back on the way out. Nothing is copied
+// wholesale: only the names a block actually binds are touched, and an
+// empty marker restores "was not bound at all".
+arr[text] CG_SCOPE_NAMES = []
+arr[text] CG_SCOPE_SLOT = []
+arr[text] CG_SCOPE_FTY = []
+arr[text] CG_SCOPE_SNAME = []
+arr[text] CG_SCOPE_ETY = []
+arr[int] CG_SCOPE_AMOR = []
+
+void func cgScopeRecord(name:text) {
+    CG_SCOPE_NAMES.push(name)
+    text ps = ''
+    if L_SLOT[name] != null { ps = L_SLOT[name] }
+    CG_SCOPE_SLOT.push(ps)
+    text pf = ''
+    if L_FTY[name] != null { pf = L_FTY[name] }
+    CG_SCOPE_FTY.push(pf)
+    text pn = ''
+    if L_SNAME[name] != null { pn = L_SNAME[name] }
+    CG_SCOPE_SNAME.push(pn)
+    text pe = ''
+    if L_ETY[name] != null { pe = L_ETY[name] }
+    CG_SCOPE_ETY.push(pe)
+    int pa = 0
+    if L_AMOR[name] != null { pa = 1 }
+    CG_SCOPE_AMOR.push(pa)
+}
+
+// Everything bound since `mark` goes back to what it was. A slot that
+// was empty before means the name was not bound at all, so the entry is
+// removed outright rather than set to a sentinel some later lookup
+// would have to know about.
+void func cgScopeRestore(mark:int) {
+    while CG_SCOPE_NAMES.length > mark {
+        int i = CG_SCOPE_NAMES.length - 1
+        text name = CG_SCOPE_NAMES[i]
+        if CG_SCOPE_SLOT[i] == '' { delete L_SLOT[name] }
+        else { L_SLOT[name] = CG_SCOPE_SLOT[i] }
+        if CG_SCOPE_FTY[i] == '' { delete L_FTY[name] }
+        else { L_FTY[name] = CG_SCOPE_FTY[i] }
+        if CG_SCOPE_SNAME[i] == '' { delete L_SNAME[name] }
+        else { L_SNAME[name] = CG_SCOPE_SNAME[i] }
+        if CG_SCOPE_ETY[i] == '' { delete L_ETY[name] }
+        else { L_ETY[name] = CG_SCOPE_ETY[i] }
+        if CG_SCOPE_AMOR[i] == 0 { delete L_AMOR[name] }
+        else { L_AMOR[name] = 1 }
+        CG_SCOPE_NAMES.pop()
+        CG_SCOPE_SLOT.pop()
+        CG_SCOPE_FTY.pop()
+        CG_SCOPE_SNAME.pop()
+        CG_SCOPE_ETY.pop()
+        CG_SCOPE_AMOR.pop()
+    }
+}
+
 void func cgBindLocalDecl(s:Node, name:text, fty:text, slot:text) {
+    cgScopeRecord(name)
     L_SLOT[name] = slot
     L_FTY[name] = fty
     // A func binding's signature rides in the element-type slot, the
@@ -8308,6 +8859,16 @@ void func cgPopFrame() {
 void func cgBlockInto(b:Node) {
     CG_TERM = false
     cgPushFrame()
+    // Every statement in here is inside a NESTED scope, whatever the
+    // enclosing one was. That matters for one thing only: a declaration
+    // directly in the program body is a global, and one inside a block
+    // at the top level is a local in main even when the two share a
+    // name. Testing the global table alone cannot tell them apart, and
+    // got it wrong the first time a loop declared a `Box b` under a
+    // top-level `Shape b`.
+    bool wasTop = CG_AT_TOPLEVEL
+    CG_AT_TOPLEVEL = false
+    int scopeMark = CG_SCOPE_NAMES.length
     arr[Node] body = cgBlockStmts(b)
     int i = 0
     while i < body.length {
@@ -8318,6 +8879,8 @@ void func cgBlockInto(b:Node) {
         cgStmt(body[i])
         i++
     }
+    CG_AT_TOPLEVEL = wasTop
+    cgScopeRestore(scopeMark)
     cgPopFrame()
 }
 
@@ -8868,10 +9431,11 @@ void func cgAssign(e:Node) {
 bool func cgStorableRefcounted(fty:text, ety:text) {
     if cgIsFuncElem(ety) { return true }
     if fty == 'struct' || fty == 'blob' || fty == 'regex' { return true }
-    // A handle or a row: one pointer, and nothing to say about
-    // elements, so there is no element type for the question below to
-    // be about.
+    // A handle, a row or an enum: one pointer, and nothing to say
+    // about elements, so there is no element type for the question
+    // below to be about.
     if fty == 'ascii' || fty == 'table' || fty == 'img' || fty == 'aud' { return true }
+    if fty == 'enum' || fty == 'http' || fty == 'socket' || fty == 'url' { return true }
     if ety == '' { return false }
     if ety == 'int' || ety == 'float' || ety == 'bool' { return true }
     return cgElemOwnsSomething(ety)
@@ -8961,6 +9525,10 @@ bool func cgIsRefcounted(fty:text) {
     // Releasing one of the first two frees the tiny handle and nothing
     // about the CONNECTION, which the connection table owns.
     if fty == 'http' || fty == 'socket' || fty == 'url' { return true }
+    // claude.md #176: both representations own a reference to whatever
+    // they currently hold, so an enum value needs the identical
+    // retain-on-alias, release-on-reassignment treatment.
+    if fty == 'enum' { return true }
     // claude.md #265: a row is reference counted, so a row an array
     // gave out survives the array it came from.
     if fty == 'table' { return true }
@@ -9090,12 +9658,21 @@ text func cgElemLty(ety:text) {
 text func cgReleaseFnFor(fty:text, ety:text) {
     // `ety` carries the struct NAME for a struct, and the element type
     // for a container -- one slot, because a value is never both.
-    if fty == 'struct' && cgStructOwnsAnything(ety) { return cgReleaseStructFn(ety) }
+    // claude.md #176: a TAGGED struct always needs its own wrapper,
+    // even owning nothing of its own -- its real allocation base sits
+    // sixteen bytes back from the payload, not eight, so the generic
+    // release would free the wrong address entirely.
+    if fty == 'struct' {
+        if cgStructOwnsAnything(ety) || CG_TAGGED[ety] != null {
+            return cgReleaseStructFn(ety)
+        }
+    }
     // claude.md #265: the same per-table wrapper an arr[Table]'s own
     // cascade uses. It is a release rather than an unconditional free,
     // which is what makes it safe to reach from an ordinary ownership
     // site and not only from a container tearing its elements down.
     if fty == 'table' { return cgTableRowReleaseFn(ety) }
+    if fty == 'enum' { return cgReleaseEnumFn(ety) }
     if fty == 'arr' && cgElemOwnsSomething(ety) { return cgReleaseArrayFn(ety) }
     if fty == 'map' && cgElemOwnsSomething(ety) { return cgReleaseMapFn(ety) }
     return cgReleaseFn(fty)
@@ -9338,11 +9915,15 @@ text func cgFieldEty(key:text) {
 text func cgRelKeyOf(name:text) {
     if cgFtyOf(name) == 'struct' { return cgSnameOf(name) }
     if cgFtyOf(name) == 'table' { return cgSnameOf(name) }
+    // An enum too: its release can only be generated from the enum's
+    // own name, and it rides in the same slot a struct's does.
+    if cgFtyOf(name) == 'enum' { return cgSnameOf(name) }
     return cgEtyOf(name)
 }
 
 text func cgRelKeyVal(v:Val) {
     if v.fty == 'struct' { return v.sname }
+    if v.fty == 'enum' { return v.sname }
     // A row too: the table name is the only thing its release can be
     // generated from, and it rides in the same slot a struct's does.
     if v.fty == 'table' { return v.sname }
@@ -9908,7 +10489,11 @@ text func cgReleaseStructFn(sname:text) {
     cgBlockLabel(freeL)
     cgReleaseStructFields('%payload', sname)
     text hdr = cgTmp()
-    cgOut(`  ${hdr} = getelementptr i8, ptr %payload, i64 -8`)
+    // claude.md #176: sixteen back for a tagged struct -- tag word,
+    // then refcount word, then payload.
+    text hdrOff = '-8'
+    if CG_TAGGED[sname] != null { hdrOff = '-16' }
+    cgOut(`  ${hdr} = getelementptr i8, ptr %payload, i64 ${hdrOff}`)
     cgOut(`  call void @festina_free_z(ptr ${hdr})`)
     cgOut(`  br label %${doneL}`)
     if cyclic { cgCycleTrial(sname, aliveL, doneL) }
@@ -10054,7 +10639,7 @@ text func cgFromJsonStructFn(sname:text) {
     CUR = gen
     cgOut(`define ptr ${name}(ptr %cursor) {`)
     cgBlockLabel('entry')
-    text out = cgFreshHeader(`%struct.${sname}`)
+    text out = cgFreshHeaderTagged(`%struct.${sname}`, cgStructTag(sname))
     cgOut(`  call void @festina_cleanup_push(ptr ${out}, ptr ${cgReleaseFnFor('struct', sname)})`)
     cgOut('  call void @festina_json_object_start(ptr %cursor)')
     text first = cgTmp()
@@ -10988,21 +11573,28 @@ text func cgThreadDesc(t:Ty, manual:bool) {
         if n == 'url' { return `url||${mf}` }
         return ''
     }
-    // claude.md #202: a manually-managed COMPOUND payload needs no
-    // clone cascade, because nothing is cloned -- the sender's own
-    // pointer is what travels. So a struct or a container crosses a
-    // thread boundary exactly when `?` says the program has taken
-    // responsibility for it, and an ordinary one still waits for the
-    // cascade this port has not generated yet.
-    if manual == false { return '' }
+    // A compound payload. claude.md #202: a MANUALLY-MANAGED one needs
+    // no clone cascade at all, because nothing is cloned -- the
+    // sender's own pointer is what travels -- while an ordinary one is
+    // deep-cloned through the generated walk.
     text mg = cgManagedFty(t)
-    if mg == 'struct' { return `struct|${t.name}|m` }
+    if mg == 'struct' { return `struct|${t.name}|${mf}` }
+    if mg == 'enum' { return `enum|${t.name}|${mf}` }
     if mg == 'arr' || mg == 'map' {
         text k = cgEtyOfTy(t)
         if k == '' { return '' }
-        return `${mg}|${k}|m`
+        return `${mg}|${k}|${mf}`
     }
     return ''
+}
+
+// The second half of a payload's type, as every other cascade spells
+// one: a struct's or an enum's own name, a container's element type.
+text func cgDescKey(desc:text) {
+    if desc == '' { return '' }
+    arr[text] parts = desc.split('|')
+    if parts.length < 2 { return '' }
+    return parts[1]
 }
 
 text func cgDescFty(desc:text) {
@@ -11029,7 +11621,7 @@ bool func cgDescManual(desc:text) {
 bool func cgDescPassthrough(desc:text) {
     text f = cgDescFty(desc)
     if f == 'text' { return true }
-    if f == 'struct' || f == 'arr' || f == 'map' { return true }
+    if f == 'struct' || f == 'arr' || f == 'map' || f == 'enum' { return true }
     return f == 'blob' || f == 'img' || f == 'aud' || f == 'url'
 }
 
@@ -11067,6 +11659,17 @@ text func cgThreadCloneValue(val:text, desc:text) {
         text cu = cgTmp()
         cgOut(`  ${cu} = call ptr @festina_url_clone(ptr ${val})`)
         return cu
+    }
+    // claude.md #197: a struct, a container or an enum, through the
+    // generated walk. Already a fresh, independent top-level
+    // allocation, which is why nothing wraps it further.
+    if fty == 'struct' || fty == 'arr' || fty == 'map' || fty == 'enum' {
+        // Minted before the function is resolved -- see cgCloneValue.
+        text cc = cgTmp()
+        text cfn = cgCloneFnFor(fty, cgDescKey(desc))
+        if cfn == '' { return val }
+        cgOut(`  ${cc} = call ptr ${cfn}(ptr ${val})`)
+        return cc
     }
     // A scalar is already its own independent copy the moment it is in
     // a register; there is nothing to clone.
@@ -11123,6 +11726,12 @@ text func cgThreadReleaseFn(desc:text) {
     // non-thread release site for that type already calls.
     if f == 'blob' || f == 'img' || f == 'aud' || f == 'url' {
         return cgReleaseFnFor(f, '')
+    }
+    // A cloned struct, container or enum carries the ordinary refcount
+    // header every other value of its type does, so its own cascade is
+    // what balances the clone.
+    if f == 'struct' || f == 'arr' || f == 'map' || f == 'enum' {
+        return cgReleaseFnFor(f, cgDescKey(desc))
     }
     // A plain box and an owned text buffer are both a single malloc,
     // and the text buffer IS the payload rather than something wrapped
@@ -11442,12 +12051,395 @@ Val func cgHttpMethod(m:text, recv:Node, obj:Val, args:arr[Node]) {
     return cgVal(out, 'ptr', rf)
 }
 
+// ---------------------------------------------------------------------
+// claude.md #197/#198: the CLONE cascades.
+//
+// The whole safety argument behind "deep clone, never a shared
+// pointer" is that a value crossing a thread boundary is a fresh,
+// independent allocation on the other side. For a scalar that is free;
+// for a handle the runtime has a clone of its own; for a struct, a
+// container or an enum it is a generated walk, the clone-side mirror of
+// the release cascade.
+//
+// Cached by the same key its release is, and the cache write happens
+// BEFORE the walk -- a self-referencing type would otherwise generate a
+// second function forever. (The analyzer already refuses to send a
+// genuinely cyclic value, because a naive recursive clone would loop on
+// the VALUE; this guard is about the TYPE graph.)
+map[text] CG_STRUCT_CLONE = {}
+map[text] CG_ARR_CLONE = {}
+map[text] CG_MAP_CLONE = {}
+map[text] CG_ENUM_CLONE = {}
+
+text func cgCloneFnFor(fty:text, key:text) {
+    if fty == 'struct' { return cgCloneStructFn(key) }
+    if fty == 'arr' { return cgCloneArrayFn(key) }
+    if fty == 'map' { return cgCloneMapFn(key) }
+    if fty == 'enum' { return cgCloneEnumFn(key) }
+    return ''
+}
+
+// One value, cloned. `key` is the second half of its type, as every
+// other cascade spells one.
+text func cgCloneValue(val:text, fty:text, key:text) {
+    if fty == 'text' {
+        text o = cgTmp()
+        cgOut(`  ${o} = call ptr @festina_text_own(ptr ${val})`)
+        return o
+    }
+    if fty == 'blob' {
+        text o = cgTmp()
+        cgOut(`  ${o} = call ptr @festina_blob_clone(ptr ${val})`)
+        return o
+    }
+    if fty == 'img' {
+        CG_USES_GRAPHICS_CODE = true
+        text o = cgTmp()
+        cgOut(`  ${o} = call ptr @festina_image_clone(ptr ${val})`)
+        return o
+    }
+    if fty == 'aud' {
+        CG_USES_AUDIO = true
+        text o = cgTmp()
+        cgOut(`  ${o} = call ptr @festina_audio_clone(ptr ${val})`)
+        return o
+    }
+    if fty == 'url' {
+        text o = cgTmp()
+        cgOut(`  ${o} = call ptr @festina_url_clone(ptr ${val})`)
+        return o
+    }
+    if fty == 'struct' || fty == 'arr' || fty == 'map' || fty == 'enum' {
+        // The temp is minted BEFORE the function is resolved, and that
+        // order is the original's: resolving may GENERATE the cascade,
+        // whose own temps then come after this one rather than before.
+        text o = cgTmp()
+        text fn = cgCloneFnFor(fty, key)
+        if fn == '' { return val }
+        cgOut(`  ${o} = call ptr ${fn}(ptr ${val})`)
+        return o
+    }
+    // A scalar is already its own independent copy the moment it is in
+    // a register, and a font's storage lives for the process.
+    return val
+}
+
+// The same, given only an ELEMENT type -- the spelling a container's
+// slots carry.
+text func cgCloneElem(val:text, ety:text) {
+    if SF_NAMES[ety] != null { return cgCloneValue(val, 'struct', ety) }
+    if EN_MEMBERS[ety] != null { return cgCloneValue(val, 'enum', ety) }
+    if cgIsNestedElem(ety) { return cgCloneValue(val, cgKeyFty(ety), cgKeyEty(ety)) }
+    return cgCloneValue(val, ety, '')
+}
+
+// A struct: a fresh header -- widened when this struct is a member of a
+// pure-struct enum -- and every field cloned across. No null check: a
+// struct-typed binding always has real storage the moment it is
+// declared, unlike an enum-typed one.
+text func cgCloneStructFn(sname:text) {
+    text fn = `@__festina_clone_struct_${sname}`
+    if CG_STRUCT_CLONE[sname] != null { return fn }
+    CG_STRUCT_CLONE[sname] = fn
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define ptr ${fn}(ptr %src) {`)
+    cgBlockLabel('entry')
+    text dst = cgFreshHeaderTagged(`%struct.${sname}`, cgStructTag(sname))
+    arr[text] fnames = []
+    if SF_NAMES[sname] != '' { fnames = SF_NAMES[sname].split('|') }
+    int i = 0
+    while i < fnames.length {
+        text fk = `${sname}.${fnames[i]}`
+        text flty = SF_LTY[fk]
+        text srcP = cgTmp()
+        cgOut(`  ${srcP} = getelementptr %struct.${sname}, ptr %src, i32 0, i32 ${SF_IDX[fk]}`)
+        text srcV = cgTmp()
+        cgOut(`  ${srcV} = load ${flty}, ptr ${srcP}`)
+        text fkey = ''
+        if SF_ETY[fk] != null { fkey = SF_ETY[fk] }
+        if SF_FTY[fk] == 'struct' || SF_FTY[fk] == 'enum' { fkey = SF_SNAME[fk] }
+        text cloned = cgCloneValue(srcV, SF_FTY[fk], fkey)
+        text dstP = cgTmp()
+        cgOut(`  ${dstP} = getelementptr %struct.${sname}, ptr ${dst}, i32 0, i32 ${SF_IDX[fk]}`)
+        cgOut(`  store ${flty} ${cloned}, ptr ${dstP}`)
+        i++
+    }
+    cgOut(`  ret ptr ${dst}`)
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return fn
+}
+
+// An array: a fresh header, a fresh buffer of the same size, and a
+// plain counted loop cloning each element across.
+text func cgCloneArrayFn(ety:text) {
+    if CG_ARR_CLONE[ety] != null { return CG_ARR_CLONE[ety] }
+    text fn = `@__festina_clone_array_${cgUid()}`
+    CG_ARR_CLONE[ety] = fn
+    text elemLty = cgElemLty(ety)
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define ptr ${fn}(ptr %src) {`)
+    cgBlockLabel('entry')
+    text dst = cgFreshHeader('%struct._FestinaArray')
+    text srcLenP = cgTmp()
+    cgOut(`  ${srcLenP} = getelementptr %struct._FestinaArray, ptr %src, i32 0, i32 0`)
+    text lenV = cgTmp()
+    cgOut(`  ${lenV} = load i64, ptr ${srcLenP}`)
+    text dstLenP = cgTmp()
+    cgOut(`  ${dstLenP} = getelementptr %struct._FestinaArray, ptr ${dst}, i32 0, i32 0`)
+    cgOut(`  store i64 ${lenV}, ptr ${dstLenP}`)
+    text srcDataF = cgTmp()
+    cgOut(`  ${srcDataF} = getelementptr %struct._FestinaArray, ptr %src, i32 0, i32 1`)
+    text srcData = cgTmp()
+    cgOut(`  ${srcData} = load ptr, ptr ${srcDataF}`)
+    text esz = cgTmp()
+    cgOut(`  ${esz} = getelementptr ${elemLty}, ptr null, i64 1`)
+    text eszi = cgTmp()
+    cgOut(`  ${eszi} = ptrtoint ptr ${esz} to i64`)
+    text total = cgTmp()
+    cgOut(`  ${total} = mul i64 ${eszi}, ${lenV}`)
+    text dstData = cgTmp()
+    cgOut(`  ${dstData} = call ptr @malloc(i64 ${total})`)
+    text dstDataF = cgTmp()
+    cgOut(`  ${dstDataF} = getelementptr %struct._FestinaArray, ptr ${dst}, i32 0, i32 1`)
+    cgOut(`  store ptr ${dstData}, ptr ${dstDataF}`)
+
+    text idxSlot = cgTmp()
+    cgOut(`  ${idxSlot} = alloca i64`)
+    cgOut(`  store i64 0, ptr ${idxSlot}`)
+    text condL = cgLabel('clonearr.loopcond')
+    text bodyL = cgLabel('clonearr.loopbody')
+    text endL = cgLabel('clonearr.loopend')
+    cgOut(`  br label %${condL}`)
+    cgBlockLabel(condL)
+    text idxV = cgTmp()
+    cgOut(`  ${idxV} = load i64, ptr ${idxSlot}`)
+    text more = cgTmp()
+    cgOut(`  ${more} = icmp slt i64 ${idxV}, ${lenV}`)
+    cgOut(`  br i1 ${more}, label %${bodyL}, label %${endL}`)
+    cgBlockLabel(bodyL)
+    text srcEP = cgTmp()
+    cgOut(`  ${srcEP} = getelementptr ${elemLty}, ptr ${srcData}, i64 ${idxV}`)
+    text srcEV = cgTmp()
+    cgOut(`  ${srcEV} = load ${elemLty}, ptr ${srcEP}`)
+    text clonedE = cgCloneElem(srcEV, ety)
+    text dstEP = cgTmp()
+    cgOut(`  ${dstEP} = getelementptr ${elemLty}, ptr ${dstData}, i64 ${idxV}`)
+    cgOut(`  store ${elemLty} ${clonedE}, ptr ${dstEP}`)
+    text nxt = cgTmp()
+    cgOut(`  ${nxt} = add i64 ${idxV}, 1`)
+    cgOut(`  store i64 ${nxt}, ptr ${idxSlot}`)
+    cgOut(`  br label %${condL}`)
+    cgBlockLabel(endL)
+    cgOut(`  ret ptr ${dst}`)
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return fn
+}
+
+// A map: a fresh, empty header handed to the runtime's own walk, which
+// strdups each key and calls a per-value-type trampoline for each
+// value. Entries are opaque to this compiler -- only the runtime knows
+// how to read a bucket -- so, exactly as for release, this cannot be a
+// raw loop the way an array's is.
+text func cgCloneMapFn(vty:text) {
+    if CG_MAP_CLONE[vty] != null { return CG_MAP_CLONE[vty] }
+    text fn = `@__festina_clone_map_${cgUid()}`
+    CG_MAP_CLONE[vty] = fn
+    text tramp = cgMapCloneTrampoline(vty)
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define ptr ${fn}(ptr %src) {`)
+    cgBlockLabel('entry')
+    text dst = cgFreshHeader('%struct._FestinaMap')
+    text srcEntF = cgTmp()
+    cgOut(`  ${srcEntF} = getelementptr %struct._FestinaMap, ptr %src, i32 0, i32 1`)
+    text srcEnt = cgTmp()
+    cgOut(`  ${srcEnt} = load ptr, ptr ${srcEntF}`)
+    text srcCapP = cgTmp()
+    cgOut(`  ${srcCapP} = getelementptr %struct._FestinaMap, ptr %src, i32 0, i32 2`)
+    text srcCap = cgTmp()
+    cgOut(`  ${srcCap} = load i64, ptr ${srcCapP}`)
+    text dstCountP = cgTmp()
+    cgOut(`  ${dstCountP} = getelementptr %struct._FestinaMap, ptr ${dst}, i32 0, i32 0`)
+    text dstEntP = cgTmp()
+    cgOut(`  ${dstEntP} = getelementptr %struct._FestinaMap, ptr ${dst}, i32 0, i32 1`)
+    text dstCapP = cgTmp()
+    cgOut(`  ${dstCapP} = getelementptr %struct._FestinaMap, ptr ${dst}, i32 0, i32 2`)
+    text dstTombP = cgTmp()
+    cgOut(`  ${dstTombP} = getelementptr %struct._FestinaMap, ptr ${dst}, i32 0, i32 3`)
+    cgOut(`  call void @festina_map_clone(ptr ${srcEnt}, i64 ${srcCap}, ptr ${dstCountP}, ptr ${dstEntP}, ptr ${dstCapP}, ptr ${dstTombP}, ptr ${tramp})`)
+    cgOut(`  ret ptr ${dst}`)
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return fn
+}
+
+// The i64-in, i64-out callback the map walk takes: unpack the raw slot
+// into the value's real shape, clone it, pack it back down.
+text func cgMapCloneTrampoline(vty:text) {
+    text fn = `@__festina_map_clone_value_${cgUid()}`
+    text vlty = cgElemLty(vty)
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define i64 ${fn}(i64 %raw) {`)
+    cgBlockLabel('entry')
+    text v = cgMapFromI64('%raw', vlty)
+    text cloned = cgCloneElem(v, vty)
+    text packed = cgMapToI64(cloned, vlty)
+    cgOut(`  ret i64 ${packed}`)
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return fn
+}
+
+// An enum: the clone-side mirror of its release, with the same
+// pure-struct against mixed split.
+//
+// An enum-typed value reads null until assigned, so both shapes check
+// for that first -- unlike a plain struct clone, which never needs one.
+text func cgCloneEnumFn(ename:text) {
+    text fn = `@__festina_clone_enum_${ename}`
+    if CG_ENUM_CLONE[ename] != null { return fn }
+    CG_ENUM_CLONE[ename] = fn
+    arr[text] ms = EN_MEMBERS[ename].split('|')
+    arr[text] saved = CUR
+    text savedBlock = CG_BLOCK
+    arr[text] gen = []
+    CUR = gen
+    cgOut(`define ptr ${fn}(ptr %src) {`)
+    cgBlockLabel('entry')
+    text isNull = cgTmp()
+    cgOut(`  ${isNull} = icmp eq ptr %src, null`)
+    text nullL = cgLabel('cloneenum.null')
+    text okL = cgLabel('cloneenum.nonnull')
+    cgOut(`  br i1 ${isNull}, label %${nullL}, label %${okL}`)
+    cgBlockLabel(nullL)
+    cgOut('  ret ptr null')
+    cgBlockLabel(okL)
+    if EN_PURE[ename] != null {
+        text tagP = cgTmp()
+        cgOut(`  ${tagP} = getelementptr i8, ptr %src, i64 -16`)
+        text tag = cgTmp()
+        cgOut(`  ${tag} = load ptr, ptr ${tagP}`)
+        int i = 0
+        while i < ms.length {
+            text matchL = cgLabel(`cloneenum.match${i}`)
+            text contL = cgLabel(`cloneenum.cont${i}`)
+            text cmp = cgTmp()
+            cgOut(`  ${cmp} = icmp eq ptr ${tag}, ${cgEnumTagConst(ms[i])}`)
+            cgOut(`  br i1 ${cmp}, label %${matchL}, label %${contL}`)
+            cgBlockLabel(matchL)
+            text cm = cgTmp()
+            cgOut(`  ${cm} = call ptr ${cgCloneStructFn(ms[i])}(ptr %src)`)
+            cgOut(`  ret ptr ${cm}`)
+            cgBlockLabel(contL)
+            i++
+        }
+        cgOut('  unreachable')
+    } else {
+        text srcTagP = cgTmp()
+        cgOut(`  ${srcTagP} = getelementptr %struct._FestinaEnumBox, ptr %src, i32 0, i32 0`)
+        text tag = cgTmp()
+        cgOut(`  ${tag} = load ptr, ptr ${srcTagP}`)
+        text srcValP = cgTmp()
+        cgOut(`  ${srcValP} = getelementptr %struct._FestinaEnumBox, ptr %src, i32 0, i32 1`)
+        text raw = cgTmp()
+        cgOut(`  ${raw} = load i64, ptr ${srcValP}`)
+        text dst = cgFreshHeader('%struct._FestinaEnumBox')
+        text dstTagP = cgTmp()
+        cgOut(`  ${dstTagP} = getelementptr %struct._FestinaEnumBox, ptr ${dst}, i32 0, i32 0`)
+        cgOut(`  store ptr ${tag}, ptr ${dstTagP}`)
+        text dstValP = cgTmp()
+        cgOut(`  ${dstValP} = getelementptr %struct._FestinaEnumBox, ptr ${dst}, i32 0, i32 1`)
+        text doneL = cgLabel('cloneenum.done')
+        int j = 0
+        while j < ms.length {
+            text matchL = cgLabel(`cloneenum.vmatch${j}`)
+            text contL = cgLabel(`cloneenum.vcont${j}`)
+            text cmp = cgTmp()
+            cgOut(`  ${cmp} = icmp eq ptr ${tag}, ${cgEnumTagConst(ms[j])}`)
+            cgOut(`  br i1 ${cmp}, label %${matchL}, label %${contL}`)
+            cgBlockLabel(matchL)
+            text mfty = cgEnumMemberFty(ms[j])
+            text inner = cgMapFromI64(raw, cgLtyOf(mfty))
+            text clonedInner = cgCloneValue(inner, mfty, cgEnumMemberKey(ms[j]))
+            text packed = cgMapToI64(clonedInner, cgLtyOf(mfty))
+            cgOut(`  store i64 ${packed}, ptr ${dstValP}`)
+            cgOut(`  br label %${doneL}`)
+            cgBlockLabel(contL)
+            j++
+        }
+        cgOut('  unreachable')
+        cgBlockLabel(doneL)
+        cgOut(`  ret ptr ${dst}`)
+    }
+    cgOut('}')
+    cgOut('')
+    CUR = saved
+    CG_BLOCK = savedBlock
+    cgEmitGenerated(gen)
+    return fn
+}
+
 // Releases a postMessage argument once the box already holds an
 // independent copy of it. `val` itself was never touched by the clone,
 // so a borrowed alias is left exactly as it was; only a genuinely fresh
 // temporary this call site now owns gets freed.
 void func cgThreadPostCleanup(e:Node, v:Val, desc:text) {
-    if cgDescFty(desc) == 'text' { cgFreeTextTemp(e, v) }
+    // claude.md #202: a manually-managed payload was never cloned, so
+    // there is no fresh temporary to give back -- `v` IS the payload
+    // now, and releasing it here would drop the one shared reference
+    // out from under it.
+    if cgDescManual(desc) { return }
+    text f = cgDescFty(desc)
+    if f == 'text' {
+        cgFreeTextTemp(e, v)
+        return
+    }
+    // Deliberately NOT the text free above whenever the target type
+    // differs from the source's: that helper's own text test is only
+    // sound while the value is STILL text, which a coercion that
+    // changes representation -- a text becoming a mixed enum's own box
+    // -- breaks. Freeing the post-coercion value as text would free the
+    // wrong allocation with the wrong function.
+    if cgIsRefcounted(f) {
+        if v.fresh || cgIsOwningRefcountedSource(e) {
+            cgOut(`  call void ${cgReleaseFnFor(f, cgDescKey(desc))}(ptr ${v.v})`)
+        }
+    }
+}
+
+// A postMessage argument in the declared payload's own type. Only an
+// enum needs anything: every other payload type is either already the
+// value's own type or a handle the box clones as it is.
+Val func cgCoerceForDesc(e:Node, v:Val, desc:text) {
+    if cgDescFty(desc) == 'enum' && v.fty != 'enum' {
+        return cgEnumCoerce(e, v, cgDescKey(desc))
+    }
+    return v
 }
 
 // The argument half both send forms share: emit it, check it against
@@ -11459,13 +12451,17 @@ text func cgThreadSendArg(args:arr[Node], desc:text, out:arr[Val]) {
         return ''
     }
     text pfty = cgDescFty(desc)
-    Val v = cgExpr(args[0])
+    Val v0 = cgExpr(args[0])
+    if CG_STUCK { return '' }
+    Val v = cgCoerceForDesc(args[0], v0, desc)
     if CG_STUCK { return '' }
     if v.fty != pfty {
         cgUnported(`postMessage() of ${v.fty} where ${pfty} is declared`)
         return ''
     }
-    out.push(v)
+    // The PRE-coercion value is what the cleanup asks about, exactly as
+    // the original's own spelling does.
+    out.push(v0)
     return cgThreadBox(v.v, desc)
 }
 
@@ -11491,7 +12487,9 @@ void func cgBarePostMessageTxn(args:arr[Node], txn:text) {
         cgUnported(`postMessage() with ${args.length} arguments`)
         return
     }
-    Val v = cgExpr(args[0])
+    Val v0 = cgExpr(args[0])
+    if CG_STUCK { return }
+    Val v = cgCoerceForDesc(args[0], v0, CG_MAIN_MSG_IN)
     if CG_STUCK { return }
     if v.fty != pfty {
         cgUnported(`postMessage() of ${v.fty} where ${pfty} is declared`)
@@ -11504,7 +12502,7 @@ void func cgBarePostMessageTxn(args:arr[Node], txn:text) {
     cgOut(`  ${handle} = load ptr, ptr ${CG_THREAD_HANDLE}`)
     text box = cgThreadBox(v.v, CG_MAIN_MSG_IN)
     cgOut(`  call void @festina_thread_post_outbound(ptr ${handle}, ptr ${box}, i64 ${txn})`)
-    cgThreadPostCleanup(args[0], v, CG_MAIN_MSG_IN)
+    cgThreadPostCleanup(args[0], v0, CG_MAIN_MSG_IN)
 }
 
 // `NAME.postMessage(x)` -- legal from main, and from inside ANOTHER
@@ -12863,10 +13861,11 @@ void func cgFuncBody(d:Node) {
                 // or fields. Its release is the runtime's own.
             } else if pf == 'struct' {
                 psname = pt.name
-            } else if pf == 'table' {
-                // A row parameter is a borrowed pointer, like a struct
-                // one -- but its release is generated from the table
-                // name, which is what `sname` carries.
+            } else if pf == 'table' || pf == 'enum' {
+                // A row or an enum parameter is a borrowed pointer,
+                // like a struct one -- but its release is generated
+                // from the TABLE or ENUM name, which is what `sname`
+                // carries.
                 psname = pt.name
             } else {
                 pety = cgEtyOfTy(pt)
@@ -13081,6 +14080,17 @@ void func cgProgram(body:arr[Node], srcPath:text) {
         i++
     }
 
+    // claude.md #176: every enum, BEFORE any struct's storage is
+    // emitted. Which structs carry the widened header is a property of
+    // the enums that name them, and a struct may be declared above the
+    // enum that makes it a member -- so this cannot wait for the walk
+    // below to reach the declaration.
+    int ed = 0
+    while ed < body.length {
+        if body[ed].kind == 'EnumDecl' { cgEnumDecl(body[ed]) }
+        ed++
+    }
+
     // One type definition per declared struct, in source order,
     // directly after the runtime's own -- the struct-definition section
     // festina/codegen.py builds from `analyzed.structs`, whose key
@@ -13105,7 +14115,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 text ffty = cgDeclFty(fs[fi])
                 if ffty == '' { ffty = cgManagedFty(ft) }
                 SF_FTY[key] = ffty
-                if ffty == 'struct' { SF_SNAME[key] = ft.name }
+                if ffty == 'struct' || ffty == 'enum' { SF_SNAME[key] = ft.name }
                 if ffty == 'arr' || ffty == 'map' {
                     if ft.elem != null {
                         SF_ETY[key] = cgEtyOfTy(ft)
@@ -13285,16 +14295,50 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 // a scalar global takes, not the {refcount, payload}
                 // one every other refcounted global has.
                 text handleG = cgManagedFty(gt)
+                // claude.md #174/#176/#197: an amortized array joins
+                // the handle list too -- it has no bare declaration to
+                // start empty from, because the language requires one
+                // to have an initializer, so the null is overwritten
+                // before any program could observe it.
+                bool plainNullG = false
                 if handleG == 'blob' || handleG == 'regex' || handleG == 'ascii'
-                        || handleG == 'img' || handleG == 'aud' {
+                        || handleG == 'img' || handleG == 'aud'
+                        || handleG == 'enum' || handleG == 'table'
+                        || handleG == 'http' || handleG == 'socket' || handleG == 'url' {
+                    plainNullG = true
+                }
+                if gt != null {
+                    if gt.amortized { plainNullG = true }
+                }
+                if plainNullG {
                     cgEmit(`@${gn} = global ptr null`)
                     G_SLOT[gn] = `@${gn}`
                     G_FTY[gn] = handleG
+                    if gt.kind == 'enum' || gt.kind == 'table' { G_SNAME[gn] = gt.name }
+                    if gt.amortized {
+                        G_AMOR[gn] = 1
+                        if gt.elem != null { G_ETY[gn] = cgEtyOfTy(gt) }
+                    }
                 }
                 text payload = cgPayloadFor(gt)
-                if payload != '' {
-                    cgEmit(`@${gn}.header = global {i64, ${payload}} {i64 -1, ${payload} zeroinitializer}`)
-                    cgEmit(`@${gn} = global ptr getelementptr({i64, ${payload}}, ptr @${gn}.header, i32 0, i32 1)`)
+                if payload != '' && plainNullG == false {
+                    // claude.md #176: a struct that is a member of a
+                    // pure-struct enum carries the widened header here
+                    // too, in static form -- tag first, refcount
+                    // second, so the count stays at exactly payload-8
+                    // whichever shape a struct has. The count is still
+                    // the immortal sentinel; the tag is a real constant,
+                    // because a global already knows its own concrete
+                    // type.
+                    text gtag = ''
+                    if gt.kind == 'struct' { gtag = cgStructTag(gt.name) }
+                    if gtag != '' {
+                        cgEmit(`@${gn}.header = global {ptr, i64, ${payload}} {ptr ${gtag}, i64 -1, ${payload} zeroinitializer}`)
+                        cgEmit(`@${gn} = global ptr getelementptr({ptr, i64, ${payload}}, ptr @${gn}.header, i32 0, i32 2)`)
+                    } else {
+                        cgEmit(`@${gn}.header = global {i64, ${payload}} {i64 -1, ${payload} zeroinitializer}`)
+                        cgEmit(`@${gn} = global ptr getelementptr({i64, ${payload}}, ptr @${gn}.header, i32 0, i32 1)`)
+                    }
                     G_SLOT[gn] = `@${gn}`
                     G_FTY[gn] = cgManagedFty(gt)
                     if gt.kind == 'struct' { G_SNAME[gn] = gt.name }
@@ -13429,12 +14473,14 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     CG_LIVE = mainLive
     CG_FRAME = mainFrames
     cgPushFrame()
+    CG_AT_TOPLEVEL = true
     int s = 0
     while s < body.length {
         CG_STUCK = false
         cgStmt(body[s])
         s++
     }
+    CG_AT_TOPLEVEL = false
     cgPopFrame()
     cgOut('  ret void')
     cgOut('}')
