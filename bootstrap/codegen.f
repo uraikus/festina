@@ -941,6 +941,13 @@ text func cgLtyOf(fty:text) {
     // Nothing ever allocates, retains or releases one here, so it sits
     // beside `font` rather than with the refcounted handles.
     if fty == 'thread' { return 'ptr' }
+    // claude.md #151/#162: a request, a websocket connection and a
+    // parsed URL are each one pointer to a runtime-owned value. The
+    // first two are HANDLES onto a connection the connection table
+    // owns separately; the third owns its own component buffers.
+    if fty == 'http' { return 'ptr' }
+    if fty == 'socket' { return 'ptr' }
+    if fty == 'url' { return 'ptr' }
     return ''
 }
 
@@ -1117,6 +1124,12 @@ text func cgManagedFty(t:Ty) {
         if t.name == 'ascii' { return 'ascii' }
         if t.name == 'img' { return 'img' }
         if t.name == 'aud' { return 'aud' }
+        // claude.md #151/#162: each carries the identical i64 header,
+        // so retain, reassignment, `free` and scope-exit release all
+        // work on them unchanged -- only the destructor differs.
+        if t.name == 'http' { return 'http' }
+        if t.name == 'socket' { return 'socket' }
+        if t.name == 'url' { return 'url' }
     }
     return ''
 }
@@ -1488,6 +1501,21 @@ map[text] CG_EVENT_REG = {
     'close': 'festina_register_close_handler'
 }
 
+// claude.md #151: the four CONNECTION handlers, registered
+// unconditionally rather than through the window-gated loop above.
+// `socketMessage` is websocket frames, spelled apart from the
+// thread-queue `message` it would otherwise collide with.
+map[text] HTTP_EVENT_REG = {
+    'request': 'festina_register_request_handler',
+    'upgrade': 'festina_register_upgrade_handler',
+    'socketMessage': 'festina_register_message_handler',
+    'socketClose': 'festina_register_socketclose_handler'
+}
+
+// The order they are registered in, which is the original's and not
+// the declaration order -- a map has no order of its own to walk.
+arr[text] HTTP_EVENT_ORDER = ['request', 'upgrade', 'socketMessage', 'socketClose']
+
 // When non-empty, the symbol and return type cgFunc emits INSTEAD of
 // the ones it would derive from the declaration's own name. An event
 // handler is an ordinary function body under a different symbol with
@@ -1592,6 +1620,31 @@ map[text] CG_REPLY_TRAMP = {}
 // through the async-io worker pool, so a program using that form needs
 // those hooks registered even if it touches no other async io at all.
 bool CG_USES_ASYNC_IO = false
+
+// claude.md #151/#160/#166: whether this program touches the HTTP
+// runtime at all -- openPort/closePort, one of the four connection
+// handlers, `.send()`, or an http value of any kind. It decides which
+// blocking loop main ends in, and whether the service hooks are
+// registered at all; a program with none of that links none of it.
+//
+// CG_USES_HTTPS is the narrower signal: mbedTLS is actually needed.
+// A `.send()` sets it unconditionally, because a URL's scheme is a
+// runtime string and no compiler can read it in advance.
+bool CG_USES_HTTP = false
+bool CG_USES_HTTPS = false
+
+// The four connection handlers, by symbol -- '' for one this program
+// never declared. Unlike a window event these are registered
+// unconditionally rather than through the graphics-gated loop: a
+// connection has nothing to do with a window.
+map[text] CG_HTTP_HANDLERS = {}
+
+// claude.md #212: which threads declared a connection handler of their
+// own, and so need a real HTTP context on their own OS thread -- and
+// which handlers each declared, joined by `|`, so its own on_load can
+// register exactly those.
+map[int] CG_TH_HTTP = {}
+map[text] CG_TH_HTTP_NAMES = {}
 
 // claude.md #209: the declared thread POOLS -- how many instances each
 // has, and the inbound descriptor they all share. A pool is N fully
@@ -2712,6 +2765,91 @@ Val func cgFieldPtr(e:Node) {
             return cgVal(wout, 'i64', 'int')
         }
     }
+    // claude.md #162: a parsed URL's components. Each is a small
+    // dedicated accessor over the value parseURL built, not a field
+    // this compiler laid out -- the same "the real value lives behind
+    // the handle" shape img.width has.
+    //
+    // Every one of them hands back something genuinely FRESH: an owned
+    // text copy, or -- searchParams -- a map reference already retained
+    // on the way out. That is what `fresh` records, and without it a
+    // text result would be copied a second time and a searchParams read
+    // would leak one reference per use.
+    if obj.fty == 'url' {
+        text uprop = rawText(e, 'prop')
+        text ufn = ''
+        if uprop == 'hash' { ufn = 'festina_url_hash' }
+        if uprop == 'hostname' { ufn = 'festina_url_hostname' }
+        if uprop == 'password' { ufn = 'festina_url_password' }
+        if uprop == 'pathname' { ufn = 'festina_url_pathname' }
+        if uprop == 'protocol' { ufn = 'festina_url_protocol' }
+        if uprop == 'username' { ufn = 'festina_url_username' }
+        if uprop == 'port' {
+            text upv = cgTmp()
+            cgOut(`  ${upv} = call i64 @festina_url_port(ptr ${obj.v})`)
+            cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+            CG_FIELD_DIRECT = true
+            return cgVal(upv, 'i64', 'int')
+        }
+        if uprop == 'searchParams' {
+            text usp = cgTmp()
+            cgOut(`  ${usp} = call ptr @festina_url_search_params(ptr ${obj.v})`)
+            cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+            CG_FIELD_DIRECT = true
+            Val spv = cgMapVal(usp, 'text')
+            spv.fresh = true
+            return spv
+        }
+        if ufn == '' {
+            cgUnported(`member access on url`)
+            return none
+        }
+        text uout2 = cgTmp()
+        cgOut(`  ${uout2} = call ptr @${ufn}(ptr ${obj.v})`)
+        cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+        CG_FIELD_DIRECT = true
+        Val utv = cgVal(uout2, 'ptr', 'text')
+        utv.fresh = true
+        return utv
+    }
+    // claude.md #151/#162: an http value's own url, method, code,
+    // headers and callback. Same shape as the URL accessors above --
+    // and the same freshness, for the same reason: headers is the SAME
+    // live map every read, retained on the way out, so treating it as
+    // an ordinary aliasing field read would leak a reference each time.
+    if obj.fty == 'http' {
+        text hprop = rawText(e, 'prop')
+        CG_USES_HTTP = true
+        if hprop == 'url' || hprop == 'method' {
+            text hfn = 'festina_http_url'
+            if hprop == 'method' { hfn = 'festina_http_method' }
+            text hout = cgTmp()
+            cgOut(`  ${hout} = call ptr @${hfn}(ptr ${obj.v})`)
+            cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+            CG_FIELD_DIRECT = true
+            Val htv = cgVal(hout, 'ptr', 'text')
+            htv.fresh = true
+            return htv
+        }
+        if hprop == 'code' {
+            text hcv = cgTmp()
+            cgOut(`  ${hcv} = call i64 @festina_http_code(ptr ${obj.v})`)
+            cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+            CG_FIELD_DIRECT = true
+            return cgVal(hcv, 'i64', 'int')
+        }
+        if hprop == 'headers' {
+            text hhv = cgTmp()
+            cgOut(`  ${hhv} = call ptr @festina_http_headers(ptr ${obj.v})`)
+            cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+            CG_FIELD_DIRECT = true
+            Val hmv = cgMapVal(hhv, 'text')
+            hmv.fresh = true
+            return hmv
+        }
+        cgUnported(`member access on http`)
+        return none
+    }
     // claude.md #216: `worker.main` -- whether the thread a handler was
     // sent from is main itself. A runtime call, like img.width above
     // and for the same reason: there is no field here to read, only a
@@ -3082,6 +3220,11 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
         // every struct literal in the language reaches code through
         // here and nowhere else.
         if fty == 'struct' { return cgStructLit(e, ety) }
+        // claude.md #162: `http x = {...}`, checked here for the same
+        // reason the struct literal above is -- a map literal wants one
+        // value type across every entry, and an http literal's keys are
+        // a text, an int, a map and a body all at once.
+        if fty == 'http' { return cgHttpLit(e) }
         if fty != 'map' {
             Val none
             cgUnported(`map literal in a ${fty} position`)
@@ -4794,6 +4937,38 @@ Val func cgMethodCall(e:Node, callee:Node) {
     Node recv = childOf(callee, 'obj')
     arr[Node] args = listOf(e, 'args')
 
+    // claude.md #151/#162/#164: `.send()`, on a request or on a socket,
+    // and the request's other fixed-shape methods.
+    //
+    // `send` is checked before the receiver is emitted because its own
+    // receiver may be a bare `{...}` -- `{...}.send()`, which is also
+    // what the `http {...}` statement form desugars to. A map literal
+    // has no meaning of its own in an expression position, so the
+    // generic emitter below could not build one.
+    if m == 'send' {
+        return cgHttpSend(e, recv, args)
+    }
+    if m == 'ok' || m == 'redirect' || m == 'upgrade'
+            || m == 'toBlob' || m == 'toImg' || m == 'toAud' {
+        Val hv = cgExpr(recv)
+        if CG_STUCK { return none }
+        if hv.fty == 'http' { return cgHttpMethod(m, recv, hv, args) }
+        cgUnported(`.${m}() on ${hv.fty}`)
+        return none
+    }
+    if m == 'close' {
+        Val sv = cgExpr(recv)
+        if CG_STUCK { return none }
+        if sv.fty == 'socket' {
+            CG_USES_HTTP = true
+            cgOut(`  call void @festina_socket_close(ptr ${sv.v})`)
+            cgReleaseOwnedReceiver(recv, sv)
+            return cgVal('0', 'void', 'void')
+        }
+        cgUnported(`.close() on ${sv.fty}`)
+        return none
+    }
+
     // claude.md #150: a LITERAL receiver is parsed at compile time, so
     // `'42'.toInt()` costs the compiled program nothing at all. The
     // fold and the runtime function must agree exactly; they do here
@@ -5639,15 +5814,27 @@ Val func cgMethodCall(e:Node, callee:Node) {
     // .toText() is the explicit spelling of exactly what a template
     // interpolation already does, so it shares cgToText rather than
     // having a copy that could drift from it.
-    if r.fty == 'blob' {
-        // The fall-through the original takes, receiver and all: this
-        // second emission is the one the call actually uses.
+    // The fall-through the original takes, receiver and all. `toText`
+    // is a method name three separate blocks in the original claim --
+    // scalars and containers, then blob's file methods, then http's --
+    // and each emits the receiver BEFORE looking at its type. So a blob
+    // receiver is emitted twice and an http one three times, and which
+    // emission the call itself uses is observable in the numbering.
+    if r.fty == 'blob' || r.fty == 'http' {
         Val again = cgExpr(recv)
         if CG_STUCK { return none }
-        text bt = cgTmp()
-        cgOut(`  ${bt} = call ptr @festina_blob_to_text(ptr ${again.v})`)
-        cgReleaseOwnedReceiver(recv, again)
-        return cgVal(bt, 'ptr', 'text')
+        if r.fty == 'blob' {
+            text bt = cgTmp()
+            cgOut(`  ${bt} = call ptr @festina_blob_to_text(ptr ${again.v})`)
+            cgReleaseOwnedReceiver(recv, again)
+            return cgVal(bt, 'ptr', 'text')
+        }
+        // claude.md #151: a response's own body, decoded as text. Not a
+        // rendering of the handle at all -- it is the one method on
+        // this receiver that reaches into the connection.
+        Val hagain = cgExpr(recv)
+        if CG_STUCK { return none }
+        return cgHttpMethod('toText', recv, hagain, args)
     }
     // A struct, a row or a container renders as JSON, through the same
     // cgToText a template interpolation uses -- one path rather than
@@ -6428,6 +6615,44 @@ Val func cgCall(e:Node, wantValue:bool) {
         cgOut(`  call void @festina_program_exit(i64 ${cv.v})`)
         return cgVal('0', 'void', 'void')
     }
+    // claude.md #151: both take one plain int, so there is no argument
+    // ownership story here at all.
+    if name == 'openPort' || name == 'closePort' {
+        arr[Node] pargs2 = listOf(e, 'args')
+        if pargs2.length != 1 {
+            cgUnported(`${name}() with other than one argument`)
+            return none
+        }
+        CG_USES_HTTP = true
+        Val pv2 = cgExpr(pargs2[0])
+        if CG_STUCK { return none }
+        text pfn = 'festina_open_port'
+        if name == 'closePort' { pfn = 'festina_close_port' }
+        cgOut(`  call void @${pfn}(i64 ${pv2.v})`)
+        return cgVal('0', 'void', 'void')
+    }
+    // claude.md #162: parseURL lives in CORE. It has nothing to do with
+    // the HTTP server or an outbound send, so it sets no flag -- a
+    // program that only ever parses a URL links none of that.
+    if name == 'parseURL' {
+        arr[Node] uargs = listOf(e, 'args')
+        if uargs.length != 1 {
+            cgUnported('parseURL() with other than one argument')
+            return none
+        }
+        Val uv2 = cgExpr(uargs[0])
+        if CG_STUCK { return none }
+        Val ut = cgToText(uv2)
+        if CG_STUCK { return none }
+        text uout = cgTmp()
+        cgOut(`  ${uout} = call ptr @festina_parse_url(ptr ${ut.v})`)
+        // The ORIGINAL value, not the converted one: a text argument
+        // makes the conversion a no-op and the two are the same
+        // pointer, and for anything else the original is what this
+        // call site allocated. That is the original's own spelling.
+        cgFreeTextTemp(uargs[0], uv2)
+        return cgVal(uout, 'ptr', 'url')
+    }
     // claude.md #141: an INDIRECT call, through a `func[...]`-typed
     // binding rather than a declared function's own name. Checked
     // BEFORE the function table below, mirroring the original's
@@ -6666,7 +6891,8 @@ void func cgStmt(s:Node) {
             // is a ROW, whose storage the runtime laid out and whose
             // local is therefore one pointer to it and nothing more.
             if managed == 'blob' || managed == 'regex' || managed == 'table'
-                    || managed == 'ascii' || managed == 'img' || managed == 'aud' {
+                    || managed == 'ascii' || managed == 'img' || managed == 'aud'
+                    || managed == 'http' || managed == 'socket' || managed == 'url' {
                 Node binit = childOf(s, 'init')
                 if binit == null {
                     cgUnported(`${managed} declaration with no initializer`)
@@ -8137,6 +8363,12 @@ text func cgReleaseFn(fty:text) {
     // A parsed URL owns the component buffers it was split into, so it
     // has a destructor of its own rather than the generic release.
     if fty == 'url' { return '@festina_release_url' }
+    // claude.md #162: an http value holds its own url, method, headers
+    // and body, so there is real content to free. A socket handle is
+    // the opposite -- {refcount, conn_id} and nothing else, because the
+    // connection itself is torn down independently of any handle.
+    if fty == 'http' { return '@festina_release_http' }
+    if fty == 'socket' { return '@festina_release_conn_handle' }
     return '@festina_release'
 }
 
@@ -8146,6 +8378,10 @@ bool func cgIsRefcounted(fty:text) {
     if fty == 'regex' { return true }
     if fty == 'ascii' { return true }
     if fty == 'img' || fty == 'aud' { return true }
+    // claude.md #151/#162: an http or socket handle, and a parsed URL.
+    // Releasing one of the first two frees the tiny handle and nothing
+    // about the CONNECTION, which the connection table owns.
+    if fty == 'http' || fty == 'socket' || fty == 'url' { return true }
     // claude.md #265: a row is reference counted, so a row an array
     // gave out survives the array it came from.
     if fty == 'table' { return true }
@@ -10279,6 +10515,318 @@ text func cgThreadReleaseFn(desc:text) {
     return '@free'
 }
 
+// ---------------------------------------------------------------------
+// claude.md #151/#162: HTTP.
+//
+// An `http` value is one runtime-owned record holding a url, a method,
+// a code, a headers map and a body -- built here and read back through
+// dedicated accessors, never laid out by this compiler.
+
+// `.send()`/`.socket.send()`'s `data:any` argument, and an http
+// literal's own `body`. Every type with a text form goes through
+// cgToText; a blob, an img and an aud send their RAW BYTES instead,
+// because a body is far more likely to be genuinely binary than a
+// log() argument ever is.
+//
+// Three answers and no tuple to carry them in: the bytes, their
+// length, and -- when this conversion allocated a scratch buffer of
+// its own -- the buffer to free once the bytes have actually been
+// used. It is '' when the pointer aliases something the caller already
+// owns.
+text CG_BODY_PTR = ''
+text CG_BODY_LEN = ''
+text CG_BODY_TEMP = ''
+
+void func cgSendableBody(v:Val) {
+    CG_BODY_PTR = ''
+    CG_BODY_LEN = ''
+    CG_BODY_TEMP = ''
+    if v.fty == 'blob' || v.fty == 'img' || v.fty == 'aud' {
+        text fn = 'festina_blob_bytes'
+        if v.fty == 'aud' {
+            CG_USES_AUDIO = true
+            fn = 'festina_audio_bytes'
+        } else if v.fty == 'img' {
+            CG_USES_GRAPHICS_CODE = true
+            fn = 'festina_image_bytes'
+        }
+        text lenP = cgTmp()
+        cgOut(`  ${lenP} = alloca i64`)
+        text data = cgTmp()
+        cgOut(`  ${data} = call ptr @${fn}(ptr ${v.v}, ptr ${lenP})`)
+        text lenV = cgTmp()
+        cgOut(`  ${lenV} = load i64, ptr ${lenP}`)
+        CG_BODY_PTR = data
+        CG_BODY_LEN = lenV
+        return
+    }
+    Val t = cgToText(v)
+    if CG_STUCK { return }
+    text ln = cgTmp()
+    cgOut(`  ${ln} = call i64 @strlen(ptr ${t.v})`)
+    CG_BODY_PTR = t.v
+    CG_BODY_LEN = ln
+    // A text receiver's own buffer is the caller's; anything else was
+    // converted into a buffer this call site now owns.
+    if v.fty != 'text' { CG_BODY_TEMP = t.v }
+}
+
+// `http x = {...}`, and `req.send({...})`'s own inline form. Entries
+// are emitted in SOURCE order, and a key never mentioned keeps
+// festina_http_literal_new's own default for it -- an empty text for
+// url and method, the int null for code, an empty map for headers, no
+// body and no callback.
+Val func cgHttpLit(e:Node) {
+    Val none
+    CG_USES_HTTP = true
+    text urlVal = cgStringConst('')
+    text methodVal = cgStringConst('')
+    text codeVal = cgNullValue('int')
+    text headersVal = 'null'
+    text bodyPtr = 'null'
+    text bodyLen = '0'
+    text cbVal = 'null'
+    // The releases owed once the literal has been built. They cannot
+    // run inside the loop: festina_http_literal_new has not copied
+    // anything yet, and freeing a body before the call that reads it
+    // would hand the runtime released memory.
+    arr[Node] cleanE = []
+    arr[Val] cleanV = []
+    arr[text] cleanTemp = []
+    arr[bool] cleanRel = []
+    arr[Node] entries = listOf(e, 'entries')
+    int i = 0
+    while i < entries.length {
+        Node kn = childOf(entries[i], 'a')
+        if kn == null || kn.kind != 'StringLit' {
+            cgUnported('an http literal key that is not a name')
+            return none
+        }
+        text k = rawText(kn, 'value')
+        Node vn = childOf(entries[i], 'b')
+        if k == 'url' || k == 'method' {
+            Val v = cgExpr(vn)
+            if CG_STUCK { return none }
+            Val t = cgToText(v)
+            if CG_STUCK { return none }
+            if k == 'url' { urlVal = t.v } else { methodVal = t.v }
+            // The PRE-conversion value is what the cleanup asks about,
+            // which is the original's own spelling: a text argument
+            // makes the conversion a no-op and the two are the same
+            // pointer anyway.
+            cleanE.push(vn)
+            cleanV.push(v)
+            cleanTemp.push('')
+            cleanRel.push(false)
+        } else if k == 'code' {
+            Val v = cgExpr(vn)
+            if CG_STUCK { return none }
+            codeVal = v.v
+        } else if k == 'headers' {
+            Val v = cgExpr(vn)
+            if CG_STUCK { return none }
+            // festina_http_literal_new takes OWNERSHIP of the map. A
+            // fresh literal or a call result hands its own reference
+            // straight in; an existing binding -- the common case --
+            // needs one extra retain first, or the literal and the
+            // binding would share a single claim on it.
+            if cgIsOwningRefcountedSource(vn) == false {
+                cgOut(`  call void @festina_retain(ptr ${v.v})`)
+            }
+            headersVal = v.v
+        } else if k == 'body' {
+            Val v = cgExpr(vn)
+            if CG_STUCK { return none }
+            cgSendableBody(v)
+            if CG_STUCK { return none }
+            bodyPtr = CG_BODY_PTR
+            bodyLen = CG_BODY_LEN
+            cleanE.push(vn)
+            cleanV.push(v)
+            cleanTemp.push(CG_BODY_TEMP)
+            cleanRel.push(cgIsRefcounted(v.fty) && cgIsOwningRefcountedSource(vn))
+        } else if k == 'callback' {
+            // claude.md #163: a bare function pointer, and a declared
+            // function is immortal for the process -- so there is
+            // nothing to retain, release or free, and the value is
+            // used exactly as emitted.
+            Val v = cgExpr(vn)
+            if CG_STUCK { return none }
+            cbVal = v.v
+        } else {
+            cgUnported(`an http literal key ${k}`)
+            return none
+        }
+        i++
+    }
+    text out = cgTmp()
+    cgOut(`  ${out} = call ptr @festina_http_literal_new(ptr ${urlVal}, ptr ${methodVal}, i64 ${codeVal}, ptr ${headersVal}, ptr ${bodyPtr}, i64 ${bodyLen}, ptr ${cbVal})`)
+    int c = 0
+    while c < cleanE.length {
+        if cleanTemp[c] != '' {
+            cgOut(`  call void @free(ptr ${cleanTemp[c]})`)
+        }
+        if cleanRel[c] {
+            Val cv = cleanV[c]
+            cgOut(`  call void ${cgReleaseFnFor(cv.fty, cgRelKeyVal(cv))}(ptr ${cv.v})`)
+        } else {
+            cgFreeTextTemp(cleanE[c], cleanV[c])
+        }
+        c++
+    }
+    Val r = cgVal(out, 'ptr', 'http')
+    r.fresh = true
+    return r
+}
+
+// claude.md #151/#164: `.send()`, in its three forms.
+//
+// The receiver is emitted HERE rather than by the caller, because it
+// may be a bare `{...}` -- `{...}.send()`, and the `http {...}`
+// statement form desugars to exactly that -- which has no meaning of
+// its own in an expression position.
+Val func cgHttpSend(e:Node, recv:Node, args:arr[Node]) {
+    Val none
+    if recv == null {
+        cgUnported('.send() with no receiver')
+        return none
+    }
+    Val obj
+    if recv.kind == 'MapLit' {
+        obj = cgHttpLit(recv)
+    } else {
+        obj = cgExpr(recv)
+    }
+    if CG_STUCK { return none }
+    if obj.fty == 'http' {
+        CG_USES_HTTP = true
+        // Overloaded by ARITY. With no argument this is the CLIENT
+        // side: an outbound request built from the receiver's own url,
+        // method, headers and body, answered into the same value.
+        if args.length == 0 {
+            // Every program reaching here needs TLS linked: a URL's
+            // scheme is a runtime string, and no compiler can read it
+            // in advance.
+            CG_USES_HTTPS = true
+            // Through the dispatcher rather than the blocking send:
+            // it reads the value's own `.callback` at run time and
+            // decides blocking against a background worker from there.
+            cgOut(`  call void @festina_http_send_client_dispatch(ptr ${obj.v})`)
+            cgHttpSendReleaseReceiver(recv, obj)
+            return cgVal('0', 'void', 'void')
+        }
+        if args.length != 1 {
+            cgUnported(`.send() with ${args.length} arguments`)
+            return none
+        }
+        // The SERVER side: answer this live connection with a response
+        // either already in hand or built inline right here.
+        Val res = cgExprExpecting(args[0], 'http', '')
+        if CG_STUCK { return none }
+        if res.fty != 'http' {
+            cgUnported(`.send() of ${res.fty}`)
+            return none
+        }
+        cgOut(`  call void @festina_http_send(ptr ${obj.v}, ptr ${res.v})`)
+        if cgIsOwningRefcountedSource(args[0]) {
+            cgOut(`  call void @festina_release_http(ptr ${res.v})`)
+        }
+        cgHttpSendReleaseReceiver(recv, obj)
+        return cgVal('0', 'void', 'void')
+    }
+    if obj.fty == 'socket' {
+        CG_USES_HTTP = true
+        if args.length != 1 {
+            cgUnported(`.send() with ${args.length} arguments on a socket`)
+            return none
+        }
+        Val d = cgExpr(args[0])
+        if CG_STUCK { return none }
+        // A blob goes as a BINARY frame; everything else as a text one,
+        // through the same text form log() would give it.
+        if d.fty == 'blob' {
+            text lenP = cgTmp()
+            cgOut(`  ${lenP} = alloca i64`)
+            text dataP = cgTmp()
+            cgOut(`  ${dataP} = call ptr @festina_blob_bytes(ptr ${d.v}, ptr ${lenP})`)
+            text lenV = cgTmp()
+            cgOut(`  ${lenV} = load i64, ptr ${lenP}`)
+            cgOut(`  call void @festina_socket_send_binary(ptr ${obj.v}, ptr ${dataP}, i64 ${lenV})`)
+        } else {
+            Val t = cgToText(d)
+            if CG_STUCK { return none }
+            cgOut(`  call void @festina_socket_send_text(ptr ${obj.v}, ptr ${t.v})`)
+            if d.fty != 'text' { cgOut(`  call void @free(ptr ${t.v})`) }
+        }
+        if cgIsRefcounted(d.fty) && cgIsOwningRefcountedSource(args[0]) {
+            cgOut(`  call void ${cgReleaseFnFor(d.fty, cgRelKeyVal(d))}(ptr ${d.v})`)
+        } else {
+            cgFreeTextTemp(args[0], d)
+        }
+        cgReleaseOwnedReceiver(recv, obj)
+        return cgVal('0', 'void', 'void')
+    }
+    cgUnported(`.send() on ${obj.fty}`)
+    return none
+}
+
+// `.send()`'s own receiver release. An http value is always
+// refcounted, so unlike the generic one this asks only about ownership
+// -- and an anonymous `{...}.send()`, with no binding anywhere to
+// release it later, is exactly the case that needs asking.
+void func cgHttpSendReleaseReceiver(recv:Node, obj:Val) {
+    if cgIsOwningRefcountedSource(recv) {
+        cgOut(`  call void @festina_release_http(ptr ${obj.v})`)
+    }
+}
+
+// The request's fixed-shape methods -- everything except `send()`,
+// whose optional argument and any-typed payload need their own path.
+Val func cgHttpMethod(m:text, recv:Node, obj:Val, args:arr[Node]) {
+    Val none
+    CG_USES_HTTP = true
+    if m == 'ok' {
+        cgOut(`  call void @festina_http_ok(ptr ${obj.v})`)
+        cgReleaseOwnedReceiver(recv, obj)
+        return cgVal('0', 'void', 'void')
+    }
+    if m == 'upgrade' {
+        cgOut(`  call void @festina_http_upgrade(ptr ${obj.v})`)
+        cgReleaseOwnedReceiver(recv, obj)
+        return cgVal('0', 'void', 'void')
+    }
+    if m == 'redirect' {
+        if args.length != 1 {
+            cgUnported(`.redirect() with ${args.length} arguments`)
+            return none
+        }
+        Val u = cgExpr(args[0])
+        if CG_STUCK { return none }
+        cgOut(`  call void @festina_http_redirect(ptr ${obj.v}, ptr ${u.v})`)
+        cgFreeTextTemp(args[0], u)
+        cgReleaseOwnedReceiver(recv, obj)
+        return cgVal('0', 'void', 'void')
+    }
+    text fn = 'festina_http_to_blob'
+    text rf = 'blob'
+    if m == 'toImg' {
+        CG_USES_GRAPHICS_CODE = true
+        fn = 'festina_http_to_img'
+        rf = 'img'
+    } else if m == 'toAud' {
+        CG_USES_AUDIO = true
+        fn = 'festina_http_to_aud'
+        rf = 'aud'
+    } else if m == 'toText' {
+        fn = 'festina_http_to_text'
+        rf = 'text'
+    }
+    text out = cgTmp()
+    cgOut(`  ${out} = call ptr @${fn}(ptr ${obj.v})`)
+    cgReleaseOwnedReceiver(recv, obj)
+    return cgVal(out, 'ptr', rf)
+}
+
 // Releases a postMessage argument once the box already holds an
 // independent copy of it. `val` itself was never touched by the clone,
 // so a borrowed alias is left exactly as it was; only a genuinely fresh
@@ -10448,7 +10996,7 @@ Val func cgThreadMethod(e:Node, callee:Node, recv:Node, idx:Node) {
     text rname = rawText(recv, 'name')
     arr[Node] args = listOf(e, 'args')
     if prop != 'postMessage' && prop != 'kill' && prop != 'live'
-            && prop != 'isAlive' && prop != 'drain' {
+            && prop != 'isAlive' && prop != 'drain' && prop != 'giveRequest' {
         cgUnported(`.${prop}() on a thread`)
         return none
     }
@@ -10460,6 +11008,40 @@ Val func cgThreadMethod(e:Node, callee:Node, recv:Node, idx:Node) {
     if prop == 'postMessage' {
         cgNamedPostMessageTxn(CG_TGT_DESC, handle, args, '0')
         if CG_STUCK { return none }
+        cgThreadCloseBounds(endL)
+        return cgVal('0', 'void', 'void')
+    }
+    // claude.md #213: `NAME.giveRequest(req)` -- hand a live, not yet
+    // answered connection to another thread, which then owns it
+    // outright.
+    //
+    // The argument is a bare pointer: semantic analysis has already
+    // proved it manually-managed, so it is never cloned, never boxed
+    // and never retained, and there is nothing here to clean up
+    // afterwards. The detach resolves the connection, checks it is
+    // still plain, live, unanswered and un-upgraded, and hands back a
+    // heap copy owning every field including the file descriptor -- or
+    // null, which is a SILENT no-op, the same "test, do not fail"
+    // convention every other thread operation follows.
+    if prop == 'giveRequest' {
+        if args.length != 1 {
+            cgUnported(`.giveRequest() with ${args.length} arguments`)
+            return none
+        }
+        CG_USES_HTTP = true
+        Val gv = cgExpr(args[0])
+        if CG_STUCK { return none }
+        text det = cgTmp()
+        cgOut(`  ${det} = call ptr @festina_conn_detach(ptr ${gv.v})`)
+        text isNullG = cgTmp()
+        cgOut(`  ${isNullG} = icmp eq ptr ${det}, null`)
+        text okL = cgLabel('giverequest.ok')
+        text skipL = cgLabel('giverequest.skip')
+        cgOut(`  br i1 ${isNullG}, label %${skipL}, label %${okL}`)
+        cgBlockLabel(okL)
+        cgOut(`  call void @festina_thread_give_request(ptr ${handle}, ptr ${det}, ptr ${gv.v})`)
+        cgOut(`  br label %${skipL}`)
+        cgBlockLabel(skipL)
         cgThreadCloseBounds(endL)
         return cgVal('0', 'void', 'void')
     }
@@ -10840,6 +11422,31 @@ text func cgThreadDbUrl(s:Node) {
 // which table, and festina_sync_table does nothing to a table already
 // shaped right. The row decoders are deliberately NOT re-registered --
 // main's prologue did that before any thread was spawned.
+// claude.md #212: this thread's own connection handlers, registered
+// into the HTTP runtime's per-thread slots FROM this thread -- they are
+// thread-local there, so main's registration does not reach here and
+// this one does not reach main. First thing the adapter does, before
+// even the database: nothing can accept a connection until this
+// thread's own loop starts, but the ordering costs nothing and the
+// original's is what the counters record.
+void func cgThreadHttpRegister(tname:text) {
+    if CG_TH_HTTP_NAMES[tname] == null { return }
+    if CG_TH_HTTP_NAMES[tname] == '' { return }
+    int i = 0
+    while i < HTTP_EVENT_ORDER.length {
+        text hn = HTTP_EVENT_ORDER[i]
+        arr[text] declared = CG_TH_HTTP_NAMES[tname].split('|')
+        int j = 0
+        while j < declared.length {
+            if declared[j] == hn {
+                cgOut(`  call void @${HTTP_EVENT_REG[hn]}(ptr @__festina_thread_${tname}_on_${hn})`)
+            }
+            j++
+        }
+        i++
+    }
+}
+
 void func cgThreadDbOpen(tname:text) {
     if CG_TH_DB[tname] == null { return }
     text url = cgStringConst(CG_TH_DB[tname])
@@ -10970,6 +11577,7 @@ void func cgThreadStateInits(d:Node, tname:text) {
 void func cgAdapterPrologue(kind:text, pnames:arr[text]) {
     Node d = CG_FN_PRE_DECL
     if kind == 'load' {
+        cgThreadHttpRegister(CG_FN_PRE_NAME)
         cgThreadDbOpen(CG_FN_PRE_NAME)
         cgThreadStateInits(d, CG_FN_PRE_NAME)
         // The context is set only AFTER the initializers, which is the
@@ -11109,6 +11717,8 @@ void func cgThreadDeclNamed(d:Node, tname:text) {
     Node onExit = null
     text dbUrl = ''
     arr[Node] privFns = []
+    arr[text] httpNames = []
+    arr[Node] httpDecls = []
     int i = 0
     while i < stmts.length {
         Node s = stmts[i]
@@ -11119,6 +11729,14 @@ void func cgThreadDeclNamed(d:Node, tname:text) {
             if hn == 'load' { onLoad = s }
             else if hn == 'message' { onMessage = s }
             else if hn == 'exit' { onExit = s }
+            else if HTTP_EVENT_REG[hn] != null {
+                // claude.md #212: one of the four connection handlers,
+                // on this thread's own OS thread. Collected here and
+                // emitted below, before the three adapters, because
+                // on_load's own prologue needs their symbols.
+                httpNames.push(hn)
+                httpDecls.push(s)
+            }
             else {
                 cgUnported(`on ${hn} inside a thread`)
                 return
@@ -11200,6 +11818,27 @@ void func cgThreadDeclNamed(d:Node, tname:text) {
         if CG_STUCK { return }
         pe++
     }
+    // claude.md #212: the connection handlers, before the three
+    // adapters -- on_load's own prologue registers them and needs their
+    // symbols. Structurally an ordinary void function taking plain
+    // parameters: these fire from the HTTP runtime's own dispatch
+    // calling straight in, with no queue payload to unbox.
+    int hq = 0
+    while hq < httpDecls.length {
+        CG_TH_HTTP[tname] = 1
+        CG_USES_HTTP = true
+        CG_FN_SYMBOL = `@__festina_thread_${tname}_on_${httpNames[hq]}`
+        CG_FN_RET = 'void'
+        CG_THREAD_HANDLE = `@__festina_thread_${tname}_handle`
+        CG_THREAD_NAME = tname
+        cgFunc(httpDecls[hq])
+        CG_THREAD_HANDLE = ''
+        CG_THREAD_NAME = ''
+        if CG_STUCK { return }
+        hq++
+    }
+    CG_TH_HTTP_NAMES[tname] = httpNames.join('|')
+
     // on_load first: the original emits the three in this order, and
     // the shared counters make that order visible.
     CG_FN_SYMBOL = `@__festina_thread_${tname}_on_load`
@@ -11267,6 +11906,7 @@ void func cgThreadLoadStub(d:Node, tname:text) {
     CG_PARAM_LIVE = freshParams
     cgOut(`define void @__festina_thread_${tname}_on_load() {`)
     cgBlockLabel(cgLabel('entry'))
+    cgThreadHttpRegister(tname)
     cgThreadDbOpen(tname)
     cgThreadStateInits(d, tname)
     cgOut('  ret void')
@@ -11560,7 +12200,8 @@ void func cgFuncBody(d:Node) {
             }
             plty = 'ptr'
             if pf == 'blob' || pf == 'regex' || pf == 'ascii'
-                    || pf == 'img' || pf == 'aud' {
+                    || pf == 'img' || pf == 'aud'
+                    || pf == 'http' || pf == 'socket' || pf == 'url' {
                 // A handle: one ptr, and nothing to say about elements
                 // or fields. Its release is the runtime's own.
             } else if pf == 'struct' {
@@ -12079,6 +12720,15 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                     CG_USES_WINDOW = true
                     CG_EVENTS.push(`${evName}|${evSym}`)
                 }
+                // claude.md #151: the four connection handlers are not
+                // window events. Declaring one without ever opening a
+                // port is legal -- it simply never fires -- but it
+                // still links the HTTP runtime, because these symbols
+                // reference it.
+                if HTTP_EVENT_REG[evName] != null {
+                    CG_USES_HTTP = true
+                    CG_HTTP_HANDLERS[evName] = evSym
+                }
             }
         }
         fb++
@@ -12146,8 +12796,27 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // loop below, which polls festina_shutdown_requested() the same
     // once-per-iteration way every other loop here does, so it meets
     // the same "a poll point is guaranteed to run soon" test.
-    if CG_USES_TIMERS || CG_USES_WINDOW || CG_USES_THREADS {
+    if CG_USES_TIMERS || CG_USES_WINDOW || CG_USES_HTTP || CG_USES_THREADS {
         cgOut('  call void @festina_install_shutdown_handler()')
+    }
+    // claude.md #151: the four connection handlers, registered
+    // unconditionally -- an http or websocket connection has nothing to
+    // do with a window, so these are not part of the graphics-gated
+    // loop further down.
+    int he = 0
+    while he < HTTP_EVENT_ORDER.length {
+        text hn = HTTP_EVENT_ORDER[he]
+        if CG_HTTP_HANDLERS[hn] != null {
+            cgOut(`  call void @${HTTP_EVENT_REG[hn]}(ptr ${CG_HTTP_HANDLERS[hn]})`)
+        }
+        he++
+    }
+    // claude.md #160: openSecurePort or an outbound send. Deliberately
+    // NOT folded into the database block below -- a port-only program
+    // has no tables and would skip the whole thing, and then never
+    // listen at all.
+    if CG_USES_HTTPS {
+        cgOut('  call void @festina_register_tls_hooks()')
     }
     // claude.md #101/#199: the image decoder is registered here, before
     // anything could decode an img column -- and before any thread is
@@ -12162,6 +12831,12 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // call, which is the whole thing that form exists to avoid.
     if CG_USES_ASYNC_IO {
         cgOut('  call void @festina_register_async_io_hooks()')
+    }
+    // claude.md #166: registered whether or not this program also opens
+    // a window -- harmless either way, and it is what lets the window's
+    // own event loop service an open port when main ends there instead.
+    if CG_USES_HTTP {
+        cgOut('  call void @festina_register_http_service_hooks()')
     }
     if CG_USES_AUDIO {
         cgOut('  call void @festina_set_audio_decoder(ptr @festina_audio_from_bytes)')
@@ -12210,6 +12885,23 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 text closeSym = cgThreadDbCloseTrampoline(tn)
                 cgOut(`  call void @festina_thread_set_db_close(ptr %__thread_${tn}, ptr ${closeSym})`)
             }
+            // claude.md #212/#248: a thread's own HTTP context. A
+            // thread that declared one of the four connection handlers
+            // gets the real service pass and the give-request hook, so
+            // its worker joins the bounded-poll dispatch loop; one that
+            // only ever SENDS gets nulls for both and keeps its
+            // efficient indefinite wait, but still gets the teardown --
+            // nothing else in this runtime frees its pooled outbound
+            // connections when it is killed.
+            if CG_TH_HTTP[tn] != null || CG_USES_HTTP {
+                text svc = 'null'
+                text give = 'null'
+                if CG_TH_HTTP[tn] != null {
+                    svc = '@festina_thread_http_service_pass'
+                    give = '@festina_thread_deliver_given_request'
+                }
+                cgOut(`  call void @festina_thread_set_http_context(ptr %__thread_${tn}, ptr ${svc}, ptr @festina_thread_http_teardown, ptr ${give})`)
+            }
             cgOut(`  call void @festina_thread_spawn(ptr %__thread_${tn})`)
             th++
         }
@@ -12243,6 +12935,12 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // messages, which the timer loop checks once per iteration whatever
     // it was entered for.
     if CG_USES_WINDOW { cgOut('  call void @festina_run_event_loop()') }
+    // claude.md #151/#166: the single-threaded poll loop that services
+    // connections AND fires pending timers, so it fully subsumes the
+    // timer loop below whenever both are in play. Only reached with no
+    // window: a program with both takes the branch above, where the
+    // event loop services the port itself.
+    else if CG_USES_HTTP { cgOut('  call void @festina_run_http_loop()') }
     else if CG_USES_TIMERS || CG_USES_ASYNC_IO || CG_USES_THREADS { cgOut('  call void @festina_run_timer_loop()') }
     // The last thing main does, and only when there is a database to
     // close: for a program that never opens one this call would be the
