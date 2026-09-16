@@ -826,6 +826,15 @@ struct Val {
     // disagree only where a coercion turns a borrowed value into a
     // fresh one.
     fresh:bool
+    // claude.md #174: whether an `arr[T]` value is an AMORTIZED one.
+    // The two are byte-compatible in their first two fields, so every
+    // read -- indexing, `.length`, iteration, the release cascade --
+    // works on either unchanged. Only the five operations that can grow
+    // the buffer need to know, and only the value can tell them: the
+    // header looks identical from the pointer alone.
+    //
+    // Spelled `isAmor` because `amor` is a keyword.
+    isAmor:bool
 }
 
 Val func cgVal(v:text, lty:text, fty:text) {
@@ -964,6 +973,9 @@ text func cgLtyOf(fty:text) {
 text func cgTyKeyOf(t:Ty) {
     if t == null { return '' }
     if t.kind == 'struct' { return t.name }
+    // A row's release is generated from the TABLE name, which rides in
+    // the same slot a struct's does.
+    if t.kind == 'table' { return t.name }
     if t.kind == 'arr' || t.kind == 'map' {
         if t.elem == null { return '' }
         if t.elem.kind == 'prim' { return t.elem.name }
@@ -978,11 +990,24 @@ text func cgFtyOfTy(t:Ty) {
     if t.kind == 'prim' {
         if t.name == 'int' || t.name == 'float' || t.name == 'bool'
                 || t.name == 'text' || t.name == 'blob' { return t.name }
+        // The other handle-shaped primitives. Each is one `ptr` with a
+        // release of its own, exactly as blob is, and leaving them out
+        // meant a function taking one had NO encoded signature at all
+        // -- so a bare reference to its name was refused, and
+        // `'x.png'.callback(onImg)` had nothing to read the loader
+        // choice off.
+        if t.name == 'img' || t.name == 'aud' || t.name == 'ascii'
+                || t.name == 'regex' || t.name == 'color' || t.name == 'font'
+                || t.name == 'http' || t.name == 'socket' || t.name == 'url' {
+            return t.name
+        }
         return ''
     }
     if t.kind == 'arr' { return 'arr' }
     if t.kind == 'map' { return 'map' }
     if t.kind == 'struct' { return 'struct' }
+    if t.kind == 'table' { return 'table' }
+    if t.kind == 'thread' { return 'thread' }
     if t.kind == 'func' { return 'func' }
     return ''
 }
@@ -1098,7 +1123,9 @@ text func cgFreshHeader(payload:text) {
 
 text func cgPayloadFor(t:Ty) {
     if t == null { return '' }
-    if t.amortized { return '' }
+    // claude.md #174: one trailing capacity field the plain shape does
+    // not have, after an identical {length, data} prefix.
+    if t.amortized { return '%struct._FestinaAmorArray' }
     if t.kind == 'arr' { return '%struct._FestinaArray' }
     if t.kind == 'map' { return '%struct._FestinaMap' }
     if t.kind == 'struct' { return `%struct.${t.name}` }
@@ -1108,7 +1135,9 @@ text func cgPayloadFor(t:Ty) {
 // The Festina-level tag for a managed type, matching cgLtyOf above.
 text func cgManagedFty(t:Ty) {
     if t == null { return '' }
-    if t.amortized { return '' }
+    // claude.md #174: an amortized array is an `arr[T]` in every way
+    // that matters here -- same fty, same element type, same release.
+    if t.amortized { return 'arr' }
     if t.kind == 'arr' { return 'arr' }
     if t.kind == 'map' { return 'map' }
     if t.kind == 'struct' { return 'struct' }
@@ -1183,6 +1212,11 @@ map[text] SF_LTY = {}
 map[text] SF_FTY = {}
 map[text] SF_SNAME = {}
 map[text] SF_ETY = {}
+// claude.md #174: which struct fields hold an AMORTIZED array. Its own
+// table for the same reason the binding one is: the element type
+// answers a different question, and every reader of that would
+// otherwise have to strip a prefix it does not care about.
+map[int] SF_AMOR = {}
 
 // Structs every one of whose fields is a scalar. Only those can have a
 // LOCAL yet: a struct with a struct/arr/map/text field is released
@@ -1367,6 +1401,20 @@ text func cgEtyOf(name:text) {
     if T_ETY[name] != null { return T_ETY[name] }
     if G_ETY[name] != null { return G_ETY[name] }
     return ''
+}
+
+// claude.md #174: which bindings hold an AMORTIZED array. Kept apart
+// from the element type rather than spelled into it, because the two
+// answer different questions and every reader of an element type would
+// otherwise have to strip a prefix it does not care about.
+map[int] L_AMOR = {}
+map[int] G_AMOR = {}
+map[int] T_AMOR = {}
+
+bool func cgAmorOf(name:text) {
+    if L_SLOT[name] != null { return L_AMOR[name] != null }
+    if T_SLOT[name] != null { return T_AMOR[name] != null }
+    return G_AMOR[name] != null
 }
 
 text func cgSnameOf(name:text) {
@@ -2315,7 +2363,11 @@ Val func cgExpr(e:Node) {
         cgOut(`  ${t} = load ${lty}, ptr ${slot}`)
         if fty == 'struct' { return cgStructVal(t, cgSnameOf(name)) }
         if fty == 'table' { return cgTableVal(t, cgSnameOf(name)) }
-        if fty == 'arr' { return cgArrVal(t, cgEtyOf(name)) }
+        if fty == 'arr' {
+            Val av3 = cgArrVal(t, cgEtyOf(name))
+            av3.isAmor = cgAmorOf(name)
+            return av3
+        }
         if fty == 'map' { return cgMapVal(t, cgEtyOf(name)) }
         if fty == 'func' { return cgFuncVal(t, cgEtyOf(name)) }
         return cgVal(t, lty, fty)
@@ -2905,6 +2957,7 @@ Val func cgFieldPtr(e:Node) {
     Val r = cgVal(fp, SF_LTY[key], SF_FTY[key])
     if SF_FTY[key] == 'struct' { r.sname = SF_SNAME[key] }
     if SF_ETY[key] != null { r.ety = SF_ETY[key] }
+    if SF_AMOR[key] != null { r.isAmor = true }
     // The base travels with the pointer, because a READ through a base
     // this expression owns has to mint the field's own ownership
     // before that base is released -- see cgMemberRead. A WRITE uses
@@ -2921,6 +2974,10 @@ Val func cgFieldPtr(e:Node) {
 // to confuse it with.
 text func cgFieldPayload(fp:Val) {
     if fp.fty == 'struct' { return `%struct.${fp.sname}` }
+    // claude.md #174: the wider header when the field is an amortized
+    // array. Vivifying the plain one would leave every later push
+    // writing a capacity field that is not there.
+    if fp.fty == 'arr' && fp.isAmor { return '%struct._FestinaAmorArray' }
     if fp.fty == 'arr' { return '%struct._FestinaArray' }
     if fp.fty == 'map' { return '%struct._FestinaMap' }
     return ''
@@ -2948,6 +3005,7 @@ Val func cgLoadFieldValue(fp:Val) {
         return cgVal(plain, fp.lty, fp.fty)
     }
 
+
     text loaded = cgTmp()
     cgOut(`  ${loaded} = load ptr, ptr ${fp.v}`)
     text isNull = cgTmp()
@@ -2967,7 +3025,11 @@ Val func cgLoadFieldValue(fp:Val) {
     text out = cgTmp()
     cgOut(`  ${out} = phi ptr [ ${loaded}, %${loadPred} ], [ ${made}, %${makePred} ]`)
     if fp.fty == 'struct' { return cgStructVal(out, fp.sname) }
-    if fp.fty == 'arr' { return cgArrVal(out, fp.ety) }
+    if fp.fty == 'arr' {
+        Val fav = cgArrVal(out, fp.ety)
+        fav.isAmor = fp.isAmor
+        return fav
+    }
     if fp.fty == 'map' { return cgMapVal(out, fp.ety) }
     return cgVal(out, 'ptr', fp.fty)
 }
@@ -2992,7 +3054,21 @@ Val func cgLoadFieldValue(fp:Val) {
 // frame slot the declaration already allocated. '' means "allocate a
 // fresh heap one", which is every other position a literal can appear
 // in.
-Val func cgArrayLit(e:Node, ety:text, header:text) {
+// claude.md #174: what the five growable operations pass as their
+// capacity argument. An amortized array hands over the ADDRESS of its
+// own capacity field, so the resize can double in place; a plain one
+// passes null, which the same resize reads as "make it exactly this
+// long" -- the behaviour it always had. One helper rather than the
+// same GEP at five call sites, because five copies is five chances for
+// one to drift.
+text func cgArrayCapacityArg(obj:Val) {
+    if obj.isAmor == false { return 'null' }
+    text capP = cgTmp()
+    cgOut(`  ${capP} = getelementptr %struct._FestinaAmorArray, ptr ${obj.v}, i32 0, i32 2`)
+    return capP
+}
+
+Val func cgArrayLit(e:Node, ety:text, header:text, wantsAmor:bool) {
     Val none
     if ety == '' || cgElemLty(ety) == '' {
         cgUnported('array literal of a non-scalar type')
@@ -3031,10 +3107,16 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
         i++
     }
 
+    // claude.md #174: the amortized header, when that is what this
+    // literal is initializing. The literal itself has no spelling of
+    // its own for the difference -- `[...]` either way -- so the
+    // expected type is the only thing that can say.
+    text hdrTy = '%struct._FestinaArray'
+    if wantsAmor { hdrTy = '%struct._FestinaAmorArray' }
     text into = header
-    if into == '' { into = cgFreshHeader('%struct._FestinaArray') }
+    if into == '' { into = cgFreshHeader(hdrTy) }
     text lenP = cgTmp()
-    cgOut(`  ${lenP} = getelementptr %struct._FestinaArray, ptr ${into}, i32 0, i32 0`)
+    cgOut(`  ${lenP} = getelementptr ${hdrTy}, ptr ${into}, i32 0, i32 0`)
     cgOut(`  store i64 ${elems.length}, ptr ${lenP}`)
 
     text total = '0'
@@ -3081,9 +3163,21 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
     }
 
     text dataP = cgTmp()
-    cgOut(`  ${dataP} = getelementptr %struct._FestinaArray, ptr ${into}, i32 0, i32 1`)
+    cgOut(`  ${dataP} = getelementptr ${hdrTy}, ptr ${into}, i32 0, i32 1`)
     cgOut(`  store ptr ${data}, ptr ${dataP}`)
-    return cgArrVal(into, ety)
+    if wantsAmor {
+        // claude.md #174: this buffer was malloc'd for EXACTLY the
+        // elements written, with no slack -- so capacity starts at
+        // exactly that, and the next push grows from a real number
+        // rather than from a zero claiming room the buffer does not
+        // have.
+        text capP = cgTmp()
+        cgOut(`  ${capP} = getelementptr ${hdrTy}, ptr ${into}, i32 0, i32 2`)
+        cgOut(`  store i64 ${elems.length}, ptr ${capP}`)
+    }
+    Val lv2 = cgArrVal(into, ety)
+    lv2.isAmor = wantsAmor
+    return lv2
 }
 
 // specification.md §8.9.4: `Person p = {'name': 'a', 'age': 3}`.
@@ -3172,7 +3266,19 @@ Val func cgStructLit(e:Node, sname:text) {
 // of their own, so a bare cgExpr could not know what to emit -- but
 // routing every typed position through one function is what keeps the
 // two from drifting.
+// claude.md #174: whether the position cgExprExpecting is about to
+// emit into wants an AMORTIZED array. It rides beside the (fty, ety)
+// pair rather than inside it because it is a property of the
+// DECLARATION and of nothing else -- `arr` is the same fty and `T` the
+// same element type either way -- and because only one of
+// cgExprExpecting's branches ever asks. Consumed one-shot, so every
+// nested emission inside that branch sees its own answer rather than
+// inheriting this one.
+bool CG_EXPECT_AMOR = false
+
 Val func cgExprExpecting(e:Node, fty:text, ety:text) {
+    bool wantsAmor = CG_EXPECT_AMOR
+    CG_EXPECT_AMOR = false
     // `null` has no type of its own, so it can only be emitted where
     // one is already known. Each Festina type spells its own null
     // differently -- i64's minimum, a NaN, 2 for a bool, the LLVM null
@@ -3191,7 +3297,10 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
             cgUnported(`array literal in a ${fty} position`)
             return none
         }
-        return cgArrayLit(e, ety, '')
+        // The expected type is the only thing that can say whether
+        // this literal builds an amortized header: `[...]` is the same
+        // spelling either way.
+        return cgArrayLit(e, ety, '', wantsAmor)
     }
     // claude.md #32-34: a `sqlite()` whose rows are COLLECTED, which
     // only the destination's declared type can say. Placed here beside
@@ -4956,6 +5065,51 @@ Val func cgMethodCall(e:Node, callee:Node) {
         cgUnported(`.${m}() on ${hv.fty}`)
         return none
     }
+    // claude.md #165/#171: `'path'.callback(fn)` -- a background load
+    // that answers by CALLING fn, on main, once the bytes are in. Which
+    // of the three loaders runs is decided by fn's own parameter type,
+    // not by anything about the path, because the path is just a text
+    // either way.
+    if m == 'callback' {
+        Val cbObj = cgExpr(recv)
+        if CG_STUCK { return none }
+        if cbObj.fty == 'text' {
+            if args.length != 1 {
+                cgUnported(`.callback() with ${args.length} arguments`)
+                return none
+            }
+            Val fnv = cgExpr(args[0])
+            if CG_STUCK { return none }
+            if fnv.fty != 'func' {
+                cgUnported(`.callback() with a ${fnv.fty} argument`)
+                return none
+            }
+            arr[text] cbps = cgSigParams(fnv.ety)
+            if cbps.length != 1 {
+                cgUnported('.callback() with a handler of the wrong arity')
+                return none
+            }
+            CG_USES_ASYNC_IO = true
+            text resF = cgSigFty(cbps[0])
+            text dfn = 'festina_blob_load_dispatch'
+            if resF == 'img' {
+                CG_USES_GRAPHICS_CODE = true
+                dfn = 'festina_image_load_dispatch'
+            } else if resF == 'aud' {
+                CG_USES_AUDIO = true
+                dfn = 'festina_audio_load_dispatch'
+            } else if resF != 'blob' {
+                cgUnported(`.callback() answering a ${resF}`)
+                return none
+            }
+            text cbout = cgTmp()
+            cgOut(`  ${cbout} = call ptr @${dfn}(ptr ${cbObj.v}, ptr ${fnv.v})`)
+            cgFreeTextTemp(recv, cbObj)
+            return cgVal(cbout, 'ptr', resF)
+        }
+        cgUnported(`.callback() on ${cbObj.fty}`)
+        return none
+    }
     if m == 'close' {
         Val sv = cgExpr(recv)
         if CG_STUCK { return none }
@@ -5123,7 +5277,7 @@ Val func cgMethodCall(e:Node, callee:Node) {
         if CG_STUCK { return none }
         text dst = cgFreshHeader('%struct._FestinaArray')
         if args.length == 2 {
-            cgOut(`  call void @festina_array_splice(ptr ${obj.v}, ptr null, i64 ${spSize}, i64 ${spStart.v}, i64 ${spCount.v}, ptr ${dst})`)
+            cgOut(`  call void @festina_array_splice(ptr ${obj.v}, ptr ${cgArrayCapacityArg(obj)}, i64 ${spSize}, i64 ${spStart.v}, i64 ${spCount.v}, ptr ${dst})`)
             Val spr = cgArrVal(dst, obj.ety)
             spr.fresh = true
             return spr
@@ -5142,7 +5296,7 @@ Val func cgMethodCall(e:Node, callee:Node) {
         cgOut(`  ${insDataP} = getelementptr %struct._FestinaArray, ptr ${ins.v}, i32 0, i32 1`)
         text insData = cgTmp()
         cgOut(`  ${insData} = load ptr, ptr ${insDataP}`)
-        cgOut(`  call void @festina_array_splice_insert(ptr ${obj.v}, ptr null, i64 ${spSize}, i64 ${spStart.v}, i64 ${spCount.v}, ptr ${insData}, i64 ${insLen}, ptr ${dst})`)
+        cgOut(`  call void @festina_array_splice_insert(ptr ${obj.v}, ptr ${cgArrayCapacityArg(obj)}, i64 ${spSize}, i64 ${spStart.v}, i64 ${spCount.v}, ptr ${insData}, i64 ${insLen}, ptr ${dst})`)
         // The call may have realloc'd this array's own data buffer, so
         // its pointer is reloaded AFTER it rather than reused.
         text nowP = cgTmp()
@@ -5202,7 +5356,7 @@ Val func cgMethodCall(e:Node, callee:Node) {
             cgOut(`  store ${elemLty} ${stored}, ptr ${slot}`)
             text fn = 'festina_array_push'
             if m == 'unshift' { fn = 'festina_array_unshift' }
-            cgOut(`  call void @${fn}(ptr ${obj.v}, ptr null, i64 ${elemSize}, ptr ${slot})`)
+            cgOut(`  call void @${fn}(ptr ${obj.v}, ptr ${cgArrayCapacityArg(obj)}, i64 ${elemSize}, ptr ${slot})`)
             // JS hands back the new length, and reading it costs one
             // load -- emitted whether or not anything wants it.
             text lenP = cgTmp()
@@ -5221,7 +5375,7 @@ Val func cgMethodCall(e:Node, callee:Node) {
         cgOut(`  store ${elemLty} ${cgNullValue(obj.ety)}, ptr ${slot}`)
         text fn = 'festina_array_pop'
         if m == 'shift' { fn = 'festina_array_shift' }
-        cgOut(`  call i8 @${fn}(ptr ${obj.v}, ptr null, i64 ${elemSize}, ptr ${slot})`)
+        cgOut(`  call i8 @${fn}(ptr ${obj.v}, ptr ${cgArrayCapacityArg(obj)}, i64 ${elemSize}, ptr ${slot})`)
         text out = cgTmp()
         cgOut(`  ${out} = load ${elemLty}, ptr ${slot}`)
         if obj.ety == 'text' { return cgVal(out, 'ptr', 'text') }
@@ -6996,6 +7150,12 @@ void func cgStmt(s:Node) {
             // as the program might still reach it, and escaping-ness is
             // exactly the bound this compiler no longer gets to set.
             if manual { stackable = false }
+            // claude.md #174: nor is an amortized array. Its whole
+            // point is a buffer that outgrows what the declaration
+            // could reserve, and a frame slot cannot be handed to
+            // realloc.
+            bool declAmor = dt.amortized
+            if declAmor { stackable = false }
             if linit != null {
                 // claude.md #81 covers both container literals, and
                 // only a literal: the entry count of a `{ ... }` is as
@@ -7008,6 +7168,7 @@ void func cgStmt(s:Node) {
                     stackable = false
                 }
             }
+            if declAmor { L_AMOR[gname] = 1 }
             if linit != null && stackable {
                 // The header is built straight into the frame slot:
                 // zeroed first (an empty literal never writes a data
@@ -7015,13 +7176,14 @@ void func cgStmt(s:Node) {
                 // only then published to the binding's own slot.
                 cgOut(`  ${backing} = alloca ${payload}`)
                 cgOut(`  store ${payload} zeroinitializer, ptr ${backing}`)
-                if managed == 'arr' { cgArrayLit(linit, declEty, backing) }
+                if managed == 'arr' { cgArrayLit(linit, declEty, backing, false) }
                 else { cgMapLit(linit, declEty, backing) }
                 if CG_STUCK { return }
                 cgOut(`  ${slot} = alloca ptr`)
                 cgOut(`  store ptr ${backing}, ptr ${slot}`)
                 cgTrackLive(`${managed}.stack`, slot, declEty)
             } else if linit != null {
+                CG_EXPECT_AMOR = declAmor
                 Val lv = cgExprExpecting(linit, managed, declEty)
                 if CG_STUCK { return }
                 if lv.fty != managed {
@@ -12453,6 +12615,9 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                     if ft.elem != null {
                         SF_ETY[key] = cgEtyOfTy(ft)
                     }
+                }
+                if ft != null {
+                    if ft.amortized { SF_AMOR[key] = 1 }
                 }
                 fi++
             }
