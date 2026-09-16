@@ -673,6 +673,27 @@ void func analyzeRecordDecl(label:text, n:Node) {
         Node f = fs[i]
         Ty t = resolveTypeField(f, 'type_expr')
         t = applyManaged(t, rawBool(f, 'manually_managed'))
+        // claude.md #332: `weak` is a struct field only, and only on a
+        // field of struct type. A table field is a database COLUMN,
+        // read back out of sqlite rather than referred to in memory, so
+        // there is nothing for a weak reference to point at; and a weak
+        // edge is defined in terms of a struct reference, both for the
+        // checked read and for the cycle walk that skips it. The
+        // position reported is the RECORD's, matching the original --
+        // a field carries no line of its own, deliberately, since every
+        // node's attributes are what the AST dump prints.
+        if rawBool(f, 'weak') {
+            bool okWeak = false
+            if label == 'STRUCT' {
+                if t != null {
+                    if t.kind == 'struct' { okWeak = true }
+                }
+            }
+            if okWeak == false {
+                semFail(rawInt(n, 'line'), rawInt(n, 'column'))
+                return
+            }
+        }
         if i > 0 { out = out + '|' }
         out = out + rawText(f, 'name') + ':' + dumpType(t)
         i++

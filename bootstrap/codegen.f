@@ -835,6 +835,11 @@ struct Val {
     //
     // Spelled `isAmor` because `amor` is a keyword.
     isAmor:bool
+    // claude.md #332: whether this is a pointer TO a `weak` field's
+    // slot. Travels on the Val because cgFieldPtr is the only place
+    // that knows the owner's name, and the load, the store and the
+    // release cascade all need the answer afterwards.
+    isWeak:bool
 }
 
 Val func cgVal(v:text, lty:text, fty:text) {
@@ -1259,6 +1264,26 @@ map[text] SF_ETY = {}
 // answers a different question, and every reader of that would
 // otherwise have to strip a prefix it does not care about.
 map[int] SF_AMOR = {}
+
+// claude.md #332: which struct fields are `weak`. Keyed `Struct.field`
+// like every other per-field table. A weak field holds its target
+// without keeping it alive, its read is checked rather than plain, and
+// -- the reason the feature exists -- cycle collection neither walks
+// the edge nor counts it when deciding whether a type can form a cycle.
+map[int] SF_WEAK = {}
+
+// Struct names some declared weak field points AT. Only these pay the
+// free-time notification that makes every weak reference to them read
+// null from then on, which is what keeps a program with no weak field
+// paying nothing (specification.md 13.5).
+map[int] SF_WEAK_TARGET = {}
+
+// Whether this program declares any weak field at all. Gates the four
+// runtime declarations: emitting them unconditionally costs nothing at
+// runtime and still changes the IR of every module, which in a
+// byte-exact differential test is the whole of the difference between
+// paying nothing and paying something.
+bool CG_USES_WEAK = false
 
 // Structs every one of whose fields is a scalar. Only those can have a
 // LOCAL yet: a struct with a struct/arr/map/text field is released
@@ -3024,6 +3049,7 @@ Val func cgFieldPtr(e:Node) {
     if SF_FTY[key] == 'struct' || SF_FTY[key] == 'enum' { r.sname = SF_SNAME[key] }
     if SF_ETY[key] != null { r.ety = SF_ETY[key] }
     if SF_AMOR[key] != null { r.isAmor = true }
+    if SF_WEAK[key] != null { r.isWeak = true }
     // The base travels with the pointer, because a READ through a base
     // this expression owns has to mint the field's own ownership
     // before that base is released -- see cgMemberRead. A WRITE uses
@@ -3064,6 +3090,21 @@ text func cgFieldPayload(fp:Val) {
 // EnumDecl is itself unported, so no program reaching here has an enum
 // at all. Porting enums means porting the tagged header with them.
 Val func cgLoadFieldValue(fp:Val) {
+    // claude.md #332: the slot holds the weak BLOCK, not the object, so
+    // the read is a load plus an upgrade -- and deliberately not the
+    // auto-vivify path below. Creating a value here would create one
+    // nothing owns, freed at once and read back as null anyway;
+    // specification.md 8.9.2 names this as its one exception.
+    if fp.isWeak {
+        text wblk = cgTmp()
+        cgOut(`  ${wblk} = load ptr, ptr ${fp.v}`)
+        text wout = cgTmp()
+        cgOut(`  ${wout} = call ptr @festina_weak_get(ptr ${wblk})`)
+        Val wv = cgVal(wout, 'ptr', fp.fty)
+        wv.sname = fp.sname
+        wv.ety = fp.ety
+        return wv
+    }
     text payload = cgFieldPayload(fp)
     if payload == '' {
         text plain = cgTmp()
@@ -9304,6 +9345,23 @@ void func cgAssign(e:Node) {
             cgOut(`  store ptr ${stored}, ptr ${fp.v}`)
             return
         }
+        // claude.md #332: a weak field stores the BLOCK, and takes no
+        // reference -- that is the whole meaning of the modifier. The
+        // indirection that was there before is dropped, after the store
+        // rather than before it, for the same reason the refcounted
+        // path below defers its release.
+        if fp.isWeak {
+            Node wvalue = childOf(e, 'value')
+            Val wv = cgExprExpecting(wvalue, fp.fty, cgRelKeyVal(fp))
+            if CG_STUCK { return }
+            text wblk = cgTmp()
+            cgOut(`  ${wblk} = call ptr @festina_weak_ref(ptr ${wv.v})`)
+            text wold = cgTmp()
+            cgOut(`  ${wold} = load ptr, ptr ${fp.v}`)
+            cgOut(`  store ptr ${wblk}, ptr ${fp.v}`)
+            cgOut(`  call void @festina_weak_drop(ptr ${wold})`)
+            return
+        }
         if cgIsRefcounted(fp.fty) {
             Node rvalue = childOf(e, 'value')
             Val rv = cgExprExpecting(rvalue, fp.fty, cgRelKeyVal(fp))
@@ -9662,8 +9720,15 @@ text func cgReleaseFnFor(fty:text, ety:text) {
     // even owning nothing of its own -- its real allocation base sits
     // sixteen bytes back from the payload, not eight, so the generic
     // release would free the wrong address entirely.
+    // claude.md #332: and so does a struct some weak field points at,
+    // for the same shape of reason -- the wrapper is the only place
+    // that knows this type's free is the moment every weak reference to
+    // it has to start reading null. Without it the generic release
+    // frees the value and nothing tells the weak blocks, which is
+    // exactly the dangling read `weak` exists to prevent.
     if fty == 'struct' {
-        if cgStructOwnsAnything(ety) || CG_TAGGED[ety] != null {
+        if cgStructOwnsAnything(ety) || CG_TAGGED[ety] != null
+                || SF_WEAK_TARGET[ety] != null {
             return cgReleaseStructFn(ety)
         }
     }
@@ -9882,6 +9947,18 @@ void func cgReleaseStructFields(objPtr:text, sname:text) {
         text f = SF_FTY[key]
         bool managed = cgIsRefcounted(f)
         if f == 'text' { managed = true }
+        // claude.md #332: a weak field owns its BLOCK and not the
+        // object, so freeing this struct drops the indirection and
+        // leaves the target's own lifetime exactly where it was. This
+        // is the line that makes `weak` mean what it says.
+        if SF_WEAK[key] != null { managed = false }
+        if SF_WEAK[key] != null {
+            text wfp = cgTmp()
+            cgOut(`  ${wfp} = getelementptr %struct.${sname}, ptr ${objPtr}, i32 0, i32 ${SF_IDX[key]}`)
+            text wfv = cgTmp()
+            cgOut(`  ${wfv} = load ptr, ptr ${wfp}`)
+            cgOut(`  call void @festina_weak_drop(ptr ${wfv})`)
+        }
         if managed {
             // decisions.md #284: a text FIELD goes through
             // festina_free_z rather than plain free, and this is the
@@ -10024,8 +10101,17 @@ arr[text] func cgManagedChildren(key:text) {
     while i < names.length {
         text fk = `${key}.${names[i]}`
         text f = SF_FTY[fk]
-        if f == 'struct' || f == 'arr' || f == 'map' {
-            out.push(cgTypeKey(f, cgFieldEty(fk)))
+        // claude.md #332: a `weak` field is not an edge in this graph.
+        // It holds its target without keeping it alive, so it can never
+        // be the reference that keeps a cycle afloat -- which is the
+        // only question this walk asks. Skipping it is what lets a
+        // parent pointer stop making its own type cyclic, and with it
+        // the detector, the traversals and the per-release trial all
+        // disappear.
+        if SF_WEAK[fk] == null {
+            if f == 'struct' || f == 'arr' || f == 'map' {
+                out.push(cgTypeKey(f, cgFieldEty(fk)))
+            }
         }
         i++
     }
@@ -10129,9 +10215,17 @@ arr[text] func cgCycleStructChildren(sname:text) {
     while i < names.length {
         text fk = `${sname}.${names[i]}`
         text f = SF_FTY[fk]
-        if f == 'struct' || f == 'arr' || f == 'map' {
-            text ck = cgTypeKey(f, cgFieldEty(fk))
-            if cgIsCyclic(ck) { out.push(`${SF_IDX[fk]}|${ck}`) }
+        // claude.md #332: skipped here too, and this is the half that
+        // costs the time. Dropping it from cgManagedChildren alone only
+        // changes whether the TYPE reads as cyclic -- a Node that still
+        // reaches itself through `kids` keeps its detector, and a
+        // traversal that still walked `parent` would still climb to the
+        // root and back down the whole document on every release.
+        if SF_WEAK[fk] == null {
+            if f == 'struct' || f == 'arr' || f == 'map' {
+                text ck = cgTypeKey(f, cgFieldEty(fk))
+                if cgIsCyclic(ck) { out.push(`${SF_IDX[fk]}|${ck}`) }
+            }
         }
         i++
     }
@@ -10493,6 +10587,12 @@ text func cgReleaseStructFn(sname:text) {
     // then refcount word, then payload.
     text hdrOff = '-8'
     if CG_TAGGED[sname] != null { hdrOff = '-16' }
+    // claude.md #332: every weak reference aimed here reads null from
+    // now on. Emitted only for a type some weak field actually targets,
+    // so no other program pays for it.
+    if SF_WEAK_TARGET[sname] != null {
+        cgOut('  call void @festina_weak_died(ptr %payload)')
+    }
     cgOut(`  ${hdr} = getelementptr i8, ptr %payload, i64 ${hdrOff}`)
     cgOut(`  call void @festina_free_z(ptr ${hdr})`)
     cgOut(`  br label %${doneL}`)
@@ -14074,9 +14174,39 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     }
     cgEmit('; ModuleID = "festina"')
     cgEmit(`; generated from ${srcPath} -- claude.md #47`)
+    // claude.md #332: whether any weak field is declared has to be
+    // known BEFORE the prelude goes out, and the per-field tables are
+    // not built until the struct walk below -- so this one fact is
+    // scanned for ahead of time. The four declarations are conditional
+    // because emitting them always costs nothing at runtime and still
+    // changes the IR of every module, which in a byte-exact
+    // differential test is the whole of the difference between paying
+    // nothing for a feature and paying something.
+    int ws = 0
+    while ws < body.length {
+        if body[ws].kind == 'StructDecl' {
+            arr[Node] wfs = listOf(body[ws], 'fields')
+            int wf = 0
+            while wf < wfs.length {
+                if rawBool(wfs[wf], 'weak') { CG_USES_WEAK = true }
+                wf++
+            }
+        }
+        ws++
+    }
     int i = 0
     while i < CG_PRE.length {
         cgEmit(CG_PRE[i])
+        // Straight after the last intrinsic, which is where the
+        // original's own list puts them.
+        if CG_PRE[i] == 'declare double @llvm.trunc.f64(double)' {
+            if CG_USES_WEAK {
+                cgEmit('declare ptr @festina_weak_ref(ptr)')
+                cgEmit('declare ptr @festina_weak_get(ptr)')
+                cgEmit('declare void @festina_weak_drop(ptr)')
+                cgEmit('declare void @festina_weak_died(ptr)')
+            }
+        }
         i++
     }
 
@@ -14127,6 +14257,15 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 // field has nothing to spell its argument and return
                 // types with.
                 if ffty == 'func' { SF_ETY[key] = cgFuncSig(ft) }
+                // claude.md #332: recorded here with the rest of the
+                // per-field facts, and the TARGET recorded alongside --
+                // the free-time notification is emitted per released
+                // type, which only the target's own name can select.
+                if rawBool(fs[fi], 'weak') {
+                    SF_WEAK[key] = 1
+                    CG_USES_WEAK = true
+                    if ffty == 'struct' { SF_WEAK_TARGET[ft.name] = 1 }
+                }
                 if ft != null {
                     if ft.amortized { SF_AMOR[key] = 1 }
                 }

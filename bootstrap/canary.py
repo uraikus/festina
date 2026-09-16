@@ -525,7 +525,8 @@ CANARIES = [
         "struct-cascade", "#310",
         "a struct with an owning field needs a generated cascade",
         """    if fty == 'struct' {
-        if cgStructOwnsAnything(ety) || CG_TAGGED[ety] != null {
+        if cgStructOwnsAnything(ety) || CG_TAGGED[ety] != null
+                || SF_WEAK_TARGET[ety] != null {
             return cgReleaseStructFn(ety)
         }
     }""",
@@ -1664,6 +1665,77 @@ CANARIES = [
     'toUpperCase': 'festina_text_to_upper|ptr||text',""",
         """    'toLowerCase': 'festina_text_to_lower|ptr||text',
     'toUpperCase': 'festina_text_to_lower|ptr||text',""",
+    ),
+    # claude.md #332: `weak` fields. Six mechanisms, and the first two
+    # are the ones worth separating -- skipping a weak edge in the TYPE
+    # walk and skipping it in the generated TRAVERSAL are different code
+    # paths, and an implementation can have either one alone. Getting
+    # only the first one produced a compiler that measured exactly as
+    # slow as before.
+    Canary(
+        "weak-edge-is-not-a-cycle-type-edge", "#332",
+        "a weak field does not count when deciding whether a type can "
+        "form a cycle, so a weak-only back edge generates no detector",
+        """        if SF_WEAK[fk] == null {
+            if f == 'struct' || f == 'arr' || f == 'map' {
+                out.push(cgTypeKey(f, cgFieldEty(fk)))
+            }
+        }""",
+        """        if true {
+            if f == 'struct' || f == 'arr' || f == 'map' {
+                out.push(cgTypeKey(f, cgFieldEty(fk)))
+            }
+        }""",
+    ),
+    Canary(
+        "weak-edge-is-not-walked-by-a-trial", "#332",
+        "a trial deletion does not traverse a weak field, so a release "
+        "walks its own subtree rather than the whole document",
+        """        if SF_WEAK[fk] == null {
+            if f == 'struct' || f == 'arr' || f == 'map' {
+                text ck = cgTypeKey(f, cgFieldEty(fk))
+                if cgIsCyclic(ck) { out.push(`${SF_IDX[fk]}|${ck}`) }
+            }
+        }""",
+        """        if true {
+            if f == 'struct' || f == 'arr' || f == 'map' {
+                text ck = cgTypeKey(f, cgFieldEty(fk))
+                if cgIsCyclic(ck) { out.push(`${SF_IDX[fk]}|${ck}`) }
+            }
+        }""",
+    ),
+    Canary(
+        "weak-read-is-checked", "#332",
+        "reading a weak field upgrades through its block rather than "
+        "loading the slot, which is what lets it answer null",
+        """        cgOut(`  ${wout} = call ptr @festina_weak_get(ptr ${wblk})`)""",
+        """        cgOut(`  ${wout} = load ptr, ptr ${wblk}`)""",
+    ),
+    Canary(
+        "weak-store-takes-no-reference", "#332",
+        "storing to a weak field stores the block and retains nothing",
+        """            cgOut(`  ${wblk} = call ptr @festina_weak_ref(ptr ${wv.v})`)""",
+        """            cgOut(`  call void @festina_retain(ptr ${wv.v})`)
+            text wblk2 = wblk
+            cgOut(`  ${wblk} = call ptr @festina_weak_ref(ptr ${wv.v})`)""",
+    ),
+    Canary(
+        "weak-field-release-drops-only-its-block", "#332",
+        "freeing a struct drops its weak field's block and leaves the "
+        "target's own lifetime alone",
+        """            cgOut(`  call void @festina_weak_drop(ptr ${wfv})`)""",
+        """            cgOut(`  call void @festina_release(ptr ${wfv})`)""",
+    ),
+    Canary(
+        "a-weak-target-tells-its-blocks-it-died", "#332",
+        "a struct some weak field points at notifies its blocks on free, "
+        "which is the whole of the no-dangling-read guarantee",
+        """    if SF_WEAK_TARGET[sname] != null {
+        cgOut('  call void @festina_weak_died(ptr %payload)')
+    }""",
+        """    if false {
+        cgOut('  call void @festina_weak_died(ptr %payload)')
+    }""",
     ),
 ]
 BY_NAME = {c.name: c for c in CANARIES}

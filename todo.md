@@ -23,15 +23,6 @@ walk is fixed in #332, by `weak` fields — checked on read rather than
 the uncounted raw pointer the report proposed, so they cannot dangle.
 These are what is left, most damaging first.
 
-- **`weak` is ported to `bootstrap/` only as far as the parser.**
-  decisions.md #332 landed the feature in the shipped compiler and in
-  `bootstrap/parser.f` (without which the AST dumps disagree), but not
-  in `bootstrap/semantic.f` or `bootstrap/codegen.f` — so the
-  self-hosted compiler parses a weak field and cannot compile one. No
-  corpus file declares one, which is what keeps every harness green and
-  is also why nothing measures the feature: a `cases/weak_fields.f` is
-  the other half, and it cannot be added until the port is done or it
-  would land as the corpus's first unported file.
 - **A struct-typed field can never read as `null`.** A struct, array or
   map field is created empty the first time it is *reached*, including
   by `== null`, so `if node.next != null` is always true and
@@ -270,12 +261,12 @@ included:
 
 | | |
 |---|---|
-| lexer | 125 match, 0 differ |
-| parser | 125 match, 0 differ, 0 unported |
-| semantic | 125 match, 0 differ, 0 unported |
-| escape analysis | 114 match, 0 differ, 0 unported — 2,232 of 2,232 records |
-| codegen | 114 match, 0 differ, 0 unported — 420,357 of 420,357 IR lines |
-| canaries | 147 registered, 0 missed — 140 caught, 7 via the ratchet |
+| lexer | 126 match, 0 differ |
+| parser | 126 match, 0 differ, 0 unported |
+| semantic | 126 match, 0 differ, 0 unported |
+| escape analysis | 115 match, 0 differ, 0 unported — 2,240 of 2,240 records |
+| codegen | 115 match, 0 differ, 0 unported — 423,147 of 423,147 IR lines |
+| canaries | 153 registered, 0 missed — 146 caught, 7 via the ratchet |
 
 All ten of the bootstrap's own files reproduce their own compilation
 byte for byte, and the second-generation binary built from that IR is

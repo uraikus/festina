@@ -6961,15 +6961,22 @@ position, straight after a field's ':', at the cost of one token of
 lookahead. `amor` is the cautionary precedent: reserving a common
 noun costs every program that name forever to buy one modifier.
 
-**What is NOT done, stated plainly.** `weak` is implemented in the
-shipped compiler and, in `bootstrap/`, in the PARSER only -- enough for
-the AST dump to agree, since a parser that silently dropped real syntax
-would be matching its original by leaving something out. The
-bootstrap's semantic analysis and codegen do not implement it, so the
-self-hosted compiler parses a weak field and cannot yet compile one.
-Nothing measures the feature differentially either: no corpus file
-declares a weak field, which is exactly the condition that makes the
-"pays nothing" claim testable and also the condition that leaves the
-mechanism itself unmeasured by every harness. A `cases/weak_fields.f`
-plus the semantic/codegen port is the follow-up, and until it lands the
-16 tests in `tests/test_weak_fields.py` are the whole of the evidence.
+**Ported, and then actually measured.** The feature landed in the
+shipped compiler first and in `bootstrap/` one pass at a time: the
+parser immediately -- a parser that silently dropped real syntax would
+be matching its original by leaving something out -- then semantic
+analysis and codegen. `bootstrap/cases/weak_fields.f` is what turns
+that from a claim into a measurement, and it could not be written until
+the port was done or it would have landed as the corpus's first
+unported file. With it the self-hosted compiler reproduces every weak
+construct byte for byte: 126 files, 423,147 of 423,147 IR lines.
+
+**Six canaries, because two of the six mechanisms are easy to
+conflate.** Skipping a weak edge in the TYPE walk and skipping it in
+the generated TRAVERSAL are separate code paths, and an implementation
+can have either alone -- having only the first is what produced a
+compiler that measured exactly as slow as before. All six are caught,
+each on the case file written for it, which the report says out loud.
+Adding the weak-target exception to `cgReleaseFnFor` also went stale on
+`struct-cascade`'s anchor, which the registry reported as BROKEN rather
+than passing; re-aimed.
