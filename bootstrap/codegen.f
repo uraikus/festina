@@ -1136,6 +1136,19 @@ map[text] L_SLOT = {}
 map[text] L_FTY = {}
 map[text] FN_RET = {}
 
+// claude.md #202: `T?` -- the slots whose bookkeeping this compiler
+// does not do.
+//
+// A manually-managed binding's RUNTIME REPRESENTATION is byte for byte
+// an ordinary one's; that is the whole point of the feature, and it is
+// why the flag is not part of the type. What `?` changes is only the
+// AUTOMATIC parts -- the retain a declaration takes, the release at
+// scope exit, the read-free-store an assignment performs -- so the
+// answer is recorded per SLOT and consulted at exactly the handful of
+// sites that emit those, leaving every type-shape dispatch in this file
+// unaware that `?` exists at all.
+map[int] CG_MANUAL = {}
+
 // Each function's parameter types, joined by `|` -- see the
 // registration site for why a call needs them.
 map[text] FN_PARAMS = {}
@@ -1182,6 +1195,14 @@ map[text] CG_STRUCT_REL = {}
 // claude.md #117/#119. Set on every cgFieldPtr and read immediately by
 // cgMemberRead, so the window in which it is live is one call wide.
 Val CG_FIELD_BASE
+
+// Whether cgFieldPtr's last answer is already the VALUE rather than a
+// pointer to load it from. `img.width`/`img.height` are runtime calls,
+// not field reads -- an img is a pointer to a box whose Cairo surface
+// owns the real dimensions -- so there is nothing to dereference, and a
+// caller that loaded from the returned i64 as though it were an address
+// emitted a wild read that happened to typecheck.
+bool CG_FIELD_DIRECT = false
 
 // A thread's own state names, visible under their PLAIN spelling only
 // while that thread's own bodies are being emitted. This is the tier
@@ -2521,6 +2542,7 @@ Val func cgFieldPtr(e:Node) {
             return none
         }
     }
+    CG_FIELD_DIRECT = false
     Val obj = cgExpr(childOf(e, 'obj'))
     if CG_STUCK { return none }
     // claude.md #92: img.width / img.height -- a runtime CALL rather
@@ -2539,6 +2561,7 @@ Val func cgFieldPtr(e:Node) {
             // an owning receiver -- `sheet.clip(...).width` -- is
             // released here rather than leaked.
             cgReleaseOwnedReceiver(childOf(e, 'obj'), obj)
+            CG_FIELD_DIRECT = true
             return cgVal(wout, 'i64', 'int')
         }
     }
@@ -2759,6 +2782,86 @@ Val func cgArrayLit(e:Node, ety:text, header:text) {
     return cgArrVal(into, ety)
 }
 
+// specification.md §8.9.4: `Person p = {'name': 'a', 'age': 3}`.
+//
+// A fresh instance plus one store per NAMED field, and nothing else.
+// Two things it does not do, both of them consequences of the value
+// being brand new rather than shortcuts:
+//
+//   - **No old value is released.** cgFreshHeader hands back calloc'd
+//     storage, so every field starts null, and semantic.f rejects a
+//     literal naming the same field twice -- so no slot here can
+//     already own something. The load-store-release dance cgAssign's
+//     own field path performs exists for slots that can.
+//   - **An omitted field costs no code at all.** Zero IS the zero
+//     value (§8.9.2), which the calloc already wrote. That is what
+//     makes `Person bare = {}` one call and no stores.
+//
+// The per-field ownership rules are cgAssign's, unchanged: a
+// refcounted field retains unless the value arrived fresh, and a text
+// field COPIES (claude.md #83), so the field holds a buffer it can
+// free outright rather than one shared with a local.
+//
+// Field names are not re-validated beyond the table lookup: semantic.f
+// has already checked every key names a real field of this struct.
+Val func cgStructLit(e:Node, sname:text) {
+    Val none
+    if SF_NAMES[sname] == null {
+        cgUnported(`struct literal of ${sname}`)
+        return none
+    }
+    text into = cgFreshHeader(`%struct.${sname}`)
+    arr[Node] entries = listOf(e, 'entries')
+    int i = 0
+    while i < entries.length {
+        Node k = childOf(entries[i], 'a')
+        if k == null || k.kind != 'StringLit' {
+            cgUnported('struct literal key that is not a name')
+            return none
+        }
+        text fname = rawText(k, 'value')
+        text fk = `${sname}.${fname}`
+        if SF_LTY[fk] == null {
+            cgUnported(`field ${fname} of ${sname}`)
+            return none
+        }
+        text ffty = SF_FTY[fk]
+        // One slot, two meanings, exactly as cgRelKeyVal reads it: a
+        // struct field carries its own type NAME, a container field
+        // its element type.
+        text fkey = ''
+        if SF_ETY[fk] != null { fkey = SF_ETY[fk] }
+        if ffty == 'struct' { fkey = SF_SNAME[fk] }
+        Node vnode = childOf(entries[i], 'b')
+        Val v = cgExprExpecting(vnode, ffty, fkey)
+        if CG_STUCK { return none }
+        text stored = v.v
+        if cgIsRefcounted(ffty) {
+            // The FRESHNESS test rather than the bare owning-source
+            // one, for claude.md #118's reason: a text initializer
+            // coerced into a blob/img/aud field is already a fresh
+            // handle cgExprExpecting's own load minted, and retaining
+            // it again would leak it.
+            bool owning = cgIsOwningRefcountedSource(vnode)
+            if v.fresh { owning = true }
+            if owning == false {
+                cgOut(`  call void @festina_retain(ptr ${stored})`)
+            }
+        } else if ffty == 'text' {
+            if cgOwnsText(vnode, v) == false {
+                text owned = cgTmp()
+                cgOut(`  ${owned} = call ptr @festina_text_own(ptr ${stored})`)
+                stored = owned
+            }
+        }
+        text slot = cgTmp()
+        cgOut(`  ${slot} = getelementptr %struct.${sname}, ptr ${into}, i32 0, i32 ${SF_IDX[fk]}`)
+        cgOut(`  store ${SF_LTY[fk]} ${stored}, ptr ${slot}`)
+        i++
+    }
+    return cgStructVal(into, sname)
+}
+
 // An expression in a position whose type is already known, which is
 // what festina/codegen.py's own _emit_value_for is for. Only an array
 // literal actually needs it -- `[]` and `[1, 2]` carry no element type
@@ -2805,6 +2908,14 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
         }
     }
     if e.kind == 'MapLit' {
+        // §8.9.4: a struct literal, checked BEFORE the map path,
+        // because a map literal wants one value type across every
+        // entry and a struct's field set generally cannot supply one.
+        // The two share the `{...}` spelling and are told apart only
+        // by the type this position already expects -- which is why
+        // every struct literal in the language reaches code through
+        // here and nowhere else.
+        if fty == 'struct' { return cgStructLit(e, ety) }
         if fty != 'map' {
             Val none
             cgUnported(`map literal in a ${fty} position`)
@@ -3392,6 +3503,12 @@ Val func cgMemberRead(e:Node) {
     Val none
     Val fp = cgFieldPtr(e)
     if CG_STUCK { return none }
+    // Already a value, with its receiver already released -- there is
+    // nothing left for this function to load or to own.
+    if CG_FIELD_DIRECT {
+        CG_FIELD_DIRECT = false
+        return fp
+    }
     Val base = CG_FIELD_BASE
     if cgLtyOf(fp.fty) == '' {
         cgUnported(`read of a ${fp.fty} field`)
@@ -3770,13 +3887,19 @@ Val func cgToText(a:Val) {
         cgOut(`  ${out} = call ptr @festina_ascii_to_text(ptr ${a.v})`)
         return cgVal(out, 'ptr', 'text')
     }
-    // claude.md #114: a struct or container renders as JSON, through
-    // the walker generated for its own type. The builder is a runtime
-    // value that owns its buffer until it is finished, which is what
-    // makes the recursive append cheap: one allocation for the whole
-    // rendering rather than one per piece.
-    if a.fty == 'struct' || a.fty == 'arr' || a.fty == 'map' {
-        text key = cgTypeKey(a.fty, cgRelKeyVal(a))
+    // claude.md #114: a struct, a row or a container renders as JSON,
+    // through the walker generated for its own type. The builder is a
+    // runtime value that owns its buffer until it is finished, which is
+    // what makes the recursive append cheap: one allocation for the
+    // whole rendering rather than one per piece.
+    //
+    // A row is keyed by its TABLE NAME, spelled bare exactly as a
+    // struct name is -- the two share one namespace, so the key cannot
+    // collide, and TBL_COLS is what tells the walker which shape it is
+    // generating for.
+    if a.fty == 'struct' || a.fty == 'table' || a.fty == 'arr' || a.fty == 'map' {
+        text key = cgRelKeyVal(a)
+        if a.fty == 'arr' || a.fty == 'map' { key = cgTypeKey(a.fty, key) }
         text fn = cgJsonFn(key)
         text sb = cgTmp()
         cgOut(`  ${sb} = call ptr @festina_sb_new()`)
@@ -5006,6 +5129,17 @@ Val func cgMethodCall(e:Node, callee:Node) {
         if CG_STUCK { return none }
         text base = ''
         if h.fty == 'blob' { base = 'festina_blob' }
+        // An img and an aud take the identical pair, against their own
+        // runtime. Only the feature flag differs: saving an image links
+        // the graphics object, saving a clip links the audio one.
+        if h.fty == 'img' {
+            base = 'festina_image'
+            CG_USES_GRAPHICS_CODE = true
+        }
+        if h.fty == 'aud' {
+            base = 'festina_audio'
+            CG_USES_AUDIO = true
+        }
         if base == '' {
             cgUnported(`.${m}() on ${h.fty}`)
             return none
@@ -5292,10 +5426,10 @@ Val func cgMethodCall(e:Node, callee:Node) {
         cgReleaseOwnedReceiver(recv, again)
         return cgVal(bt, 'ptr', 'text')
     }
-    // A struct or container renders as JSON, through the same
+    // A struct, a row or a container renders as JSON, through the same
     // cgToText a template interpolation uses -- one path rather than
     // two that could drift apart.
-    if r.fty == 'struct' || r.fty == 'arr' || r.fty == 'map' {
+    if r.fty == 'struct' || r.fty == 'table' || r.fty == 'arr' || r.fty == 'map' {
         Val t = cgToText(r)
         if CG_STUCK { return none }
         cgReleaseOwnedReceiver(recv, r)
@@ -6231,10 +6365,11 @@ void func cgStmt(s:Node) {
         // already enforced by the time anything reaches here. Codegen
         // never consults the flag at all, so a const declaration emits
         // exactly what the same declaration without it would.
-        if fieldOf(s, 'manually_managed').raw == 'true' {
-            cgUnported('manually-managed declaration')
-            return
-        }
+        //
+        // claude.md #202: `T?` is the opposite -- read here, once, and
+        // carried into each branch below. Nothing about WHAT is emitted
+        // depends on it; only the bookkeeping around what is emitted.
+        bool manual = fieldOf(s, 'manually_managed').raw == 'true'
         text fty = cgDeclFty(s)
         if fty == '' {
             Ty dt = resolveTypeField(s, 'type_expr')
@@ -6271,7 +6406,7 @@ void func cgStmt(s:Node) {
                     cgUnported(`${managed} global of a non-scalar type`)
                     return
                 }
-                Val gv = cgExprExpecting(ginit, managed, cgEtyOf(gname))
+                Val gv = cgExprExpecting(ginit, managed, cgRelKeyOf(gname))
                 if CG_STUCK { return }
                 if gv.fty != managed {
                     cgUnported(`initializer of type ${gv.fty} for ${managed}`)
@@ -6279,6 +6414,16 @@ void func cgStmt(s:Node) {
                 }
                 bool gOwning = cgIsOwningRefcountedSource(ginit)
                 if gv.fresh { gOwning = true }
+                // claude.md #202: a manually-managed global's slot is
+                // not touched by the bookkeeping at all -- no release
+                // of whatever the globals section left there, no
+                // retain of the new value. The STORE still happens,
+                // exactly as it would without the flag.
+                if manual {
+                    CG_MANUAL[G_SLOT[gname]] = 1
+                    cgOut(`  store ptr ${gv.v}, ptr ${G_SLOT[gname]}`)
+                    return
+                }
                 cgStoreRefcounted(G_SLOT[gname], managed, cgRelKeyOf(gname),
                                   gv.v, gOwning)
                 return
@@ -6318,6 +6463,13 @@ void func cgStmt(s:Node) {
                 // port is for, and the note is kept here rather than
                 // deleted because "the original does this" is not on
                 // its own a reason, and this is the case that proved it.
+                // claude.md #202: `T?` never auto-retains at its
+                // declaration, aliased initializer or not. The binding
+                // shares whatever single reference the initializer
+                // already held -- or, when that value was born fresh,
+                // the one it came with -- and only an explicit `free`
+                // or `clear` will ever give it back.
+                if manual { bOwning = true }
                 if bOwning == false {
                     cgOut(`  call void @festina_retain(ptr ${bv.v})`)
                 }
@@ -6328,7 +6480,10 @@ void func cgStmt(s:Node) {
                 // purpose.
                 text bkey = ''
                 if managed == 'table' { bkey = dt.name }
-                cgTrackLive(managed, bslot, bkey)
+                // claude.md #202: and it is never tracked, so scope
+                // exit walks straight past it.
+                if manual { CG_MANUAL[bslot] = 1 }
+                else { cgTrackLive(managed, bslot, bkey) }
                 L_SLOT[gname] = bslot
                 L_FTY[gname] = managed
                 if managed == 'table' { L_SNAME[gname] = dt.name }
@@ -6380,6 +6535,12 @@ void func cgStmt(s:Node) {
             text slot = `%${gname}.${uid}`
             text backing = `%${gname}.storage.${uid}`
             bool stackable = cgEscapes(gname) == false
+            // claude.md #202: a manually-managed value is NEVER frame
+            // storage, whatever escape analysis concluded. It needs a
+            // stable, independently freeable heap address for as long
+            // as the program might still reach it, and escaping-ness is
+            // exactly the bound this compiler no longer gets to set.
+            if manual { stackable = false }
             if linit != null {
                 // claude.md #81 covers both container literals, and
                 // only a literal: the entry count of a `{ ... }` is as
@@ -6414,12 +6575,16 @@ void func cgStmt(s:Node) {
                 }
                 bool lOwning = cgIsOwningRefcountedSource(linit)
                 if lv.fresh { lOwning = true }
+                // claude.md #202: no retain at the declaration and no
+                // tracking afterwards -- see the blob branch above.
+                if manual { lOwning = true }
                 if lOwning == false {
                     cgOut(`  call void @festina_retain(ptr ${lv.v})`)
                 }
                 cgOut(`  ${slot} = alloca ptr`)
                 cgOut(`  store ptr ${lv.v}, ptr ${slot}`)
-                cgTrackLive(managed, slot, declEty)
+                if manual { CG_MANUAL[slot] = 1 }
+                else { cgTrackLive(managed, slot, declEty) }
             } else if stackable {
                 cgOut(`  ${backing} = alloca ${payload}`)
                 cgOut(`  store ${payload} zeroinitializer, ptr ${backing}`)
@@ -6442,7 +6607,8 @@ void func cgStmt(s:Node) {
                 text made = cgFreshHeader(payload)
                 cgOut(`  ${slot} = alloca ptr`)
                 cgOut(`  store ptr ${made}, ptr ${slot}`)
-                cgTrackLive(managed, slot, declEty)
+                if manual { CG_MANUAL[slot] = 1 }
+                else { cgTrackLive(managed, slot, declEty) }
             }
             L_SLOT[gname] = slot
             L_FTY[gname] = managed
@@ -6472,6 +6638,12 @@ void func cgStmt(s:Node) {
         if isLocalDecl {
             localSlot = `%${name}.${cgUid()}`
             cgOut(`  ${localSlot} = alloca ${lty}`)
+            // claude.md #202: recorded before anything below consults
+            // it. A scalar `T?` is a no-op either way -- there is no
+            // bookkeeping for an int -- but a `text?` skips both the
+            // scope-exit free and the in-place append path, which is
+            // what the record is read for.
+            if manual { CG_MANUAL[localSlot] = 1 }
             if fty == 'text' {
                 // claude.md #243's append shadow gets storage of its
                 // own and is initialized empty. The allocas are hoisted
@@ -6482,7 +6654,7 @@ void func cgStmt(s:Node) {
                 cgOut(`  ${localSlot}.aplen = alloca i64`)
                 cgOut(`  store ptr null, ptr ${localSlot}.ap`)
                 cgOut(`  store i64 0, ptr ${localSlot}.aplen`)
-                cgTrackLiveLate('text', localSlot, '')
+                if manual == false { cgTrackLiveLate('text', localSlot, '') }
             }
             freshLocal = true
         }
@@ -6492,7 +6664,9 @@ void func cgStmt(s:Node) {
             // so this is already "after the store" (there is none).
             if isLocalDecl { cgBindLocalDecl(s, name, fty, localSlot) }
             if fty == 'text' {
-                if freshLocal { cgCleanupPush('text', cgSlotOf(name), '') }
+                if freshLocal && manual == false {
+                    cgCleanupPush('text', cgSlotOf(name), '')
+                }
             }
             return
         }
@@ -6524,7 +6698,7 @@ void func cgStmt(s:Node) {
                     owned = o
                 }
                 cgOut(`  store ptr ${owned}, ptr ${cgSlotOf(name)}`)
-                cgCleanupPush('text', cgSlotOf(name), '')
+                if manual == false { cgCleanupPush('text', cgSlotOf(name), '') }
                 return
             }
             cgStoreText(cgSlotOf(name), `${cgSlotOf(name)}.ap`, v,
@@ -6741,6 +6915,31 @@ void func cgSqliteBind(paramsNode:Node, stmt:text) {
             text z = cgTmp()
             cgOut(`  ${z} = zext i8 ${pv.v} to i64`)
             cgOut(`  call void @festina_sqlite_bind_int(ptr ${stmt}, i32 ${idx}, i64 ${z})`)
+        } else if pv.fty == 'blob' || pv.fty == 'img' || pv.fty == 'aud' {
+            // claude.md #101/#109: all three bind as their own encoded
+            // BYTES, so a query stores the file rather than a pointer.
+            // They read naturally as one branch rather than as a
+            // special case: each is "content plus the bytes it came
+            // from", so each stores its bytes. Only the accessor and
+            // the feature flag differ -- a blob's lives in the core
+            // runtime and needs no flag at all.
+            text bfn = 'festina_blob_bytes'
+            if pv.fty == 'img' {
+                bfn = 'festina_image_bytes'
+                CG_USES_GRAPHICS_CODE = true
+            }
+            if pv.fty == 'aud' {
+                bfn = 'festina_audio_bytes'
+                CG_USES_AUDIO = true
+            }
+            text lenSlot = cgTmp()
+            cgOut(`  ${lenSlot} = alloca i64`)
+            cgOut(`  store i64 0, ptr ${lenSlot}`)
+            text dataP = cgTmp()
+            cgOut(`  ${dataP} = call ptr @${bfn}(ptr ${pv.v}, ptr ${lenSlot})`)
+            text blen = cgTmp()
+            cgOut(`  ${blen} = load i64, ptr ${lenSlot}`)
+            cgOut(`  call void @festina_sqlite_bind_blob(ptr ${stmt}, i32 ${idx}, ptr ${dataP}, i64 ${blen})`)
         } else {
             cgUnported(`sqlite() parameter of type ${pv.fty}`)
             return
@@ -7512,7 +7711,7 @@ void func cgAssign(e:Node) {
         }
         if cgIsRefcounted(fp.fty) {
             Node rvalue = childOf(e, 'value')
-            Val rv = cgExprExpecting(rvalue, fp.fty, fp.ety)
+            Val rv = cgExprExpecting(rvalue, fp.fty, cgRelKeyVal(fp))
             if CG_STUCK { return }
             text old = cgTmp()
             cgOut(`  ${old} = load ptr, ptr ${fp.v}`)
@@ -7567,7 +7766,11 @@ void func cgAssign(e:Node) {
     // Checked BEFORE the value is emitted: the append path consumes the
     // target's own old buffer instead of building a new one, so the
     // ordinary emission must not have happened yet.
-    if fty == 'text' {
+    //
+    // claude.md #202: a manually-managed `text?` is not eligible. The
+    // append path rewrites the buffer the binding holds, which is a
+    // decision about a value this compiler no longer owns.
+    if fty == 'text' && CG_MANUAL[slot] == null {
         arr[Node] pieces = cgAppendPieces(name, value)
         if pieces.length > 0 {
             cgEmitAppendAssign(slot, pieces)
@@ -7575,9 +7778,14 @@ void func cgAssign(e:Node) {
         }
     }
 
-    Val v = cgExprExpecting(value, fty, cgEtyOf(name))
+    Val v = cgExprExpecting(value, fty, cgRelKeyOf(name))
     if CG_STUCK { return }
     if fty == 'text' {
+        // A manually-managed text still copies and frees on
+        // reassignment: `text?` hands over the SCOPE-EXIT release, not
+        // the copy-on-alias rule (claude.md #83) that makes a text
+        // binding's buffer exclusively its own. The two are
+        // independent, and only the first is what `?` names.
         cgStoreText(slot, `${slot}.ap`, v, cgOwnsText(value, v))
         return
     }
@@ -7588,6 +7796,14 @@ void func cgAssign(e:Node) {
         }
         bool owning = cgIsOwningRefcountedSource(value)
         if v.fresh { owning = true }
+        // claude.md #202: the slot is not touched by the bookkeeping --
+        // no release of what it held, no retain of what replaces it.
+        // The store itself still runs, exactly as it would without the
+        // flag.
+        if CG_MANUAL[slot] != null {
+            cgOut(`  store ptr ${v.v}, ptr ${slot}`)
+            return
+        }
         cgStoreRefcounted(slot, fty, cgRelKeyOf(name), v.v, owning)
         return
     }
@@ -7763,6 +7979,14 @@ bool func cgValIsElem(v:Val, ety:text) {
 Val func cgExprExpectingElem(e:Node, ety:text) {
     if cgIsNestedElem(ety) {
         return cgExprExpecting(e, cgKeyFty(ety), cgKeyEty(ety))
+    }
+    // §8.9.4: a struct literal in an element position -- `arr[Person]
+    // crowd = [{...}]`. Spelled as the (fty, key) pair a literal needs,
+    // and ONLY for a literal: every other expression keeps reaching
+    // cgExprExpecting with the element type in the fty slot, which is
+    // what the non-literal paths below it already expect.
+    if e != null && e.kind == 'MapLit' {
+        if SF_NAMES[ety] != null { return cgExprExpecting(e, 'struct', ety) }
     }
     return cgExprExpecting(e, ety, '')
 }
@@ -8499,12 +8723,13 @@ void func cgCycleTrial(key:text, aliveL:text, doneL:text) {
 // so was never strdup'd at all.
 text func cgTableRowReleaseFn(tname:text) {
     if CG_ROW_REL[tname] != null { return CG_ROW_REL[tname] }
-    // A blob/img/aud column is a heap pointer too, but not a plain
-    // buffer -- the runtime decoded the stored BLOB into a real handle
-    // and freeing it needs that type's own destructor. Refused rather
-    // than freed wrongly, and refused HERE rather than at the
-    // declaration, so a table with such a column can still be synced
-    // by a program that never queries it.
+    // claude.md #101/#109: a blob/img/aud column is a heap pointer too,
+    // but not a plain buffer -- the runtime decoded the stored BLOB
+    // into a real handle, and freeing it needs that type's own
+    // destructor. An img owns a Cairo surface and an aud owns its
+    // decoded PCM, neither of which @free releases; a blob owns its
+    // path and byte buffer and carries a refcount besides. Each gets
+    // its own call rather than the plain free a text column takes.
     arr[text] pre = TBL_TYPES[tname].split('|')
     int pi = 0
     while pi < TBL_NCOLS[tname] {
@@ -8542,12 +8767,17 @@ text func cgTableRowReleaseFn(tname:text) {
     int n = TBL_NCOLS[tname]
     int i = 0
     while i < n {
-        if ctypes[i] == 'text' {
+        text colFree = ''
+        if ctypes[i] == 'text' { colFree = '@free' }
+        if ctypes[i] == 'blob' { colFree = '@festina_blob_release' }
+        if ctypes[i] == 'img' { colFree = '@festina_image_free' }
+        if ctypes[i] == 'aud' { colFree = '@festina_audio_free' }
+        if colFree != '' {
             text slot = cgTmp()
             cgOut(`  ${slot} = getelementptr i64, ptr %row, i64 ${i}`)
             text v = cgTmp()
             cgOut(`  ${v} = load ptr, ptr ${slot}`)
-            cgOut(`  call void @free(ptr ${v})`)
+            cgOut(`  call void ${colFree}(ptr ${v})`)
         }
         i++
     }
@@ -8877,9 +9107,11 @@ void func cgJsonSlot(sb:text, fty:text, key:text, slot:text, depth:text) {
         cgOut(`  call void @festina_sb_append_json_text(ptr ${sb}, ptr ${v})`)
         return
     }
-    if fty == 'struct' || fty == 'arr' || fty == 'map' {
+    if fty == 'struct' || fty == 'table' || fty == 'arr' || fty == 'map' {
         cgOut(`  ${v} = load ptr, ptr ${slot}`)
-        text inner = cgJsonFn(cgTypeKey(fty, key))
+        text ik = key
+        if fty == 'arr' || fty == 'map' { ik = cgTypeKey(fty, key) }
+        text inner = cgJsonFn(ik)
         text d = cgTmp()
         cgOut(`  ${d} = add i64 ${depth}, 1`)
         cgOut(`  call void ${inner}(ptr ${v}, ptr ${sb}, i64 ${d})`)
@@ -8921,7 +9153,74 @@ text func cgJsonFn(key:text) {
     cgOut(`  br i1 ${toodeep}, label %${nullL}, label %${goL}`)
     cgBlockLabel(goL)
 
-    if kf == 'struct' {
+    // claude.md #111: a row is flat 8-byte cells with a presence mask
+    // one slot past the last column, and an UNDEFINED column is
+    // OMITTED -- exactly what JSON.stringify does with an undefined
+    // property, which is the analogy #111 was built on. That omission
+    // is why a row cannot borrow the struct branch's comma placement:
+    // which column comes first is not known until run time, so the
+    // separator has to be decided from a flag the loop carries rather
+    // than from the index.
+    if TBL_COLS[ke] != null {
+        arr[text] cnames = TBL_COLS[ke].split('|')
+        arr[text] ctypes = TBL_TYPES[ke].split('|')
+        int ncols = TBL_NCOLS[ke]
+        text firstSlot = cgTmp()
+        cgOut(`  ${firstSlot} = alloca i8`)
+        cgOut(`  store i8 1, ptr ${firstSlot}`)
+        cgSbConst('%sb', '{')
+        text maskP = cgTmp()
+        cgOut(`  ${maskP} = getelementptr i8, ptr %v, i64 ${ncols * 8}`)
+        text mask = cgTmp()
+        cgOut(`  ${mask} = load i64, ptr ${maskP}`)
+        int ci = 0
+        while ci < ncols {
+            text skipL = cgLabel(`json.skip${ci}`)
+            text emitL = cgLabel(`json.emit${ci}`)
+            text csepL = cgLabel(`json.sep${ci}`)
+            text ckeyL = cgLabel(`json.key${ci}`)
+            // The mask holds one bit per column and an int is 64 bits
+            // wide, so a table past its sixty-fourth column has no bit
+            // to test and its columns are always rendered.
+            if ci < 64 {
+                text bit = cgTmp()
+                cgOut(`  ${bit} = and i64 ${mask}, ${1 << ci}`)
+                text present = cgTmp()
+                cgOut(`  ${present} = icmp ne i64 ${bit}, 0`)
+                cgOut(`  br i1 ${present}, label %${emitL}, label %${skipL}`)
+            } else {
+                cgOut(`  br label %${emitL}`)
+            }
+            cgBlockLabel(emitL)
+            text fst = cgTmp()
+            cgOut(`  ${fst} = load i8, ptr ${firstSlot}`)
+            text isFirst = cgTmp()
+            cgOut(`  ${isFirst} = icmp ne i8 ${fst}, 0`)
+            cgOut(`  br i1 ${isFirst}, label %${ckeyL}, label %${csepL}`)
+            cgBlockLabel(csepL)
+            cgSbConst('%sb', ',')
+            cgOut(`  br label %${ckeyL}`)
+            cgBlockLabel(ckeyL)
+            cgOut(`  store i8 0, ptr ${firstSlot}`)
+            cgSbConst('%sb', `${cgDq()}${cnames[ci]}${cgDq()}:`)
+            text slot = cgTmp()
+            cgOut(`  ${slot} = getelementptr i8, ptr %v, i64 ${ci * 8}`)
+            if ctypes[ci] == 'bool' {
+                // A column stores a bool in a full i64 cell carrying
+                // the INT null sentinel -- not the i8-with-2 form a
+                // struct field uses, so it needs its own appender.
+                text bv = cgTmp()
+                cgOut(`  ${bv} = load i64, ptr ${slot}`)
+                cgOut(`  call void @festina_sb_append_json_bool64(ptr %sb, i64 ${bv})`)
+            } else {
+                cgJsonSlot('%sb', ctypes[ci], '', slot, '%depth')
+            }
+            cgOut(`  br label %${skipL}`)
+            cgBlockLabel(skipL)
+            ci++
+        }
+        cgSbConst('%sb', '}')
+    } else if kf == 'struct' {
         arr[text] fnames = []
         if SF_NAMES[ke] != '' { fnames = SF_NAMES[ke].split('|') }
         int i = 0
@@ -8984,6 +9283,7 @@ text func cgJsonFn(key:text) {
         text efty = ke
         text ekey = ''
         if SF_NAMES[ke] != null { efty = 'struct'  ekey = ke }
+        else if TBL_COLS[ke] != null { efty = 'table'  ekey = ke }
         else if cgIsNestedElem(ke) { efty = cgKeyFty(ke)  ekey = cgKeyEty(ke) }
         cgJsonSlot('%sb', efty, ekey, ep, '%depth')
         text nx = cgTmp()
@@ -9058,6 +9358,7 @@ text func cgJsonFn(key:text) {
         text vfty = ke
         text vkey = ''
         if SF_NAMES[ke] != null { vfty = 'struct'  vkey = ke }
+        else if TBL_COLS[ke] != null { vfty = 'table'  vkey = ke }
         else if cgIsNestedElem(ke) { vfty = cgKeyFty(ke)  vkey = cgKeyEty(ke) }
         cgJsonSlot('%sb', vfty, vkey, vslot, '%depth')
         cgOut(`  store i8 1, ptr ${emittedSlot}`)
@@ -9534,7 +9835,14 @@ void func cgReturn(s:Node) {
     // covers a ternary or field read a name-based exclusion never
     // could.
     if cgIsRefcounted(r.fty) {
-        if cgIsOwningRefcountedSource(v) == false {
+        // decisions.md #322's rule again: freshness belongs to the
+        // VALUE, not only to the expression. `return 'x.png'` in a blob
+        // function reads as a string literal, which owns nothing, and
+        // holds a handle the coercion just minted, which owns
+        // everything -- so the node-only test alone retains a reference
+        // nobody ever gives back. Unreachable until a corpus file
+        // returned a coerced handle, which media_churn.f does.
+        if cgIsOwningRefcountedSource(v) == false && r.fresh == false {
             cgOut(`  call void @festina_retain(ptr ${val})`)
         }
     } else if r.fty == 'text' {
