@@ -918,6 +918,53 @@ class TestHttpClient:
         assert result.returncode == 0, result.stdout
         assert f"127.0.0.1:{server.port}" in result.stdout
 
+    def test_a_large_response_does_not_wait_for_the_read_timeout(
+            self, compile_and_run_server, compile_and_run):
+        # claude.md #331: the read loop cached the end of the header
+        # block as a POINTER into the response buffer, and that buffer
+        # is realloc'd as the body grows. Once it moved, `body_start`
+        # was computed from a stale address and came out as a wrapped
+        # garbage offset, so "have I got Content-Length bytes yet" was
+        # false forever and the read ran until the socket timeout. A
+        # 640 KB page that curl fetches in milliseconds cost tens of
+        # seconds. Reported by uraikus/archtelos-browser.
+        #
+        # TWO requests, deliberately: one is enough to expose the bug,
+        # but the wait ends at whichever of the peer's close and the
+        # 30s SO_RCVTIMEO comes first, and the first of those is close
+        # enough to this fixture's own 15s budget to be a race. Two
+        # puts the broken case far past it and leaves the fixed one at
+        # a tenth of a second.
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) {
+            text unit = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n'
+            req.send({'body': unit.repeat(10000)})
+        }
+        """)
+        source = f"""
+        http a = {{'url': 'http://127.0.0.1:{server.port}/', 'method': 'GET'}}
+        a.send()
+        http b = {{'url': 'http://127.0.0.1:{server.port}/', 'method': 'GET'}}
+        b.send()
+        log(`${{a.code}} ${{a.toText().length}} ${{b.code}} ${{b.toText().length}}`)
+        """
+        started = time.monotonic()
+        try:
+            result = compile_and_run(source)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                "two 640 KB responses did not finish inside the fixture's "
+                "15s budget -- the read loop is waiting for a timeout it "
+                "should not need, which is the whole of this bug")
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0, result.stdout
+        assert "200 640000 200 640000" in result.stdout
+        # Generous: this includes compiling the client. The two fetches
+        # themselves are ~0.1s fixed and ~30s broken, so anything in
+        # between is a real regression rather than a slow machine.
+        assert elapsed < 12, f"took {elapsed:.1f}s"
+
     def test_client_send_to_an_unreachable_host_throws(self, compile_and_run):
         # claude.md #162: a genuine network failure -- DNS/connect/TLS --
         # throws via the existing throw/catch mechanism (claude.md #157),

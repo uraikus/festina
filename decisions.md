@@ -6816,3 +6816,64 @@ actually writes" -- it had pinned the bug, deliberately and in
 writing, while testing something else. Its own subject, that a
 caller's hand-built `host` loses to the runtime's, is unchanged and
 still asserted; only the spelling it incidentally recorded moved.
+
+331. A POINTER INTO A BUFFER THAT MOVES
+
+**A 640 KB response took 15 seconds; `curl` fetched the same page in
+7 milliseconds.** Reported by uraikus/archtelos-browser as "a response
+over 64 KiB takes thirty seconds", and reproduced here at 15.021s
+against this project's own server -- the difference being only which
+comes first, the peer's close or the 30s `SO_RCVTIMEO`. Either way the
+read was waiting for a timeout it had no need of.
+
+**The diagnosis in the report was wrong, and worth recording as
+wrong.** It read "the client read loop ends at EOF; a keep-alive server
+never sends one", with the fix given as "end the read at
+`Content-Length`". But `festina_client_read_response` already ended at
+`Content-Length` -- #248 wrote it for exactly that reason, and its own
+doc comment says so. The symptom matched the theory perfectly and the
+theory was still not what was happening.
+
+**`hdr_end` was a pointer into a buffer that gets realloc'd.** The end
+of the header block was found once and cached, and the response buffer
+doubles as the body arrives. The moment realloc moved it, `hdr_end`
+pointed into the old allocation, and `body_start`, computed as
+`hdr_end - *buf + 4`, became a subtraction between two unrelated
+allocations. Instrumented rather than reasoned about:
+
+    len=131072 buf=0x55dc9089a680 hdr_end=0x55dc9089a6c4 body_start=72
+    len=262144 buf=0x7f6159cee010 hdr_end=0x55dc9089a6c4 body_start=18446698423420372664
+
+From there `have_body` was 0 for the rest of the read, so "have I got
+Content-Length bytes yet" was false no matter how many arrived.
+
+**Which is why it was a SIZE threshold and not a server-behaviour
+one.** realloc extends in place until it cannot; 8 KiB through 128 KiB
+kept the same address and worked, and the jump to 256 KiB moved it.
+"Over 64 KiB" was the reporter observing the allocator, not the
+protocol.
+
+**Nothing could have caught it automatically.** The stale pointer is
+only ever used in arithmetic, never dereferenced, so there is no access
+for ASan to trap -- confirmed by running the reproducing client under
+the leak harness, which reports `ok`. The compiler has nothing to warn
+about either. A response that is merely SLOW, and correct when it
+finally arrives, is invisible to every assertion this suite had.
+
+**The server side had already learned this.** `FestinaHttpConn` caches
+`body_start_offset`, an offset, with a comment explaining that
+re-deriving it from `hdr_end` would mean rescanning. The client reader,
+written later, cached the pointer instead. The fix makes the client do
+what the server does: keep `hdr_end_off`, and re-derive the pointer
+inside the single iteration that uses it, where no realloc can
+intervene.
+
+**Verified.** 15.021s to 0.005s on the reproducing case, and the test
+is two sequential 640 KB fetches rather than one -- one exposes the bug
+but ends at whichever of the peer's close and the read timeout comes
+first, which is close enough to the fixture's own 15s budget to be a
+race; two puts the broken case far past it. It fails before this
+change with the message it was written to give. All 101 tests in
+tests/test_http.py pass, chunked transfer included -- that path set its
+offset in the same iteration the pointer was still valid, so it was
+never affected.

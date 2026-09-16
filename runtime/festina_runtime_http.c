@@ -3557,7 +3557,20 @@ static void festina_client_read_response(FestinaClientTransport *t, uint8_t **bu
     *out_reusable = 0;
 
     size_t header_scan_pos = 0;
-    const char *hdr_end = NULL; /* start of the "\r\n\r\n" once found */
+    /* claude.md #331: an OFFSET, not a pointer. `*buf` is realloc'd
+     * every time the body outgrows it, so a pointer saved when the
+     * header block was found dangles the moment the buffer moves --
+     * and it is only ever used to compute `body_start`, so nothing
+     * dereferences it and neither the compiler nor ASan has anything
+     * to complain about. What happened instead was a subtraction
+     * between two unrelated allocations: `body_start` came out as a
+     * wrapped garbage offset, `have_body` was 0 for the rest of the
+     * read, and a response with a perfectly good Content-Length was
+     * read until the socket timed out. Small responses were unaffected
+     * because realloc extends in place until the buffer has to move,
+     * which is why this only showed above ~64 KiB. */
+    int have_hdr_end = 0;
+    size_t hdr_end_off = 0;    /* offset of the "\r\n\r\n" once found */
     int64_t content_length = -1;
     int is_chunked = 0;
     int explicit_close = 0;
@@ -3592,7 +3605,7 @@ static void festina_client_read_response(FestinaClientTransport *t, uint8_t **bu
         }
         *len += (size_t)n;
 
-        if (!hdr_end) {
+        if (!have_hdr_end) {
             /* claude.md #155's own resumable-scan trick (see
              * festina_try_parse_request), applied here for the
              * identical reason: avoid rescanning already-scanned bytes
@@ -3601,11 +3614,15 @@ static void festina_client_read_response(FestinaClientTransport *t, uint8_t **bu
             for (size_t i = scan_start; i + 3 < *len; i++) {
                 if ((*buf)[i] == '\r' && (*buf)[i + 1] == '\n'
                         && (*buf)[i + 2] == '\r' && (*buf)[i + 3] == '\n') {
-                    hdr_end = (const char *)*buf + i;
+                    hdr_end_off = i;
+                    have_hdr_end = 1;
                     break;
                 }
             }
-            if (!hdr_end) { header_scan_pos = *len; continue; }
+            if (!have_hdr_end) { header_scan_pos = *len; continue; }
+            /* Re-derived from `*buf` inside this iteration only, which
+             * is the whole point -- no realloc can intervene here. */
+            const char *hdr_end = (const char *)*buf + hdr_end_off;
 
             is_http_1_0 = (*len >= 8 && memcmp(*buf, "HTTP/1.0", 8) == 0);
             const char *hdr_line_start = memchr((const char *)*buf, '\n',
@@ -3613,7 +3630,7 @@ static void festina_client_read_response(FestinaClientTransport *t, uint8_t **bu
             hdr_line_start = hdr_line_start ? hdr_line_start + 1 : (const char *)*buf;
             festina_client_scan_head(hdr_line_start, hdr_end, &content_length,
                                      &is_chunked, &explicit_close);
-            if (is_chunked) chunk_scan_pos = (size_t)(hdr_end - (const char *)*buf) + 4;
+            if (is_chunked) chunk_scan_pos = hdr_end_off + 4;
         }
 
         if (is_chunked) {
@@ -3634,7 +3651,7 @@ static void festina_client_read_response(FestinaClientTransport *t, uint8_t **bu
         }
 
         if (content_length >= 0) {
-            size_t body_start = (size_t)(hdr_end - (const char *)*buf) + 4;
+            size_t body_start = hdr_end_off + 4;
             size_t have_body = *len > body_start ? *len - body_start : 0;
             if (have_body >= (size_t)content_length) {
                 *out_reusable = !explicit_close && !is_http_1_0;

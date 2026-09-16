@@ -346,6 +346,21 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **A large response waited for the read timeout instead of finishing.**
+  A 640 KB page took 15 seconds against this project's own server, where
+  `curl` fetched it in 7 milliseconds. The read loop cached the end of
+  the header block as a **pointer** into the response buffer, and that
+  buffer is `realloc`'d as the body grows — once it moved, the offset of
+  the body was computed by subtracting two unrelated allocations, came
+  out as a wrapped garbage value, and "have I received `Content-Length`
+  bytes yet" stayed false however many arrived. It showed above roughly
+  64 KiB because `realloc` extends in place until it cannot, so the
+  threshold was the allocator's rather than the protocol's. Now 0.005s.
+  Reported by
+  [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser)
+  — though not with this cause; the read loop already ended at
+  `Content-Length`, as the report suggested it should.
+  (decisions.md #331)
 - **The query string was dropped from every outbound request.**
   `req.send()` built its request line from the URL's path alone, so
   `http://host/page?a=1` went out as `GET /page`. The specification

@@ -17,16 +17,10 @@ decisions.md #326 (the `ascii` aliasing use-after-free, `==` on two
 struct references, `ascii.toInt()`). The dropped query string is fixed
 in decisions.md #330, which also fixed a `Host` header that omitted a
 non-default port and a leak on a repeated query key, both found while
-verifying it. These are what is left, most damaging first.
+verifying it; the thirty-second read is fixed in #331, where the cause
+turned out not to be the one reported. These are what is left, most
+damaging first.
 
-- **A response over 64 KiB takes thirty seconds.** The client read loop
-  ends at EOF; a keep-alive server never sends one, so the 30-second
-  `SO_RCVTIMEO` is what actually ends the read. A 640 KB page that
-  `curl` fetches in 53 ms costs 30.8 s. End the read at
-  `Content-Length` when the response declares one, and at the
-  terminating zero-length chunk when it is chunked — both are already
-  parsed in the same file. Keep the timeout as the backstop it was
-  meant to be.
 - **Releasing a live alias walks everything reachable from it.** A
   value whose TYPE can participate in a cycle runs a synchronous trial
   deletion on release, so binding a child to a local inside a loop
