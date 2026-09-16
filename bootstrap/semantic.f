@@ -931,6 +931,17 @@ void func analyzeArrow(s:Scope, e:Node) {
     int col = rawInt(e, 'column')
     text name = '__festina_arrow_' + ARROW_N.toText()
     ARROW_N++
+    // claude.md #142: the synthesized name is recorded ON THE NODE, so
+    // codegen emits the same function this analysis just declared
+    // rather than re-deriving a name from a counter of its own. The
+    // original stashes the whole synthesized FuncDecl here; this port
+    // stores only the name and rebuilds the declaration where it is
+    // needed, which is the same arrangement with less to keep in step.
+    //
+    // Mutating the node during analysis is safe for every harness: the
+    // parser dump is taken before this runs, and the semantic dump is
+    // a record sequence rather than a tree.
+    addStr(e, 'arrow_name', name)
     define(GLOBAL_SCOPE, name, returnTypeOf(e), 'function', line, col)
     Scope inner = childScope(s)
     defineParams(inner, listOf(e, 'params'), line, col)

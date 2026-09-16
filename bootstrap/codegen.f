@@ -2114,6 +2114,19 @@ Val func cgExpr(e:Node) {
     // would silently keep serving the first pattern forever.
     if e.kind == 'RegexLit' { return cgRegexLit(e) }
 
+    // claude.md #142: an arrow function is an ordinary function under a
+    // synthesized name, emitted WHERE ITS EXPRESSION IS REACHED rather
+    // than hoisted -- it has no name a forward reference could spell,
+    // so it only needs to exist by the time this expression does. The
+    // name was fixed during semantic analysis and travels on the node,
+    // so both stages emit the same function rather than each deriving
+    // a name from a counter of its own.
+    //
+    // This is what makes cgFunc re-entrant a requirement rather than a
+    // nicety: the call below happens in the middle of the enclosing
+    // body, whose buffer, locals and live list are all still in use.
+    if e.kind == 'ArrowFuncExpr' { return cgArrowFunc(e) }
+
     if e.kind == 'BinOp' { return cgBinOp(e) }
     if e.kind == 'LogicalOp' { return cgLogical(e) }
     if e.kind == 'UnaryOp' { return cgUnary(e) }
@@ -7518,7 +7531,18 @@ void func cgAssign(e:Node) {
             cgOut(`  call void ${cgReleaseFnFor(fp.fty, cgRelKeyVal(fp))}(ptr ${old})`)
             return
         }
-        if fp.fty != 'int' && fp.fty != 'float' && fp.fty != 'bool' {
+        // claude.md #141: `func`, `font` and `color` join the plain
+        // store. All three are scalar-shaped and IMMORTAL -- a function
+        // pointer and a font record both live for the process, and a
+        // colour is a packed integer -- so none of them has a reference
+        // to claim or an old value to release, which is the only thing
+        // the refcounted path above exists to do. Only `func` was
+        // actually needed (a struct holding a callback, which is what
+        // cases/arrow_numbering.f is built on); the other two are the
+        // same shape and were refused for no reason beyond never having
+        // been reached.
+        if fp.fty != 'int' && fp.fty != 'float' && fp.fty != 'bool'
+                && fp.fty != 'func' && fp.fty != 'font' && fp.fty != 'color' {
             cgUnported(`assignment to a ${fp.fty} field`)
             return
         }
@@ -10525,7 +10549,172 @@ void func cgMainOnMessage(d:Node) {
 // Emitted into CG_FUNCS before main is emitted at all, because the
 // shared temp/label/uid counters must reach them first.
 
+// One function's signature, registered. Split out of cgProgram's own
+// hoisting pass because an ARROW function needs the identical
+// registration at the point its expression is reached (claude.md #142)
+// -- it has no name a forward reference could spell, so it is never
+// part of the up-front pass, but everything a call site needs to know
+// about it is the same.
+void func cgRegisterFuncSignature(d:Node) {
+    Ty rt = resolveTypeField(d, 'return_type')
+    text rf = 'void'
+    text rkey = ''
+    if rt != null {
+        if rt.kind == 'prim' { rf = rt.name }
+        else { rf = '' }
+        // A struct/container return is one `ptr` whatever it holds,
+        // exactly like a parameter -- but the release a call result
+        // eventually gets depends on WHICH, so the second half of the
+        // key travels with it.
+        if rf == '' || cgLtyOf(rf) == '' {
+            text managedR = cgManagedFty(rt)
+            if managedR != '' {
+                rf = managedR
+                if rt.kind == 'struct' { rkey = rt.name }
+                else if rt.elem != null { rkey = rt.elem.name }
+            }
+        }
+    }
+    if rf == 'void' || cgLtyOf(rf) != '' || cgIsRefcounted(rf) {
+        FN_RETKEY[rawText(d, 'name')] = rkey
+    }
+    if rf == 'void' || cgLtyOf(rf) != '' || cgIsRefcounted(rf) {
+        text fname = rawText(d, 'name')
+        FN_RET[fname] = rf
+        // The parameter types too, joined -- a `null` ARGUMENT has no
+        // type of its own and takes the parameter's, so a call site
+        // needs the signature and not just the return. An entry is ''
+        // for a parameter whose type this port does not spell, which
+        // falls back to the untyped null exactly as the original does.
+        arr[Node] ps = listOf(d, 'params')
+        text joined = ''
+        int pi = 0
+        while pi < ps.length {
+            if pi > 0 { joined = joined + '|' }
+            joined = joined + cgDeclFty(ps[pi])
+            pi++
+        }
+        FN_PARAMS[fname] = joined
+        // claude.md #141: and the whole signature, encoded, so a bare
+        // reference to this name can become a first-class VALUE with a
+        // callable type. Separate from FN_PARAMS because that one
+        // deliberately spells a non-scalar parameter as '' and a call
+        // through a value cannot.
+        FN_SIG[fname] = cgSigOfDeclNode(d)
+    }
+}
+
+// The arrow functions emitted so far, so a repeated reference to the
+// same one does not emit it twice.
+map[int] CG_ARROWS = {}
+
+// One field copied from one node to another, whichever shape it has.
+// A type field is raw for a plain named type and a node for a compound
+// one, and a synthesized declaration has to carry whichever the source
+// node had rather than assuming either.
+void func cgCopyField(dst:Node, src:Node, name:text) {
+    Field f = fieldOf(src, name)
+    if f.tag == 'raw' { addRaw(dst, name, f.raw) }
+    else if f.tag == 'node' { addNode(dst, name, f.node) }
+    else if f.tag == 'list' { addList(dst, name, f.list) }
+}
+
+// The synthesized declaration an arrow function compiles to, and the
+// first-class value naming it. Built here rather than in the analyzer
+// because the analyzer is a checker that annotates nothing else, and
+// the NAME is the only part of it codegen cannot re-derive on its own.
+//
+// A void arrow's body is an ExprStmt -- the value is discarded -- and a
+// non-void one's is a Return. That asymmetry is the language's own:
+// `return <expr>` inside a void function is already a compile error, so
+// the shape shown in the request would not typecheck as written.
+Val func cgArrowFunc(e:Node) {
+    Val none
+    text name = rawText(e, 'arrow_name')
+    if name == '' {
+        cgUnported('an arrow function the analyzer did not name')
+        return none
+    }
+    text sym = `@${name}`
+    if CG_ARROWS[name] == null {
+        CG_ARROWS[name] = 1
+        Node blk = mk('Block')
+        arr[Node] stmts = []
+        Node bodyExpr = childOf(e, 'body')
+        // A plain named type is stored as a RAW field rather than a
+        // node (see addType), so the return type is copied field-and-
+        // all rather than fetched as a child -- and the void test reads
+        // the raw text, which is the only spelling it ever has.
+        if rawText(e, 'return_type') == 'void' {
+            Node es = mk('ExprStmt')
+            addNode(es, 'expr', bodyExpr)
+            stmts.push(es)
+        } else {
+            Node rs = mk('Return')
+            addNode(rs, 'value', bodyExpr)
+            addInt(rs, 'line', rawInt(e, 'line'))
+            addInt(rs, 'column', rawInt(e, 'column'))
+            stmts.push(rs)
+        }
+        addList(blk, 'body', stmts)
+        Node d = mk('FuncDecl')
+        addStr(d, 'name', name)
+        cgCopyField(d, e, 'return_type')
+        addList(d, 'params', listOf(e, 'params'))
+        addNode(d, 'body', blk)
+        addInt(d, 'line', rawInt(e, 'line'))
+        addInt(d, 'column', rawInt(e, 'column'))
+        cgRegisterFuncSignature(d)
+        CG_FN_SYMBOL = sym
+        cgFunc(d)
+        if CG_STUCK { return none }
+    }
+    return cgFuncVal(sym, FN_SIG[name])
+}
+
+// claude.md #142: the save/restore wrapper. cgFuncBody has half a dozen
+// early returns -- an unspellable parameter type, an escape analysis
+// that gave up -- and every one of them used to leave the caller's
+// buffer, scope and live list pointing at the abandoned function's.
+// That is invisible for a TOP-LEVEL body, whose caller resets all of it
+// anyway, and immediately fatal for a nested one: the enclosing body
+// went on emitting into the inner function's buffer and resolving its
+// own parameters against the inner function's empty scope, reporting
+// them as unknown names. Found by a nested arrow inside another arrow's
+// own body, which is the shape cases/arrow_numbering.f exists for.
+//
+// L_SNAME/L_ETY are deliberately not here: cgFuncBody does not reset
+// them either, so saving them would change behaviour for every
+// ordinary function rather than only for a nested one.
 void func cgFunc(d:Node) {
+    arr[text] wCur = CUR
+    map[text] wLSlot = L_SLOT
+    map[text] wLFty = L_FTY
+    arr[text] wLive = CG_LIVE
+    arr[int] wFrame = CG_FRAME
+    arr[text] wParamLive = CG_PARAM_LIVE
+    bool wInFunc = CG_IN_FUNC
+    text wBlock = CG_BLOCK
+    bool wTerm = CG_TERM
+    text wFn = CG_FUNC_NAME
+    text wRet = CG_FUNC_RET
+    map[int] wEsc = CG_ESC
+    cgFuncBody(d)
+    CUR = wCur
+    L_SLOT = wLSlot
+    L_FTY = wLFty
+    CG_LIVE = wLive
+    CG_FRAME = wFrame
+    CG_PARAM_LIVE = wParamLive
+    CG_IN_FUNC = wInFunc
+    CG_BLOCK = wBlock
+    CG_TERM = wTerm
+    CG_FUNC_NAME = wFn
+    CG_FUNC_RET = wRet
+    CG_ESC = wEsc
+}
+
+void func cgFuncBody(d:Node) {
     text name = rawText(d, 'name')
     text symbol = `@${name}`
     if CG_FN_SYMBOL != '' {
@@ -10562,6 +10751,14 @@ void func cgFunc(d:Node) {
         text psname = ''
         text pety = ''
         text plty = cgLtyOf(pf)
+        // claude.md #141/#142: a `func` PARAMETER carries its signature
+        // in the element-type slot, exactly as a func LOCAL does (see
+        // cgBindLocalDecl) -- without it a call through the parameter
+        // has nothing to spell the argument and return types with, and
+        // was refused. Only locals had ever been given it, because
+        // until an arrow function existed nothing passed a function
+        // as an argument.
+        if pf == 'func' { pety = cgFuncSig(resolveTypeField(params[i], 'type_expr')) }
         if pf == '' {
             // A struct/arr[T]/map[T] parameter: one `ptr` in the
             // signature whatever it holds, so the caller's side needs
@@ -10630,7 +10827,7 @@ void func cgFunc(d:Node) {
         cgUnported(`escape analysis: expression ${ESC_UNKNOWN_KIND}`)
         return
     }
-    map[int] savedEsc = CG_ESC
+    // The wrapper puts CG_ESC back; this only installs this body's own.
     CG_ESC = escSet
 
     // Into a buffer of this function's OWN, appended to CG_FUNCS only
@@ -10645,8 +10842,6 @@ void func cgFunc(d:Node) {
     arr[text] body = []
     CUR = body
     CG_IN_FUNC = true
-    text savedFn = CG_FUNC_NAME
-    text savedRet = CG_FUNC_RET
     CG_FUNC_NAME = name
     CG_FUNC_RET = retF
     if sigOverride != '' { joined = sigOverride }
@@ -10743,10 +10938,6 @@ void func cgFunc(d:Node) {
         CG_FUNCS.push(body[b])
         b++
     }
-    CG_IN_FUNC = false
-    CG_FUNC_NAME = savedFn
-    CG_FUNC_RET = savedRet
-    CG_ESC = savedEsc
 
     // claude.md #74 stage 2: registered AFTER the body, so a LATER
     // function's own analysis can exempt a call argument this one
@@ -11027,56 +11218,7 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // (claude.md #58) is a language rule, not an ordering accident.
     int fs2 = 0
     while fs2 < body.length {
-        if body[fs2].kind == 'FuncDecl' {
-            Ty rt = resolveTypeField(body[fs2], 'return_type')
-            text rf = 'void'
-            text rkey = ''
-            if rt != null {
-                if rt.kind == 'prim' { rf = rt.name }
-                else { rf = '' }
-                // A struct/container return is one `ptr` whatever it
-                // holds, exactly like a parameter -- but the release a
-                // call result eventually gets depends on WHICH, so the
-                // second half of the key travels with it.
-                if rf == '' || cgLtyOf(rf) == '' {
-                    text managedR = cgManagedFty(rt)
-                    if managedR != '' {
-                        rf = managedR
-                        if rt.kind == 'struct' { rkey = rt.name }
-                        else if rt.elem != null { rkey = rt.elem.name }
-                    }
-                }
-            }
-            if rf == 'void' || cgLtyOf(rf) != '' || cgIsRefcounted(rf) {
-                FN_RETKEY[rawText(body[fs2], 'name')] = rkey
-            }
-            if rf == 'void' || cgLtyOf(rf) != '' || cgIsRefcounted(rf) {
-                text fname = rawText(body[fs2], 'name')
-                FN_RET[fname] = rf
-                // The parameter types too, joined -- a `null` ARGUMENT
-                // has no type of its own and takes the parameter's, so
-                // a call site needs the signature and not just the
-                // return. An entry is '' for a parameter whose type
-                // this port does not spell, which falls back to the
-                // untyped null exactly as the original does.
-                arr[Node] ps = listOf(body[fs2], 'params')
-                text joined = ''
-                int pi = 0
-                while pi < ps.length {
-                    if pi > 0 { joined = joined + '|' }
-                    joined = joined + cgDeclFty(ps[pi])
-                    pi++
-                }
-                FN_PARAMS[fname] = joined
-                // claude.md #141: and the whole signature, encoded, so
-                // a bare reference to this name can become a
-                // first-class VALUE with a callable type. Separate
-                // from FN_PARAMS because that one deliberately spells
-                // a non-scalar parameter as '' and a call through a
-                // value cannot.
-                FN_SIG[fname] = cgSigOfDeclNode(body[fs2])
-            }
-        }
+        if body[fs2].kind == 'FuncDecl' { cgRegisterFuncSignature(body[fs2]) }
         fs2++
     }
 

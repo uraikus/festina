@@ -6733,3 +6733,17 @@ uraikus/archtelos-browser is a browser engine written in Festina, and it exists 
 **Five of the eight names have no other receiver to compete with** (`startsWith`, `endsWith`, `toLowerCase`, `toUpperCase`, `repeat`), so those may emit the receiver before knowing its type. The other three cannot, and the set is named in the code rather than left to be re-derived.
 
 **Verified.** All four harnesses green; codegen 0 differ. Every method clean under valgrind at 2,000 iterations, receiver and arguments both. `cases/text_methods.f` puts every one of them, and a multi-byte version of each index question, in the corpus -- without it nothing measured any of this.
+
+329. ARROW FUNCTIONS, AND A FUNCTION EMITTER THAT COULD NOT BE RE-ENTERED
+
+**358,118 of 371,385 file-specific IR lines -- 96.4% -- and 89 files match, 0 differ**, up from 87.
+
+**An arrow function is an ordinary function under a synthesized name**, emitted WHERE ITS EXPRESSION IS REACHED rather than hoisted: it has no name a forward reference could spell, so it only needs to exist by the time the expression does. The name is fixed during semantic analysis and now travels ON THE NODE, so both stages emit the same function instead of each deriving a name from a counter of its own -- the arrangement the original uses, with only the name stored rather than the whole synthesized declaration.
+
+**Emitting it where the expression is reached is what made cgFunc's re-entrancy a requirement rather than a nicety.** The call lands in the middle of an enclosing body whose buffer, locals, live list and current block are all still in use. CG_ESC had already been saved for exactly this reason, with a comment saying so; nothing else had.
+
+**Half a dozen early returns were the real problem, not the happy path.** An unspellable parameter type or an escape analysis that gave up returns from the middle of cgFunc, and every one of those paths left the caller's state pointing at the abandoned function's. For a TOP-LEVEL body that is invisible -- its caller resets all of it anyway -- and for a nested one it is immediately fatal: the enclosing body went on emitting into the inner function's buffer and resolving its own parameters against the inner function's empty scope. It presented as `read of z`, an "unknown name" for a parameter that was plainly right there. The fix is a wrapper that saves and restores unconditionally, so no early return can skip it.
+
+**Two smaller gaps fell out of the same file.** A `func` PARAMETER never recorded its signature, only a func LOCAL did -- so a call through the parameter had nothing to spell its argument and return types with and was refused. Nothing had ever passed a function as an argument before an arrow existed. And a `func` struct FIELD could not be assigned, because the field-store path allowed only int/float/bool; `func`, `font` and `color` are all scalar-shaped and immortal, with no reference to claim and no old value to release, so they belong on the plain store with them.
+
+**Verified.** Codegen 89 match and 0 differ. `cases/arrow_numbering.f` -- three arrows, one nested inside another's body, which is the file that found every one of these -- matches at 100%.
