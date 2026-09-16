@@ -791,16 +791,46 @@ CANARIES = [
         """            bool isGlobalDecl = false
             if G_SLOT[gname] != null { isGlobalDecl = true }""",
     ),
+    # Three edits, because the property is now over-determined. The
+    # port keeps its scope in GLOBAL maps, where Python keeps it in an
+    # `Env` chained per body and passed down -- so Python cannot leak a
+    # body's names by construction and the port has to unbind them, and
+    # it now does so in three independent places:
+    #
+    #   1. `cgScopeRestore` unbinds everything a block bound, and a
+    #      function body IS a block (block scope, #325).
+    #   2. `cgFunc` saves and restores L_SLOT/L_FTY around cgFuncBody,
+    #      for the nested-function early returns (#142).
+    #   3. main resets them outright, which is what #313 actually fixed.
+    #
+    # Removing any ONE of the three -- or any two -- emits a
+    # byte-identical compiler, so a single-edit canary here reports NOT
+    # CAUGHT and reads like a corpus gap when it is nothing of the kind.
+    # It was a single edit until block scope landed and quietly made it
+    # vacuous; measured, not assumed. What is worth asserting is the
+    # PROPERTY rather than any one of the three spellings of it, so the
+    # canary removes all three and the corpus is asked whether a
+    # compiler with no scope discipline at all would show.
     Canary(
         "main-gets-a-fresh-local-scope", "#313",
         "__festina_main does not inherit the locals of whichever "
         "function was emitted last",
-        """    map[text] mainSlot = {}
+        [
+            ("""    map[text] mainSlot = {}
     map[text] mainFty = {}
     L_SLOT = mainSlot
     L_FTY = mainFty
-""",
-        "",
+""", ""),
+            ("""    L_SLOT = wLSlot
+    L_FTY = wLFty
+""", """    wLSlot = L_SLOT
+    wLFty = L_FTY
+"""),
+            ("""void func cgScopeRestore(mark:int) {
+    while CG_SCOPE_NAMES.length > mark {""",
+             """void func cgScopeRestore(mark:int) {
+    while false {"""),
+        ],
     ),
     Canary(
         "map-keys-is-not-map-values", "#313",

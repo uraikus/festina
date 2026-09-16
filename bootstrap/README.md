@@ -65,9 +65,10 @@ file**:
   both** — 2,224 of 2,224 records.
 - **codegen: 114 match, 0 differ, 0 unported, 11 rejected by both** —
   419,389 of 419,389 file-specific IR lines.
-- **canaries: 147 registered**; the 16 re-aimed after this port and the
-  2 written for it re-measured, all 18 caught. A full-registry sweep is
-  what turns that into "0 missed", and it has not finished yet.
+- **canaries: 147 registered, 0 missed** — 140 caught outright, 7 via
+  the ratchet. The sweep found one that had stopped being a breakage
+  rather than one the corpus could not see; the note below says which
+  and why the two look identical in the report.
 
 The eleven "rejected by both" are programs the front end refuses —
 deliberately ill-formed sources the corpus keeps so that both
@@ -492,10 +493,31 @@ saying whether it is the `cases/` file written for the mechanism (the
 intended arrangement) or something that merely happens to exercise it.
 That distinction came from a pass, not a failure: decisions.md #312's
 seven canaries all fired, and all seven fired on `bootstrap/codegen.f`
-alone. With the check in place, **eleven of the fifty-five have a
-single witness, and in every one of those eleven it is the `cases/`
-file written for the mechanism** — which is the intended arrangement,
-and now a measured fact rather than an assumption.
+alone. With the check in place, **nineteen of the 147 have a single
+witness, and in every one of those nineteen it is the `cases/` file
+written for the mechanism** — which is the intended arrangement, and
+now a measured fact rather than an assumption.
+
+**A canary can also stop being a breakage, which looks exactly like a
+corpus gap and is not one.** Running the whole registry after the port
+closed returned one `NOT CAUGHT`: `main-gets-a-fresh-local-scope`,
+decisions.md #313, whose single edit removed the reset that stops
+`__festina_main` inheriting the locals of whichever function was
+emitted last. The corpus had not drifted. The edit had stopped being
+wrong. The port keeps its scope in global maps where the original
+keeps it in an `Env` chained per body, so the original cannot leak a
+body's names at all and the port has to unbind them — and by then it
+was unbinding them in three independent places: `cgScopeRestore`, since
+a function body is a block; `cgFunc`'s save/restore around
+`cgFuncBody`, added for the nested-function early returns; and #313's
+own reset. Removing any one, or any two, builds a byte-identical
+compiler. The fix was a third edit rather than a corpus file, and the
+canary now asserts the property instead of one of three spellings of
+it: with all three gone it is caught by `examples/hello.f` and
+`tests/stress/media_churn.f`, two ordinary programs and no `cases/`
+file involved. Worth the note because the two failures are
+indistinguishable from the report alone — "the corpus cannot see this"
+and "there is no longer anything to see" both print `NOT CAUGHT`.
 
 Scanning cheapest-first with an early exit is also what keeps the suite
 affordable. Re-dumping the whole matching corpus per canary was about a

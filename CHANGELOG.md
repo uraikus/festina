@@ -73,7 +73,13 @@ round-by-round design and implementation record predating 0.1 lives in
   statement about this corpus rather than about the language — a
   construct no file exercises is unmeasured however carefully both
   sides were written, which is what `bootstrap/canary.py`'s 147
-  deliberate breakages exist to say out loud.
+  deliberate breakages exist to say out loud. All 147 are caught — 140
+  outright, 7 through the coverage ratchet. The sweep also turned up a
+  failure mode the report cannot distinguish on its own: one canary had
+  stopped being a breakage rather than stopped being visible, because
+  block scope gave the port a third independent way to unbind a body's
+  names and removing only one of the three built a byte-identical
+  compiler. `bootstrap/README.md` has the detail.
 
 - **`==`/`!=` between two values of a reference type now means
   identity.** §8.9.1 previously said equality between two structs was
