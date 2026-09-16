@@ -542,8 +542,54 @@ Node func parseEquality() {
 }
 
 Node func parseRelational() {
-    Node left = parseAdditive()
+    Node left = parseBitOr()
     while (atOp('<') || atOp('>') || atOp('<=') || atOp('>=')) && FAILED == false {
+        Tok op = advance()
+        Node right = parseBitOr()
+        left = mkBin(op.val, left, right, op)
+    }
+    return left
+}
+
+// claude.md #327: the three binary bitwise levels, and the shifts, sit
+// BETWEEN the comparisons and `+`/`-` -- so `flags & MASK == 0` groups
+// as `(flags & MASK) == 0`, the reading every use of a bit mask wants.
+// C groups it the other way; Python, Rust and Go all made the same
+// correction this does. The shifts stay BELOW `+`, where C, Python and
+// Rust put them and where Go alone does not.
+Node func parseBitOr() {
+    Node left = parseBitXor()
+    while atOp('|') && FAILED == false {
+        Tok op = advance()
+        Node right = parseBitXor()
+        left = mkBin(op.val, left, right, op)
+    }
+    return left
+}
+
+Node func parseBitXor() {
+    Node left = parseBitAnd()
+    while atOp('^') && FAILED == false {
+        Tok op = advance()
+        Node right = parseBitAnd()
+        left = mkBin(op.val, left, right, op)
+    }
+    return left
+}
+
+Node func parseBitAnd() {
+    Node left = parseShift()
+    while atOp('&') && FAILED == false {
+        Tok op = advance()
+        Node right = parseShift()
+        left = mkBin(op.val, left, right, op)
+    }
+    return left
+}
+
+Node func parseShift() {
+    Node left = parseAdditive()
+    while (atOp('<<') || atOp('>>')) && FAILED == false {
         Tok op = advance()
         Node right = parseAdditive()
         left = mkBin(op.val, left, right, op)
@@ -572,7 +618,9 @@ Node func parseMultiplicative() {
 }
 
 Node func parseUnary() {
-    if atOp('!') || atOp('-') || atOp('+') {
+    // claude.md #327: `~` joins the unary operators at the same level
+    // as `!`, which is where every language that has both puts it.
+    if atOp('!') || atOp('-') || atOp('+') || atOp('~') {
         Tok op = advance()
         Node operand = parseUnary()
         Node n = mk('UnaryOp')

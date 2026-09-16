@@ -225,6 +225,9 @@ _TEXT = types_mod.PrimitiveType("text")
 _BLOB = types_mod.PrimitiveType("blob")
 _ASCII = types_mod.PrimitiveType("ascii")
 _BOOL = types_mod.PrimitiveType("bool")
+# claude.md #327: the five binary bitwise operators. `~` is unary and is
+# handled on its own, beside `!`.
+_BITWISE_BINARY_OPS = frozenset({"&", "|", "^", "<<", ">>"})
 
 
 def _is_blob_type(t):
@@ -2393,6 +2396,30 @@ def analyze(program, filename="<string>"):
                         category="invalid operand type",
                     )
                 return types_mod.PrimitiveType("bool")
+            if expr.op in _BITWISE_BINARY_OPS:
+                # claude.md #327: `&`, `|`, `^`, `<<` and `>>` are int
+                # and only int. A float operand is a compile error
+                # rather than a silent truncation -- the same refusal
+                # §8.3 already makes everywhere else that would need an
+                # implicit float-to-int conversion, and the one that
+                # keeps `1 & 2.5` from quietly meaning something.
+                #
+                # NULL is admitted on either side for the same reason
+                # the ordering operators admit it: a null int is still
+                # an int, and §8.3 leaves what further arithmetic on one
+                # produces unspecified rather than rejecting the program.
+                int_or_null = (_INT, NULL)
+                left_ok = left is None or left in int_or_null
+                right_ok = right is None or right in int_or_null
+                if not (left_ok and right_ok):
+                    raise CompileError(
+                        f"'{expr.op}' requires int operands, found "
+                        f"{types_mod.type_name(left)} and {types_mod.type_name(right)}",
+                        file=filename, line=getattr(expr, "line", 0),
+                        column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
+                return _INT
             if expr.op == "/":
                 # claude.md #143: division always returns float,
                 # unconditionally -- the one arithmetic operator that's
@@ -2408,6 +2435,18 @@ def analyze(program, filename="<string>"):
             operand = infer(expr.operand, scope)
             if expr.op == "!":
                 return types_mod.PrimitiveType("bool")
+            if expr.op == "~":
+                # claude.md #327: int only, on exactly the binary
+                # operators' terms just above.
+                if operand is not None and operand not in (_INT, NULL):
+                    raise CompileError(
+                        f"'~' requires an int operand, found "
+                        f"{types_mod.type_name(operand)}",
+                        file=filename, line=getattr(expr, "line", 0),
+                        column=getattr(expr, "column", 0),
+                        category="invalid operand type",
+                    )
+                return _INT
             return operand
         if isinstance(expr, ast.TypeofExpr):
             # claude.md #176: always text, regardless of the operand's

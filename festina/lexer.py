@@ -69,7 +69,12 @@ TOKEN_SPEC = [
     ("COMMENT", r"//[^\n]*|/\*.*?\*/"),
     ("TEMPLATE", r"`(?:\\.|[^`\\])*`"),
     ("STRING", r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\""),
-    ("NUMBER", r"\d+\.\d+|\d+"),
+    # claude.md #327: the hexadecimal form comes FIRST, so `0xff` lexes
+    # as one NUMBER rather than `0` followed by the identifier `xff` --
+    # which is what the decimal alternative would do to it, silently and
+    # with no error until something downstream tripped over the stray
+    # name.
+    ("NUMBER", r"0[xX][0-9a-fA-F]+|\d+\.\d+|\d+"),
     ("LPAREN", r"\("), ("RPAREN", r"\)"),
     ("LBRACE", r"\{"), ("RBRACE", r"\}"),
     ("LBRACK", r"\["), ("RBRACK", r"\]"),
@@ -78,7 +83,12 @@ TOKEN_SPEC = [
     # claude.md #142: `=>` (arrow function) must come before the
     # single-char class too, for the identical reason -- otherwise
     # `=>` would lex as `=` then `>`, two separate OP tokens.
-    ("OP", r"===|!==|==|!=|<=|>=|=>|&&|\|\||\+\+|--|[+\-*/%=<>!?:.,;]"),
+    # claude.md #327: `<<`/`>>` and `&&`/`||` all have to beat the
+    # single-character class below them, and `&&`/`||` have to beat the
+    # bare `&`/`|` that class now contains -- alternation is ordered, so
+    # the longest spelling of each simply comes first. `~` and `^` are
+    # single characters with no two-character form to lose to.
+    ("OP", r"===|!==|==|!=|<=|>=|=>|<<|>>|&&|\|\||\+\+|--|[+\-*/%=<>!?:.,;&|^~]"),
     ("IDENT", r"[A-Za-z_][A-Za-z0-9_]*"),
 ]
 MASTER_RE = re.compile("|".join(f"(?P<{n}>{p})" for n, p in TOKEN_SPEC), re.DOTALL)
@@ -396,7 +406,15 @@ def tokenize(source, filename="<string>"):
             continue
 
         if kind == "NUMBER":
-            value = float(text) if "." in text else int(text)
+            # claude.md #327: `int(text, 16)` for the hexadecimal form,
+            # which has no fractional variant at all -- so the `.` test
+            # below can never see one, and a `0x1.8` lexes as the
+            # literal `0x1` followed by `.8`, which the grammar then
+            # refuses rather than silently truncating.
+            if len(text) > 1 and text[0] == "0" and text[1] in "xX":
+                value = int(text, 16)
+            else:
+                value = float(text) if "." in text else int(text)
             tokens.append(Token("NUMBER", value, line, col))
             prev_significant = tokens[-1]
             continue

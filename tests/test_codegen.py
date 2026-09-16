@@ -601,6 +601,160 @@ class TestReturnTextToHandleConversion:
         assert result.stdout.strip() == "false"
 
 
+class TestBitwiseOperators:
+    """specification.md §8.3 and §9.13 [#327]: `&`, `|`, `^`, `~`, `<<`
+    and `>>` on `int`.
+
+    Requested by uraikus/archtelos-browser, where their absence showed
+    up wherever a value is packed: a CSS specificity triple, a
+    text-decoration bit set, a Unicode character class. Every one of
+    those was written through `Math.floor`, `*` and `%` instead, with a
+    comment explaining why.
+
+    The precedence choice is the part worth testing hardest. These bind
+    TIGHTER than the comparisons, so `flags & MASK == 0` groups the way
+    a bit mask wants rather than the way C groups it.
+    """
+
+    def test_and_or_xor(self, compile_and_run):
+        result = compile_and_run(
+            "int a = 12\nint b = 10\n"
+            "log(a & b)\nlog(a | b)\nlog(a ^ b)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["8", "14", "6"]
+
+    def test_not_is_minus_x_minus_one(self, compile_and_run):
+        result = compile_and_run("log(~0)\nlog(~5)\nlog(~(0 - 1))")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["-1", "-6", "0"]
+
+    def test_shifts(self, compile_and_run):
+        result = compile_and_run(
+            "int x = 1\nint y = 256\n"
+            "log(x << 8)\nlog(y >> 4)\nlog(y >> 0)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["256", "16", "256"]
+
+    def test_right_shift_is_arithmetic(self, compile_and_run):
+        """int is signed, so `>>` preserves the sign bit."""
+        result = compile_and_run("int n = 0 - 16\nlog(n >> 2)\nlog((0 - 1) >> 40)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["-4", "-1"]
+
+    def test_shift_count_out_of_range_is_null(self, compile_and_run):
+        """§8.3: the same "test, don't fail" rule division by zero
+        follows -- and the machine instruction's own behaviour at a
+        count of a whole word or more is undefined, so there is nothing
+        to fall back on."""
+        result = compile_and_run(
+            "int n = 1\nint big = 64\nint neg = 0 - 1\n"
+            "log((n << big) == null)\n"
+            "log((n >> big) == null)\n"
+            "log((n << neg) == null)\n"
+            "log((n << 62) == null)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["true", "true", "true", "false"]
+
+    def test_setting_the_top_bit_is_indistinguishable_from_null(
+            self, compile_and_run):
+        """A sharp edge worth pinning rather than hiding.
+
+        `int`'s null is the i64 minimum, and `1 << 63` produces exactly
+        that bit pattern -- so a perfectly valid shift answers a value
+        that compares equal to null. This is a property of the sentinel,
+        not of shifts (`Math.floorDiv` can reach the same value, and
+        overflow wraps onto it), but shifts are where it is easiest to
+        hit by accident, because setting the top bit is an ordinary
+        thing to want from a bit mask. §8.3 says so.
+        """
+        result = compile_and_run(
+            "int n = 1\nlog((n << 63) == null)\nlog(n << 63)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["true", "-9223372036854775808"]
+
+    def test_bitwise_binds_tighter_than_comparison(self, compile_and_run):
+        """The C wart, deliberately not inherited: `a & b == c` means
+        `(a & b) == c` here, as in Python, Rust and Go."""
+        result = compile_and_run(
+            "int flags = 6\nint mask = 4\n"
+            "log(flags & mask == 4)\n"
+            "log(flags | 1 == 7)\n"
+            "log(flags ^ 2 == 4)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["true", "true", "true"]
+
+    def test_shifts_bind_looser_than_addition(self, compile_and_run):
+        """§9.13: the shifts sit BELOW `+`/`-`, so `1 << 4 + 1` is
+        `1 << (4 + 1)`. C, Python and Rust all agree here -- the
+        departure from C is only about the comparisons, and Go's
+        choice (shifts at the top, with `*`) is the outlier."""
+        result = compile_and_run("log(1 << 4 + 1)\nlog(8 >> 2 + 1)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["32", "1"]
+
+    def test_and_binds_tighter_than_xor_binds_tighter_than_or(
+            self, compile_and_run):
+        result = compile_and_run("log(1 | 6 ^ 3 & 1)")
+        assert result.returncode == 0
+        # 3 & 1 == 1; 6 ^ 1 == 7; 1 | 7 == 7
+        assert result.stdout.strip() == "7"
+
+    def test_logical_and_still_lexes_as_one_token(self, compile_and_run):
+        """`&&` and `||` must keep winning over `&` and `|` in the
+        lexer, and must stay below them in precedence."""
+        result = compile_and_run(
+            "bool t = true\nbool f = false\n"
+            "log(t && f)\nlog(t || f)\n"
+            "log(1 & 1 == 1 && 2 | 0 == 2)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["false", "true", "true"]
+
+    def test_packing_and_unpacking_round_trips(self, compile_and_run):
+        """The actual use case: a packed triple, written and read back.
+        This is the shape their `specIds`/`specClasses`/`specTypes`
+        helpers existed to work around."""
+        result = compile_and_run(
+            "int r = 0xde\nint g = 0xad\nint b = 0xbe\n"
+            "int packed = (r << 16) | (g << 8) | b\n"
+            "log(packed)\n"
+            "log((packed >> 16) & 0xff)\n"
+            "log((packed >> 8) & 0xff)\n"
+            "log(packed & 0xff)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["14593470", "222", "173", "190"]
+
+    def test_a_float_operand_is_a_compile_error(self, parser, semantic, errors):
+        """§8.3: a compile error rather than a silent truncation."""
+        for source in ["float x = 2.0\nlog(1 & x)",
+                       "float x = 2.0\nlog(1 << x)",
+                       "float x = 2.0\nlog(~x)",
+                       "log(1 & 'a')"]:
+            program = parser.parse(source, filename="main.f")
+            with pytest.raises(errors.CompileError):
+                semantic.analyze(program, filename="main.f")
+
+
+class TestHexLiterals:
+    """specification.md §7.5.1 [#327]."""
+
+    def test_hex_literal_is_an_int(self, compile_and_run):
+        result = compile_and_run("log(0xff)\nlog(0x0)\nlog(0xDEADBEEF)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["255", "0", "3735928559"]
+
+    def test_hex_digits_are_case_insensitive(self, compile_and_run):
+        result = compile_and_run("log(0xAbCdEf)\nlog(0XABCDEF)")
+        assert result.returncode == 0
+        assert result.stdout.split() == ["11259375", "11259375"]
+
+    def test_hex_has_no_fractional_form(self, parser, errors):
+        """`0x1.8` is not one literal: the `.8` after it has no reading
+        this grammar gives, so it is refused rather than silently
+        truncated to `0x1`."""
+        with pytest.raises(errors.CompileError):
+            parser.parse("log(0x1.8)", filename="main.f")
+
+
 class TestStructs:
     """claude.md #27: structs are native in-memory objects with typed,
     assignable fields."""

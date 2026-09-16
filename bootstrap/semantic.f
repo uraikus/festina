@@ -717,6 +717,17 @@ bool func isNumeric(t:Ty) {
 // answers float, even for two ints. That last rule is what makes
 // `int b = a / 2 / 5` a compile error rather than integer division.
 Ty func inferArith(op:text, l:Ty, r:Ty) {
+    // claude.md #327: the five binary bitwise operators are int and
+    // only int, so their result needs no promotion rule at all -- and
+    // a float operand is refused by the original rather than silently
+    // truncated, which this port spells by inferring nothing for it.
+    if op == '&' || op == '|' || op == '^' || op == '<<' || op == '>>' {
+        if l == null || r == null { return tyPrim('int') }
+        if l.kind == 'prim' && l.name == 'int' && r.kind == 'prim' && r.name == 'int' {
+            return tyPrim('int')
+        }
+        return null
+    }
     if op == '/' {
         if isNumeric(l) && isNumeric(r) { return tyPrim('float') }
         return null
@@ -810,6 +821,8 @@ Ty func inferExpr(s:Scope, e:Node) {
     if k == 'UnaryOp' {
         text op = rawText(e, 'op')
         if op == '!' { return tyPrim('bool') }
+        // claude.md #327: int only, on the binary operators' terms.
+        if op == '~' { return tyPrim('int') }
         if op == 'typeof' { return tyPrim('text') }
         return inferExpr(s, childOf(e, 'operand'))
     }

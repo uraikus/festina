@@ -2387,6 +2387,23 @@ Val func cgBinOp(e:Node) {
         return cgDivMod(op, lv, rv, asFloat)
     }
 
+    // claude.md #327: the three binary bitwise operators are single
+    // instructions with nothing to decide -- both operands are int by
+    // §8.3, so there is no float form and no promotion to undo. Emitted
+    // BEFORE the shared result temp below, because the original mints
+    // its own there and the numbering is observable.
+    if op == '&' || op == '|' || op == '^' {
+        text bins = 'and'
+        if op == '|' { bins = 'or' }
+        if op == '^' { bins = 'xor' }
+        text bout = cgTmp()
+        cgOut(`  ${bout} = ${bins} i64 ${l.v}, ${r.v}`)
+        return cgVal(bout, 'i64', 'int')
+    }
+    if op == '<<' || op == '>>' {
+        return cgShift(op, l.v, r.v, rn)
+    }
+
     // The result temp is taken BEFORE the comparison temp, which is
     // what festina/codegen.py does and therefore what the numbering
     // has to be: `out = self.tmp()` runs above the icmp branch.
@@ -3854,6 +3871,20 @@ Val func cgUnary(e:Node) {
         return none
     }
 
+    if op == '~' {
+        // claude.md #327: LLVM has no `not` instruction -- the
+        // canonical spelling of a bitwise complement is xor against
+        // all-ones, which is exactly what `~x == -x - 1` means for a
+        // two's-complement int.
+        if v.fty != 'int' {
+            cgUnported(`unary ~ on ${v.fty}`)
+            return none
+        }
+        text nout = cgTmp()
+        cgOut(`  ${nout} = xor i64 ${v.v}, -1`)
+        return cgVal(nout, 'i64', 'int')
+    }
+
     if op == '!' {
         if v.fty != 'bool' {
             cgUnported(`unary ! on ${v.fty}`)
@@ -3874,6 +3905,69 @@ Val func cgUnary(e:Node) {
 
     cgUnported(`unary ${op}`)
     return none
+}
+
+// claude.md #327: `a << b` / `a >> b`, with §8.3's out-of-range rule.
+//
+// `shl`/`ashr` are UNDEFINED when the count is negative or at least the
+// operand's width, so a count outside 0..63 cannot be handed to the
+// instruction and cannot be trusted to do anything in particular if it
+// is. §8.3 answers null there, on the same "test, don't fail" rule
+// division by zero already follows -- one compare and a branch, exactly
+// what division already pays.
+//
+// A LITERAL count in range costs none of that, and that is not an
+// optimization for its own sake: packing and unpacking a value is the
+// whole reason these operators exist, every shift in that code is by a
+// constant, and a single instruction is what asking for them asked for.
+//
+// `>>` is ARITHMETIC, because `int` is signed. A logical shift on a
+// signed 64-bit type has no meaning this language picks; masking
+// afterwards spells it.
+Val func cgShift(op:text, lv:text, rv:text, rn:Node) {
+    text ins = 'shl'
+    if op == '>>' { ins = 'ashr' }
+    if cgIsSmallIntLiteral(rn) {
+        text sout = cgTmp()
+        cgOut(`  ${sout} = ${ins} i64 ${lv}, ${rv}`)
+        return cgVal(sout, 'i64', 'int')
+    }
+    text inRange = cgTmp()
+    // One UNSIGNED compare does both halves: a negative count
+    // reinterpreted as u64 is enormous, so `ult 64` rejects it too.
+    cgOut(`  ${inRange} = icmp ult i64 ${rv}, 64`)
+    text okL = cgLabel('shift.ok')
+    text badL = cgLabel('shift.bad')
+    text endL = cgLabel('shift.end')
+    cgOut(`  br i1 ${inRange}, label %${okL}, label %${badL}`)
+    cgBlockLabel(okL)
+    text shifted = cgTmp()
+    cgOut(`  ${shifted} = ${ins} i64 ${lv}, ${rv}`)
+    text okPred = CG_BLOCK
+    cgOut(`  br label %${endL}`)
+    cgBlockLabel(badL)
+    text badPred = CG_BLOCK
+    cgOut(`  br label %${endL}`)
+    cgBlockLabel(endL)
+    text sout2 = cgTmp()
+    cgOut(`  ${sout2} = phi i64 [ ${shifted}, %${okPred} ], [ ${cgNullValue('int')}, %${badPred} ]`)
+    return cgVal(sout2, 'i64', 'int')
+}
+
+// A NumberLit with no fractional part whose value is a shift count the
+// instruction can take as it stands.
+bool func cgIsSmallIntLiteral(n:Node) {
+    if n == null { return false }
+    if n.kind != 'NumberLit' { return false }
+    text raw = fieldOf(n, 'value').raw
+    int i = 0
+    while i < raw.length {
+        if raw.charCodeAt(i) == 46 { return false }
+        i++
+    }
+    int v = raw.toInt()
+    if v == null { return false }
+    return v >= 0 && v <= 63
 }
 
 Val func cgDivMod(op:text, lv:text, rv:text, asFloat:bool) {

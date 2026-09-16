@@ -216,6 +216,43 @@ int count = 5
 log(count.toText())   // "5" -- identical to log(`${count}`)
 ```
 
+### Bitwise operators
+
+`&`, `|`, `^` (binary), `~` (unary) and `<<` / `>>` work on `int` and
+only on `int` — a `float` operand is a compile error, not a silent
+truncation. `int` is signed and 64-bit, so `>>` is an **arithmetic**
+shift (it preserves the sign bit) and `~x` is `-x - 1`.
+
+```festina
+int r = 0xde
+int g = 0xad
+int b = 0xbe
+int packed = (r << 16) | (g << 8) | b
+log((packed >> 16) & 0xff)   // 222
+```
+
+Hexadecimal literals (`0x`, case-insensitive digits) are `int`. There
+is no octal or binary form.
+
+**They bind tighter than the comparisons**, so `flags & MASK == 0`
+means `(flags & MASK) == 0` — the reading a bit mask wants. C groups
+that the other way; this follows Python, Rust and Go instead. The
+shifts bind *looser* than `+`/`-`, where C, Python and Rust all put
+them, so `1 << 4 + 1` is `1 << 5`. The full table is in
+[specification.md §9.13](specification.md).
+
+A shift count outside `0`–`63` returns `null`, the same way dividing by
+zero does — shifting by a whole word or more has no answer, and the
+machine instruction's behaviour there is undefined. A literal count in
+range costs no check at all, so packing and unpacking with constant
+shifts is one instruction each.
+
+One sharp edge: `int`'s null **is** the i64 minimum, which is also the
+value of `1 << 63` — so setting the top bit produces something that
+compares equal to `null`. That is a property of the sentinel (overflow
+wraps onto the same value) rather than of shifts, but shifts are where
+it is easiest to reach.
+
 ## Variables, constants, functions
 
 ```festina

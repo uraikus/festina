@@ -6693,3 +6693,25 @@ uraikus/archtelos-browser is a browser engine written in Festina, and it exists 
 **`ascii.toInt()` was accepted and then refused.** The analyzer's own check names an ascii receiver explicitly; codegen had no branch, so the call died with "cannot access field 'toInt' on ascii" and `a.toText().toInt()` was the workaround -- an allocation and a UTF-8 walk to reach a parse that could already read those bytes. An ascii payload is a NUL-terminated byte buffer by construction, so the same runtime call serves both receivers; only the release differs, ascii being refcounted where text is freed outright.
 
 **Verified.** Codegen 85 match and 0 differ, 345,342 of 358,828 lines -- both implementations changed in lockstep, which is what a fix to a shared behaviour has to look like. Every one of the six aliasing shapes clean under valgrind at 2,000 iterations, and the same file 31 errors against the compiler before the fix.
+
+327. BITWISE OPERATORS, AND THE ONE SPELLING THAT WAS NOT AVAILABLE
+
+**353,231 of 366,717 file-specific IR lines -- 96.3% -- and 86 files match, 0 differ.** All four harnesses green: lexer 123/123, parser 123/123, semantic 123/123, escape analysis 105 match.
+
+**`&`, `|`, `^`, `~`, `<<`, `>>` and hexadecimal literals**, requested by uraikus/archtelos-browser, where their absence showed up wherever a value is packed: a CSS specificity triple, a text-decoration bit set, a Unicode character class. Each of those was written through `Math.floor`, `*` and `%`, with a comment explaining why.
+
+**Integer division could not have the spelling it asked for.** `a // b` is not available and never was: `//` is the line-comment token, matched by the lexer before any operator, so the request is unsatisfiable as written. `Math.floorDiv(a, b)` already does the job and is already specified; the gap is ergonomic rather than expressive, and no operator spelling worth having was left. Said here rather than solved with a worse character.
+
+**The precedence question is the only real design choice in this entry.** C puts `&`, `^` and `|` BELOW the comparisons, so `flags & MASK == 0` means `flags & (MASK == 0)` -- a mistake it has been apologising for since 1978. Python, Rust and Go all corrected it. This does too: the three binary bitwise operators bind tighter than `==` and `<`, and `flags & MASK == 0` groups the way every use of a bit mask wants.
+
+**The shifts stay where C puts them**, below `+`/`-`, which is also where Python and Rust put them; Go's decision to raise them to `*`'s level is the outlier. Departing from C twice would have been a worse answer than departing once for a reason.
+
+**A shift count outside 0 to 63 answers null**, on the same "test, don't fail" rule division by zero already follows -- and for a harder reason than division has: `shl`/`ashr` are UNDEFINED there, so there is no behaviour to fall back on, only whatever the machine happens to do. One unsigned compare covers both directions at once, since a negative count reinterpreted as u64 is enormous.
+
+**A literal count in range costs none of that**, and that is not an optimization for its own sake. Packing and unpacking is the entire reason these operators were asked for, every shift in that code is by a constant, and "a single instruction" was the request. The checked form exists for the rare case that actually needs it.
+
+**`1 << 63` is indistinguishable from null**, and that is worth saying out loud rather than discovering. `int`'s null is the i64 minimum, which is exactly what setting the top bit produces. It is a property of the sentinel -- overflow wraps onto the same value, and `Math.floorDiv` can reach it -- but shifts are where it is easiest to hit, because setting the top bit is an ordinary thing to ask of a mask. Specification, api.md and a test all name it.
+
+**Four modules, not one.** A language addition costs the lexer (a hex form that must beat the decimal scan, and `&&`/`||` that must keep beating `&`/`|`), the parser (four new precedence levels), the analyzer (int-only, with a float operand refused rather than truncated) and codegen (three instructions, a complement that LLVM spells as xor, and the two shift forms) -- in BOTH implementations. Eight files.
+
+**And a case file, because otherwise nothing measured any of it.** No corpus file used these operators, so every canary written for them would have reported the corpus unable to see the mechanism -- which is the registry's way of saying "write a case file", and it is right. `cases/bitwise.f` exercises each operator, both shift forms, all three precedence departures, and the packed-triple round trip the operators exist for.

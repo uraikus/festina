@@ -977,8 +977,47 @@ class Parser:
         return left
 
     def parse_relational(self):
-        left = self.parse_additive()
+        left = self.parse_bitwise_or()
         while self.at_op("<", ">", "<=", ">="):
+            op_tok = self.eat()
+            right = self.parse_bitwise_or()
+            left = ast.BinOp(op_tok.value, left, right, op_tok.line, op_tok.column)
+        return left
+
+    # claude.md #327: the three binary bitwise levels, and the shifts,
+    # sit BETWEEN the comparisons and `+`/`-` -- so `flags & MASK == 0`
+    # groups as `(flags & MASK) == 0`, the reading every use of a bit
+    # mask wants. C groups it the other way and has been regretting it
+    # since; Python, Rust and Go all made the same correction this does.
+    # Their relative order (`|` loosest, then `^`, then `&`, then the
+    # shifts) is the one every language with these operators agrees on.
+    def parse_bitwise_or(self):
+        left = self.parse_bitwise_xor()
+        while self.at_op("|"):
+            op_tok = self.eat()
+            right = self.parse_bitwise_xor()
+            left = ast.BinOp(op_tok.value, left, right, op_tok.line, op_tok.column)
+        return left
+
+    def parse_bitwise_xor(self):
+        left = self.parse_bitwise_and()
+        while self.at_op("^"):
+            op_tok = self.eat()
+            right = self.parse_bitwise_and()
+            left = ast.BinOp(op_tok.value, left, right, op_tok.line, op_tok.column)
+        return left
+
+    def parse_bitwise_and(self):
+        left = self.parse_shift()
+        while self.at_op("&"):
+            op_tok = self.eat()
+            right = self.parse_shift()
+            left = ast.BinOp(op_tok.value, left, right, op_tok.line, op_tok.column)
+        return left
+
+    def parse_shift(self):
+        left = self.parse_additive()
+        while self.at_op("<<", ">>"):
             op_tok = self.eat()
             right = self.parse_additive()
             left = ast.BinOp(op_tok.value, left, right, op_tok.line, op_tok.column)
@@ -1001,7 +1040,10 @@ class Parser:
         return left
 
     def parse_unary(self):
-        if self.at_op("!", "-", "+"):
+        # claude.md #327: `~` joins the unary operators at the same
+        # level as `!`, which is where every language that has both puts
+        # it -- and, like `!`, it takes exactly one operand type.
+        if self.at_op("!", "-", "+", "~"):
             op_tok = self.eat()
             operand = self.parse_unary()
             return ast.UnaryOp(op_tok.value, operand)

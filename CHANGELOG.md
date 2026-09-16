@@ -12,6 +12,31 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ## [Unreleased]
 
+### Added
+
+- **Bitwise operators and hexadecimal literals.** `&`, `|`, `^`
+  (binary), `~` (unary) and `<<` / `>>` on `int`, plus `0x` literals.
+  `int` is signed and 64-bit, so `>>` is an **arithmetic** shift and
+  `~x` is `-x - 1`; a `float` operand is a compile error rather than a
+  silent truncation. **They bind tighter than the comparisons**, so
+  `flags & MASK == 0` means `(flags & MASK) == 0` — C groups that the
+  other way and has regretted it since; this follows Python, Rust and
+  Go. The shifts stay *below* `+`/`-`, where C, Python and Rust all put
+  them. A shift count outside `0`–`63` returns `null` (the machine
+  instruction is undefined there, so there is nothing to fall back on),
+  while a literal count in range costs no check at all — packing and
+  unpacking with constant shifts is one instruction each. One sharp
+  edge, documented in all three places: `int`'s null **is** the i64
+  minimum, which is also `1 << 63`, so setting the top bit produces a
+  value that compares equal to `null`. Requested by
+  [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser),
+  where their absence showed up wherever a value was packed — a CSS
+  specificity triple, a text-decoration bit set, a Unicode character
+  class — each written through `Math.floor`, `*` and `%` instead.
+  Integer division was requested alongside them as `a // b` and is
+  **not** added: `//` is the line-comment token, so that spelling is
+  unavailable, and `Math.floorDiv(a, b)` already does the job.
+
 ### Changed
 
 - **`==`/`!=` between two values of a reference type now means
@@ -121,9 +146,9 @@ round-by-round design and implementation record predating 0.1 lives in
   (decisions.md #299).
 
 - **`bootstrap/codegen.f`** — `festina/codegen.py` ported to Festina,
-  the fourth and last stage: **85 of 122 corpus files emit
+  the fourth and last stage: **86 of 123 corpus files emit
   byte-identical LLVM IR, 0 differ, 26 not yet ported, 11 rejected by
-  both** — 345,342 of 358,828 file-specific IR lines. **The bootstrap
+  both** — 353,231 of 366,717 file-specific IR lines. **The bootstrap
   compiler reproduces its own compilation**: all ten of its files —
   `lexer.f` (4,552), `parser.f` (13,139), `semantic.f` (20,651),
   `escape.f` (22,232), `codegen.f` (94,459) and the five command-line
@@ -253,7 +278,7 @@ round-by-round design and implementation record predating 0.1 lives in
   the two implementations agree; it says nothing about whether the
   corpus could tell them apart if they stopped agreeing, and for four
   consecutive slices of the codegen port the answer was that it could
-  not. A hundred and thirty-five deliberate breakages, one per mechanism,
+  not. A hundred and forty-two deliberate breakages, one per mechanism,
   re-run by `tests/test_bootstrap_canary.py`: **0 not caught**. And "caught" is
   no longer the whole verdict: a canary looks for TWO independent
   witnesses and reports a lone one in its own output, because

@@ -11421,6 +11421,19 @@ class CodeGen:
             out = self._emit_divmod(expr.op, left_val, right_val, use_float, lines)
             return out, (FLOAT if use_float else INT)
 
+        # claude.md #327: `&`, `|`, `^` are single instructions with
+        # nothing to decide -- both operands are int by §8.3, so there
+        # is no float form and no promotion to undo. The two SHIFTS are
+        # the ones that need care, and they get their own emitter below.
+        if expr.op in ("&", "|", "^"):
+            out = self.tmp()
+            instr = {"&": "and", "|": "or", "^": "xor"}[expr.op]
+            lines.append(f"  {out} = {instr} i64 {left_val}, {right_val}")
+            return out, INT
+        if expr.op in ("<<", ">>"):
+            out = self._emit_shift(expr.op, left_val, right_val, expr.right, lines)
+            return out, INT
+
         arith = {"+": "add", "-": "sub", "*": "mul"}
         farith = {"+": "fadd", "-": "fsub", "*": "fmul"}
         icmp = {"<": "slt", ">": "sgt", "<=": "sle", ">=": "sge", "==": "eq", "!=": "ne"}
@@ -11465,6 +11478,60 @@ class CodeGen:
             lines.append(f"  {out} = zext i1 {cmp_out} to i8")
             return out, BOOL
         raise CodegenError(f"unsupported operator '{expr.op}'", file=self.filename, line=expr.line)
+
+    def _emit_shift(self, op, left_val, right_val, right_expr, lines):
+        """claude.md #327: `a << b` / `a >> b`, with §8.3's out-of-range
+        rule.
+
+        LLVM's `shl`/`ashr` are UNDEFINED when the count is negative or
+        at least the operand's width, so a count outside 0..63 cannot
+        simply be handed to the instruction and cannot be trusted to do
+        anything in particular if it is. §8.3 answers `null` there, on
+        the same "test, don't fail" rule division by zero already
+        follows -- which costs a compare and a branch, exactly as
+        division already pays.
+
+        A LITERAL count in range costs none of that. That is not an
+        optimization for its own sake: packing and unpacking a value is
+        the whole reason these operators exist, every shift in that code
+        is by a constant, and "a single instruction" is what the request
+        for them asked for. A non-literal count is the rare case and
+        pays for the check it actually needs.
+
+        `>>` is ARITHMETIC (`ashr`), because `int` is signed -- see
+        §8.3. A logical shift on a signed 64-bit type has no meaning
+        this language wants to pick; masking afterwards spells it.
+        """
+        instr = "shl" if op == "<<" else "ashr"
+        if isinstance(right_expr, ast.NumberLit) and isinstance(right_expr.value, int) \
+                and 0 <= right_expr.value <= 63:
+            out = self.tmp()
+            lines.append(f"  {out} = {instr} i64 {left_val}, {right_val}")
+            return out
+        in_range = self.tmp()
+        # One unsigned compare does both halves: a negative count
+        # reinterpreted as u64 is enormous, so `ult 64` rejects it too.
+        lines.append(f"  {in_range} = icmp ult i64 {right_val}, 64")
+        ok_label = self.label("shift.ok")
+        bad_label = self.label("shift.bad")
+        end_label = self.label("shift.end")
+        lines.append(f"  br i1 {in_range}, label %{ok_label}, label %{bad_label}")
+
+        self._start_block(ok_label, lines)
+        shifted = self.tmp()
+        lines.append(f"  {shifted} = {instr} i64 {left_val}, {right_val}")
+        ok_pred = self.cur_block
+        lines.append(f"  br label %{end_label}")
+
+        self._start_block(bad_label, lines)
+        bad_pred = self.cur_block
+        lines.append(f"  br label %{end_label}")
+
+        self._start_block(end_label, lines)
+        out = self.tmp()
+        lines.append(f"  {out} = phi i64 [ {shifted}, %{ok_pred} ], "
+                     f"[ {INT_NULL_CONST}, %{bad_pred} ]")
+        return out
 
     def _emit_divmod(self, op, left_val, right_val, is_float, lines):
         """claude.md #57: division/modulo by zero returns null instead of
@@ -11577,6 +11644,14 @@ class CodeGen:
             else:
                 lines.append(f"  {out} = sub i64 0, {val}")
             return out, vtype
+        if expr.op == "~":
+            # claude.md #327: LLVM has no `not` instruction -- the
+            # canonical spelling of a bitwise complement is xor against
+            # all-ones, which is exactly what `~x == -x - 1` means for a
+            # two's-complement int. The operand is int by §8.3, checked
+            # in the analyzer, so there is no float form to branch on.
+            lines.append(f"  {out} = xor i64 {val}, -1")
+            return out, INT
         return val, vtype  # unary '+' is a no-op
 
     def _emit_typeof(self, expr, env, lines):

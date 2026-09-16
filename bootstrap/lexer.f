@@ -38,6 +38,30 @@ struct Seg {
 // [A-Za-z_]; here they are explicit code-point tests against the byte
 // blob.byteAt hands back.
 
+// claude.md #327: a hexadecimal digit, in either case.
+bool func isHexDigit(c:int) {
+    if c >= 48 && c <= 57 { return true }
+    if c >= 97 && c <= 102 { return true }
+    return c >= 65 && c <= 70
+}
+
+// The value of the hex digits in [lo, hi). Accumulated rather than
+// handed to a conversion function, because this port has no
+// base-taking parse and the arithmetic is four lines.
+int func hexValue(src:blob, lo:int, hi:int) {
+    int acc = 0
+    int i = lo
+    while i < hi {
+        int c = src.byteAt(i)
+        int d = c - 48
+        if c >= 97 { d = c - 87 }
+        else if c >= 65 { d = c - 55 }
+        acc = acc * 16 + d
+        i++
+    }
+    return acc
+}
+
 bool func isDigit(c:int) {
     return c >= 48 && c <= 57
 }
@@ -480,6 +504,32 @@ arr[Tok] func tokenize(src:blob, from:int, to:int) {
         // --- number ---
         if isDigit(c0) {
             int i = pos
+            // claude.md #327: the hexadecimal form, checked first --
+            // `0xff` is ONE literal, and letting the decimal scan below
+            // have it would leave `0` followed by the identifier `xff`,
+            // silently and with no error until something downstream
+            // tripped over the stray name. A bare `0x` with no digits
+            // after it is not one: the scan falls back to the decimal
+            // path, which reads the `0` and leaves `x` to be lexed as
+            // an identifier, exactly as it would have before.
+            if c0 == 48 && pos + 2 < n {
+                int x = src.byteAt(from + pos + 1)
+                if (x == 120 || x == 88) && isHexDigit(src.byteAt(from + pos + 2)) {
+                    int h = pos + 2
+                    while h < n && isHexDigit(src.byteAt(from + h)) { h++ }
+                    Tok ht
+                    ht.kind = 'NUMBER'
+                    ht.val = 'int ' + `${hexValue(src, from + pos + 2, from + h)}`
+                    ht.extra = ''
+                    ht.line = line
+                    ht.col = col
+                    toks.push(ht)
+                    prevKind = 'NUMBER'
+                    prevVal = ht.val
+                    pos = h
+                    continue
+                }
+            }
             while i < n && isDigit(src.byteAt(from + i)) { i++ }
             bool isFloat = false
             if i + 1 < n && src.byteAt(from + i) == 46 && isDigit(src.byteAt(from + i + 1)) {
@@ -543,15 +593,21 @@ arr[Tok] func tokenize(src:blob, from:int, to:int) {
             text two = src.slice(from + pos, from + pos + 2)
             if two == '==' || two == '!=' || two == '<=' || two == '>='
                     || two == '=>' || two == '&&' || two == '||'
+                    || two == '<<' || two == '>>'
                     || two == '++' || two == '--' {
                 op = two
             }
         }
         if op == '' {
+            // claude.md #327: `&` `|` `^` `~` join the single-character
+            // operators. The two-character check above already claimed
+            // `&&` and `||`, so a bare `&`/`|` only reaches here when
+            // that is genuinely what was written.
             if c0 == 43 || c0 == 45 || c0 == 42 || c0 == 47 || c0 == 37
                     || c0 == 61 || c0 == 60 || c0 == 62 || c0 == 33
                     || c0 == 63 || c0 == 58 || c0 == 46 || c0 == 44
-                    || c0 == 59 {
+                    || c0 == 59 || c0 == 38 || c0 == 124 || c0 == 94
+                    || c0 == 126 {
                 op = c0.toChar()
             }
         }

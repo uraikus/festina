@@ -516,13 +516,16 @@ lists them.
 
 #### 7.5.1 Numeric literals
 
-*NumericLiteral* ::= digit { digit } [ `.` digit { digit } ]
+*NumericLiteral* ::= *DecimalLiteral* | *HexLiteral*
+*DecimalLiteral* ::= digit { digit } [ `.` digit { digit } ]
+*HexLiteral* ::= `0x` hexDigit { hexDigit } | `0X` hexDigit { hexDigit }
 
 A literal without a fractional part has type `int`; one with a
-fractional part has type `float`. There is no exponent, hexadecimal,
-octal or binary form, and no numeric separator. A negative number is
-the unary `-` operator applied to a literal (§9.6). An integer literal
-must be representable as an `int`.
+fractional part has type `float`. A *HexLiteral* has type `int`; its
+digits are case-insensitive, and it has no fractional form. There is no
+exponent, octal or binary form, and no numeric separator. A negative
+number is the unary `-` operator applied to a literal (§9.6). An
+integer literal must be representable as an `int`. [#327]
 
 #### 7.5.2 String literals
 
@@ -669,6 +672,26 @@ is `float x = 5`. The only conversions from `float` to `int` are
 **Division and modulo by zero** do not fail the program: the result is
 the operand type's `null` (§8.2). `Math.floorDiv` follows the same
 rule. Using a null number in further arithmetic is unspecified. [#57, #188]
+
+**Bitwise operators** apply to `int` and only to `int`: `&`, `|` and
+`^` are binary, `~` is unary, and `<<` and `>>` shift. `int` is signed
+and 64-bit, so `>>` is an ARITHMETIC shift — it preserves the sign bit
+— and `~x` is `-x - 1`. A `float` operand is a compile error rather
+than a silent truncation, matching the rest of §8.3's refusal to
+convert `float` to `int` implicitly.
+
+**A shift count outside 0 to 63** yields `null`, on the same "test,
+don't fail" rule division by zero follows just above: shifting by a
+whole word or more has no answer this language is willing to invent,
+and the machine instruction's own behaviour there is undefined. A count
+that is a literal in range costs no check at all.
+
+`int`'s `null` is the i64 minimum (§8.2), which is also the value of
+`1 << 63`, so setting the top bit produces a result that compares equal
+to `null`. That is a property of the sentinel rather than of shifts —
+overflow wraps onto the same value, and so can `Math.floorDiv` — but
+shifts are where it is easiest to reach, since setting the top bit is
+an ordinary thing to ask of a bit mask. [#327]
 
 **Methods.** `int` has `.toFloat()`, `.toText()` and `.toChar()`;
 `float` and `bool` have `.toText()` (§16.3). Integer overflow wraps.
@@ -1315,15 +1338,25 @@ From highest to lowest: [#66]
 | Level | Operators | Associativity |
 |---|---|---|
 | 1 | member `.`, index `[ ]`, call `( )`, postfix `++` `--` | left |
-| 2 | unary `-` `+` `!` `typeof` | right |
+| 2 | unary `-` `+` `!` `~` `typeof` | right |
 | 3 | `*` `/` `%` | left |
 | 4 | `+` `-` | left |
-| 5 | `<` `>` `<=` `>=` | left |
-| 6 | `==` `!=` | left |
-| 7 | `&&` | left |
-| 8 | `\|\|` | left |
-| 9 | `? :` | right |
-| 10 | `=` | right |
+| 5 | `<<` `>>` | left |
+| 6 | `&` | left |
+| 7 | `^` | left |
+| 8 | `\|` | left |
+| 9 | `<` `>` `<=` `>=` | left |
+| 10 | `==` `!=` | left |
+| 11 | `&&` | left |
+| 12 | `\|\|` | left |
+| 13 | `? :` | right |
+| 14 | `=` | right |
+
+The three binary bitwise operators bind TIGHTER than the comparisons,
+so `flags & MASK == 0` groups as `(flags & MASK) == 0` — the reading
+every use of a bit mask wants. This deliberately departs from C, whose
+opposite choice is a long-standing source of bugs, and follows Python,
+Rust and Go instead. [#327]
 
 ### 9.14 Evaluation order
 

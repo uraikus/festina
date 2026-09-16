@@ -1473,7 +1473,80 @@ CANARIES = [
         """    cgOut(`  ${phi} = phi i8 [ ${out}, %${pred} ], [ 0, %${oob} ]`)""",
         """    cgOut(`  ${phi} = phi i8 [ ${out}, %${pred} ], [ 1, %${oob} ]`)""",
     ),
+
+    # --- decisions.md #327: bitwise operators and hex literals --------
+    Canary(
+        "bitwise-ops-are-distinct-instructions", "#327",
+        "each binary bitwise operator emits its own instruction",
+        """        if op == '|' { bins = 'or' }
+        if op == '^' { bins = 'xor' }""",
+        """        if op == '|' { bins = 'and' }
+        if op == '^' { bins = 'and' }""",
+    ),
+    Canary(
+        "bitwise-not-is-xor-against-all-ones", "#327",
+        "the unary complement is xor -1, which is what ~x means for two's complement",
+        """        cgOut(`  ${nout} = xor i64 ${v.v}, -1`)""",
+        """        cgOut(`  ${nout} = sub i64 0, ${v.v}`)""",
+    ),
+    Canary(
+        "right-shift-is-arithmetic", "#327",
+        "`>>` preserves the sign bit, because int is signed",
+        """    text ins = 'shl'
+    if op == '>>' { ins = 'ashr' }""",
+        """    text ins = 'shl'
+    if op == '>>' { ins = 'lshr' }""",
+    ),
+    Canary(
+        "a-literal-shift-count-skips-the-bounds-check", "#327",
+        "a shift by a literal count in range is one instruction and no branch",
+        """    if cgIsSmallIntLiteral(rn) {""",
+        """    if false {""",
+    ),
+    Canary(
+        "an-out-of-range-shift-count-answers-null", "#327",
+        "a shift count outside 0 to 63 yields null rather than whatever the instruction does",
+        """    cgOut(`  ${inRange} = icmp ult i64 ${rv}, 64`)""",
+        """    cgOut(`  ${inRange} = icmp ult i64 ${rv}, 1024`)""",
+    ),
+    Canary(
+        "a-hex-literal-is-base-sixteen", "#327",
+        "a hexadecimal literal is read in base sixteen, and as one token",
+        """        acc = acc * 16 + d""",
+        """        acc = acc * 10 + d""",
+        path=os.path.join(REPO_ROOT, "bootstrap", "lexer.f"),
+    ),
+    Canary(
+        "bitwise-binds-tighter-than-comparison", "#327",
+        "the binary bitwise operators group inside the comparisons, unlike C",
+        [
+            ("""Node func parseRelational() {
+    Node left = parseBitOr()""",
+             """Node func parseRelational() {
+    Node left = parseAdditive()"""),
+            ("""        Node right = parseBitOr()
+        left = mkBin(op.val, left, right, op)
+    }
+    return left
+}
+
+// claude.md #327: the three binary bitwise levels""",
+             """        Node right = parseAdditive()
+        left = mkBin(op.val, left, right, op)
+    }
+    return left
+}
+
+// claude.md #327: the three binary bitwise levels"""),
+            ("""Node func parseShift() {
+    Node left = parseAdditive()""",
+             """Node func parseShift() {
+    Node left = parseRelational()"""),
+        ],
+        path=os.path.join(REPO_ROOT, "bootstrap", "parser.f"),
+    ),
 ]
+
 BY_NAME = {c.name: c for c in CANARIES}
 
 
