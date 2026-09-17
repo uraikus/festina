@@ -130,6 +130,25 @@ class FuncDecl(Node):
         self.column = column
 
 
+class TestDecl(Node):
+    """claude.md #341: `test NAME = 'description'` (specification.md
+    11.7).
+
+    The node exists only so the declaration has somewhere to live; the
+    ASSERTIONS are ordinary Call/Member nodes, resolved by the type of
+    what they call rather than by a syntax of their own. That is the
+    whole reason `test` is a type: a binding of that type being
+    callable needs no new call machinery, only a new callee type -- the
+    same ground `func[T]:R` values already stand on (claude.md #141).
+    """
+
+    def __init__(self, name, description, line=0, column=0):
+        self.name = name
+        self.description = description
+        self.line = line
+        self.column = column
+
+
 class StructDecl(Node):
     def __init__(self, name, fields, line=0, column=0):
         self.name = name

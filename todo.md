@@ -108,97 +108,31 @@ larger than they look.
   exactly as `img`/`aud` already gate theirs. That conditional-linking
   property is the point: a program with no `vid` in it must not grow a
   video decoder.
-- **A built-in test suite: a `test` type and `festina test`.** Named
-  groups of assertions, run by a CLI verb of their own, so a Festina
-  program can be tested without a second language in the loop.
+- **The `test` type's remaining methods.** `.throws()` and
+  `.contains()` were named in the original sketch as the natural home
+  for assertions that are not plain equality, and decisions.md #341
+  shipped only `.near()` — the one that answers a real trap (exact float
+  equality) rather than a convenience. `.throws()` needs a decision
+  about what it takes: a `func[]:void` value is the obvious shape, and
+  it interacts with `try`/`catch` in ways the equality assertions do
+  not.
 
-  ```festina
-  test basicMath = 'basic math test'
-  basicMath(2 + 2, 4)
-  basicMath(3 - 1, 2)
-  basicMath(2 - 2, 4)
+- **Deep equality, if an assertion ever needs it.** #341 restricted an
+  assertion's arguments to types whose `==` is value equality, because a
+  struct compares by identity (specification.md 8.9.1) and giving `test`
+  a second meaning of equality would make it disagree with `==` on the
+  same two values. Widening that restriction stays compatible; it needs
+  its own answers for cycles, map ordering and NaN first, and nothing
+  has asked for it yet.
 
-  test stringInterpolation = 'string interpolation'
-  text name = 'Patrick'
-  text greeting = `Hello, ${name}!`
-  stringInterpolation(greeting, 'Hello, Patrick!')
-  ```
-
-  ```
-  $ festina test ./test-example.f
-  basic math test: 2 pass, 1 fail. 66%
-   | - fail: basicMath(2-2, 4) // 0
-  string interpolation: 1 pass. 100%
-  Overall: 3 pass, 1 fail. 75%
-  ```
-
-  **`test` is a TYPE**, which is what makes this fit the language
-  rather than bolt onto it. It joins `blob`/`img`/`aud`/`regex`/
-  `ascii`/`color`/`font`/`http`/`url`/`socket`/`thread` in the type
-  namespace — a list this language already extends by adding to — and
-  the group's NAME is an ordinary binding, so nothing about `test` has
-  to be contextual on what follows it. A `test` value being CALLABLE
-  also has precedent: `func[T]:R` values already are (decisions.md
-  #141), so the call syntax needs no new machinery, only a new callee
-  type. And "methods on the type" is then the natural home for every
-  assertion that isn't plain equality — `.throws()`, `.near()`,
-  `.contains()` — instead of a growing set of global names.
-
-  An earlier sketch made `test` both a block keyword and a callable.
-  That is the version this replaces, and the reason is recorded rather
-  than dropped: a name that is a declaration in one position and a call
-  in another has no precedent here, and decisions.md #298 and #317 are
-  two separate rounds of exactly that kind of name confusion already.
-
-  What is still open:
-
-  **Grouping is by the binding CALLED, not by position.** `basicMath(…)`
-  belongs to `basicMath` wherever it appears, which is better than a
-  block's brace-scoping — but it means a call can precede its own
-  declaration, and it leaves open what happens to an assertion whose
-  group was never declared (a compile error, presumably, since the
-  callee would be an unknown name anyway).
-
-  **What a `test` call ANSWERS.** Nothing (a statement), or a `bool` so
-  a failing assertion can be branched on? The sketch only ever uses it
-  as a statement, and `bool` is the choice that costs nothing and
-  allows more.
-
-  **What `test(actual, expected)` means for a non-scalar.** Scalars and
-  `text` are obvious. `struct == struct` is settled now — it compares
-  IDENTITY (§8.9.1, decisions.md #326) — but identity is the wrong
-  question for an assertion: `test(makePoint(1, 2), makePoint(1, 2))`
-  wants those to be equal and they are two instances. So a test
-  assertion still needs deep equality, and would be the first thing in
-  the language to need it; this either forces that decision or
-  restricts the call to types whose `==` already means what an
-  assertion wants.
-
-  **The failure line quotes the assertion's own SOURCE.** `basicMath(2-2,
-  4)` appears spelled as it was written, not reconstructed from the AST
-  — note the `2-2` against the `2 - 2` in the source. That needs the
-  source span carried to wherever the report is produced, which today
-  only error messages do. (The sample output writes `test(2-2, 4)` on
-  that line, which is the older spelling; quoting the real callee is
-  what the rest of the format implies.)
-
-  **The percentages are truncated, not rounded** (2 of 3 is 66%, not
-  67%), and a group with no failures omits the fail count entirely
-  (`1 pass. 100%`, not `1 pass, 0 fail`). Both are worth pinning in
-  tests, since both are the kind of detail a reimplementation gets
-  subtly wrong.
-
-  **The exit code is what makes it usable in CI**, and the sketch does
-  not say what it is. Non-zero on any failure is the only answer that
-  makes `festina test` usable in a pipeline.
-
-  Also open: whether `festina test` runs the file's ordinary top-level
-  code as well as its assertions (here it must — `name` and `greeting`
-  are ordinary declarations between the test calls), and whether `test`
-  bindings and their calls are stripped from a normal `festina compile`
-  (they should be — a test in a shipped binary is dead weight, and that
-  is a codegen change, which by the caution above means porting it
-  twice).
+- **Porting the `test` type to `bootstrap/`.** #341 landed in the
+  Python implementation. The bootstrap compiler needs the declaration in
+  `parser.f`, the declaration and assertion rules in `semantic.f`, and
+  the STRIPPING half in `codegen.f` — an ordinary build removes every
+  assertion, which is the half a corpus case can measure, since
+  `bootstrap/irdumpf.f` compiles with assertions disabled like any other
+  ordinary build. The emitting half has no differential that can see it
+  until the bootstrap grows a test build of its own.
 
 - **Research a `gguf` type, for talking to a model directly.** The
   open questions are what the value actually owns (a memory-mapped

@@ -107,6 +107,11 @@ _RUNTIME_ASYNC_C = os.path.join(_RUNTIME_DIR, "festina_runtime_async.c")
 # is blob/img/aud's fire-and-forget background-load pool; this one is
 # a long-lived, stateful worker running real, isolated Festina code).
 _RUNTIME_THREAD_C = os.path.join(_RUNTIME_DIR, "festina_runtime_thread.c")
+# claude.md #341: the built-in test suite's group registry and report.
+# A separate translation unit for the same reason as the two above, plus
+# one specific to it: specification.md 11.7.3 promises an ordinary build
+# carries none of this, and not linking the object is how that is kept.
+_RUNTIME_TEST_C = os.path.join(_RUNTIME_DIR, "festina_runtime_test.c")
 # Both headers are #included by more than one of the .c files above (see
 # festina_runtime_internal.h's own doc comment) -- included in every
 # object file's cache-freshness check below (_ensure_runtime_object)
@@ -604,6 +609,17 @@ _RUNTIME_FEATURES = {
         "pkgs": [],
         "extra_link_flags": ["-pthread"],
     },
+    # claude.md #341: the built-in test suite. Linked ONLY by
+    # `festina test`, never by `festina compile`/`run` -- which is what
+    # makes specification.md 11.7.3's promise literal rather than a
+    # matter of the optimizer's opinion: an ordinary build does not
+    # contain this code, and does not pick up the -pthread its lock
+    # needs either.
+    "tests": {
+        "source": _RUNTIME_TEST_C,
+        "pkgs": [],
+        "extra_link_flags": ["-pthread"],
+    },
 }
 
 
@@ -1097,7 +1113,7 @@ def _check_feature_supported(feature, platform_name=None):
 
 def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=False,
                                     uses_http=False, uses_https=False, uses_async_io=False,
-                                    uses_threads=False):
+                                    uses_threads=False, uses_tests=False):
     """Every program links core (log/fail/sqlite/regex/timers -- see
     festina_runtime.c's top comment) plus -lm (claude.md #56's
     Math.floor/ceil/round/trunc lower to libm intrinsics -- round() in
@@ -1146,7 +1162,8 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
 
     for name, wants in (("graphics", uses_graphics), ("audio", uses_audio),
                         ("http", uses_http), ("https", uses_https),
-                        ("async_io", uses_async_io), ("threads", uses_threads)):
+                        ("async_io", uses_async_io), ("threads", uses_threads),
+                        ("tests", uses_tests)):
         if not wants:
             continue
         skip_gate = name == "graphics" and not wants_window
@@ -1166,7 +1183,8 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
     return objects, link_libs
 
 
-def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", target="native"):
+def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", target="native",
+                 tests_enabled=False):
     # claude.md #5, #6: resolves entry_path's full import graph (a plain
     # single-file program is the degenerate case -- just entry_path on
     # its own) and merges every file into one ast.Program, in dependency
@@ -1184,7 +1202,8 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
     # this function's own linking choices below -- wasm32-wasi's 32-bit
     # size_t needs real codegen differences (see CodeGen.__init__'s own
     # note on self.pointer_bits), not just a different link recipe.
-    gen = codegen_mod.CodeGen(analyzed, filename=entry_path, target=target)
+    gen = codegen_mod.CodeGen(analyzed, filename=entry_path, target=target,
+                              tests_enabled=tests_enabled)
     ir = gen.generate(program)
 
     if emit_llvm:
@@ -1225,7 +1244,7 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
     runtime_objects, link_libs = _runtime_objects_and_link_libs(
         cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics,
         uses_http=gen.uses_http, uses_https=gen.uses_https, uses_async_io=gen.uses_async_io,
-        uses_threads=gen.uses_threads)
+        uses_threads=gen.uses_threads, uses_tests=gen.tests_enabled)
 
     if llvm_backend.available():
         _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs)
@@ -1240,7 +1259,7 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
 _WASM_RUN_SCRIPT = os.path.join(_WASM_DIR, "run_wasi.mjs")
 
 
-def run_program(entry_path, cc="clang", target="native"):
+def run_program(entry_path, cc="clang", target="native", tests_enabled=False):
     """`festina run` -- compile entry_path to a throwaway temp executable
     and run it immediately, the same way `go run`/`cargo run` do: no
     lasting output file, stdin/stdout/stderr inherited directly from this
@@ -1267,7 +1286,8 @@ def run_program(entry_path, cc="clang", target="native"):
         # .exe itself when the name has no suffix, and running the name
         # we ASKED for rather than the file it WROTE would fail.
         out_path = os.path.join(d, _default_output_name("program.f", target=target))
-        compile_file(entry_path, out_path, cc=cc, target=target)
+        compile_file(entry_path, out_path, cc=cc, target=target,
+                     tests_enabled=tests_enabled)
         if target == "wasm32-wasi":
             node = shutil.which("node")
             if node is None:
@@ -2185,6 +2205,18 @@ def _build_arg_parser():
     run_p.add_argument("--cc", default=default_cc, help=cc_help)
     run_p.add_argument("--target", choices=["native", "wasm32-wasi"], default="native", help=target_help)
 
+    # claude.md #341: `festina test` -- specification.md 11.7.3/21.2.
+    # Deliberately the same shape as `run`: compile to a throwaway
+    # binary and execute it, inheriting streams and propagating its exit
+    # code, which is already non-zero exactly when an assertion failed.
+    # The single difference is tests_enabled, and that difference is a
+    # different COMPILE rather than a different way of running the same
+    # program -- an ordinary build has no assertions in it to run.
+    test_p = sub.add_parser("test", help="compile a Festina program with its assertions enabled and run them")
+    test_p.add_argument("input", help="entry .f file")
+    test_p.add_argument("--cc", default=default_cc, help=cc_help)
+    test_p.add_argument("--target", choices=["native", "wasm32-wasi"], default="native", help=target_help)
+
     doctor_p = sub.add_parser("doctor", help="check whether the compiler's own dependencies are installed")
     doctor_p.add_argument("--fix", action="store_true",
                            help="try to auto-install missing dependencies via the detected "
@@ -2216,9 +2248,10 @@ def main(argv=None):
     if args.command == "update":
         return _run_update()
 
-    if args.command == "run":
+    if args.command in ("run", "test"):
         try:
-            return run_program(args.input, cc=args.cc, target=args.target)
+            return run_program(args.input, cc=args.cc, target=args.target,
+                               tests_enabled=args.command == "test")
         except CompileError as e:
             print(str(e), file=sys.stderr)
             return 1

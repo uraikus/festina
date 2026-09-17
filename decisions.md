@@ -7573,3 +7573,113 @@ I predicted three gray calls for a two-node ring with two roots and
 forgot the ring's back edge: root a walks a, then b, then b's edge back
 to a, which finds a already gray. Four. The compiler was right and the
 prediction was not -- the same shape as #338's blank-line miscount.
+
+341. A `test` TYPE, AND `festina test`
+
+todo.md's largest queued capability, and the one it had already thought
+hardest about: named groups of assertions, run by a CLI verb of their
+own, so a Festina program can be tested without a second language in
+the loop. The sketch was settled -- `test` is a TYPE, the group's name
+is an ordinary binding, and calling it asserts -- and what it left open
+was a list of real questions. This entry answers them, in the order
+specification-first requires (#278): the clause, then the tests, then
+the code.
+
+**`test` cannot be a reserved word, and the repository says so.**
+`bootstrap/semantic.f` declares `void func checkCondition(s:Scope,
+stmt:Node, test:Node)`, and `regex.test(s)` is an existing method of
+16.3. Reserving `test` would stop the bootstrap compiler compiling --
+which the differential harness would report as the entire corpus
+breaking, for a reason having nothing to do with what broke. So it is
+CONTEXTUAL, recognised only as the first token of a statement that
+continues `Identifier =`: the same treatment `weak` got in #332, and
+the same three-token lookahead keeps `test = 5` and `test(1, 2)`
+parsing exactly as they always did. Checking first is what turned this
+from a design question into a settled one.
+
+**Which found that `weak` was never listed as contextual either.** 7.4
+has a table of contextual words and #332 never added `weak` to it,
+though its own clause says it is one. Fixed here, since this entry is
+what made the table worth reading twice.
+
+**What an assertion may compare, and why that is the conservative half
+of a fork.** todo.md asked what `test(actual, expected)` means for a
+non-scalar and named the difficulty exactly: `==` on a struct is
+IDENTITY (8.9.1, settled by #326), so `t(makePoint(1, 2), makePoint(1,
+2))` would be a failing assertion about two distinct values while
+plainly meaning to pass. The two ways out are deep equality -- the
+first thing in the language to need it, with its own answers owed for
+cycles, map ordering and NaN -- or a restriction. The restriction won:
+both arguments must be the same type, and that type must be one whose
+`==` is value equality (`int`, `float`, `bool`, `text`, `ascii`, an
+enum of those). Anything else is a compile error naming identity as the
+reason.
+
+The deciding argument is not that deep equality is hard. It is that
+giving `test` a second meaning of equality that no operator in the
+language has would make `==` and an assertion disagree about the same
+two values, silently. A compile error says so at the call. And
+widening a restriction later is compatible where narrowing one is not.
+
+**`.near`, and why it is in the first version rather than the second.**
+Exact float equality is a trap: `t(0.1 + 0.2, 0.3)` fails, correctly
+and uselessly. A language that ships assertions without an answer to
+that ships a footgun, so 11.7.2's `.near(actual, expected, tolerance)`
+is here. It is also the whole of the method surface for now --
+`.throws()` and `.contains()` are real and deferred, not forgotten.
+The comparison is `fcmp ole`, the ORDERED one, which makes a null
+actual, expected or tolerance fail the assertion with no branch of its
+own: null IS the NaN payload for float (8.2).
+
+**The report's source line is defined over the tree, not the source
+text.** todo.md wanted the failing assertion quoted "as it was
+written", and noted its own sample was inconsistent about it (`test(2-2,
+4)` against a source reading `2 - 2`). Quoting verbatim needs byte
+offsets carried through the lexer and onto every node -- a change that
+ripples into the token dump the lexer differential compares -- to buy a
+difference only an unusually spelled program could observe. So 11.7.4
+renders the call from its own syntax tree, with binary operators spaced
+and nothing parenthesised the tree does not require. For the
+expressions an assertion contains that IS the source spelling: the
+example prints `basicMath(2 - 2, 4)`.
+
+**Stripped from an ordinary build, and literally so.** 11.7.3 removes
+every declaration and every assertion from a `festina compile`. Not
+disabled at runtime, not left to the optimizer: never emitted, the
+runtime declares are not even in the IR, and `festina_runtime_test.c`
+is a translation unit of its own that an ordinary build does not link
+-- which also keeps the `-pthread` its lock needs off a program that
+never asked for it. The consequence is worth stating loudly and 11.7.3
+does: an assertion's arguments are not evaluated there, so their side
+effects do not happen. Assert over values, not over calls that do work.
+
+**The report is global where #340's buffer is per-thread, and that is
+not an inconsistency.** A deferred-root buffer is about a heap, and
+threads have disjoint heaps (#163), so it is `__thread`. A report is
+about a PROGRAM, and an assertion inside a thread's handler belongs in
+the same group as one in main. So this is the one piece of mutable
+global state in the runtime two threads can reach, and it takes a lock
+-- which costs nothing that matters, because an assertion is not a hot
+path and a test build is not a shipped one.
+
+**A `text` assertion aborted, immediately, and that was the good
+version of the mistake.** The first runtime took ownership of the
+rendered `actual` string. For every type but `text` that is a fresh
+allocation; for `text` the rendering IS the value, so asserting on two
+strings freed a `.rodata` literal and the process died with SIGABRT on
+the spot. The runtime copies what it keeps now. A quieter failure here
+would have been a corrupted heap in a test harness, which is the worst
+place to have one.
+
+**And a test that skipped silently, which looks exactly like one that
+passes.** The ASan check for the report path probed for a sanitizer
+with `shutil.which("clang") or shutil.which("gcc")` and took clang
+because it exists -- but this container has clang with no
+`libclang_rt.asan` at all, so the check skipped every time while the
+run stayed green. `scripts/leak_stress.sh` has had the right shape for
+this since it was written (probe each candidate by actually LINKING
+with `-fsanitize=address`), and copying it made the check run and pass:
+600 assertions through a loop over text, int and `.near`, clean under
+AddressSanitizer and LeakSanitizer. The check had already been run by
+hand before that; a check that ran once and was not kept is not
+coverage, which is why it is a test.

@@ -11,7 +11,7 @@ specification this compiler is built against, see
 
 ## CLI
 
-Five subcommands (`festina/cli.py`), not a single bare `festina file.f`
+Six subcommands (`festina/cli.py`), not a single bare `festina file.f`
 — that would leave `festina run` (which executes the compiled result)
 ambiguous with `festina compile` (which never does) without inventing a
 flag to distinguish them:
@@ -20,6 +20,7 @@ flag to distinguish them:
 |---|---|
 | `festina compile entry.f -o out` | Compile to a native executable at `out` (default: `entry`'s own filename without `.f`). `--emit-llvm` prints LLVM IR to stdout instead of linking. `--cc` picks the C compiler/linker (default: whichever of `clang`/`gcc`/`cc` is found first). `--target=wasm32-wasi` cross-compiles to a standalone `.wasm` binary instead — see [wasm.md](wasm.md) for setup, usage, and limitations (graphics/audio aren't available under WASI). |
 | `festina run entry.f` | Compile to a throwaway temp executable and run it immediately — stdin/stdout/stderr inherited directly (not captured), so an interactive program (graphics/audio/timers) behaves exactly like a normal compile-then-run. Exits with the *compiled program's own* exit code, so `festina run x.f && ...` composes the same way `go run`/`cargo run` do. The temp binary is always cleaned up afterward. `--target=wasm32-wasi` runs the compiled `.wasm` through Node's built-in WASI support instead of executing it directly. |
+| `festina test entry.f` | Compile with assertions enabled and run them, printing the report and exiting non-zero if any assertion failed — see [Tests](#tests). This is a different *compile*, not a different way of running the same program: `festina compile` and `festina run` remove every `test` declaration and every assertion from the program entirely, so an ordinary binary has none in it to run. `--target=wasm32-wasi` works the same way it does for `run`. |
 | `festina doctor` | Checks every dependency the compiler itself needs (a C compiler, `pkg-config`, sqlite3/cairo-xlib/alsa dev headers, `libLLVM`) and reports what's missing and how to install it — the same install hints a real compile failure would give, just checked proactively instead of only on failure. Also reports whether `festina` itself is resolvable on `PATH`, and if not, exactly how to add it (the checkout's `bin/` directory, or a packaged binary — see [setup.md](setup.md)). Exits 0 if every *required* dependency is present — graphics/audio are optional, since a compiler that can't build a graphics program is still a fully working compiler for everything else (see [security.md](security.md#slim-binaries)). |
 | `festina doctor --fix` | Same report, then actually fixes what it found instead of leaving the printed hint for a human to act on by hand: installs whatever dependencies are missing (required and optional both) via the detected package manager — `apt` on Linux, Homebrew on macOS, MSYS2's `pacman` on Windows — and, if `festina` itself isn't resolving on `PATH`, adds it (a symlink for a packaged binary, an `export PATH=...` line appended to `~/.bashrc`/`~/.zshrc` for a checkout, `setx` on Windows). Prints the exact command/change first and asks for confirmation (`--yes`/`-y` skips that, for every prompt this can raise); refuses to guess for any other package manager, overwrite something unrelated already on disk, or run non-interactively without `--yes`, rather than doing nothing or making a change nobody agreed to. The exit code reflects the dependency side only — not being on `PATH` has never been a required check. |
 | `festina update` | Pulls the latest source into this installation's own git checkout and fast-forwards to it (`git fetch` + `git merge --ff-only`) — there's no separate release pipeline or package to fetch (install.sh's own approach), the running `festina` *is* this checkout, so updating it is exactly this. Refuses, with a clear message and no changes made, when the working tree has uncommitted changes, when HEAD is detached, or when local history has genuinely diverged from origin (never force-resets over local work the way install.sh's own first-time bootstrap does — that runs against a fresh clone with nothing to lose, this runs against a checkout someone may actually be living in). Not available for a packaged (PyInstaller) binary, which has no source tree of its own to pull into. |
@@ -1641,6 +1642,97 @@ normally. Works under `--target=wasm32-wasi` too (WASI has its own
 argc/argv), but this checkout's own runner (`run_wasi.mjs`) only ever
 passes the compiled module's own path through, so `argv` there is
 always a single-element array — see [wasm.md](wasm.md).
+
+## Tests
+
+A named group of assertions, run by `festina test`:
+
+```festina
+test basicMath = 'basic math test'
+basicMath(2 + 2, 4)
+basicMath(3 - 1, 2)
+basicMath(2 - 2, 4)
+
+test stringInterpolation = 'string interpolation'
+text name = 'Patrick'
+text greeting = `Hello, ${name}!`
+stringInterpolation(greeting, 'Hello, Patrick!')
+```
+
+```
+$ festina test ./test-example.f
+basic math test: 2 pass, 1 fail. 66%
+ | - fail: basicMath(2 - 2, 4) // 0
+string interpolation: 1 pass. 100%
+Overall: 3 pass, 1 fail. 75%
+```
+
+`test NAME = 'description'` declares the group; **calling** the binding
+asserts. An assertion belongs to the binding it calls, wherever the call
+appears — in a function, a loop, a branch, another file — so grouping is
+by name rather than by position, and there is no block to keep
+assertions inside.
+
+The call answers a `bool` (`true` when it passed), so you can branch on
+one; most code doesn't. Percentages are truncated, not rounded — two of
+three is 66% — and a group with no failures omits the fail count
+entirely. The exit code is non-zero if anything failed, which is what
+makes `festina test` usable in CI.
+
+`test` is **contextual**: it means a declaration only at the start of a
+statement that continues `name =`. A variable, parameter, field or
+method called `test` still works, `regex.test(s)` included.
+
+### What you can assert on
+
+Both arguments must be the same type, and that type must be one whose
+`==` is **value** equality: `int`, `float`, `bool`, `text`, `ascii`, or
+an enum of those. Anything else is a compile error:
+
+```festina
+test t = 'points'
+Point a
+Point b
+t(a, b)         // error: Point compares by identity
+```
+
+That's deliberate. A struct, row, `arr[T]` or `map[T]` compares by
+**identity** (see `==` under [Arrays](#arrays)), so
+`t(makePoint(1, 2), makePoint(1, 2))`
+would be a *failing* assertion about two distinct values — while plainly
+meaning to pass. Rather than give `test` a second, deeper meaning of
+equality that no operator in the language has, the call is rejected and
+you assert on the fields that matter. (Widening this later stays
+compatible; narrowing it would not.)
+
+### Floats
+
+```festina
+test t = 'floats'
+t(0.1 + 0.2, 0.3)              // fails -- correctly, and unhelpfully
+t.near(0.1 + 0.2, 0.3, 0.0001) // passes
+```
+
+`.near(actual, expected, tolerance)` passes when `|actual - expected| <=
+tolerance` and records in the same group. A null anywhere fails the
+assertion rather than erroring.
+
+### Assertions are not in your shipped binary
+
+`festina compile` and `festina run` remove every `test` declaration and
+every assertion **from the program**. Not disabled at runtime, not left
+for the optimizer — never emitted, and the runtime object that holds the
+report isn't even linked.
+
+One consequence to know: under an ordinary compile an assertion's
+arguments are **not evaluated**, so their side effects don't happen.
+Assert over values, not over calls that do work:
+
+```festina
+t(counter.next(), 5)   // don't -- .next() won't run in a normal build
+int n = counter.next()
+t(n, 5)                // do
+```
 
 ## Regex
 

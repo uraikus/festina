@@ -252,6 +252,25 @@ class RegexType:
 
 
 @dataclass(frozen=True)
+class TestType:
+    """claude.md #341: a named group of assertions (specification.md
+    11.7).
+
+    Like RegexType there is only one shape of it -- a group's
+    description is a runtime value, not part of its type -- and unlike
+    every other type here it is never reference counted and never
+    reclaimed: a group is a fixed, program-global reporting slot
+    created before `main` runs and read once after it ends, so there is
+    no lifetime for the memory model to have an opinion about. That is
+    also why it carries no `manually_managed` flag: `test?` would mean
+    manually managing something the program never allocates.
+    """
+
+    def __repr__(self):
+        return "TestType()"
+
+
+@dataclass(frozen=True)
 class ColorType:
     """claude.md #91: a colour, resolved to its channels at compile time.
 
@@ -389,6 +408,8 @@ def type_name(t):
         return f"url{mm}"
     if isinstance(t, SocketType):
         return f"socket{mm}"
+    if isinstance(t, TestType):
+        return "test"
     if isinstance(t, ColorType):
         return "color"
     if isinstance(t, FontType):

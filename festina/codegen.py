@@ -980,8 +980,22 @@ class _StackArrayOrMap:
 
 
 class CodeGen:
-    def __init__(self, analyzed, filename="main.f", target="native", host_platform=None):
+    def __init__(self, analyzed, filename="main.f", target="native", host_platform=None,
+                 tests_enabled=False):
         self.analyzed = analyzed
+        # claude.md #341: whether this is a `festina test` build
+        # (specification.md 11.7.3). False for `festina compile`/`run`,
+        # where every test declaration and every assertion is removed
+        # from the program entirely -- not optimized away, not disabled
+        # at runtime, but never emitted, so the promise holds however
+        # the optimizer feels about it.
+        self.tests_enabled = tests_enabled
+        # group name -> the global holding its runtime id. Populated
+        # only in a test build; `_test_names` is populated either way,
+        # because an ordinary build still has to RECOGNISE an assertion
+        # in order to remove it rather than fail on an unknown callee.
+        self._test_groups = {}
+        self._test_names = {d.name for d in getattr(analyzed, "test_decls", [])}
         self.entry_filename = filename         # the file actually passed to the compiler -- see generate()
         self.filename = filename               # mutated per top-level statement (see generate()); used by every error site
         # claude.md #148: WASM export. Every native target festina/cli.py
@@ -2341,6 +2355,17 @@ class CodeGen:
             # _release_fn_for_struct and festina_release_check's own
             # comment in runtime/festina_runtime.c.
             "declare i8 @festina_release_check(ptr)",
+            # claude.md #341: declared only when this is a `festina
+            # test` build, because festina_runtime_test.c is linked only
+            # then -- a declare for a symbol no object provides is
+            # harmless to LLVM but would be a lie in the IR about what
+            # the program depends on, and specification.md 11.7.3's
+            # promise is exactly about what an ordinary build contains.
+            *(["declare i64 @festina_test_group(ptr)",
+               "declare void @festina_test_assert(i64, i8, ptr, ptr)",
+               "declare void @festina_test_report()",
+               "declare i64 @festina_test_failures()"]
+              if self.tests_enabled else []),
             # claude.md #79: reference counting for arr[T]/map[T]
             # values that escape -- see _release_fn_for and each
             # function's own doc comment in runtime/festina_runtime.c.
@@ -5841,6 +5866,14 @@ class CodeGen:
         if isinstance(stmt, ast.Block):
             inner = self._emit_block(stmt, env, return_type, lines)
             ctx["terminated"] = inner["terminated"]
+            return
+        if isinstance(stmt, ast.TestDecl):
+            # claude.md #341: specification.md 11.7. In an ordinary
+            # build this emits nothing at all -- the declaration is
+            # removed, which is what 11.7.3 promises and what keeps a
+            # shipped binary free of the whole mechanism.
+            if self.tests_enabled:
+                self._emit_test_decl(stmt, env, lines)
             return
         if isinstance(stmt, ast.FuncDecl):
             # claude.md #140: a FuncDecl nested inside an if/while/for/
@@ -11149,6 +11182,182 @@ class CodeGen:
         body.append("")
         return body
 
+    # ---- the built-in test suite -- claude.md #341 ----
+
+    def _emit_test_decl(self, stmt, env, lines):
+        """specification.md 11.7: register one group and remember the
+        global its runtime id lives in.
+
+        A global rather than a local because a group is reachable from
+        anywhere a `test` binding is -- a function body, a handler, a
+        thread -- exactly like the binding itself, which is an ordinary
+        global value name. The id is an integer the runtime hands back,
+        not a pointer, because its own group array grows.
+        """
+        slot = f"@__festina_test_{stmt.name}"
+        self._test_groups[stmt.name] = slot
+        self.extra_globals.append(f"{slot} = global i64 0")
+        desc, desc_type = self._emit_value_for(stmt.description, env, lines, TEXT)
+        desc = self._coerce(desc, desc_type, TEXT, lines, source_expr=stmt.description)
+        gid = self.tmp()
+        lines.append(f"  {gid} = call i64 @festina_test_group(ptr {desc})")
+        lines.append(f"  store i64 {gid}, ptr {slot}")
+
+    def _emit_assertion(self, expr, name, env, lines):
+        """specification.md 11.7.1: compare the two arguments and record
+        the result in `name`'s group.
+
+        In an ordinary build this emits NOTHING and answers `true`.
+        11.7.3 says an assertion's arguments are not evaluated there, so
+        their side effects do not happen -- which is a real consequence
+        and is why the clause says to assert over values rather than
+        over calls that do work. `true` is the honest answer to "did
+        anything fail": nothing ran.
+        """
+        if not self.tests_enabled:
+            return "1", BOOL
+        slot = self._test_groups[name]
+        actual_expr, expected_expr = expr.args[0], expr.args[1]
+        a_val, a_type = self._emit_expr(actual_expr, env, lines)
+        e_val, e_type = self._emit_expr(expected_expr, env, lines)
+        cmp_type = a_type if a_type is not None else e_type
+        passed = self._emit_value_equality(a_val, e_val, cmp_type, lines)
+        rendered = self._to_text(a_val, a_type, lines) if a_type is not None else None
+        if rendered is None:
+            rendered = self.tmp()
+            lines.append(f"  {rendered} = call ptr @festina_str_dup(ptr "
+                         f"{self.string_const('null')})")
+        src = self.string_const(self._render_expr_source(expr))
+        gid = self.tmp()
+        lines.append(f"  {gid} = load i64, ptr {slot}")
+        lines.append(f"  call void @festina_test_assert(i64 {gid}, i8 {passed}, "
+                     f"ptr {src}, ptr {rendered})")
+        # The runtime copies what it keeps, so whatever this produced is
+        # ours to dispose of -- a rendering is a fresh allocation, and a
+        # text argument is its own value, which the ordinary
+        # owned-temporary release handles.
+        if a_type is not None and a_type != TEXT:
+            lines.append(f"  call void @free(ptr {rendered})")
+        self._release_owned_receiver(actual_expr, a_val, a_type, lines)
+        self._release_owned_receiver(expected_expr, e_val, e_type, lines)
+        return passed, BOOL
+
+    def _emit_assertion_near(self, expr, name, env, lines):
+        """specification.md 11.7.2: |actual - expected| <= tolerance,
+        recorded in the same group a plain call records in.
+
+        Exists because exact float equality is a trap rather than
+        because methods are decorative: `myTest(0.1 + 0.2, 0.3)` fails,
+        correctly and unhelpfully, and a language that ships assertions
+        without an answer to that ships a footgun.
+        """
+        if not self.tests_enabled:
+            return "1", BOOL
+        slot = self._test_groups[name]
+        a_val, a_type = self._emit_expr(expr.args[0], env, lines)
+        e_val, e_type = self._emit_expr(expr.args[1], env, lines)
+        t_val, t_type = self._emit_expr(expr.args[2], env, lines)
+        a_val = self._coerce(a_val, a_type, FLOAT, lines, source_expr=expr.args[0])
+        e_val = self._coerce(e_val, e_type, FLOAT, lines, source_expr=expr.args[1])
+        t_val = self._coerce(t_val, t_type, FLOAT, lines, source_expr=expr.args[2])
+        diff = self.tmp()
+        mag = self.tmp()
+        bit = self.tmp()
+        passed = self.tmp()
+        lines.append(f"  {diff} = fsub double {a_val}, {e_val}")
+        lines.append(f"  {mag} = call double @llvm.fabs.f64(double {diff})")
+        # `ole`, the ORDERED comparison: a NaN anywhere makes this false
+        # and the assertion fails, which is the answer 11.7.2 specifies
+        # for a null actual, expected or tolerance -- null IS the NaN
+        # payload for float (8.2), so this needs no branch of its own.
+        lines.append(f"  {bit} = fcmp ole double {mag}, {t_val}")
+        lines.append(f"  {passed} = zext i1 {bit} to i8")
+        rendered = self._to_text(a_val, FLOAT, lines)
+        src = self.string_const(self._render_expr_source(expr))
+        gid = self.tmp()
+        lines.append(f"  {gid} = load i64, ptr {slot}")
+        lines.append(f"  call void @festina_test_assert(i64 {gid}, i8 {passed}, "
+                     f"ptr {src}, ptr {rendered})")
+        lines.append(f"  call void @free(ptr {rendered})")
+        return passed, BOOL
+
+    def _emit_value_equality(self, a_val, e_val, type_, lines):
+        """The comparison an assertion means, for the types
+        specification.md 11.7.1 allows: value equality, never identity.
+
+        Semantic analysis has already refused every type whose `==` is
+        identity, so there is no struct/array/map case to get wrong
+        here -- the restriction is enforced where it can carry a
+        message, and this stays a small dispatch over types that all
+        genuinely compare by value.
+        """
+        out = self.tmp()
+        if type_ == TEXT or type_ == ASCII:
+            lines.append(f"  {out} = call i8 @festina_str_eq(ptr {a_val}, ptr {e_val})")
+            return out
+        if type_ == FLOAT:
+            bit = self.tmp()
+            lines.append(f"  {bit} = fcmp oeq double {a_val}, {e_val}")
+            lines.append(f"  {out} = zext i1 {bit} to i8")
+            return out
+        llvm = _llvm_type(type_) if type_ is not None else "i64"
+        bit = self.tmp()
+        lines.append(f"  {bit} = icmp eq {llvm} {a_val}, {e_val}")
+        lines.append(f"  {out} = zext i1 {bit} to i8")
+        return out
+
+    def _render_expr_source(self, expr):
+        """specification.md 11.7.4: the assertion as the report prints
+        it, rendered from its own syntax tree.
+
+        Defined over the tree rather than the source text on purpose --
+        the alternative is carrying byte offsets through the lexer and
+        into every node, which buys a difference only an unusually
+        spelled program could observe. Binary operators are spaced and
+        nothing is parenthesised that the tree does not require, so for
+        the expressions an assertion actually contains this IS the
+        source spelling.
+        """
+        if isinstance(expr, ast.NumberLit):
+            v = expr.value
+            if isinstance(v, float) and v.is_integer() and "." not in str(v):
+                return str(v)
+            return str(v)
+        if isinstance(expr, ast.StringLit):
+            return "'" + str(expr.value).replace("'", "\\'") + "'"
+        if isinstance(expr, ast.BoolLit):
+            return "true" if expr.value else "false"
+        if isinstance(expr, ast.NullLit):
+            return "null"
+        if isinstance(expr, ast.Identifier):
+            return expr.name
+        if isinstance(expr, (ast.BinOp, ast.LogicalOp)):
+            return (f"{self._render_expr_source(expr.left)} {expr.op} "
+                    f"{self._render_expr_source(expr.right)}")
+        if isinstance(expr, ast.UnaryOp):
+            return f"{expr.op}{self._render_expr_source(expr.operand)}"
+        if isinstance(expr, ast.Member):
+            if expr.computed:
+                return (f"{self._render_expr_source(expr.obj)}"
+                        f"[{self._render_expr_source(expr.prop)}]")
+            return f"{self._render_expr_source(expr.obj)}.{expr.prop}"
+        if isinstance(expr, ast.Call):
+            args = ", ".join(self._render_expr_source(a) for a in expr.args)
+            return f"{self._render_expr_source(expr.callee)}({args})"
+        if isinstance(expr, ast.TemplateLit):
+            # A template's own pieces are already expressions; rendering
+            # it back exactly would need the literal chunks, which the
+            # node keeps. Backticks and ${} restored around them.
+            out = []
+            for i, chunk in enumerate(expr.parts):
+                out.append(str(chunk))
+                if i < len(expr.exprs):
+                    out.append("${" + self._render_expr_source(expr.exprs[i]) + "}")
+            return "`" + "".join(out) + "`"
+        # Anything else renders as its own kind rather than guessing --
+        # a report line that says less is better than one that lies.
+        return f"<{type(expr).__name__}>"
+
     def _emit_cycle_trial(self, body, type_, alive_label, done_label):
         """The still-referenced branch of a cyclic type's release
         wrapper: when the released value remains at a positive count,
@@ -12045,6 +12254,19 @@ class CodeGen:
 
     def _emit_call(self, expr, env, lines, expected_type=None):
         callee = expr.callee
+        # claude.md #341: an assertion -- a call of a `test` binding
+        # (specification.md 11.7.1). Checked before every builtin below,
+        # because a `test` binding may not take a builtin's name in the
+        # first place (6.7) and so this can never shadow one.
+        if (isinstance(callee, ast.Identifier)
+                and callee.name in self._test_names):
+            return self._emit_assertion(expr, callee.name, env, lines)
+        if (isinstance(callee, ast.Member) and not callee.computed
+                and callee.prop == "near"
+                and isinstance(callee.obj, ast.Identifier)
+                and callee.obj.name in self._test_names):
+            # claude.md #341: specification.md 11.7.2's one method.
+            return self._emit_assertion_near(expr, callee.obj.name, env, lines)
         if isinstance(callee, ast.Identifier):
             name = callee.name
             if name == "postMessage" and self._current_thread_ctx is not None:
@@ -14892,6 +15114,22 @@ class CodeGen:
         # release wrapper has been generated -- an ordering dependency
         # worth more than the line it would save.
         main_lines.append("  call void @festina_cycle_flush()")
+        # claude.md #341: specification.md 11.7.4 -- the report prints
+        # after the program's own execution ends, and the exit code is
+        # non-zero exactly when something failed, which is what makes
+        # `festina test` usable in a pipeline. Emitted only in a test
+        # build; an ordinary one returns 0 as it always did.
+        if self.tests_enabled:
+            main_lines.append("  call void @festina_test_report()")
+            fails = self.tmp()
+            failed = self.tmp()
+            code = self.tmp()
+            main_lines.append(f"  {fails} = call i64 @festina_test_failures()")
+            main_lines.append(f"  {failed} = icmp ne i64 {fails}, 0")
+            main_lines.append(f"  {code} = select i1 {failed}, i32 1, i32 0")
+            main_lines.append(f"  ret i32 {code}")
+            main_lines.append("}")
+            return entry_func + [""] + main_lines
         main_lines.append("  ret i32 0")
         main_lines.append("}")
 

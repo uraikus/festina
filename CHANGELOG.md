@@ -14,6 +14,41 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Added
 
+- **A built-in test suite: a `test` type and `festina test`.** Named
+  groups of assertions, run by a CLI verb of their own, so a Festina
+  program can be tested without a second language in the loop.
+
+  ```festina
+  test basicMath = 'basic math test'
+  basicMath(2 + 2, 4)
+  basicMath(2 - 2, 4)
+  ```
+  ```
+  $ festina test ./test-example.f
+  basic math test: 1 pass, 1 fail. 50%
+   | - fail: basicMath(2 - 2, 4) // 0
+  Overall: 1 pass, 1 fail. 50%
+  ```
+
+  `test NAME = 'description'` declares the group and **calling** the
+  binding asserts, so an assertion belongs to the binding it calls
+  wherever the call appears — no block to keep them inside. The call
+  answers a `bool`. `test` is **contextual**, not reserved: a variable,
+  parameter, field or method called `test` still works, `regex.test(s)`
+  included. Percentages are truncated (two of three is 66%), a clean
+  group omits its fail count, and the exit code is non-zero if anything
+  failed.
+
+  Both arguments must share a type whose `==` is **value** equality
+  (`int`, `float`, `bool`, `text`, `ascii`, an enum of those); a struct
+  or container is a compile error, because those compare by identity and
+  an assertion over two separately-built structs would fail while
+  plainly meaning to pass. `.near(actual, expected, tolerance)` covers
+  floats, where exact equality is a trap. `festina compile` and
+  `festina run` remove every declaration and assertion **from the
+  program** — the report's runtime object is not even linked — so an
+  assertion's arguments are not evaluated in an ordinary build and must
+  not be relied on for side effects. (decisions.md #341)
 - **`weak` struct fields.** `parent:weak Node` refers to a value without
   keeping it alive, and **its read is checked**: it yields the value
   while something else still holds it and `null` once nothing does, so

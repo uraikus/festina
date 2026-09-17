@@ -225,6 +225,11 @@ _TEXT = types_mod.PrimitiveType("text")
 _BLOB = types_mod.PrimitiveType("blob")
 _ASCII = types_mod.PrimitiveType("ascii")
 _BOOL = types_mod.PrimitiveType("bool")
+# claude.md #341: the type of a `test` group binding (specification.md
+# 11.7). Never resolved from a type NAME -- `test` is contextual, so it
+# only ever reaches a program through a TestDecl -- which is why it is
+# absent from resolve_type_name below.
+_TEST = types_mod.TestType()
 # claude.md #327: the five binary bitwise operators. `~` is unary and is
 # handled on its own, beside `!`.
 _BITWISE_BINARY_OPS = frozenset({"&", "|", "^", "<<", ">>"})
@@ -1321,9 +1326,14 @@ class _ThreadInfo:
 
 class AnalyzedProgram:
     def __init__(self, symbols, structs, tables, enums, imports, threads=None,
-                 main_message_type=None, main_reply_type=None, weak_fields=None):
+                 main_message_type=None, main_reply_type=None, weak_fields=None,
+                 test_decls=None):
         self.symbols = symbols
         self.structs = structs
+        # claude.md #341: every `test` group, in declaration order,
+        # which is the order specification.md 11.7.4 reports them in.
+        # A list rather than a dict for exactly that reason.
+        self.test_decls = test_decls if test_decls is not None else []
         # claude.md #332: struct name -> frozenset of weak field names.
         self.weak_fields = weak_fields if weak_fields is not None else {}
         self.tables = tables
@@ -1587,6 +1597,7 @@ def analyze(program, filename="<string>"):
     enums = {}  # claude.md #176: name -> _EnumInfo
     threads = {}  # claude.md #195: name -> _ThreadInfo
     imports = []
+    test_decls = []  # claude.md #341: in declaration order
     entry_filename = filename  # see the DatabaseURL check at the bottom
     # claude.md #195: a one-slot mutable box naming which thread's OWN
     # handler body is currently being analyzed (a _ThreadInfo, or None
@@ -3315,6 +3326,16 @@ def analyze(program, filename="<string>"):
                             )
                 return _BUILTIN_RETURN_TYPES.get(name)
             sym = scope.lookup(name)
+            if sym is not None and isinstance(sym.type, types_mod.TestType):
+                # claude.md #341: an ASSERTION -- calling a `test`
+                # binding (specification.md 11.7.1). Checked here, in
+                # the same place an indirect call through a func-typed
+                # binding is, and for the same reason: a callee is
+                # decided by the TYPE of what it names, not by a syntax
+                # of its own. That is what made `test` a type rather
+                # than a second block keyword.
+                _check_assertion(expr, name, scope)
+                return _BOOL
             if (sym is not None and sym.kind != "function"
                     and isinstance(sym.type, types_mod.FuncType)):
                 # claude.md #141: an INDIRECT call, through a func[...]:...
@@ -4732,6 +4753,28 @@ def analyze(program, filename="<string>"):
             # a condition" case, where that restriction otherwise pushes
             # every call site's own accumulator state into extra
             # globals purely so the callback can reach it.
+            # claude.md #341: specification.md 11.7.2 -- `.near` on a
+            # `test` binding. The one method the first version of this
+            # type carries, and it is here because exact float equality
+            # is a trap rather than because methods are nice to have:
+            # `myTest(0.1 + 0.2, 0.3)` fails, correctly and uselessly.
+            if callee.prop == "near":
+                obj_type = infer(callee.obj, scope)
+                if isinstance(obj_type, types_mod.TestType):
+                    if len(expr.args) != 3:
+                        raise CompileError(
+                            f"near() takes three arguments "
+                            f"(actual, expected, tolerance), got "
+                            f"{len(expr.args)}",
+                            file=filename, line=callee.line,
+                            column=callee.column,
+                            category="invalid function argument type",
+                        )
+                    for i, arg in enumerate(expr.args):
+                        arg_type = infer(arg, scope)
+                        check_assignable(_FLOAT, arg_type, expr,
+                                         what=f"argument {i + 1}")
+                    return _BOOL
             if callee.prop in ("keys", "values"):
                 obj_type = infer(callee.obj, scope)
                 if isinstance(obj_type, types_mod.MapType):
@@ -5148,6 +5191,80 @@ def analyze(program, filename="<string>"):
                 check_assignable(declared_type, actual_type, decl)
         kind = "constant" if decl.is_const else "variable"
         scope.define(decl.name, Symbol(decl.name, declared_type, kind, decl), decl, filename)
+
+    def _assertion_comparable(t):
+        """specification.md 11.7.1: the types whose `==` is VALUE
+        equality, which is the only kind an assertion can mean.
+
+        A struct, table row, arr[T] or map[T] compares by IDENTITY
+        (8.9.1), so `myTest(makePoint(1, 2), makePoint(1, 2))` would be
+        a failing assertion about two distinct values rather than the
+        passing one it plainly means. Giving `test` a second, deeper
+        meaning of equality that no operator in the language has would
+        make `==` and an assertion disagree about the same two values;
+        rejecting the call says so instead. An enum qualifies only when
+        every member does, since an enum compares as whichever member
+        it holds.
+        """
+        if t is None or t is NULL:
+            return True
+        if isinstance(t, types_mod.PrimitiveType):
+            return t.name in ("int", "float", "bool", "text", "ascii")
+        if isinstance(t, types_mod.EnumType):
+            info = enums.get(t.name)
+            members = getattr(info, "members", None) if info else None
+            if not members:
+                return False
+            return all(_assertion_comparable(m) for m in members)
+        return False
+
+    def _check_assertion(expr, name, scope):
+        if len(expr.args) != 2:
+            raise CompileError(
+                f"'{name}' is a test, so it takes exactly two arguments "
+                f"(actual, expected), got {len(expr.args)}",
+                file=filename, line=getattr(expr, "line", 0),
+                column=getattr(expr, "column", 0),
+                category="invalid function argument type",
+            )
+        actual = infer(expr.args[0], scope)
+        expected = infer(expr.args[1], scope)
+        for t in (actual, expected):
+            if not _assertion_comparable(t):
+                raise CompileError(
+                    f"'{name}' cannot assert on "
+                    f"{types_mod.type_name(t)}: it compares by identity "
+                    f"(specification.md 8.9.1), so two separately-built "
+                    f"values are never equal however alike they are -- "
+                    f"assert on the fields or elements that matter "
+                    f"instead",
+                    file=filename, line=getattr(expr, "line", 0),
+                    column=getattr(expr, "column", 0),
+                    category="invalid function argument type",
+                )
+        check_assignable(actual, expected, expr, what="the expected value")
+
+    def analyze_test_decl(decl, scope):
+        """claude.md #341: specification.md 11.7.
+
+        The description is checked as an ordinary `text` expression and
+        the name defined as an ordinary value name -- which is what
+        gets a `test` group every rule a global already has, including
+        claude.md #339's "may not take the name of a built-in" and the
+        plain "already declared" collision, with nothing written here
+        for either.
+        """
+        desc_type = infer(decl.description, scope)
+        if desc_type is not None and desc_type is not NULL and desc_type != _TEXT:
+            raise CompileError(
+                f"a test's description must be text, not "
+                f"{types_mod.type_name(desc_type)}",
+                file=filename, line=decl.line, column=decl.column,
+                category="invalid argument type",
+            )
+        scope.define(decl.name, Symbol(decl.name, _TEST, "test", decl),
+                     decl, filename)
+        test_decls.append(decl)
 
     def register_func_signature(decl):
         # `log`/`fail`/`sqlite` are already lexer keywords, so a
@@ -5668,6 +5785,8 @@ def analyze(program, filename="<string>"):
             analyze_event_handler(stmt)
         elif isinstance(stmt, ast.ThreadDecl):
             analyze_thread(stmt)
+        elif isinstance(stmt, ast.TestDecl):
+            analyze_test_decl(stmt, scope)
         elif isinstance(stmt, ast.VarDecl):
             analyze_var_decl(stmt, scope, scope is global_scope)
         elif isinstance(stmt, ast.IfStmt):
@@ -6088,4 +6207,4 @@ def analyze(program, filename="<string>"):
     return AnalyzedProgram(global_scope.vars, structs, tables, enums, imports, threads,
                             main_message_type=_main_message_type[0],
                             main_reply_type=_main_reply_type[0],
-                            weak_fields=weak_fields)
+                            weak_fields=weak_fields, test_decls=test_decls)

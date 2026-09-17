@@ -212,6 +212,49 @@ def compile_and_run(tmp_path, codegen, cli_mod):
     return _run
 
 
+@pytest.fixture
+def run_festina_test(tmp_path, codegen, cli_mod):
+    """claude.md #341: compile a source string with assertions enabled
+    and run it, returning (stdout, exit code).
+
+    A separate fixture from compile_and_run because `festina test` is a
+    different COMPILE, not a different way of running the same binary:
+    an ordinary build removes every assertion (specification.md 11.7.3),
+    so a test that went through compile_and_run would be measuring a
+    program with nothing in it. The exit code is returned rather than
+    asserted on, since non-zero is the expected outcome for most of
+    these."""
+    cc = _require_c_compiler()
+
+    def _run(source, filename="main.f", args=None):
+        src_path = tmp_path / filename
+        src_path.write_text(source, encoding="utf-8")
+        out_path = tmp_path / "program"
+        compile_file_or_skip(cli_mod, str(src_path), str(out_path), cc=cc,
+                             tests_enabled=True)
+        result = subprocess.run(
+            [str(out_path), *(args or [])],
+            cwd=tmp_path, capture_output=True, text=True, timeout=30,
+            encoding="utf-8",
+        )
+        return result.stdout, result.returncode
+
+    return _run
+
+
+@pytest.fixture
+def ir_of(parser, semantic, codegen):
+    """The LLVM IR for a source string, with assertions compiled out --
+    an ordinary `festina compile`, which is the build that has to carry
+    none of this."""
+    def _ir(source, filename="main.f"):
+        program = parser.parse(source, filename=filename)
+        analyzed = semantic.analyze(program, filename=filename)
+        return codegen.generate_ir(program, analyzed, filename=filename)
+
+    return _ir
+
+
 def _free_tcp_port():
     """claude.md #151: an OS-assigned free port, for openPort()'s own
     literal (Festina's source text, not the running process, decides

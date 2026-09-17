@@ -519,6 +519,8 @@ position and are ordinary identifiers elsewhere.
 | `default` | the fall-through arm of a `match` | §10.9 |
 | `use` | `on request use NAME` | §20.9 |
 | `DatabaseURL` | database path assignment | §6.4, §20.7 |
+| `test` | `test NAME = 'description'` | §11.7 |
+| `weak` | a struct field's `name:weak T` modifier | §13.5 |
 
 The built-in global function and global object names of §16 (`log`,
 `sqlite`, `Math`, `environment`, `argv`, `clientWidth`, `postMessage`,
@@ -1725,6 +1727,129 @@ implementation may warn. [#189]
 
 See §20.
 
+### 11.7 Tests
+
+*TestDeclaration* ::= `test` *Identifier* `=` *Expression*
+
+A *TestDeclaration* declares a named group of assertions. The
+expression is its description and must have type `text`. The
+identifier is an ordinary **value name** (§6.7) of type `test`, and is
+subject to every rule a global binding already has: it must be declared
+before its first use, it may not collide with another value name, and
+it may not take the name of a built-in (§16). [#341]
+
+```festina
+test basicMath = 'basic math test'
+basicMath(2 + 2, 4)
+basicMath(3 - 1, 2)
+```
+
+`test` is **contextual** (§7.4): it is recognised only as the first
+token of a statement that continues `Identifier =`, so a program
+already using `test` as a variable, parameter, field or method name is
+unaffected — `regex.test(s)` (§16.3) in particular. It is not a
+reserved word. [#341]
+
+#### 11.7.1 Assertions
+
+*Assertion* ::= *Identifier* `(` *Expression* `,` *Expression* `)`
+
+Calling a `test` binding asserts that its two arguments are equal and
+records the result in that binding's group. The call is an expression
+of type `bool` — `true` when the assertion passed — so a program may
+branch on it; most do not, and a bare call is an ordinary expression
+statement.
+
+An assertion belongs to the binding **called**, wherever the call
+appears: in a function body, a loop, a branch, another file. Position
+relative to the declaration does not group anything, and a call may not
+precede the declaration, because nothing else may either.
+
+Both arguments must have the same type (§8.20 assignability applies, so
+`null` is accepted against any of them), and that type must be one
+whose `==` is **value** equality: `int`, `float`, `bool`, `text`,
+`ascii`, or an enum whose members are all of those. Any other type is a
+compile error (§14.1).
+
+That restriction is deliberate and is the conservative half of a fork.
+A struct, table row, `arr[T]` or `map[T]` compares by **identity**
+(§8.9.1), so `myTest(makePoint(1, 2), makePoint(1, 2))` would be a
+failing assertion about two distinct values rather than the passing one
+it plainly means. Silently giving `test` a second, deeper meaning of
+equality that no other operator in the language has would make `==` and
+an assertion disagree; rejecting the call says so at the declaration
+site instead. A later revision may widen this — widening a restriction
+is compatible, narrowing one is not.
+
+#### 11.7.2 Methods
+
+**`test`**: `.near(actual:float, expected:float, tolerance:float):bool`
+— passes when `|actual - expected| <= tolerance`, and records in the
+same group as a plain call. It exists because exact float equality is
+a trap, not a convenience: `myTest(0.1 + 0.2, 0.3)` fails, correctly
+and unhelpfully. A null actual, expected or tolerance fails the
+assertion rather than erroring.
+
+#### 11.7.3 Running them
+
+Assertions are compiled and evaluated **only** by `festina test`
+(§21.2). `festina compile` and `festina run` remove every
+*TestDeclaration* and every assertion call from the program entirely,
+so a shipped binary carries neither the code nor the report.
+
+A consequence a program must not rely on: under `festina compile` an
+assertion's argument expressions are **not evaluated**, so their side
+effects do not happen. Write assertions over values, not over calls
+that do work.
+
+`festina test` compiles the program with assertions enabled and runs
+it. Ordinary top-level code runs exactly as it always does — the
+declarations between assertions in the example above are ordinary
+declarations — and the report is printed after the program's own
+execution ends, before the process exits.
+
+#### 11.7.4 The report
+
+For each group, in declaration order, one line:
+
+```
+<description>: <n> pass, <m> fail. <p>%
+```
+
+followed by one line per failure:
+
+```
+ | - fail: <source> // <actual>
+```
+
+`<source>` is the assertion call **rendered from its own syntax
+tree**: the binding's name, then its arguments, with binary operators
+spaced and no parentheses beyond those the expression needs. For the
+expressions an assertion contains that is the source spelling, and it
+is defined in terms of the tree rather than the source text on purpose
+— the alternative is carrying byte offsets through the lexer, which
+buys a difference only a program written in an unusual style could
+observe. `<actual>` is the first argument's value rendered as
+`.toText()` would render it. A group with no failures omits the fail
+count entirely (`1 pass. 100%`). Percentages are **truncated**, not
+rounded: two of three is `66%`. A final line reports the totals across
+every group in the same form, prefixed `Overall: `.
+
+```
+$ festina test ./test-example.f
+basic math test: 2 pass, 1 fail. 66%
+ | - fail: basicMath(2 - 2, 4) // 0
+string interpolation: 1 pass. 100%
+Overall: 3 pass, 1 fail. 75%
+```
+
+A group that is declared and never called reports `0 pass. 100%` — no
+assertion failed. The process exits non-zero if any assertion in any
+group failed, and zero otherwise; that is what makes the command usable
+in a pipeline. A program that fails or throws before its end exits as
+it normally would, and whatever report had accumulated is printed
+first. [#341]
+
 ## 12 Execution Model
 
 ### 12.1 The main thread and the event loop
@@ -2006,6 +2131,8 @@ least: [#48, #266]
   invalid regex flag, a non-ASCII `ascii` literal, a mixed-type map
   literal, duplicate literal map keys;
 - `amor` without an initializer or before `map`; misuse of `T?`;
+- an assertion (§11.7.1) whose arguments differ in type, or whose type
+  compares by identity rather than by value;
 - `break`/`continue` outside a loop, `return` with the wrong shape;
 - `match` non-exhaustive, unknown or duplicate tag, complex subject;
 - thread isolation violations (§20.3), messaging without a matching
@@ -2762,6 +2889,7 @@ The compiler executable is named `festina`. [#1, #144, #145, #148, #250]
 | `festina run entry.f [--target=...]` | compile to a temporary executable, run it with inherited streams, exit with its code |
 | `festina doctor [--fix [--yes]]` | check every dependency and `PATH`; with `--fix`, install what is missing via the detected package manager and fix `PATH`, confirming first |
 | `festina update` | fast-forward the installation's own git checkout; refuses on a dirty tree, detached HEAD, diverged history or a packaged binary |
+| `festina test entry.f [--target=...]` | compile with assertions enabled, run, print the report of §11.6, exit non-zero if any assertion failed |
 | `festina help` | print the command list |
 
 The compiler caches lex and parse results per source file on disk,
@@ -2931,7 +3059,7 @@ clear const continue delete else enum fail false float for free func
 http if img import int let log map match null on return socket sqlite
 struct table text thread throw true try typeof var void while`.
 
-**Contextual words**: `default`, `use`, `DatabaseURL`.
+**Contextual words**: `default`, `use`, `DatabaseURL`, `test`, `weak`.
 
 **Global names that may not be redeclared** (§16): every function in
 §16.1, plus `Math`, `environment`, `argv`, `clientWidth`,

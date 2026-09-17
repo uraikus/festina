@@ -272,6 +272,20 @@ class Parser:
             return self.parse_thread_decl()
         if t.type == "on":
             return self.parse_event_handler()
+        # claude.md #341: `test NAME = 'description'` (specification.md
+        # 11.7). Recognised by VALUE at this one position, and only when
+        # what follows is an identifier and `=`, exactly the way `use`
+        # just above and `DatabaseURL` are -- `test` is NOT a reserved
+        # word, because `bootstrap/semantic.f` declares a parameter
+        # called `test` and `regex.test(s)` is an existing method, and
+        # reserving it would break both. The three-token lookahead is
+        # what keeps `test = 5` (an assignment to a variable called
+        # `test`) and `test(1, 2)` (a call of one) parsing as they
+        # always did: neither has an IDENT then `=` after the word.
+        if (t.type == "IDENT" and t.value == "test"
+                and self.peek(1).type == "IDENT"
+                and self.peek(2).type == "OP" and self.peek(2).value == "="):
+            return self.parse_test_decl()
         if t.type == "if":
             return self.parse_if()
         if t.type == "while":
@@ -786,6 +800,22 @@ class Parser:
             self.eat("RBRACK")
         body = self.parse_block()
         return ast.ThreadDecl(name_tok.value, body, t.line, t.column, pool_size=pool_size)
+
+    def parse_test_decl(self):
+        """claude.md #341: specification.md 11.7's TestDeclaration.
+
+        The description is a full expression rather than a literal, so
+        a group can name itself from a constant or an interpolation --
+        it is an ordinary `text` value and semantic analysis checks the
+        type. Only the DECLARATION has syntax of its own; an assertion
+        is an ordinary call, resolved by the type of what it calls.
+        """
+        test_tok = self.eat("IDENT")        # 'test'
+        name_tok = self.eat("IDENT")
+        self.eat_op("=")
+        description = self.parse_expression()
+        return ast.TestDecl(name_tok.value, description,
+                            test_tok.line, test_tok.column)
 
     def parse_event_handler(self):
         t = self.eat("on")

@@ -1709,6 +1709,16 @@ void festina_noop_release(void *payload);
  * 60 of the same header and is the only part of this state that
  * persists between collections; festina_retain and
  * festina_release_check are deliberately untouched by it. */
+/* claude.md #341: the built-in test suite (specification.md 11.7).
+ * Defined in festina_runtime_test.c, which is linked only into a
+ * `festina test` build -- an ordinary compile emits no call to any of
+ * these and does not link that object at all. */
+int64_t festina_test_group(const char *description);
+void festina_test_assert(int64_t group, int8_t passed,
+                         const char *source, const char *actual);
+void festina_test_report(void);
+int64_t festina_test_failures(void);
+
 void festina_cycle_add_root(void *p, void (*gray)(void *),
                             void (*scan)(void *), void (*white)(void *));
 void festina_cycle_collect(void);
