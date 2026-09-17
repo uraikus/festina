@@ -32,20 +32,6 @@ fixed in #335, and in #336 the default flipped to portable with
 is now closed, and nothing is open here.**
 
 
-## Known-flaky test
-
-- **`test_audio_demo_plays_through_the_null_alsa_device` races under
-  heavy parallelism.** `examples/audio.f` plays the clip on channels 0,
-  1 and 2, stops channel 0, and expects `isPlaying()` — which asks "is
-  this CLIP playing anywhere" — to be false, which needs channels 1 and
-  2 to have finished on their own by then. Under real contention they
-  sometimes have not. Measured at 24-way parallelism: **5 of 120 runs
-  fail with a host-native binary and 6 of 120 with a portable one**, so
-  it is a wall-clock race and not a consequence of decisions.md #336.
-  `stopAudioPlayer` itself is synchronous — it joins the channel thread
-  — so the fix belongs in the demo or the assertion, not the runtime.
-  Surfaced by a full-suite run; passes alone every time.
-
 ## Platforms
 
 Linux is the primary, fully verified target. macOS and Windows builds
@@ -179,13 +165,14 @@ larger than they look.
   allows more.
 
   **What `test(actual, expected)` means for a non-scalar.** Scalars and
-  `text` are obvious. `struct == struct` is currently *unsettled* — it
-  emits invalid LLVM and nothing rejects it (see the entry below), and
-  decisions.md #54's ambiguity rule is why neither identity nor deep
-  equality was ever picked. A test assertion wants deep equality and
-  would be the first thing in the language to need it, so this either
-  forces that decision or restricts the call to types that already have
-  `==`.
+  `text` are obvious. `struct == struct` is settled now — it compares
+  IDENTITY (§8.9.1, decisions.md #326) — but identity is the wrong
+  question for an assertion: `test(makePoint(1, 2), makePoint(1, 2))`
+  wants those to be equal and they are two instances. So a test
+  assertion still needs deep equality, and would be the first thing in
+  the language to need it; this either forces that decision or
+  restricts the call to types whose `==` already means what an
+  assertion wants.
 
   **The failure line quotes the assertion's own SOURCE.** `basicMath(2-2,
   4)` appears spelled as it was written, not reconstructed from the AST
@@ -268,8 +255,8 @@ included:
 | lexer | 127 match, 0 differ |
 | parser | 127 match, 0 differ, 0 unported |
 | semantic | 127 match, 0 differ, 0 unported |
-| escape analysis | 116 match, 0 differ, 0 unported — 2,248 of 2,248 records |
-| codegen | 116 match, 0 differ, 0 unported — 422,239 of 422,239 IR lines |
+| escape analysis | 116 match, 0 differ, 0 unported — 2,258 of 2,258 records |
+| codegen | 116 match, 0 differ, 0 unported — 423,678 of 423,678 IR lines |
 | canaries | 156 registered, 0 missed — 149 caught, 7 via the ratchet |
 
 All ten of the bootstrap's own files reproduce their own compilation
@@ -302,50 +289,6 @@ written, which is what `bootstrap/canary.py` exists to say out loud.
   would require the *reverse* conversion to be exact for every literal
   too, and the fast path there refuses values like
   `0.30000000000000004`.
-
-- **A local that shadows a function name still reports badly inside a
-  template literal.** The silent-miscompilation half of this is fixed
-  (decisions.md #298): a shadowing local now reads as itself
-  everywhere, because `_emit_expr`'s Identifier branch consults the
-  scope chain before the program-wide function table. What remains is
-  diagnostics. Interpolating a `func` value fails the whole compile
-  with
-
-      bootstrap/codegen.f:0:0: error: cannot interpolate a value of
-      type func[text]:bool
-
-  — no line, no column, and a type that appears nowhere in the
-  statement at fault, so the only way to find it is to bisect the file.
-  That message now only appears for a genuine attempt to interpolate a
-  function, which is a real mistake worth reporting; it just has to say
-  *where*. Two of this session's three shadowing hits presented as
-  exactly this.
-
-  Short helper names are what the bootstrap's own modules export
-  (`at`, `esc`, `known`) and exactly what a code generator's locals
-  want to be called, so this will keep coming up.
-
-- **`struct == struct` emits invalid LLVM and fails to build.** The
-  shipped compiler lowers it to `icmp eq i64 %ptr, %ptr`, which LLVM
-  rejects: `'%t1' defined with type 'ptr' but expected 'i64'`. Two
-  struct values reach the ordinary integer comparison, which never
-  learns they were pointers. Reproduced on a four-line program:
-
-      struct P { x:int }
-      P a
-      P b
-      if a == b { log(1) }
-
-  `festina/codegen.py` calls the construct "unsupported" in a comment
-  -- it would have to mean identity or deep equality, and claude.md
-  picks neither (#54's ambiguity rule) -- but nothing rejects it, so
-  the error surfaces from LLVM rather than from the front end. Either
-  answer is a decision rather than a fix: semantic.py could refuse it
-  with a real message, or codegen could commit to identity and emit
-  `icmp eq ptr`. Comparison against `null` already works and takes a
-  branch of its own. Found while porting -- both implementations agree
-  on the invalid IR, so this is the language's, not the port's
-  (decisions.md #311).
 
 - **`Math` is a namespace per method name, not per receiver.** With a
   variable called `Math` in scope, `Math.sqrt(9.0)` is still

@@ -248,6 +248,38 @@ int func colAt(src:blob, from:int, lineStart:int, pos:int) {
     return chars + 1
 }
 
+// claude.md #338: where an interpolated expression actually is.
+//
+// tokenize() lexes a ${...} fragment by re-entering itself on that byte
+// range, and the coordinates it produces are relative to the fragment --
+// so every token inside a template used to report 1:1, and every
+// diagnostic about one pointed at the first character of the FILE. These
+// two globals carry the fragment's absolute position back out, since
+// Festina has no multiple return.
+//
+// Columns count CODE POINTS, exactly as colAt does and for the same
+// reason: a continuation byte (10xxxxxx) is not a new character.
+int TPOS_LINE = 0
+int TPOS_COL = 0
+
+void func templateExprPos(src:blob, tstart:int, estart:int, line:int, col:int) {
+    int l = line
+    int c = col
+    int b = tstart
+    while b < estart {
+        int by = src.byteAt(b)
+        if by == 10 {
+            l = l + 1
+            c = 1
+        } else {
+            if by < 128 || by >= 192 { c = c + 1 }
+        }
+        b++
+    }
+    TPOS_LINE = l
+    TPOS_COL = c
+}
+
 bool func regexMayStart(prevKind:text, prevVal:text) {
     if prevKind == '' { return true }
     if EXPR_ENDING[prevKind] != null { return false }
@@ -261,9 +293,14 @@ bool func regexMayStart(prevKind:text, prevVal:text) {
 // Tokenizes the half-open byte range [from, to) of `src`. Line and
 // column are relative to `from`, not to the file: a ${...} fragment is
 // re-entered here as its own range, and festina/lexer.py's own recursive
-// tokenize() call sees a fresh string starting at line 1, column 1. The
-// coordinates it produces for those sub-tokens are relative in exactly
-// the same way, so this reproduces them rather than "fixing" them.
+// tokenize() call sees a fresh string starting at line 1, column 1.
+//
+// claude.md #338: those relative coordinates are REBASED onto the file
+// by the caller, in the template branch below, on both sides. This
+// comment used to end "so this reproduces them rather than 'fixing'
+// them" -- faithful, and faithfully wrong: every diagnostic about an
+// interpolated expression pointed at the first character of the file.
+// The port was right to mirror it and right to stop.
 
 arr[Tok] func tokenize(src:blob, from:int, to:int) {
     arr[Tok] toks = []
@@ -441,9 +478,22 @@ arr[Tok] func tokenize(src:blob, from:int, to:int) {
                             errOut.push(sub[sub.length - 1])
                             return errOut
                         }
+                        // claude.md #338: rebase onto the real file.
+                        // A token on the fragment's FIRST line shares
+                        // that line and is offset along it; one on a
+                        // later line keeps its own column, which is
+                        // already measured from a real line start.
+                        templateExprPos(src, from + pos, exprs[e].start, line, col)
                         int q = 0
                         while q < sub.length - 1 {
-                            toks.push(sub[q])
+                            Tok sq = sub[q]
+                            if sq.line == 1 {
+                                sq.col = TPOS_COL + sq.col - 1
+                                sq.line = TPOS_LINE
+                            } else {
+                                sq.line = TPOS_LINE + sq.line - 1
+                            }
+                            toks.push(sq)
                             q++
                         }
                         Tok mid

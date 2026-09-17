@@ -259,22 +259,34 @@ def _line_index(source):
 
 
 def _split_template(raw):
-    """Split backtick contents into alternating (is_expr, text) segments.
+    """Split backtick contents into alternating segments.
 
-    "Hello ${name}" -> [(False, "Hello "), (True, "name"), (False, "")]
+    Each is `(is_expr, text, offset)`, where `offset` is where `text`
+    begins inside `raw`.
+
+    "Hello ${name}" -> [(False, "Hello ", 0), (True, "name", 8),
+                        (False, "", 13)]
+
+    claude.md #338: the offset is what lets an interpolated expression's
+    tokens carry their real source position. They used to be lexed as a
+    standalone string starting at 1:1, so every diagnostic about one
+    pointed at the first character of the file.
     """
     segments = []
     buf = []
+    buf_start = 0
     i = 0
     n = len(raw)
     while i < n:
         c = raw[i]
         if c == "\\" and i + 1 < n:
+            if not buf:
+                buf_start = i
             buf.append(raw[i:i + 2])
             i += 2
             continue
         if c == "$" and i + 1 < n and raw[i + 1] == "{":
-            segments.append((False, "".join(buf)))
+            segments.append((False, "".join(buf), buf_start))
             buf = []
             i += 2
             depth = 1
@@ -287,13 +299,39 @@ def _split_template(raw):
                     if depth == 0:
                         break
                 i += 1
-            segments.append((True, raw[start:i]))
+            segments.append((True, raw[start:i], start))
             i += 1  # skip closing '}'
+            buf_start = i
             continue
+        if not buf:
+            buf_start = i
         buf.append(c)
         i += 1
-    segments.append((False, "".join(buf)))
+    segments.append((False, "".join(buf), buf_start))
     return segments
+
+
+def _offset_to_position(text, offset, line, col):
+    """Absolute (line, column) of `text[offset]`, given that `text[0]`
+    sits at (line, col). claude.md #338."""
+    prefix = text[:offset]
+    breaks = prefix.count("\n")
+    if not breaks:
+        return line, col + offset
+    return line + breaks, offset - prefix.rfind("\n")
+
+
+def _rebase(tok, line, col):
+    """A sub-token lexed from a standalone fragment, moved to where that
+    fragment actually is. claude.md #338.
+
+    A token on the fragment's FIRST line shares that line and is offset
+    along it; one on a later line (an interpolation spanning a newline)
+    keeps its own column, since that column is already measured from a
+    real line start."""
+    if tok.line == 1:
+        return Token(tok.type, tok.value, line, col + tok.column - 1)
+    return Token(tok.type, tok.value, line + tok.line - 1, tok.column)
 
 
 def tokenize(source, filename="<string>"):
@@ -389,16 +427,25 @@ def tokenize(source, filename="<string>"):
         if kind == "TEMPLATE":
             _reject_nul_escape(text[1:-1], filename, line, col)
             segments = _split_template(text[1:-1])
-            expr_parts = [t for is_expr, t in segments if is_expr]
-            str_parts = [t for is_expr, t in segments if not is_expr]
+            expr_parts = [(t, off) for is_expr, t, off in segments if is_expr]
+            str_parts = [t for is_expr, t, _ in segments if not is_expr]
             if not expr_parts:
                 tokens.append(Token("STRING", _unescape(str_parts[0]), line, col))
                 prev_significant = tokens[-1]
                 continue
             tokens.append(Token("TSTRING_START", _unescape(str_parts[0]), line, col))
-            for k, expr_text in enumerate(expr_parts):
+            for k, (expr_text, expr_off) in enumerate(expr_parts):
                 sub_tokens = tokenize(expr_text, filename)
-                tokens.extend(sub_tokens[:-1])  # drop sub-EOF
+                # claude.md #338: rebase onto the real file. The
+                # recursive call lexes the fragment as a standalone
+                # string, so its tokens start at 1:1 -- which meant
+                # every diagnostic about an interpolated expression
+                # pointed at the first character of the FILE.
+                # `expr_off` is where the fragment begins inside the
+                # backticks, and +1 steps over the opening backtick to
+                # make it an offset into `text`.
+                e_line, e_col = _offset_to_position(text, expr_off + 1, line, col)
+                tokens.extend(_rebase(t, e_line, e_col) for t in sub_tokens[:-1])
                 is_last = k == len(expr_parts) - 1
                 part_value = _unescape(str_parts[k + 1])
                 tokens.append(Token("TSTRING_END" if is_last else "TSTRING_MID", part_value, line, col))

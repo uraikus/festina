@@ -160,6 +160,14 @@ class TestIndividualExamples:
         assert lines[4] == "three channels: 0 1 2"
         # claude.md #99: a reserved, looping channel, released by name.
         assert lines[5] == "looping on channel 0: true"
+        # claude.md #337: the demo asks `isAudioPlayerPlaying(0)` here,
+        # not `beep.isPlaying()`. The clip is still on `second`'s own
+        # channel at this point, so the clip-level question had a
+        # wall-clock answer -- this line failed about 4% of the time
+        # under a parallel suite run, and never on its own.
+        # `stopAudioPlayer(0)` joins channel 0's thread before
+        # returning, so the channel-level question is settled the
+        # instant it comes back.
         assert lines[6] == "after stopAudioPlayer(0): false"
         assert lines[7].startswith("isPlaying() after 100ms: ")
         assert lines[8] == "stopping early"

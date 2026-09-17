@@ -257,3 +257,80 @@ class TestTypeCheckingExamples:
         program = parser.parse(source)
         with pytest.raises(errors.CompileError):
             semantic.analyze(program)
+
+
+class TestCodegenDiagnosticsCarryAPosition:
+    """claude.md #338: specification.md 14.1 requires every compile
+    error to be reported as `file:line:column: error: message`. A
+    handful of codegen errors named the file and then `0:0`, which
+    satisfies the shape and not the point -- a reader had no way to find
+    the statement at fault except by bisecting the file.
+
+    The one that actually bit, twice, during the bootstrap port: a local
+    shadowing a function name, so an ordinary-looking interpolation
+    turned out to be interpolating the FUNCTION. The message was right;
+    it just would not say where.
+    """
+
+    def _error(self, cli_mod, tmp_path, source, name="main.f"):
+        import pytest
+        from festina.errors import CompileError
+        src = tmp_path / name
+        src.write_text(source, encoding="utf-8")
+        with pytest.raises(CompileError) as excinfo:
+            cli_mod.compile_file(str(src), str(tmp_path / "out"))
+        return excinfo.value
+
+    def test_interpolating_a_function_names_its_line(self, cli_mod, tmp_path):
+        # The `${known}` is on line 8, and nothing else in the file can
+        # produce this error -- so a correct answer is unambiguous.
+        source = """bool func known(s:text) {
+    return s.length > 0
+}
+
+int a = 1
+log(`a=${a}`)
+
+log(`oops: ${known}`)
+"""
+        err = self._error(cli_mod, tmp_path, source)
+        assert "cannot interpolate" in str(err)
+        assert err.line == 8, f"reported line {err.line}, expected 8"
+        assert err.column > 0, "a column of 0 is the bug this fixes"
+
+    def test_the_line_moves_with_the_offending_expression(self, cli_mod, tmp_path):
+        # Same program, the fault pushed down seven blank lines. A
+        # hard-coded or accidentally-constant line number passes the
+        # test above and fails this one -- and the count is asserted
+        # exactly rather than "greater than 8", since an off-by-one in
+        # the rebasing is precisely the bug this guards.
+        source = """bool func known(s:text) {
+    return s.length > 0
+}
+
+int a = 1
+log(`a=${a}`)
+
+
+
+
+
+
+
+log(`oops: ${known}`)
+"""
+        err = self._error(cli_mod, tmp_path, source)
+        assert err.line == 14, f"reported line {err.line}, expected 14"
+
+    def test_a_value_with_no_text_form_names_its_line(self, cli_mod, tmp_path):
+        # The sibling message, raised by the same function and
+        # previously carrying the same `0:0`. An `img` has no text form
+        # -- rendering one could only print a pointer.
+        source = """img picture = 'examples/beep.wav'
+
+log(`p: ${picture}`)
+"""
+        err = self._error(cli_mod, tmp_path, source)
+        assert "no text form" in str(err)
+        assert err.line == 3, f"reported line {err.line}, expected 3"
+        assert err.column > 0

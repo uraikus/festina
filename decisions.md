@@ -7206,3 +7206,89 @@ README's get-started section and setup.md both carry the one-line
 on the machine, including how to export it for a shell. The previous
 round's failure here was not the default -- it was that the behaviour
 was undocumented, so nobody could have chosen either way.
+
+337. A DEMO ASKING THE WRONG QUESTION
+
+**`test_audio_demo_plays_through_the_null_alsa_device` failed about 4%
+of the time under a parallel suite run and never on its own.** Found by
+a full-suite run during #336 and deliberately not waved away: measured
+at 24-way parallelism before touching anything, it failed 5 of 120 runs
+built for the host and 6 of 120 built portable, which is what
+established it as pre-existing rather than a consequence of that
+change.
+
+**The demo was asking about the CLIP where it meant the CHANNEL.**
+`examples/audio.f` plays `beep` on three channels, stops one, loops on
+channel 0, stops channel 0, and then asked `beep.isPlaying()` -- which
+is true while that clip is playing ANYWHERE. `second` is still on its
+own channel at that point, so the answer depended on whether an
+unrelated playback had finished yet. It usually had, because the null
+ALSA device consumes samples as fast as it is given them, and under
+real contention it sometimes had not.
+
+**api.md already said which tool to use**: "`isPlaying()` is about the
+clip, not one playback of it: it is true while any channel is playing
+that clip. To ask about a single playback, name its channel with
+`isAudioPlayerPlaying(n)` instead." The documentation was right and the
+example was on the wrong side of it, which is the more embarrassing
+version of this bug and the more useful one -- there was nothing to
+design, only something to correct.
+
+**The channel question has no race in it.** `stopAudioPlayer(channel)`
+runs `festina_audio_halt_locked`, which sets `stop_requested` and then
+`pthread_join`s the channel's thread before returning. So by the time
+the call comes back, channel 0 is definitively idle and
+`isAudioPlayerPlaying(0)` cannot answer anything else.
+
+**Verified by the same measurement that found it**, at double the
+sample size: 9 of 240 heavily-parallel runs wrong before, 0 of 240
+after. A flake fixed without a reproduction is a flake moved.
+
+338. AN INTERPOLATED EXPRESSION HAD NO POSITION
+
+**Every diagnostic about an expression inside a template literal
+pointed at the first character of the file.** todo.md carried this as a
+single bad error message -- `cannot interpolate a value of type
+func[text]:bool` reported at `:0:0`, with the note that "it just has to
+say *where*". The message was not the problem.
+
+**The tokens themselves had no position.** `festina/lexer.py` lexes a
+`${...}` fragment by calling `tokenize()` recursively on that text
+alone, so its tokens come back numbered from 1:1 -- and those
+coordinates are what every node built from them carries. Measured
+before writing anything:
+
+    log(`p: ${picture}`)     IDENT 'picture'   line=1 col=1
+
+on line 3 of the file. So this was never about one message. Any
+diagnostic about any interpolated expression, present or future, was
+pointing at the top of the file.
+
+**Which is why passing the node down did not work.** The first attempt
+threaded the offending expression into the error, which is what the
+todo entry implies; it produced `line=1 col=1` instead of `line=0
+col=0`. A better-looking wrong answer. The node's position was itself
+the thing that was broken.
+
+**The fix is in the lexer, and in both of them.** `_split_template` now
+reports where each fragment begins, and the sub-tokens are rebased onto
+the file: a token on the fragment's first line shares that line and is
+offset along it, one on a later line keeps its own column, since that
+column is already measured from a real line start. Token positions are
+in the canonical dump, so `bootstrap/lexer.f` had to make the identical
+change -- and its own comment had documented the bug as deliberate
+fidelity ("so this reproduces them rather than 'fixing' them"), which
+was the right call at the time and is now the wrong one.
+
+**Columns count code points on both sides.** The Python lexer indexes a
+`str` and gets that for free; the Festina one scans bytes and has to
+skip UTF-8 continuation bytes, which `colAt` already did and the new
+walk does the same way. Getting it wrong would misplace the caret on
+any line with a non-ASCII character before the token.
+
+**Verified.** Three tests, each failing first, and the middle one
+earned its place immediately: it asserts the line MOVES when the fault
+is pushed down the file, and it caught my own miscount of the blank
+lines rather than a compiler bug -- the compiler said 14 and 14 was
+right. All 127 corpus files still lex identically on both sides, which
+is the check that a rebasing off-by-one would fail.

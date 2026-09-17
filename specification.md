@@ -1960,7 +1960,10 @@ file:line:column: error: message
 ```
 
 naming the file the offending statement came from (§6.2). The column
-counts characters (code points), not bytes. [#272] Lexical
+counts characters (code points), not bytes. [#272] **Every diagnostic
+carries a real position**, including one about an expression inside a
+template literal: `${...}` is part of the file it is written in, not a
+fragment with coordinates of its own. [#338] Lexical
 errors (an unexpected character, an unterminated string, `${` outside a
 template) are reported in the same form. Compile errors include at
 least: [#48, #266]
@@ -1971,8 +1974,8 @@ least: [#48, #266]
   condition or logical operand, mismatched ternary branches;
 - duplicate declaration in a namespace, or redeclaring a builtin;
 - invalid or circular import, `DatabaseURL` out of position;
-- unsupported operator (`===`, `!==`, `+` on mixed text/number,
-  equality between structs), assignment to a read-only target;
+- unsupported operator (`===`, `!==`, `+` on mixed text/number),
+  assignment to a read-only target;
 - a `color`/`font` from a non-literal, an unknown color name, an
   invalid regex flag, a non-ASCII `ascii` literal, a mixed-type map
   literal, duplicate literal map keys;

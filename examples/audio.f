@@ -51,7 +51,15 @@ stopAudioPlayer(third)
 beep.playLoop(0)
 log(`looping on channel 0: ${beep.isPlaying()}`)
 stopAudioPlayer(0)          // stop that channel and hand it back
-log(`after stopAudioPlayer(0): ${beep.isPlaying()}`)
+// claude.md #337: the CHANNEL query, not the clip one. `isPlaying()`
+// asks "is this clip playing ANYWHERE", and `second` is still on its
+// own channel here -- so the clip-level answer depends on whether that
+// unrelated playback has finished yet, which is a wall-clock race and
+// not something this line is trying to show. `stopAudioPlayer(0)` joins
+// channel 0's thread before it returns, so asking about channel 0 is
+// answerable the instant the call comes back. api.md draws exactly this
+// distinction; the demo was on the wrong side of it.
+log(`after stopAudioPlayer(0): ${isAudioPlayerPlaying(0)}`)
 
 // Back to a one-shot for the timer demo below.
 beep.play()

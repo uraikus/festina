@@ -1015,6 +1015,12 @@ class CodeGen:
         # is not, so a terminal read answers null instead of creating
         # the thing the question was about.
         self._receiver_ctx = False
+        # claude.md #338: the last expression node emitted, for a
+        # diagnostic raised deep in codegen with no node in hand.
+        # specification.md 14.1 asks every error for
+        # file:line:column, and several reported 0:0 -- the right
+        # message with no way to find the statement it is about.
+        self._last_expr_node = None
         self.struct_order = list(analyzed.structs.keys())
         self.tables = analyzed.tables          # name -> {field: festina-type-name}
         self.enums = analyzed.enums            # claude.md #176: name -> semantic._EnumInfo
@@ -6211,6 +6217,13 @@ class CodeGen:
         return out
 
     def _emit_expr(self, expr, env, lines):
+        # claude.md #338: remember where we are. One attribute store per
+        # expression, so an error raised several frames down can still
+        # say which line it was about. Only nodes carrying a real
+        # position count -- a synthesized one would otherwise overwrite
+        # a good answer with 0.
+        if getattr(expr, "line", 0):
+            self._last_expr_node = expr
         if isinstance(expr, ast.NumberLit):
             if isinstance(expr.value, float):
                 return _format_double(expr.value), FLOAT
@@ -6754,7 +6767,7 @@ class CodeGen:
         self._release_owned_receiver(key_expr, val, vtype, lines)
         return rendered, True
 
-    def _to_text(self, val, type_, lines):
+    def _to_text(self, val, type_, lines, node=None):
         """claude.md #114: every non-text value in log() or `${}`
         compiles as its .toText() -- int/float/bool through the
         stringifiers they always had, struct/table/arr/map through a
@@ -6801,17 +6814,32 @@ class CodeGen:
             # could only ever print a raw pointer, and the specific
             # message is the one that tells a reader what to do instead
             # (`worker.main`, or an ordinary value the thread sent).
+            where = node if getattr(node, "line", 0) else self._last_expr_node
             raise CodegenError(
                 f"a value of type {types_mod.type_name(type_)} has no text "
                 f"form and cannot appear in log() or a template",
-                file=self.filename)
+                file=self.filename, line=getattr(where, "line", 0),
+                column=getattr(where, "column", 0))
         else:
             # claude.md #218: `file=` here too -- without it this
             # fallback reported `<string>:0:0`, naming neither the file
             # nor anything else a reader could act on.
+            #
+            # claude.md #338: and the line/column with it. Naming the
+            # file was half a fix -- `file:0:0` satisfies the shape
+            # specification.md 14.1 asks for and still leaves a reader
+            # bisecting. `node` when the caller has one, and otherwise
+            # whatever _emit_expr last saw, which (since _to_text is
+            # called straight after emitting the value it renders) is
+            # that value's own expression. This message's commonest
+            # cause is a local shadowing a function name, where the
+            # interpolation looks entirely ordinary and only the
+            # position says which one.
+            where = node if getattr(node, "line", 0) else self._last_expr_node
             raise CodegenError(
                 f"cannot interpolate a value of type {types_mod.type_name(type_)}",
-                file=self.filename)
+                file=self.filename, line=getattr(where, "line", 0),
+                column=getattr(where, "column", 0))
         return out
 
     def _emit_sendable_body(self, val, vtype, lines):

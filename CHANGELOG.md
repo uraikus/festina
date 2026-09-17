@@ -77,8 +77,8 @@ round-by-round design and implementation record predating 0.1 lives in
   now agrees with the Python implementation it mirrors on **every file
   of the 127-file corpus** — including its own source, which is
   122,000 lines of IR on its own. Lexer, parser and analyzer: 127
-  match, 0 differ each. Escape analysis: 2,248 of 2,248 records.
-  Codegen: 422,239 of 422,239 file-specific IR lines, byte for byte.
+  match, 0 differ each. Escape analysis: 2,258 of 2,258 records.
+  Codegen: 423,678 of 423,678 file-specific IR lines, byte for byte.
   The eleven files neither side compiles are deliberately ill-formed
   sources the corpus keeps so that both implementations are checked on
   the rejection as well as the acceptance.
@@ -361,6 +361,18 @@ round-by-round design and implementation record predating 0.1 lives in
   keep running on every platform (decisions.md #287).
 
 ### Fixed
+
+- **An expression inside a template literal had no source position.**
+  Every diagnostic about one pointed at the first character of the
+  file: `${...}` was lexed by re-entering the tokenizer on that
+  fragment alone, so its tokens came back numbered from 1:1 and every
+  node built from them carried those coordinates. Reported as a single
+  bad error message (`cannot interpolate a value of type …` at `:0:0`)
+  and it was never about the message — any diagnostic about any
+  interpolated expression was affected. Interpolated tokens are now
+  rebased onto the file they are written in, in both the shipped lexer
+  and `bootstrap/lexer.f`, with columns counted in code points on both
+  sides. (decisions.md #338)
 
 - **Compiled binaries are portable by default**, and
   `FESTINA_TARGET_CPU=native` builds for the machine you are on. Every
