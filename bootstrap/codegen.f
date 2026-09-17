@@ -1574,6 +1574,16 @@ map[bool] TEST_NAMES = {}
 // irdumpf.f's own `--tests` argument, which is what gives the emitting
 // half a differential at all.
 bool CG_TESTS = false
+// claude.md #341: the handful of characters the report's own rendering
+// needs to emit by code point. Spelling them as escapes inside a
+// literal would work; naming them keeps the escaping of THIS file's
+// source out of a question about what the RENDERED text contains.
+text LF_CH = (10).toChar()
+text TAB_CH = (9).toChar()
+text CR_CH = (13).toChar()
+text DQUOTE_CH = (34).toChar()
+text BSLASH_CH = (92).toChar()
+text QUOTE_CH = (39).toChar()
 
 // Set only while a THROW emits its own scope walk, so a try-frame
 // marker in the range is left alone. See cgFreeOne.
@@ -7815,20 +7825,28 @@ text func cgRenderExprSource(e:Node) {
 
 // The inverse of parser.f's addStr, for the one place a stored string
 // is wanted as characters rather than as the dump spells them.
+//
+// Written with charCodeAt/toChar rather than `v[i]`, and that is a
+// self-hosting constraint rather than a style: this compiler does not
+// implement indexing a text, so a version using it made codegen.f a
+// file the bootstrap could no longer compile -- which the coverage
+// ratchet caught as 245,801 IR lines vanishing, exactly codegen.f plus
+// irdumpf.f. Code in this directory has to stay inside the subset the
+// thing it builds supports.
 text func cgUnescapeDumpText(v:text) {
     text out = ''
     int i = 0
     while i < v.length {
-        text ch = v[i]
-        if ch == '\\' && i + 1 < v.length {
-            text nx = v[i + 1]
-            if nx == 'n' { out = out + '\n'  i = i + 2  continue }
-            if nx == 't' { out = out + '\t'  i = i + 2  continue }
-            if nx == 'r' { out = out + '\r'  i = i + 2  continue }
-            if nx == 'q' { out = out + '"'  i = i + 2  continue }
-            if nx == '\\' { out = out + '\\'  i = i + 2  continue }
+        int c = v.charCodeAt(i)
+        if c == 92 && i + 1 < v.length {
+            int n = v.charCodeAt(i + 1)
+            if n == 110 { out = out + LF_CH  i = i + 2  continue }
+            if n == 116 { out = out + TAB_CH  i = i + 2  continue }
+            if n == 114 { out = out + CR_CH  i = i + 2  continue }
+            if n == 113 { out = out + DQUOTE_CH  i = i + 2  continue }
+            if n == 92 { out = out + BSLASH_CH  i = i + 2  continue }
         }
-        out = out + ch
+        out = out + c.toChar()
         i++
     }
     return out
@@ -7838,8 +7856,8 @@ text func cgRenderEscapeQuotes(v:text) {
     text out = ''
     int i = 0
     while i < v.length {
-        text ch = v[i]
-        if ch == "'" { out = out + "\\'" } else { out = out + ch }
+        int c = v.charCodeAt(i)
+        if c == 39 { out = out + BSLASH_CH + QUOTE_CH } else { out = out + c.toChar() }
         i++
     }
     return out
