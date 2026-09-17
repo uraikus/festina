@@ -65,7 +65,7 @@ file**:
   both** — 2,275 of 2,275 records.
 - **codegen: 118 match, 0 differ, 0 unported, 13 rejected by both** —
   426,716 of 426,716 file-specific IR lines.
-- **canaries: 161 registered, 0 missed** — 154 caught outright, 7 via
+- **canaries: 161 registered, 0 missed** — 152 caught outright, 9 via
   the ratchet. The sweep found one that had stopped being a breakage
   rather than one the corpus could not see; the note below says which
   and why the two look identical in the report.

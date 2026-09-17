@@ -7708,6 +7708,23 @@ accident is a no-op rather than a wrong report -- and the ordering it
 guards is already a compile error, since a global must precede its
 first use.
 
+**Both canaries for the stripping catch through the RATCHET, with one
+witness each, and that is the intended state rather than a gap.**
+Breaking either makes `cases/test_groups.f` go unported, which the
+coverage number catches and the per-file comparison does not -- the
+weaker of the two signals, named separately because it is a different
+claim (#312). The single witness is the purpose-written case file
+itself, which is the shape #312 recommended rather than the shape it
+warned about: no other corpus file uses `test`, and none should.
+
+**I got the canary breakdown wrong by doing arithmetic on it.** The
+registry went from 159 to 161 and I wrote "154 caught outright, 7 via
+the ratchet" -- adding the two to the wrong column without waiting for
+the sweep to say which column they land in. It is 152 and 9. A small
+error, and exactly the kind this project's own rule about measuring
+rather than extrapolating exists to prevent; the number was available
+twenty minutes later for the asking.
+
 **And a test that skipped silently, which looks exactly like one that
 passes.** The ASan check for the report path probed for a sanitizer
 with `shutil.which("clang") or shutil.which("gcc")` and took clang
