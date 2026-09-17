@@ -172,7 +172,7 @@ included:
 | semantic | 131 match, 0 differ, 0 unported |
 | escape analysis | 118 match, 0 differ, 0 unported — 2,275 of 2,275 records |
 | codegen | 118 match, 0 differ, 0 unported — 426,716 of 426,716 IR lines |
-| canaries | 161 registered, 0 missed — 152 caught, 9 via the ratchet |
+| canaries | 161 registered, 0 missed — 154 caught, 7 via the ratchet |
 
 All ten of the bootstrap's own files reproduce their own compilation
 byte for byte, and the second-generation binary built from that IR is
