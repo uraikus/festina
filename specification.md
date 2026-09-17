@@ -2785,6 +2785,25 @@ project's own WASI host. [#148, #237, #242, #263]
 | `FESTINA_AUDIO_NULL=1` | use a silent audio device |
 | `FESTINA_NO_PARSE_CACHE=1` | disable the compiler's parse cache |
 | `FESTINA_ENABLE_MACOS_GRAPHICS`, `FESTINA_ENABLE_MACOS_AUDIO`, `FESTINA_ENABLE_MACOS_HTTP`, `FESTINA_ENABLE_WINDOWS_AUDIO` | compile-time platform opt-ins (§21.4) |
+| `FESTINA_TARGET_CPU` | the CPU to generate code for (§21.7) |
+
+### 21.7 What a compiled binary targets
+
+**By default a binary is built for the machine that compiled it** — the
+host's exact CPU model and its full feature set. That is the fastest
+code for the build machine and it is not portable: a binary built on a
+processor with AVX-512 will not start on one without it, and tools that
+implement only part of a very new instruction set (valgrind, for one)
+may fail on it before `main` runs.
+
+`FESTINA_TARGET_CPU` overrides that. `generic` builds for the
+architecture's portable baseline; any other value is used as a CPU
+name, so a known floor can be named (`x86-64-v2`, `haswell`) rather
+than dropping all the way down. Setting it at all also clears the
+host's feature set, since a named CPU carries its own. An
+implementation that does not build through LLVM may ignore the
+variable, but must not silently produce host-specific code when it is
+set to `generic`. [#335]
 
 ---
 

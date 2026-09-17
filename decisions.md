@@ -7102,3 +7102,55 @@ is a runtime semantic with no codegen footprint. The 13 tests in
 tests/test_text_null.py are the whole of the evidence, which is worth
 saying out loud rather than leaving the registry's silence to imply
 coverage that is not there.
+
+335. WHAT A BINARY IS BUILT FOR
+
+**Every compiled binary targeted the machine that compiled it.**
+`festina/llvm_backend.py` built its target machine from
+`LLVMGetHostCPUName()` and `LLVMGetHostCPUFeatures()`, so the object it
+emits is tuned for -- and may only run on -- the processor that
+produced it. Measured on the machine this was written on: CPU
+`emeraldrapids`, with twelve AVX-512 feature flags enabled.
+
+**The reported harm is the smaller of the two.** todo.md carried this
+as a valgrind problem: on an AVX-512 host every valgrind run dies with
+SIGILL before `main`, which matters because valgrind is how two of the
+other bugs in the same report were found -- the tool that finds memory
+bugs was unusable on exactly the machines with the newest instructions.
+True, and the plainer problem is that a binary built on a recent chip
+simply does not start on an older one. That is a surprising default for
+a compiler whose whole output is a native executable you would hand to
+someone.
+
+**`FESTINA_TARGET_CPU` is a dial rather than a switch.** `generic`
+builds for the architecture's portable baseline; any other value is
+passed to LLVM as a CPU name, so a project with a known floor can say
+`x86-64-v2` instead of giving up every extension. Unset keeps the
+existing behaviour exactly.
+
+**Clearing the FEATURES is the half that makes it work.** LLVM derives
+a named CPU's features from the name, so passing the host's feature
+string alongside `generic` puts every AVX-512 flag straight back and
+the setting appears to do nothing at all. The two have to move
+together, and the test for that is a unit test rather than an
+end-to-end one because the failure is silent.
+
+**Verified on the instructions, not just the exit code.** The same
+program built both ways differs where it should: the host build emits
+VEX-encoded scalar float ops (`vxorpd`, `vmulsd`, `vdivsd`) and the
+generic build emits baseline SSE2 (`xorpd`, `mulsd`, `divsd`), with
+identical output from both. Checked the way these have been checked
+throughout: by putting the bug back. With the wiring reverted to read
+the host directly, two of the eight tests fail -- the one comparing the
+two binaries byte for byte, and the one reading the disassembly. The
+six unit-level ones still pass, which is the useful warning about what
+a unit test can and cannot see here.
+
+**The default is unchanged and that is a decision, not an omission.**
+Making `generic` the default would trade measurable speed on the build
+machine for portability nobody asked for in this repository, and it is
+the kind of change that should be made deliberately rather than as a
+side effect of adding an escape hatch. It is now written down in
+specification.md 21.7 -- previously the behaviour was undocumented,
+which is the part that made it a trap rather than a tradeoff -- and
+todo.md carries the question of whether the default should flip.

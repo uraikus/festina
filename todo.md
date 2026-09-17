@@ -5,7 +5,7 @@ item lives in [decisions.md](decisions.md) (the numbered decision log,
 cited as `claude.md #N` throughout the repository) and
 [tests/CONTRACT.md](tests/CONTRACT.md) (what is verified, and how).
 
-## Open bugs
+## Reported bugs — all closed
 
 Reported by [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser)
 — a browser engine written in Festina, whose `FINDINGS.md` and
@@ -26,14 +26,20 @@ rule about terminal reads rather than the narrower one about null tests
 that the report suggested, which would have left a list walk still
 non-terminating; `'' == null` is fixed in #334, where the cause turned
 out to be one line of the runtime's text comparison rather than the
-representation the report suspected. These are what is left, most
-damaging first.
+representation the report suspected; and the host-CPU targeting is
+fixed in #335. **Every bug from that report is now closed.** What
+follows is a design question the last of them raised rather than a
+defect.
 
-- **Compiled binaries target the host CPU's exact feature set.** On an
-  AVX-512 machine every valgrind run dies with SIGILL before `main`,
-  and valgrind is the tool that found two of the bugs above. A
-  `FESTINA_TARGET_CPU=generic` escape hatch is what the reporter had to
-  monkeypatch the compiler to get.
+- **Should a binary target the build machine by default?** The escape
+  hatch exists now (`FESTINA_TARGET_CPU`, decisions.md #335) and the
+  behaviour is specified (§21.7), but the default still builds for the
+  host's exact CPU — so a binary built on a recent chip does not start
+  on an older one. That is fast and surprising in equal measure.
+  Flipping the default to `generic` trades measurable speed for
+  portability and should be decided deliberately, not as a side effect
+  of adding the hatch. Nothing in this repository depends on either
+  answer.
 
 ## Platforms
 

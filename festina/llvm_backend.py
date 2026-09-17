@@ -191,6 +191,41 @@ def available():
     return _binding().lib is not None
 
 
+# claude.md #335: the env var that decides what CPU the object is built
+# for. Unset keeps the historical behaviour; `generic` is the documented
+# portable value, and any other value is passed to LLVM as a CPU name.
+TARGET_CPU_ENV = "FESTINA_TARGET_CPU"
+
+
+def target_cpu_and_features(environ=None, binding=None):
+    """(cpu, features) to build the target machine with, as bytes.
+
+    claude.md #335: unset means the HOST's exact CPU and its full
+    feature set, which is what this has always done and what makes a
+    binary built here refuse to start on an older machine -- and what
+    makes valgrind die with SIGILL before `main` on an AVX-512 host,
+    which matters because valgrind is how two of the bugs above this one
+    in todo.md were found.
+
+    Setting the variable pins the CPU instead. `generic` is the portable
+    baseline for the triple; anything else is handed to LLVM as a CPU
+    name (`x86-64-v2`, `haswell`, ...), so this is an escape hatch with
+    a dial rather than a switch.
+
+    FEATURES ARE CLEARED whenever the variable is set, and that is the
+    load-bearing half. LLVM derives a named CPU's features from the name
+    itself, so passing the host's feature string alongside `generic`
+    would put every AVX-512 flag straight back and the setting would
+    appear to do nothing at all."""
+    if environ is None:
+        environ = os.environ
+    b = binding if binding is not None else _binding()
+    requested = (environ.get(TARGET_CPU_ENV) or "").strip()
+    if not requested:
+        return b.host_cpu_name(), b.host_cpu_features()
+    return requested.encode("utf-8"), b"".strip()
+
+
 def emit_object_file(ir_text, out_path, filename="<ir>"):
     """Compile LLVM IR text to a native object file at `out_path`, using
     libLLVM directly. Raises LLVMBackendError on any failure (bad IR,
@@ -229,8 +264,7 @@ def emit_object_file(ir_text, out_path, filename="<ir>"):
         message = target_err.value.decode(errors="replace") if target_err.value else "unknown target error"
         raise LLVMBackendError(f"could not resolve target '{triple.decode()}': {message}")
 
-    cpu = b.host_cpu_name()
-    features = b.host_cpu_features()
+    cpu, features = target_cpu_and_features(binding=b)
     tm = b.create_target_machine(target, triple, cpu, features,
                                   _CODEGEN_OPT_DEFAULT, _RELOC_PIC, _CODE_MODEL_DEFAULT)
     if not tm:

@@ -362,6 +362,19 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **`FESTINA_TARGET_CPU`, for building portable binaries.** Every
+  compiled binary targeted the exact CPU of the machine that compiled
+  it — measured here as `emeraldrapids` with twelve AVX-512 feature
+  flags — so it might not start on an older processor, and valgrind
+  died with SIGILL before `main` on an AVX-512 host. `generic` builds
+  for the architecture's portable baseline; any other value is used as
+  an LLVM CPU name (`x86-64-v2`, `haswell`), so a known floor can be
+  named rather than giving up every extension. Setting it also clears
+  the host feature set, without which the CPU name would be overridden
+  straight back. **The default is unchanged** and is now documented
+  (§21.7) rather than implicit. Reported by
+  [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser).
+  (decisions.md #335)
 - **`'' == null` was `true`** — in a local, a struct field, an array
   element, a map value, and for a computed empty string too, so a
   program could not tell an attribute whose value is empty
