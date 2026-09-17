@@ -125,14 +125,15 @@ larger than they look.
   its own answers for cycles, map ordering and NaN first, and nothing
   has asked for it yet.
 
-- **Porting the `test` type to `bootstrap/`.** #341 landed in the
-  Python implementation. The bootstrap compiler needs the declaration in
-  `parser.f`, the declaration and assertion rules in `semantic.f`, and
-  the STRIPPING half in `codegen.f` — an ordinary build removes every
-  assertion, which is the half a corpus case can measure, since
-  `bootstrap/irdumpf.f` compiles with assertions disabled like any other
-  ordinary build. The emitting half has no differential that can see it
-  until the bootstrap grows a test build of its own.
+- **A test build for `bootstrap/`.** The port of #341 covers what a
+  corpus file can measure: the declaration parses and analyses the same
+  on both sides, and an ordinary build removes every assertion. What has
+  no harness is the EMITTING half, because `bootstrap/irdumpf.f`
+  compiles the way `festina compile` does. Giving it a `festina test`
+  mode of its own would put the group registration, the comparison per
+  type, the rendered source line and the report under the same
+  byte-exact differential as everything else — worth doing before the
+  `test` type grows any further.
 
 - **Research a `gguf` type, for talking to a model directly.** The
   open questions are what the value actually owns (a memory-mapped

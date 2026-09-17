@@ -118,6 +118,11 @@ text func typeName(t:Ty) {
         if t.name == '' { return 'thread' }
         return `thread '${t.name}'`
     }
+    // claude.md #341: a `test` group binding (specification.md 11.7).
+    // Carries no `?`: `test?` would mean manually managing something
+    // the program never allocates -- a group is a fixed, program-global
+    // reporting slot, not a value with a lifetime.
+    if t.kind == 'test' { return 'test' }
     return 'unknown'
 }
 
@@ -1180,6 +1185,18 @@ void func analyzeStmt(s:Scope, n:Node) {
     }
     if k == 'FreeStmt' || k == 'DeleteStmt' { return }
     if k == 'ImportDecl' { return }
+    // claude.md #341: `test NAME = 'description'` (specification.md
+    // 11.7). The description is walked as an ordinary expression and
+    // the name defined as an ordinary value name -- which is what gets
+    // a group every rule a global already has (the built-in-name
+    // refusal of claude.md #339, the plain collision) with nothing
+    // written here for either.
+    if k == 'TestDecl' {
+        walkExpr(s, childOf(n, 'description'))
+        define(s, rawText(n, 'name'), tyNamed('test', ''), 'test',
+               rawInt(n, 'line'), rawInt(n, 'column'))
+        return
+    }
     if k == 'FuncDecl' { analyzeFuncDecl(s, n)  return }
     if k == 'StructDecl' { analyzeRecordDecl('STRUCT', n)  return }
     if k == 'TableDecl' { analyzeRecordDecl('TABLE', n)  return }

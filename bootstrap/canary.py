@@ -340,6 +340,28 @@ CANARIES = [
         """    bool cyclic = false
     text aliveL = doneL""",
     ),
+    # --- decisions.md #341: the test type ----------------------------
+    #
+    # Only the STRIPPING half can be canaried, and that is the honest
+    # shape of it rather than a gap: `bootstrap/irdumpf.f` compiles the
+    # way `festina compile` does, with assertions off, so an ordinary
+    # build removing them is the whole of what this compiler ever does
+    # with the feature. `bootstrap/cases/test_groups.f` is the witness.
+    Canary(
+        "assertion-is-stripped", "#341",
+        "an ordinary build removes an assertion rather than emitting a call",
+        """    if TEST_NAMES[name] != null {
+        return cgVal('1', 'i8', 'bool')
+    }""",
+        "",
+    ),
+    Canary(
+        "test-decl-emits-nothing", "#341",
+        "a test declaration contributes nothing to an ordinary build",
+        "    if s.kind == 'TestDecl' { return }",
+        "",
+    ),
+
     # --- decisions.md #340: the deferred-root buffer -----------------
     Canary(
         "cycle-release-buffers-the-root", "#340",

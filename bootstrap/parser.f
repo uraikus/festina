@@ -1082,6 +1082,25 @@ Node func parseRecordDecl(kw:text, kind:text) {
     return n
 }
 
+// claude.md #341: specification.md 11.7's TestDeclaration. The
+// description is a full expression, not a literal, so a group can name
+// itself from a constant or an interpolation; semantic analysis is what
+// checks it is text. Only the DECLARATION has syntax of its own -- an
+// assertion is an ordinary call, resolved by the type of what it calls.
+Node func parseTestDecl() {
+    Tok t = advance()
+    Tok nameTok = eat('IDENT')
+    eatOp('=')
+    Node desc = parseExpression()
+    eatSemi()
+    Node n = mk('TestDecl')
+    addStr(n, 'name', nameTok.val)
+    addNode(n, 'description', desc)
+    addInt(n, 'line', t.line)
+    addInt(n, 'column', t.col)
+    return n
+}
+
 Node func parseEnumDecl() {
     Tok t = eat('enum')
     Tok nameTok = eat('IDENT')
@@ -1467,6 +1486,21 @@ Node func parseStatement() {
     if k == 'thread' { return parseThreadDecl() }
     if k == 'on' { return parseEventHandler() }
     if k == 'match' { return parseMatch() }
+
+    // claude.md #341: `test NAME = 'description'` (specification.md
+    // 11.7). Recognised by VALUE at this one position, and only when an
+    // IDENT and `=` follow -- `test` is NOT a reserved word, and this
+    // file's own siblings are why: bootstrap/semantic.f declares a
+    // parameter called `test`, and `regex.test(s)` is an existing
+    // method. The three-token lookahead is what keeps `test = 5` and
+    // `test(1, 2)` parsing exactly as they always did; neither has an
+    // IDENT then `=` after the word.
+    if k == 'IDENT' && t.val == 'test' {
+        if peekAt(1).kind == 'IDENT' {
+            Tok eqTok = peekAt(2)
+            if eqTok.kind == 'OP' && eqTok.val == '=' { return parseTestDecl() }
+        }
+    }
 
     // Not ported yet -- each announces itself rather than being
     // mis-parsed. See this file's own header for the list.

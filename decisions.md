@@ -7671,6 +7671,43 @@ the spot. The runtime copies what it keeps now. A quieter failure here
 would have been a corrupted heap in a test harness, which is the worst
 place to have one.
 
+**The bootstrap port, and what a corpus file can actually measure.**
+`bootstrap/irdumpf.f` compiles the way `festina compile` does, with
+assertions off, so the only half of this feature that has a harness is
+the half that REMOVES them -- which is also the half every shipped
+binary depends on. `cases/test_groups.f` is the witness: a working
+program with assertions scattered through it, including inside a
+function body and a loop, whose IR contains not one line of any of it.
+The emitting half has no differential that can see it until the
+bootstrap grows a test build of its own, and todo.md says so rather
+than leaving it to be discovered.
+
+**That corpus file found two bugs on its first run, both in the Python
+implementation.** It was written to exercise the port and it failed
+against the original instead, which is the better outcome:
+
+- An assertion inside a FUNCTION BODY crashed the compiler. Functions
+  are emitted before top-level statements run, so the group's global
+  was registered by the declaration statement long after the assertion
+  that needed it. Registration moved to a pre-pass over the analysis,
+  where every other whole-program fact is decided. The bootstrap port
+  has the same shape for the same reason, written that way from the
+  start because this had already happened once.
+- `kinds(1, null)` emitted `icmp eq i64 1, null`, which is not valid
+  IR: `null` is only a pointer, and an int's null is a SENTINEL.
+  `_emit_binop` has needed exactly this since `x == null` existed, and
+  an assertion is one more position with a type on the other side to
+  read the encoding from. The file asserts against null precisely
+  because 11.7.1 says null is accepted.
+
+The globals are initialised to -1 rather than 0, which is the other
+half of the first fix: 0 is a real group id, so a slot read before its
+declaration ran would file assertions under whichever group happened to
+be first. `festina_test_assert` ignores a negative group, so the
+accident is a no-op rather than a wrong report -- and the ordering it
+guards is already a compile error, since a global must precede its
+first use.
+
 **And a test that skipped silently, which looks exactly like one that
 passes.** The ASan check for the report path probed for a sanitizer
 with `shutil.which("clang") or shutil.which("gcc")` and took clang

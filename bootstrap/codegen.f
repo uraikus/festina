@@ -1563,6 +1563,11 @@ bool CG_IN_FUNC = false
 // or the throw walks past it. A program with none of them pays
 // literally nothing: the IR is unchanged.
 bool CG_HAS_TRY = false
+// claude.md #341: the names declared as `test` groups. Needed even
+// though this compiler never emits an assertion, because an ordinary
+// build has to RECOGNISE one in order to remove it rather than fail on
+// a callee it cannot resolve.
+map[bool] TEST_NAMES = {}
 
 // Set only while a THROW emits its own scope walk, so a try-frame
 // marker in the range is left alone. See cgFreeOne.
@@ -6976,6 +6981,13 @@ Val func cgCall(e:Node, wantValue:bool) {
             if rawText(recv, 'name') == 'Math' && cgIsMathMethod(prop) {
                 return cgMathCall(e, prop)
             }
+            // claude.md #341: `t.near(a, b, tol)` on a `test` binding
+            // (specification.md 11.7.2). Removed exactly like a plain
+            // assertion, and for the same reason: this compiler only
+            // ever produces an ordinary build.
+            if TEST_NAMES[rawText(recv, 'name')] != null {
+                return cgVal('1', 'i8', 'bool')
+            }
         }
         return cgMethodCall(e, callee)
     }
@@ -6984,6 +6996,16 @@ Val func cgCall(e:Node, wantValue:bool) {
         return none
     }
     text name = rawText(callee, 'name')
+    // claude.md #341: an ASSERTION -- a call of a `test` binding
+    // (specification.md 11.7.1). An ordinary build removes it from the
+    // program entirely, arguments included, so nothing is emitted and
+    // the expression answers `true`: nothing failed, because nothing
+    // ran. Checked before every builtin below, which is safe because
+    // a `test` binding may not take a builtin's name in the first place
+    // (6.7) and so can never shadow one.
+    if TEST_NAMES[name] != null {
+        return cgVal('1', 'i8', 'bool')
+    }
     // claude.md #208: the bare, context-implicit send -- FROM the
     // thread whose body is being emitted, TO main. Checked first, and
     // only inside a thread: at the top level `postMessage` is an
@@ -7743,6 +7765,14 @@ void func cgStmt(s:Node) {
     // main's own prologue, long before __festina_main starts. Nothing
     // is owed here either way.
     if s.kind == 'TableDecl' { return }
+    // claude.md #341: `test NAME = 'description'` (specification.md
+    // 11.7). Nothing reaches an ordinary build at all -- 11.7.3 removes
+    // every declaration and every assertion from a `festina compile`,
+    // which is the half of this feature a corpus file can measure,
+    // since this compiler only ever builds one. The description is not
+    // evaluated either, for the same reason its assertions' arguments
+    // are not: it is part of what was removed.
+    if s.kind == 'TestDecl' { return }
     // An event handler's body was emitted with the functions; nothing
     // reaches main where the declaration stands.
     if s.kind == 'EventHandler' { return }
@@ -14228,6 +14258,18 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     while tq < body.length {
         if cgContainsTry(body[tq]) { CG_HAS_TRY = true }
         tq++
+    }
+    // claude.md #341: which names are `test` groups, collected for the
+    // whole program before anything is emitted. Not as each declaration
+    // is REACHED, because functions are emitted before the top-level
+    // statements run and an assertion inside a function body would be
+    // generated while the set was still empty -- which is exactly the
+    // bug `bootstrap/cases/test_groups.f` found in the original
+    // implementation on its first run.
+    int tn = 0
+    while tn < body.length {
+        if body[tn].kind == 'TestDecl' { TEST_NAMES[rawText(body[tn], 'name')] = true }
+        tn++
     }
     cgEmit('; ModuleID = "festina"')
     cgEmit(`; generated from ${srcPath} -- claude.md #47`)

@@ -994,8 +994,24 @@ class CodeGen:
         # only in a test build; `_test_names` is populated either way,
         # because an ordinary build still has to RECOGNISE an assertion
         # in order to remove it rather than fail on an unknown callee.
-        self._test_groups = {}
+        # claude.md #341: registered HERE, from the analysis, rather
+        # than when each declaration statement is emitted -- because
+        # functions are emitted before top-level statements run, and an
+        # assertion inside a function body would otherwise be generated
+        # while this map was still empty. A corpus case with exactly
+        # that shape (`bootstrap/cases/test_groups.f`) found it on its
+        # first run. The declaration statement now only STORES the
+        # runtime id into a global that already exists.
+        #
+        # The initial value is -1, not 0: 0 is a real group id, so a
+        # slot read before its declaration ran would silently file
+        # assertions under whichever group happened to be first.
+        # `festina_test_assert` ignores a negative group, so the
+        # accident is a no-op instead of a wrong report -- and the
+        # ordering it protects against is already a compile error,
+        # since a global must precede its first use.
         self._test_names = {d.name for d in getattr(analyzed, "test_decls", [])}
+        self._test_groups = {}
         self.entry_filename = filename         # the file actually passed to the compiler -- see generate()
         self.filename = filename               # mutated per top-level statement (see generate()); used by every error site
         # claude.md #148: WASM export. Every native target festina/cli.py
@@ -1088,6 +1104,11 @@ class CodeGen:
                                                 # never by an arbitrary TableType-typed binding, which
                                                 # would double-free a row the array still owns.
         self.extra_globals = []                # globals discovered while emitting main() (e.g. table column arrays)
+        if self.tests_enabled:
+            for _decl in getattr(analyzed, "test_decls", []):
+                _slot = f"@__festina_test_{_decl.name}"
+                self._test_groups[_decl.name] = _slot
+                self.extra_globals.append(f"{_slot} = global i64 -1")
         # claude.md #256: interned ascii literals -- text -> the constant
         # GEP expression naming its payload. See ascii_const.
         self.ascii_constants = {}
@@ -11194,9 +11215,7 @@ class CodeGen:
         global value name. The id is an integer the runtime hands back,
         not a pointer, because its own group array grows.
         """
-        slot = f"@__festina_test_{stmt.name}"
-        self._test_groups[stmt.name] = slot
-        self.extra_globals.append(f"{slot} = global i64 0")
+        slot = self._test_groups[stmt.name]
         desc, desc_type = self._emit_value_for(stmt.description, env, lines, TEXT)
         desc = self._coerce(desc, desc_type, TEXT, lines, source_expr=stmt.description)
         gid = self.tmp()
@@ -11218,8 +11237,23 @@ class CodeGen:
             return "1", BOOL
         slot = self._test_groups[name]
         actual_expr, expected_expr = expr.args[0], expr.args[1]
-        a_val, a_type = self._emit_expr(actual_expr, env, lines)
-        e_val, e_type = self._emit_expr(expected_expr, env, lines)
+        # A bare `null` against a concretely-typed operand needs that
+        # operand's own null SENTINEL, not LLVM's `null` keyword, which
+        # is only valid IR for a pointer -- `icmp eq i64 1, null` does
+        # not parse. _emit_binop has needed exactly this since `x ==
+        # null` existed, and an assertion is one more position with a
+        # type on the other side to read the encoding from. Found by
+        # `bootstrap/cases/test_groups.f`, which asserts `kinds(1,
+        # null)` precisely because 11.7.1 says null is accepted.
+        if isinstance(expected_expr, ast.NullLit):
+            a_val, a_type = self._emit_expr(actual_expr, env, lines)
+            e_val, e_type = self._emit_value_for(expected_expr, env, lines, a_type)
+        elif isinstance(actual_expr, ast.NullLit):
+            e_val, e_type = self._emit_expr(expected_expr, env, lines)
+            a_val, a_type = self._emit_value_for(actual_expr, env, lines, e_type)
+        else:
+            a_val, a_type = self._emit_expr(actual_expr, env, lines)
+            e_val, e_type = self._emit_expr(expected_expr, env, lines)
         cmp_type = a_type if a_type is not None else e_type
         passed = self._emit_value_equality(a_val, e_val, cmp_type, lines)
         rendered = self._to_text(a_val, a_type, lines) if a_type is not None else None

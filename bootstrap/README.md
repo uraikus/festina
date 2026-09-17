@@ -65,7 +65,7 @@ file**:
   both** — 2,265 of 2,265 records.
 - **codegen: 117 match, 0 differ, 0 unported, 13 rejected by both** —
   425,103 of 425,103 file-specific IR lines.
-- **canaries: 159 registered, 0 missed** — 152 caught outright, 7 via
+- **canaries: 161 registered, 0 missed** — 154 caught outright, 7 via
   the ratchet. The sweep found one that had stopped being a breakage
   rather than one the corpus could not see; the note below says which
   and why the two look identical in the report.
@@ -106,7 +106,7 @@ figure.
 the two implementations agree; it says nothing about whether the corpus
 could tell them apart if they stopped agreeing — and for four
 consecutive slices of the codegen port, the honest answer was that it
-could not. `bootstrap/canary.py` holds a hundred and fifty-nine
+could not. `bootstrap/canary.py` holds a hundred and sixty-one
 deliberate breakages, one per mechanism, and asks the corpus whether it
 notices:
 **0 not caught.** A failure
