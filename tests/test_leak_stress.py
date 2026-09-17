@@ -776,4 +776,14 @@ class TestLeakStress:
             # connections' strdup'd host strings would leak on every
             # single kill().
             "http_client_pool_kill_live_churn.f",
+            # claude.md #340: the deferred-root buffer. A
+            # still-referenced release of a cycle-capable value records
+            # it as a possible root and one collection answers a batch,
+            # which puts three new ways to leak or to free twice into
+            # code every struct/arr/map-using program runs through: the
+            # batch's pending-free discipline, a root whose count hits
+            # zero while it waits, and the flush that answers the last
+            # partial batch. This program earned its place on its first
+            # run, reporting the use-after-free that #340 then fixed.
+            "cycle_buffer_churn.f",
         }
