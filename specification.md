@@ -1842,8 +1842,9 @@ value's lifetime permits. A program may rely on the following: [#43,
    elements or values recursively; freeing a map frees its keys.
 5. Query result arrays, rows and their columns are reclaimed like any
    other value (§15.6).
-6. Reference cycles among structs, arrays and maps are collected when
-   the last outside reference is released (§13.3).
+6. Reference cycles among structs, arrays and maps are collected once
+   the last outside reference is released, not necessarily at that
+   moment (§13.3, §14.5).
 7. `text` globals are not freed at process exit.
 
 When a `struct` local is proven non-escaping it is a stack allocation,
@@ -1870,9 +1871,21 @@ one binding is visible through every other. [#83, #109, #118, #265]
 A type that can form a reference cycle (a struct naming itself, or
 reaching itself through fields, elements or map values) carries a cycle
 detector: when a value of such a type is released but still referenced,
-the runtime determines whether only the cycle itself holds it and frees
-the cycle if so. A cycle anything outside still reaches is never
-touched. Types that cannot form cycles pay nothing. Edges through an
+it becomes a **possible root**, and the runtime later determines
+whether only the cycle itself holds it and frees the cycle if so. A
+cycle anything outside still reaches is never touched. Types that
+cannot form cycles pay nothing.
+
+**When that determination runs is not specified** (§14.5). An
+implementation may answer each possible root as it arises or batch them
+and answer a group at once; batching is what makes repeated release of
+references into one large shared structure cost less than one full walk
+of it per release. What *is* guaranteed: a cycle whose last outside
+reference has been released is collected before the program exits, and
+a value is never reclaimed while anything can still reach it (§13.1).
+A program must not depend on the moment of collection, and — since the
+language has no destructors — nothing observable but peak memory
+depends on it. [#340] Edges through an
 enum-typed field are not walked; a cycle closed only through an enum
 field is not collected. Edges through a `weak` field are not walked
 either, and do not count when deciding whether a type can form a cycle

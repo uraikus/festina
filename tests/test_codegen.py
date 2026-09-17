@@ -8594,7 +8594,12 @@ class TestCycleCollection:
         """
         ir = self._ir(parser, semantic, codegen, source)
         wrapper = ir.split("define void @__festina_release_struct_Node(")[1].split("\n}")[0]
-        assert "call i8 @festina_cycle_candidate(" in wrapper
+        # claude.md #340: one add_root carrying the three per-type
+        # traversal functions, where this used to be a candidate check
+        # followed by three calls. The functions still have to be NAMED
+        # here -- that is what makes this a test about the release
+        # wrapper rather than about the buffer.
+        assert "call void @festina_cycle_add_root(" in wrapper
         assert "@__festina_cycle_gray_" in wrapper
         assert "@__festina_cycle_scan_" in wrapper
         assert "@__festina_cycle_white_" in wrapper
@@ -8613,8 +8618,7 @@ class TestCycleCollection:
         f()
         """
         ir = self._ir(parser, semantic, codegen, source)
-        assert "festina_cycle_candidate" not in ir.replace(
-            "declare i8 @festina_cycle_candidate(ptr)", "")
+        assert "call void @festina_cycle_add_root" not in ir
         assert "@__festina_cycle_" not in ir
 
     def test_garbage_cycles_are_reclaimed_and_reused_memory_stays_sane(

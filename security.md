@@ -175,12 +175,23 @@ The memory model is escape analysis plus reference counting, with
 cycle collection by trial deletion for the types that can form one, and
 `free`/`delete` as explicit overrides — continuously exercised under
 AddressSanitizer, LeakSanitizer and (for the audio thread pool)
-ThreadSanitizer. `scripts/leak_stress.sh` runs eleven mixed churn
-programs (background `.callback()` loading for `blob`/`img`/`aud`,
-nested `.toStruct()`/`.toArr()` JSON parsing, ternary-branch ownership,
-`amor arr[T]`'s amortized growth, and both `enum` representations,
-among others) plus one isolation program per data type on every test
-run, and a canary test proves the harness itself can fail.
+ThreadSanitizer. `scripts/leak_stress.sh` runs 44 churn programs
+(background `.callback()` loading for `blob`/`img`/`aud`, nested
+`.toStruct()`/`.toArr()` JSON parsing, ternary-branch ownership,
+`amor arr[T]`'s amortized growth, both `enum` representations, and the
+cycle collector's own batching, among others) plus one isolation
+program per data type on every test run, and a canary test proves the
+harness itself can fail.
+
+The trial is **batched** (decisions.md #340): a release that finds a
+cycle-capable value still referenced records it as a possible root, and
+one collection answers a group. That changes when garbage is reclaimed
+and nothing about what may be. The safety argument is unchanged — a
+reachable cycle is provably restored intact — with one addition the
+batch makes necessary and which AddressSanitizer found rather than
+review: within a batch, storage a sweep has decided on is not handed
+back until every sweep in that batch has run, because the fields of
+other nodes still point at it and a later sweep reads its header.
 
 The knowingly accepted gaps, none of which is remotely triggerable and
 each of which is a **leak or a documented manual contract, not
@@ -206,7 +217,10 @@ corruption**:
   "optimization" cannot silently trade one for the other. Reference
   cycles are collected by trial deletion — a reachable cycle is
   provably restored intact, so the collector cannot be tricked into
-  freeing live data by a cycle that is still held.
+  freeing live data by a cycle that is still held. Batching the trials
+  (decisions.md #340) delays a collection, never a restoration: a node
+  the batch finds externally reachable is restored by the same scan
+  that always restored it.
 
 ## Slim binaries
 

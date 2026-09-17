@@ -816,6 +816,45 @@ anything outside them can reach them. Cycles through containers
 collect the same way. Programs whose types cannot form a cycle carry
 none of this machinery.
 
+**When** that check runs is deliberately unspecified. Such a release
+records the value as a *possible root*, and the runtime answers a group
+of them at once rather than one per release — which is what stops
+repeatedly taking and dropping references into one big shared structure
+from re-walking all of it every single time. What is promised is that
+a cycle whose last outside reference has gone is collected before the
+program exits, and that nothing is ever reclaimed while something can
+still reach it. Since Festina has no destructors, nothing observable
+but peak memory depends on the timing, so don't write code that waits
+for a collection.
+
+#### `weak` fields
+
+If a back-pointer is the only thing keeping a structure cyclic, declare
+it `weak` and there is no cycle to collect:
+
+```festina
+struct Node {
+    parent:weak Node
+    kids:arr[Node]
+    name:text
+}
+```
+
+A `weak` field refers to a value **without keeping it alive**, and the
+read is checked: it yields the value while something else still holds
+it, and `null` once nothing does. It cannot dangle. Cycle collection
+does not walk a weak edge and does not count it when deciding whether a
+type can form a cycle at all — so a type whose only path back to itself
+runs through `weak` fields carries no detector and pays nothing for it.
+That is the whole point: a parent pointer is what turns releasing one
+node into walking the entire document.
+
+A weak field is never auto-vivified — reading one that was never
+assigned gives `null` rather than a fresh value, the one exception to
+the usual rule for struct fields. `weak` is not a reserved word; it is
+recognised only immediately after a field's `:`, so a program already
+using the name is unaffected.
+
 Memory for structs, arrays, and maps is managed automatically — no
 manual allocation or freeing. A local struct/`arr[T]`/`map[T]`
 declared in a function, event handler, `if` branch, `while` body, or

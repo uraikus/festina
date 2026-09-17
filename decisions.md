@@ -7429,3 +7429,147 @@ all passed either way, which is what they are for. The `environment`
 half was put back the same way, by reverting `festina/semantic.py`
 alone: its five new tests failed and its twelve existing ones did
 not.
+
+340. THE DEFERRED-ROOT BUFFER
+
+Phase 2 of #254, which measured the case for this and deliberately
+stopped there. A still-referenced release of a cycle-capable value ran
+a whole trial deletion on the spot -- one full walk of the reachable
+subgraph, per release -- so a program repeatedly taking and dropping
+references into one large shared structure re-walked all of it every
+time. #254 measured a shared ring at 9-10x the cost of the same node
+count split into private rings and left the implementation to its own
+round, "its own plan, its own ASan/LeakSanitizer-under-stress
+verification of the zombie-free path specifically". This is that round.
+
+**What it does now.** Such a release records the value as a possible
+root -- pointer plus its three generated traversal functions -- and one
+collection answers a whole batch: mark every root, then scan every
+root, then sweep every root. The phases cannot interleave, because
+scan's verdict for a node is only meaningful once every internal edge
+in the batch's combined subgraph has been tentatively removed. The
+saving is entirely in the sharing: `festina_cycle_begin_gray` already
+claimed each node exactly once, so the second root inside a ring the
+batch has walked costs one call that returns immediately, where two
+separate trials walked the whole ring twice.
+
+**Measured on one machine, interleaved, against a binary built from
+the previous commit** -- the shape #254 used, at its parameters:
+
+| | old | new |
+|---|---|---|
+| shared: one 5,000-node ring, 10 anchors, 5,000 iterations | 199 ms | 2.3 ms |
+| disjoint: 10 private 500-node rings, same totals | 12.0 ms | 2.1 ms |
+| shared, 4x ring (20,000 nodes) | 1,992 ms | 4.6 ms |
+| shared, 2x iterations (10,000) | 304 ms | 2.5 ms |
+| fresh: 20,000 separate 21-node cycles, built and dropped | 34.4 ms | 22.0 ms |
+
+The 16.6x penalty for sharing collapses to about 1.1x, which was the
+whole point. The last row is the clearest statement of the mechanism:
+doubling the churn against the same structure costs the old collector
+another 105 ms and costs this one 0.2 ms, because a node is buffered
+once however often it is dropped.
+
+**That benchmark is favourable by construction and should be read as
+such.** Ten anchors means at most ten buffered roots, so the batch
+never fills and one collection at exit answers everything. The win is
+proportional to how much of the old walking was redundant, which is
+exactly the quantity #254 set out to measure.
+
+So the last row is the control: 20,000 separate short-lived cycles, the
+case batching was NOT designed for and the one that actually fills
+batches. It improves too, 34.4 ms to 22.0 ms, rather than paying for
+the other case. That row is also a check on the harness itself -- 34.4
+ms is #120's own "20k dropped 21-node cycles in ~34 ms", reproduced
+here on different hardware years later, which is the reason to believe
+the other rows measure what they claim.
+
+**The memory side of the trade, which #254 asked to be confirmed rather
+than assumed.** Batching delays collection, so garbage sits longer.
+Measured as peak RSS: the fresh-cycles program goes from 10,180 KB to
+10,344 KB (+1.6%), and the shared one from 10,156 KB to 10,180 KB
+(+0.2%). A batch of 1,024 roots is the whole of it, and at 21 nodes a
+root that is about half a megabyte held back. Real, small, and the
+`FESTINA_CYCLE_BATCH` constant is the single place to change it.
+
+**The zombie case turned out not to need any code.** #254's warning
+was that a node still marked as a possible root when its count hits
+zero must not be deallocated, because this buffer holds its pointer.
+The rule falls out of what is already there: `festina_release_check`
+tests the whole header against zero, and a buffered header carries bit
+60, so it is never zero -- the release reports "still referenced" and
+skips its free branch by itself. The node is genuine garbage and the
+collection frees it properly, as an ordinary root with a zero count
+that markGray/scan/collectWhite dispose of along with whatever it alone
+still held. `festina_retain` stays a plain increment and
+`festina_release_check` is untouched, so the two hottest functions in
+the runtime never learn this bit exists.
+
+**The real hazard was somewhere else, and AddressSanitizer found it
+rather than I did.** The first version freed a node the moment its
+sweep was done, exactly as the single-root trial always had. The
+stress program's first run reported a heap-use-after-free in
+`festina_cycle_begin_white`. A batch sweeps several roots in turn, and
+a node the first sweep has finished with is still POINTED AT by the
+fields of other nodes -- nothing nulls them -- so a later sweep walks
+straight into it and reads its header to ask what colour it is. One
+sweep never had this problem because there was only one.
+
+So a sweep now decides and nothing is handed back until every sweep in
+the batch has finished: white nodes go onto a pending-free list and the
+collection drains it at the end. A black header in freed-but-not-yet-
+returned memory still reads as black, which is what makes the second
+visit a no-op rather than a crash. Interior storage -- an array's
+element buffer, a map's entries and keys -- is not deferred, because no
+node in the graph points at it.
+
+**A guard that pinned nothing came out again.** The first version also
+refused to free a buffered node inside `festina_cycle_begin_white`, on
+the reasoning that one root's sweep must not free another root out from
+under the buffer. Once the pending-free list existed that was no longer
+true: both orders are correct, and removing the check made no test
+fail, under ASan or otherwise. A check no test can fail reads as
+protection and is not, so it went -- the same rule #339 applied to a
+canary whose breakage had stopped being one. What stayed is clearing
+the bit on every root as its turn comes, which matters for a root that
+SURVIVES: a node left marked buffered could never be recorded as a root
+again, and a later cycle through it would go uncollected.
+
+**Two instruments, because neither sees the whole thing.**
+`tests/stress/cycle_buffer_churn.f` runs under ASan/LeakSanitizer and
+is what caught the use-after-free; putting that bug back (freeing
+immediately instead of deferring) reproduces the report exactly.
+`tests/test_cycle_buffer.py` drives the runtime helpers from C with
+hand-written traversal functions, and covers the two things the
+sanitizer cannot: how much walking a batch does (counted -- four gray
+calls for a two-node ring with two roots, where two independent trials
+are six), and that the flush collects the final partial batch.
+
+**LeakSanitizer cannot see an un-flushed buffer, and that is worth
+saying out loud.** Removing main's flush and running the stress program
+reported nothing at all: the buffer is a live `__thread` array holding
+those pointers, so LSan classifies the nodes as still-reachable rather
+than leaked. The C probe is what fails without the flush. I would have
+recorded the flush as leak-tested on the strength of a green sanitizer
+run, and it would not have been.
+
+**`festina_cycle_candidate` is gone.** It answered "is this value
+worth trying as a root", and the buffered branch no longer asks:
+`festina_cycle_add_root` makes the same null/immortal decision itself
+and one more it could not -- whether the value is already waiting. With
+its last caller removed it was a public runtime function nothing
+called, which would have read to the next person as though the check
+still happened somewhere. Three tests asserted on it in the emitted IR
+and now assert on `add_root`; their subject moved, not their point.
+
+**Per thread, not global.** Threads have disjoint heaps (#163) and
+never touch each other's refcounted values, so the buffer is `__thread`
+like the catch-frame stack -- no lock on the hottest path in the
+runtime. Each thread flushes its own buffer where it already frees its
+cleanup stack, and main flushes its own before returning.
+
+**An expected count in my own test was wrong, and the test said so.**
+I predicted three gray calls for a two-node ring with two roots and
+forgot the ring's back edge: root a walks a, then b, then b's edge back
+to a, which finds a already gray. Four. The compiler was right and the
+prediction was not -- the same shape as #338's blank-line miscount.

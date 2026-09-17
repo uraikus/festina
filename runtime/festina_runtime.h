@@ -1695,13 +1695,25 @@ int8_t festina_release_check(void *payload);
 void festina_noop_release(void *payload);
 
 /* claude.md #120: the type-blind state half of cycle collection --
- * synchronous single-root trial deletion (Bacon-Rajan), driven by
- * compiler-generated per-type traversal functions whenever a value of
- * a possibly-cyclic TYPE is released but still referenced. Color state
- * lives in bits 61-62 of the ordinary refcount header (black=0
- * outside every trial), and every helper is null- and immortal-safe.
- * See the block comment in festina_runtime.c. */
-int8_t festina_cycle_candidate(void *p);
+ * trial deletion (Bacon-Rajan), driven by compiler-generated per-type
+ * traversal functions whenever a value of a possibly-cyclic TYPE is
+ * released but still referenced. Color state lives in bits 61-62 of
+ * the ordinary refcount header (black=0 outside every collection), and
+ * every helper is null- and immortal-safe. See the block comment in
+ * festina_runtime.c.
+ *
+ * claude.md #340: such a release now BUFFERS the value as a possible
+ * root rather than running its own trial on the spot, and one
+ * collection answers a whole batch -- which is what stops a large
+ * shared structure being re-walked once per release. `buffered` is bit
+ * 60 of the same header and is the only part of this state that
+ * persists between collections; festina_retain and
+ * festina_release_check are deliberately untouched by it. */
+void festina_cycle_add_root(void *p, void (*gray)(void *),
+                            void (*scan)(void *), void (*white)(void *));
+void festina_cycle_collect(void);
+void festina_cycle_flush(void);
+void festina_cycle_defer_free(void *alloc_base);
 int8_t festina_cycle_begin_gray(void *p);
 void festina_cycle_dec(void *p);
 void festina_cycle_inc(void *p);

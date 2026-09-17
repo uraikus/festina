@@ -72,13 +72,32 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Changed
 
+- **Reference cycles are collected in batches.** A release that finds a
+  cycle-capable value still referenced used to run a whole trial
+  deletion on the spot — one full walk of everything it reaches, per
+  release — so repeatedly taking and dropping references into one large
+  shared structure re-walked all of it every time. Such a release now
+  records the value as a possible root and one collection answers a
+  whole batch. Measured interleaved against the previous commit: one
+  5,000-node ring with 10 anchors and 5,000 iterations goes from 199 ms
+  to 2.3 ms, and the same node count split into private rings from
+  12.0 ms to 2.1 ms — the 16.6× penalty for *sharing* collapses to about
+  1.1×. Doubling the churn against the same structure costs the old
+  collector another 105 ms and this one 0.2 ms, because a node is
+  buffered once however often it is dropped. **The moment of collection
+  is no longer the moment of the last release** (it was already
+  implementation-defined, specification.md §14.5); what is guaranteed is
+  unchanged — a cycle is collected before the program exits, and nothing
+  is ever reclaimed while anything can still reach it. Since the
+  language has no destructors, nothing observable but peak memory
+  depends on the difference. (decisions.md #340)
 - **The bootstrap compiler is complete.** `bootstrap/` holds Festina's
   own compiler, written in Festina, and every one of its five passes
   now agrees with the Python implementation it mirrors on **every file
-  of the 129-file corpus** — including its own source, which is
-  122,000 lines of IR on its own. Lexer, parser and analyzer: 129
-  match, 0 differ each. Escape analysis: 2,258 of 2,258 records.
-  Codegen: 424,234 of 424,234 file-specific IR lines, byte for byte.
+  of the 130-file corpus** — including its own source, which is
+  122,000 lines of IR on its own. Lexer, parser and analyzer: 130
+  match, 0 differ each. Escape analysis: 2,265 of 2,265 records.
+  Codegen: 425,103 of 425,103 file-specific IR lines, byte for byte.
   The thirteen files neither side compiles are deliberately ill-formed
   sources the corpus keeps so that both implementations are checked on
   the rejection as well as the acceptance.

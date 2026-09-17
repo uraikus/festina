@@ -5994,7 +5994,9 @@ void festina_weak_died(void *payload) {
 
 #define FESTINA_COLOR_SHIFT 61
 #define FESTINA_COLOR_MASK (3LL << FESTINA_COLOR_SHIFT)
-#define FESTINA_COUNT_MASK (~FESTINA_COLOR_MASK)
+#define FESTINA_BUFFERED_SHIFT 60
+#define FESTINA_BUFFERED_BIT (1LL << FESTINA_BUFFERED_SHIFT)
+#define FESTINA_COUNT_MASK (~(FESTINA_COLOR_MASK | FESTINA_BUFFERED_BIT))
 #define FESTINA_GRAY 1LL
 #define FESTINA_WHITE 2LL
 
@@ -6002,12 +6004,213 @@ static int64_t *festina_cycle_header(void *p) {
     return (int64_t *)((char *)p - sizeof(int64_t));
 }
 
-/* Whether a just-released-but-still-referenced value should be tried
- * as a cycle root: non-null with a positive header (positive rules out
- * both immortal and colored -- outside a trial, color bits are 0). */
-int8_t festina_cycle_candidate(void *p) {
-    if (!p) return 0;
-    return *festina_cycle_header(p) > 0;
+/* ---- the deferred-root buffer -- claude.md #340 ----
+ *
+ * A still-referenced release used to run a whole trial on the spot.
+ * That is one full walk of the reachable subgraph PER RELEASE, so a
+ * program that repeatedly takes and drops references into one large
+ * shared structure re-walks all of it every time: decisions.md #254
+ * measured a shared ring at 9-10x the cost of the same node count split
+ * into private rings, scaling linearly in both ring size and iteration
+ * count. Batching is what collapses that. The roots accumulate here,
+ * and one collection answers the whole batch with a single pass of each
+ * phase -- `festina_cycle_begin_gray`'s once-per-node claim is what
+ * makes the second root inside an already-walked ring cost nothing.
+ *
+ * `buffered` is bit 60, immediately below the two colour bits, and it
+ * is the one piece of this state that persists BETWEEN collections.
+ * That would be alarming if the hot paths had to learn about it, and
+ * they do not: `festina_retain` is still a plain increment (a count
+ * that reached 2^60 would have exhausted memory long before), and
+ * `festina_release_check` still tests the whole header against zero --
+ * which for a buffered node is never zero, so the release reports
+ * "still referenced" and skips the free branch by itself. That is
+ * exactly the zombie rule Bacon-Rajan needs (a node whose pointer is
+ * sitting in this buffer must not be deallocated out from under it)
+ * falling out of the existing code rather than being bolted onto it.
+ * Such a node is genuine garbage and the collection frees it properly:
+ * it is an ordinary root with a zero count, so markGray/scan/
+ * collectWhite free it AND whatever it alone still holds.
+ *
+ * Every helper below that rewrites a header preserves this bit, and
+ * each root's own turn clears it -- which matters for a root that
+ * SURVIVES: a node left marked buffered could never be recorded as a
+ * root again, and a later cycle through it would go uncollected.
+ *
+ * A first version also refused to free a buffered node inside
+ * `festina_cycle_begin_white`, on the reasoning that one root's sweep
+ * must not free another root out from under this buffer. The
+ * pending-free list below makes that unnecessary -- nothing is handed
+ * back until every sweep in the batch has run, so either order is
+ * correct -- and removing it was the right call once no test could be
+ * made to fail without it. A guard that pins nothing reads as
+ * protection and is not.
+ *
+ * `__thread` for the reason claude.md #163 gives for the catch-frame
+ * stack: threads have disjoint heaps and never touch each other's
+ * refcounted values, so a per-thread buffer needs no lock and a shared
+ * one would need one on the hottest path in the runtime. */
+
+typedef struct {
+    void *payload;
+    void (*gray)(void *);
+    void (*scan)(void *);
+    void (*white)(void *);
+} FestinaCycleRoot;
+
+/* How many possible roots accumulate before a collection runs. The
+ * trade decisions.md #254 names is lower amortized CPU for higher peak
+ * memory, and this number is the whole of it: garbage sits uncollected
+ * until the batch fills. Small enough that a program's peak is barely
+ * moved, large enough that a shared structure is walked once per batch
+ * rather than once per release. */
+#define FESTINA_CYCLE_BATCH 1024
+
+static __thread FestinaCycleRoot *g_festina_cycle_roots = NULL;
+static __thread size_t g_festina_cycle_len = 0;
+static __thread size_t g_festina_cycle_cap = 0;
+static __thread int g_festina_cycle_collecting = 0;
+
+/* Storage the batch has decided is garbage, not yet handed back.
+ *
+ * This list is the answer to a use-after-free AddressSanitizer found
+ * rather than one reasoned out in advance, and it is worth saying which
+ * way round that was. A batch answers several roots in turn. A node one
+ * root's sweep has finished with is coloured black, but the FIELDS of
+ * other nodes still point at it -- nothing nulls them -- so a later
+ * root's sweep walks straight into it and reads its header to ask what
+ * colour it is. If the first sweep had already freed it, that read is
+ * the use-after-free. The old single-root trial never had this problem
+ * because there was only ever one sweep.
+ *
+ * So a sweep decides, and nothing is handed back until every sweep in
+ * the batch has finished. A black header in freed-but-not-yet-returned
+ * memory still reads as black, which is what makes the second visit a
+ * no-op instead of a crash. Interior storage (an array's elements
+ * buffer, a map's entries and keys) is not deferred: no node in the
+ * graph points at it, so nothing can walk into it. */
+static __thread void **g_festina_cycle_pending = NULL;
+static __thread size_t g_festina_cycle_pending_len = 0;
+static __thread size_t g_festina_cycle_pending_cap = 0;
+
+void festina_cycle_defer_free(void *alloc_base) {
+    if (!alloc_base) return;
+    if (g_festina_cycle_pending_len == g_festina_cycle_pending_cap) {
+        size_t cap = g_festina_cycle_pending_cap ? g_festina_cycle_pending_cap * 2 : 64;
+        void **grown = (void **)realloc(g_festina_cycle_pending, cap * sizeof(void *));
+        if (!grown) {
+            /* No room to defer. Freeing now risks the use-after-free
+             * above; leaking one node does not. Correctness first --
+             * and this is reachable only when the allocator has
+             * already failed. */
+            return;
+        }
+        g_festina_cycle_pending = grown;
+        g_festina_cycle_pending_cap = cap;
+    }
+    g_festina_cycle_pending[g_festina_cycle_pending_len++] = alloc_base;
+}
+
+static void festina_cycle_drain_pending(void) {
+    for (size_t i = 0; i < g_festina_cycle_pending_len; i++) {
+        festina_free_z(g_festina_cycle_pending[i]);
+    }
+    g_festina_cycle_pending_len = 0;
+}
+
+static void festina_cycle_clear_buffered(void *p) {
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    *h &= ~FESTINA_BUFFERED_BIT;
+}
+
+/* Answer every buffered root at once: mark the whole batch, then scan
+ * the whole batch, then collect it. The phases must not interleave --
+ * scan's verdict for a node is only meaningful once EVERY internal
+ * edge in the batch's combined subgraph has been tentatively removed,
+ * which is what the separate loops guarantee. */
+void festina_cycle_collect(void) {
+    if (g_festina_cycle_collecting) return;
+    if (g_festina_cycle_len == 0) return;
+    g_festina_cycle_collecting = 1;
+    size_t n = g_festina_cycle_len;
+    for (size_t i = 0; i < n; i++) {
+        g_festina_cycle_roots[i].gray(g_festina_cycle_roots[i].payload);
+    }
+    for (size_t i = 0; i < n; i++) {
+        g_festina_cycle_roots[i].scan(g_festina_cycle_roots[i].payload);
+    }
+    for (size_t i = 0; i < n; i++) {
+        /* Every root's bit is cleared, including one that turns out
+         * to be alive: a node left marked buffered could never be
+         * recorded as a possible root again, and a later cycle through
+         * it would go uncollected. Safe to touch here because nothing
+         * has been handed back yet -- the drain below is what frees. */
+        festina_cycle_clear_buffered(g_festina_cycle_roots[i].payload);
+        g_festina_cycle_roots[i].white(g_festina_cycle_roots[i].payload);
+    }
+    festina_cycle_drain_pending();
+    /* Emptying the buffer outright is sound because nothing a sweep
+     * runs can add to it: a sweep releases only a node's ACYCLIC
+     * fields (the cyclic ones are the walk's own business), and an
+     * acyclic type's release wrapper has no add_root branch at all.
+     * Written down rather than defended against, because a change that
+     * broke it would show up as a silently uncollected cycle -- roots
+     * appended during a collection would be dropped here with their
+     * buffered bit already set, and a node marked buffered is never
+     * recorded again. */
+    g_festina_cycle_len = 0;
+    g_festina_cycle_collecting = 0;
+}
+
+/* Record a released-but-still-referenced value as a possible root.
+ * Immortal, null and already-buffered values are not roots: the first
+ * two are never collected at all, and the third is already waiting. */
+void festina_cycle_add_root(void *p, void (*gray)(void *),
+                            void (*scan)(void *), void (*white)(void *)) {
+    if (!p) return;
+    int64_t *h = festina_cycle_header(p);
+    if (*h < 0) return;
+    if (*h & FESTINA_BUFFERED_BIT) return;
+    if (g_festina_cycle_len == g_festina_cycle_cap) {
+        size_t cap = g_festina_cycle_cap ? g_festina_cycle_cap * 2 : 64;
+        FestinaCycleRoot *grown = (FestinaCycleRoot *)realloc(
+            g_festina_cycle_roots, cap * sizeof(FestinaCycleRoot));
+        if (!grown) {
+            /* Out of memory for the buffer itself. Falling back to the
+             * old synchronous trial is strictly better than dropping
+             * the root on the floor, which would leak the cycle. */
+            gray(p); scan(p); white(p);
+            festina_cycle_drain_pending();
+            return;
+        }
+        g_festina_cycle_roots = grown;
+        g_festina_cycle_cap = cap;
+    }
+    *h |= FESTINA_BUFFERED_BIT;
+    g_festina_cycle_roots[g_festina_cycle_len].payload = p;
+    g_festina_cycle_roots[g_festina_cycle_len].gray = gray;
+    g_festina_cycle_roots[g_festina_cycle_len].scan = scan;
+    g_festina_cycle_roots[g_festina_cycle_len].white = white;
+    g_festina_cycle_len++;
+    if (g_festina_cycle_len >= FESTINA_CYCLE_BATCH) festina_cycle_collect();
+}
+
+/* Run at the end of main and at the end of each thread body, so a
+ * cycle whose last outside reference went during the final partial
+ * batch is still collected before exit (specification.md 13.3) and
+ * LeakSanitizer sees the same heap it always did. Frees the buffer's
+ * own storage too -- this thread will not use it again. */
+void festina_cycle_flush(void) {
+    festina_cycle_collect();
+    free(g_festina_cycle_roots);
+    g_festina_cycle_roots = NULL;
+    g_festina_cycle_cap = 0;
+    g_festina_cycle_len = 0;
+    free(g_festina_cycle_pending);
+    g_festina_cycle_pending = NULL;
+    g_festina_cycle_pending_cap = 0;
+    g_festina_cycle_pending_len = 0;
 }
 
 /* markGray's node half: claim the node for the gray traversal. The
@@ -6019,7 +6222,10 @@ int8_t festina_cycle_begin_gray(void *p) {
     int64_t *h = festina_cycle_header(p);
     if (*h < 0) return 0;
     if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) == FESTINA_GRAY) return 0;
-    *h = (*h & FESTINA_COUNT_MASK) | (FESTINA_GRAY << FESTINA_COLOR_SHIFT);
+    /* claude.md #340: ~FESTINA_COLOR_MASK, not FESTINA_COUNT_MASK --
+     * the buffered bit sits outside the count and must survive every
+     * recolouring, or a root would stop protecting itself mid-batch. */
+    *h = (*h & ~FESTINA_COLOR_MASK) | (FESTINA_GRAY << FESTINA_COLOR_SHIFT);
     return 1;
 }
 
@@ -6049,7 +6255,7 @@ int64_t festina_cycle_begin_scan(void *p) {
     if (*h < 0) return 0;
     if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) != FESTINA_GRAY) return 0;
     if ((*h & FESTINA_COUNT_MASK) > 0) return 1;
-    *h = (*h & FESTINA_COUNT_MASK) | (FESTINA_WHITE << FESTINA_COLOR_SHIFT);
+    *h = (*h & ~FESTINA_COLOR_MASK) | (FESTINA_WHITE << FESTINA_COLOR_SHIFT);
     return 2;
 }
 
@@ -6057,7 +6263,7 @@ void festina_cycle_set_black(void *p) {
     if (!p) return;
     int64_t *h = festina_cycle_header(p);
     if (*h < 0) return;
-    *h &= FESTINA_COUNT_MASK;
+    *h &= ~FESTINA_COLOR_MASK;
 }
 
 /* scanBlack's recursion guard: a child that is not yet black still
@@ -6077,7 +6283,7 @@ int8_t festina_cycle_begin_white(void *p) {
     int64_t *h = festina_cycle_header(p);
     if (*h < 0) return 0;
     if (((*h & FESTINA_COLOR_MASK) >> FESTINA_COLOR_SHIFT) != FESTINA_WHITE) return 0;
-    *h &= FESTINA_COUNT_MASK;
+    *h &= ~FESTINA_COLOR_MASK;
     return 1;
 }
 
@@ -6110,8 +6316,12 @@ void festina_cycle_visit_map(void *payload, void (*fn)(void *)) {
  * refcount check the trial has already superseded. */
 void festina_cycle_dispose_array(void *payload) {
     void *data = *(void **)((char *)payload + sizeof(int64_t));
+    /* The element buffer is interior storage -- no other node in the
+     * graph points at it -- so it goes now. The node's own header is
+     * what a later walk in this batch could still reach, so it is
+     * deferred (claude.md #340). */
     festina_free_z(data);
-    festina_free_z((char *)payload - sizeof(int64_t));
+    festina_cycle_defer_free((char *)payload - sizeof(int64_t));
 }
 
 void festina_cycle_dispose_map(void *payload) {
@@ -6126,7 +6336,7 @@ void festina_cycle_dispose_map(void *payload) {
         }
     }
     free(entries);
-    free((char *)payload - sizeof(int64_t));
+    festina_cycle_defer_free((char *)payload - sizeof(int64_t));
 }
 
 /* ---------------------------------------------------------------------

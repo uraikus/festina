@@ -531,7 +531,9 @@ arr[text] CG_PRE = [
     'declare void @festina_free_z(ptr)',
     'declare void @festina_retain(ptr)',
     'declare void @festina_release(ptr)',
-    'declare i8 @festina_cycle_candidate(ptr)',
+    'declare void @festina_cycle_add_root(ptr, ptr, ptr, ptr)',
+    'declare void @festina_cycle_flush()',
+    'declare void @festina_cycle_defer_free(ptr)',
     'declare i8 @festina_cycle_begin_gray(ptr)',
     'declare void @festina_cycle_dec(ptr)',
     'declare void @festina_cycle_inc(ptr)',
@@ -10406,7 +10408,13 @@ void func cgCycleStructBody(op:text, sname:text, name:text) {
         }
         text hdr = cgTmp()
         cgOut(`  ${hdr} = getelementptr i8, ptr %p, i64 -8`)
-        cgOut(`  call void @free(ptr ${hdr})`)
+        // claude.md #340: handed to the runtime's pending-free list
+        // rather than freed here. A batch answers several roots, and a
+        // node one root's sweep has finished with can still be REACHED
+        // by a later root's sweep, through a field of some third node
+        // that nothing nulls out -- so nothing in a batch is handed
+        // back until every walk in it is done.
+        cgOut(`  call void @festina_cycle_defer_free(ptr ${hdr})`)
         cgOut(`  br label %${done}`)
         cgBlockLabel(done)
     }
@@ -10488,23 +10496,20 @@ void func cgCycleContainerBody(op:text, key:text, name:text) {
 }
 
 // The still-referenced branch of a cyclic type's release wrapper: the
-// value survives its own release, so try it as a cycle root. The
-// candidate check keeps the trial off null and immortal values;
-// everything else is at worst wasted work -- an externally-reachable
-// subgraph scans black and comes out exactly as it went in -- never
-// corruption.
+// value survives its own release, so record it as a possible cycle
+// root. claude.md #120 ran the whole trial here, once per release;
+// claude.md #340 hands the value and its three per-type traversal
+// functions to the runtime's deferred-root buffer instead, and one
+// collection answers a whole batch. No candidate check any more:
+// festina_cycle_add_root makes the same null/immortal decision itself,
+// and is also the only thing that can see whether this value is
+// already waiting in the buffer.
 void func cgCycleTrial(key:text, aliveL:text, doneL:text) {
     cgBlockLabel(aliveL)
-    text cand = cgTmp()
-    text cc = cgTmp()
-    text trial = cgLabel('reltrial.run')
-    cgOut(`  ${cand} = call i8 @festina_cycle_candidate(ptr %payload)`)
-    cgOut(`  ${cc} = icmp ne i8 ${cand}, 0`)
-    cgOut(`  br i1 ${cc}, label %${trial}, label %${doneL}`)
-    cgBlockLabel(trial)
-    cgOut(`  call void ${cgCycleFn('gray', key)}(ptr %payload)`)
-    cgOut(`  call void ${cgCycleFn('scan', key)}(ptr %payload)`)
-    cgOut(`  call void ${cgCycleFn('white', key)}(ptr %payload)`)
+    text g = cgCycleFn('gray', key)
+    text sc = cgCycleFn('scan', key)
+    text w = cgCycleFn('white', key)
+    cgOut(`  call void @festina_cycle_add_root(ptr %payload, ptr ${g}, ptr ${sc}, ptr ${w})`)
     cgOut(`  br label %${doneL}`)
 }
 
@@ -14850,6 +14855,14 @@ void func cgProgram(body:arr[Node], srcPath:text) {
         cgOut('  %final_db = load ptr, ptr @__festina_db')
         cgOut('  call void @festina_db_close(ptr %final_db)')
     }
+    // claude.md #340: answer whatever possible roots are still waiting
+    // in the deferred-root buffer. specification.md 13.3 promises a
+    // cycle is collected before the program exits, and without this the
+    // last partial batch would not be. Unconditional: the call
+    // early-returns on an empty buffer, and a gate would have to read
+    // state that is only complete once every release wrapper has been
+    // generated.
+    cgOut('  call void @festina_cycle_flush()')
     cgOut('  ret i32 0')
     cgOut('}')
 

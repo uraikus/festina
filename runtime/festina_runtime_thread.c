@@ -733,6 +733,14 @@ static void *festina_thread_main(void *arg) {
      * OS-level handles just above: nothing else will ever run on this
      * thread again. */
     festina_cleanup_stack_free();
+    /* claude.md #340: and this thread's own deferred-root buffer, for
+     * the same reason and in the same place. The buffer is `__thread`
+     * because threads have disjoint heaps (claude.md #163), so nothing
+     * else can ever answer the possible roots this thread left in it --
+     * main()'s own flush is a different buffer entirely. Without this,
+     * a cycle a thread dropped during its final partial batch would
+     * outlive the thread. */
+    festina_cycle_flush();
     pthread_mutex_lock(&h->in_lock);
     h->alive = 0;
     /* claude.md #232: release any drain() waiter -- its predicate

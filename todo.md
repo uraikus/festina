@@ -220,26 +220,6 @@ X11 stack buffer, and a header would have to be valid for all four. Reference cy
 deletion, with `free`/`delete` as the manual override. What remains
 open:
 
-- **Cycle trials are synchronous and per-release** — every
-  still-referenced release of a cycle-capable type walks the value's
-  reachable subgraph. Fine for ordinary object graphs (20k dropped
-  21-node *disjoint* cycles in ~34 ms) — but the case that number
-  never tested, *shared* structure under repeated release-while-live
-  churn, measures a real, cleanly linear cost specifically tied to
-  sharing rather than to total node count:
-  a shared ring costs ~9-10x a disjoint one at the same total node/
-  iteration count, scaling linearly in both ring size and iteration
-  count. The classic deferred-root buffer is the known optimization,
-  now motivated by measurement rather than assumption. Still
-  deliberately not started: the real algorithm needs the *free* path of
-  every cyclic release wrapper to become buffering-aware too (a
-  still-buffered node hitting refcount zero can't be freed immediately
-  without leaving a dangling pointer in the pending-roots buffer) — new
-  correctness-critical surface in code every struct/arr/map-using
-  Festina program runs through, and batching still trades lower
-  amortized CPU for higher peak memory (collection is delayed). Earns
-  its own dedicated round: a fresh plan, and ASan/LeakSanitizer-under-
-  stress verification of the deferred-free "zombie" path specifically.
 - **Text globals are not freed at process exit** — deliberate: they are
   reachable until exit, LeakSanitizer agrees, and freeing them would be
   exit-time busywork.
@@ -252,12 +232,12 @@ included:
 
 | | |
 |---|---|
-| lexer | 129 match, 0 differ |
-| parser | 129 match, 0 differ, 0 unported |
-| semantic | 129 match, 0 differ, 0 unported |
-| escape analysis | 116 match, 0 differ, 0 unported — 2,258 of 2,258 records |
-| codegen | 116 match, 0 differ, 0 unported — 424,234 of 424,234 IR lines |
-| canaries | 156 registered, 0 missed — 149 caught, 7 via the ratchet |
+| lexer | 130 match, 0 differ |
+| parser | 130 match, 0 differ, 0 unported |
+| semantic | 130 match, 0 differ, 0 unported |
+| escape analysis | 117 match, 0 differ, 0 unported — 2,265 of 2,265 records |
+| codegen | 117 match, 0 differ, 0 unported — 425,103 of 425,103 IR lines |
+| canaries | 159 registered, 0 missed — 152 caught, 7 via the ratchet |
 
 All ten of the bootstrap's own files reproduce their own compilation
 byte for byte, and the second-generation binary built from that IR is

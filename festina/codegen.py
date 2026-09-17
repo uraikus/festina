@@ -2314,7 +2314,15 @@ class CodeGen:
             # claude.md #120: the type-blind state half of cycle
             # collection -- see the festina_cycle_* block comment in
             # runtime/festina_runtime.c and _cycle_fn here.
-            "declare i8 @festina_cycle_candidate(ptr)",
+            # claude.md #340: add_root/flush/defer_free are the
+            # deferred-root buffer. `festina_cycle_candidate` used to
+            # be declared here and no longer exists at all -- the
+            # branch that called it is now a single add_root, which
+            # makes the same null/immortal decision plus the
+            # already-buffered one it could not.
+            "declare void @festina_cycle_add_root(ptr, ptr, ptr, ptr)",
+            "declare void @festina_cycle_flush()",
+            "declare void @festina_cycle_defer_free(ptr)",
             "declare i8 @festina_cycle_begin_gray(ptr)",
             "declare void @festina_cycle_dec(ptr)",
             "declare void @festina_cycle_inc(ptr)",
@@ -4904,9 +4912,13 @@ class CodeGen:
         # delete is a reassignment to null with one extra effect.
         #
         # claude.md #120: the null is stored BEFORE the old value is
-        # released -- a cycle trial run by the release must never see
-        # this field still pointing at the value whose count it just
-        # dropped (see _emit_assign's store-before-release comment).
+        # released (see _emit_assign's store-before-release comment).
+        # claude.md #340 moved when the walk happens, not whether this
+        # ordering is needed: the release buffers the old value as a
+        # possible root, and the batch that eventually answers it must
+        # not find this field still pointing at the value whose count it
+        # dropped -- an edge from outside the subgraph makes the whole
+        # cycle look externally reachable, and it goes uncollected.
         old = None
         if _llvm_type(ftype) == "ptr":
             old = self.tmp()
@@ -7453,9 +7465,10 @@ class CodeGen:
             # literal's repeated key already follows. Store-then-release
             # (not release-then-store), the same ordering claude.md
             # #120's own cycle-trial-safety comment on _emit_assign
-            # requires: a trial deletion triggered by the release must
-            # never see this slot still pointing at the value whose
-            # count it just dropped.
+            # requires: this slot must not still point at the value
+            # whose count the release dropped, or the cycle it sits on
+            # reads as externally reachable when the batch claude.md
+            # #340 defers it to finally walks it.
             #
             # claude.md #233: the SAME order for a text field too. It
             # used to free the old text BEFORE reading the new value --
@@ -8549,9 +8562,11 @@ class CodeGen:
                 lines.append(f"  call void @festina_retain(ptr {value_val})")
             # claude.md #120: the release of the overwritten value is
             # DEFERRED until after festina_map_set has stored the new
-            # one -- a cycle trial run by the release must never see the
-            # entry still pointing at the value whose count it just
-            # dropped (see _emit_assign's store-before-release comment).
+            # one -- the entry must not still point at the value whose
+            # count that release dropped (see _emit_assign's
+            # store-before-release comment, and claude.md #340 on why
+            # buffering the root rather than walking it on the spot
+            # leaves this requirement exactly where it was).
             deferred_release = (self._release_fn_for(value_type), old_ptr)
         elif value_type == TEXT:
             # claude.md #83: the text counterpart just above -- same
@@ -11045,7 +11060,16 @@ class CodeGen:
             hdr_offset = -16 if type_.name in self._tagged_structs else -8
             hdr = self.tmp()
             body.append(f"  {hdr} = getelementptr i8, ptr %p, i64 {hdr_offset}")
-            body.append(f"  call void @free(ptr {hdr})")
+            # claude.md #340: handed to the runtime's pending-free list
+            # rather than freed here. A batch answers several roots, and
+            # a node one root's sweep has finished with can still be
+            # REACHED by a later root's sweep -- through a field of some
+            # third node, which nothing nulls out. Freeing on the spot
+            # made that a use-after-free the moment the second walk read
+            # the freed header's colour, which is exactly what
+            # AddressSanitizer reported. Nothing in a batch is freed
+            # until every walk in it is done.
+            body.append(f"  call void @festina_cycle_defer_free(ptr {hdr})")
             body.append(f"  br label %{done}")
             body.append(f"{done}:")
         body.append("  ret void")
@@ -11128,22 +11152,27 @@ class CodeGen:
     def _emit_cycle_trial(self, body, type_, alive_label, done_label):
         """The still-referenced branch of a cyclic type's release
         wrapper: when the released value remains at a positive count,
-        try it as a cycle root -- markGray / scan / collectWhite, the
-        classic synchronous trial. A candidate check keeps the trial
-        off null and immortal values; everything else is at worst
-        wasted work (an externally-reachable subgraph scans black and
-        comes out exactly as it went in), never corruption."""
+        record it as a possible cycle root.
+
+        claude.md #120 ran the whole trial here -- markGray / scan /
+        collectWhite on the spot, once per release. claude.md #340
+        hands the value and its three per-type traversal functions to
+        the runtime's deferred-root buffer instead, and one collection
+        answers a whole batch. The saving is entirely in the sharing:
+        `festina_cycle_begin_gray` claims each node once, so a second
+        root inside a ring the batch has already walked costs nothing,
+        where two separate trials walked all of it twice.
+
+        No candidate check is emitted any more.
+        `festina_cycle_add_root` makes the same null/immortal decision
+        itself, and has to -- it is also the only thing that can see
+        whether this value is already waiting in the buffer, which the
+        old branch had no equivalent of."""
         body.append(f"{alive_label}:")
-        cand = self.tmp()
-        cc = self.tmp()
-        trial = self.label("reltrial.run")
-        body.append(f"  {cand} = call i8 @festina_cycle_candidate(ptr %payload)")
-        body.append(f"  {cc} = icmp ne i8 {cand}, 0")
-        body.append(f"  br i1 {cc}, label %{trial}, label %{done_label}")
-        body.append(f"{trial}:")
-        body.append(f"  call void {self._cycle_fn('gray', type_)}(ptr %payload)")
-        body.append(f"  call void {self._cycle_fn('scan', type_)}(ptr %payload)")
-        body.append(f"  call void {self._cycle_fn('white', type_)}(ptr %payload)")
+        body.append(f"  call void @festina_cycle_add_root(ptr %payload, "
+                    f"ptr {self._cycle_fn('gray', type_)}, "
+                    f"ptr {self._cycle_fn('scan', type_)}, "
+                    f"ptr {self._cycle_fn('white', type_)})")
         body.append(f"  br label %{done_label}")
 
     def _emit_assign(self, expr, env, lines):
@@ -14850,6 +14879,19 @@ class CodeGen:
         if self.tables or self.uses_sqlite:
             main_lines.append("  %final_db = load ptr, ptr @__festina_db")
             main_lines.append("  call void @festina_db_close(ptr %final_db)")
+        # claude.md #340: answer whatever possible roots are still
+        # waiting in the deferred-root buffer. specification.md 13.3
+        # promises a cycle is collected before the program exits, and
+        # without this the last partial batch would not be -- which
+        # LeakSanitizer would report, correctly, as a leak.
+        #
+        # Emitted unconditionally rather than gated on the program
+        # having a cyclic type. The call early-returns on an empty
+        # buffer, so the cost is one call at process exit, and the gate
+        # would have to read state that is only complete once every
+        # release wrapper has been generated -- an ordering dependency
+        # worth more than the line it would save.
+        main_lines.append("  call void @festina_cycle_flush()")
         main_lines.append("  ret i32 0")
         main_lines.append("}")
 

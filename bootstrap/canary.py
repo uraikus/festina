@@ -340,6 +340,27 @@ CANARIES = [
         """    bool cyclic = false
     text aliveL = doneL""",
     ),
+    # --- decisions.md #340: the deferred-root buffer -----------------
+    Canary(
+        "cycle-release-buffers-the-root", "#340",
+        "a still-referenced release BUFFERS the value, it does not walk it",
+        "    cgOut(`  call void @festina_cycle_add_root(ptr %payload, ptr ${g}, ptr ${sc}, ptr ${w})`)",
+        "    cgOut(`  call void ${g}(ptr %payload)`)\n"
+        "    cgOut(`  call void ${sc}(ptr %payload)`)\n"
+        "    cgOut(`  call void ${w}(ptr %payload)`)",
+    ),
+    Canary(
+        "cycle-white-defers-its-free", "#340",
+        "a white sweep hands its node to the pending-free list rather than freeing it",
+        "        cgOut(`  call void @festina_cycle_defer_free(ptr ${hdr})`)",
+        "        cgOut(`  call void @free(ptr ${hdr})`)",
+    ),
+    Canary(
+        "cycle-buffer-is-flushed-at-exit", "#340",
+        "main flushes the deferred-root buffer before returning",
+        "    cgOut('  call void @festina_cycle_flush()')",
+        "",
+    ),
     Canary(
         "cycle-white-disposes-acyclic-fields", "#311",
         "a white sweep disposes exactly the fields the trial did not traverse",

@@ -216,9 +216,12 @@ class TestCycleCollectionIsSkipped:
         # The `declare` lines for the runtime's type-blind helpers are
         # unconditional boilerplate in every module; what this is about
         # is whether any per-type traversal is DEFINED and whether any
-        # release actually runs a trial.
+        # release treats its value as a possible cycle root.
+        # claude.md #340 moved the second half from a candidate check
+        # plus an inline trial to a single add_root, which is now the
+        # one call that says "this release thinks a cycle is possible".
         assert "define void @__festina_cycle" not in ir
-        assert "call i8 @festina_cycle_candidate" not in ir
+        assert "call void @festina_cycle_add_root" not in ir
 
     def test_the_same_shape_with_a_strong_back_edge_does_generate_one(self, tmp_path):
         # The control. Identical but for the modifier, so this pins that
@@ -239,7 +242,7 @@ class TestCycleCollectionIsSkipped:
         log(`${d.kids.length}`)
         """, tmp_path)
         assert "define void @__festina_cycle" in ir
-        assert "call i8 @festina_cycle_candidate" in ir
+        assert "call void @festina_cycle_add_root" in ir
 
     def test_a_self_referential_type_keeps_its_detector(self, tmp_path):
         # `weak` narrows what the collector WALKS without switching it
