@@ -24,15 +24,11 @@ the uncounted raw pointer the report proposed, so they cannot dangle;
 the struct field that could never read as `null` is fixed in #333, by a
 rule about terminal reads rather than the narrower one about null tests
 that the report suggested, which would have left a list walk still
-non-terminating. These are what is left, most damaging first.
+non-terminating; `'' == null` is fixed in #334, where the cause turned
+out to be one line of the runtime's text comparison rather than the
+representation the report suspected. These are what is left, most
+damaging first.
 
-- **`'' == null` is `true`,** in a local, a struct field, an array
-  element and a map value — a NUL-terminated `char *` with no header
-  cannot tell them apart. It matters immediately for HTML, where
-  `<input checked>` has an attribute whose value is the empty string.
-  Either a static empty-string sentinel the runtime recognizes, or say
-  so in the specification next to "`null` reads 0"; it is currently
-  undocumented and surprising.
 - **Compiled binaries target the host CPU's exact feature set.** On an
   AVX-512 machine every valgrind run dies with SIGILL before `main`,
   and valgrind is the tool that found two of the bugs above. A

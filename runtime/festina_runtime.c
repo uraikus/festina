@@ -3278,9 +3278,23 @@ char *festina_format_time(int64_t ms, const char *format) {
     return strdup(buf);
 }
 
+/* claude.md #334: NULL-STRICT, matching festina_ascii_eq just as it is
+ * written above. This used to coerce both sides to "" before comparing,
+ * which made `'' == null` true -- the empty string and the absent
+ * string were one value under `==`, so a program could not tell an
+ * attribute whose value is empty (`<input checked>`) from an attribute
+ * that is not there.
+ *
+ * The coercion is defensible for two ordinary text operands and wrong
+ * the moment either side is null itself, and there is no way to tell
+ * those apart from in here: `x == null` and `x == someEmptyString`
+ * arrive identically. So the rule is the one `ascii` already had --
+ * null equals null, and equals nothing else. `.length` on a null text
+ * still reads 0 (specification.md 8.4); this is about identity under
+ * `==`, not about a null text acquiring a length. */
 int8_t festina_str_eq(const char *a, const char *b) {
-    if (!a) a = "";
-    if (!b) b = "";
+    if (a == b) return 1;      /* both null, or literally the same buffer */
+    if (!a || !b) return 0;    /* null is not the empty string */
     return strcmp(a, b) == 0;
 }
 

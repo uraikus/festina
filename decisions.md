@@ -7050,3 +7050,55 @@ files; every harness green, and the codegen figure went DOWN, from
 423,147 to 422,239 file-specific lines, despite the case file adding
 about 1,400: the fix deletes a branch and an allocation from every
 terminal struct-field read in the corpus.
+
+334. THE EMPTY STRING AND THE ABSENT ONE
+
+**`'' == null` was `true`** -- in a local, a struct field, an array
+element, a map value, and for a computed empty string too. Reported by
+uraikus/archtelos-browser, where it matters immediately: `<input
+checked>` is an attribute whose value IS the empty string, and it was
+indistinguishable from an attribute that is not present at all.
+
+**The cause is one line, and it is not the representation.** The todo
+entry guessed at "a NUL-terminated `char *` with no header cannot tell
+them apart", and proposed a static empty-string sentinel. No sentinel
+is needed: `festina_text_own("")` already returns a real heap pointer,
+and an empty `text` is genuinely distinct from a null one in memory.
+What conflated them was `festina_str_eq`, which opened by coercing both
+sides to `""` before comparing. `x == null` and `x == someEmptyString`
+arrive at that function identically, so there is no way to tell them
+apart from in there -- the coercion decides both, and it decided wrong.
+
+**`ascii` had it right the whole time.** `festina_ascii_eq` opens with
+`if (a == b) return 1; if (!a || !b) return 0;`. So this was the two
+string types disagreeing rather than a design question, and the fix is
+whichever one makes them agree -- which settles it without having to
+argue about what `null` ought to mean for a string.
+
+**The mirror direction is fixed with it, deliberately.** Making only
+`'' == null` false would have left `null == ''` true, which is worse
+than the original bug in one specific way: two values neither equal to
+each other nor distinguishable by the obvious test. Null now equals
+null and equals nothing else.
+
+**What this did NOT change.** `.length` on a null text still reads 0,
+which specification.md 8.4 already promised and which is about a null
+text's CONTENT rather than its identity. Content comparison between two
+ordinary strings is untouched. And `festina_str_eq` is also the map's
+own bucket-key comparison, so an empty KEY and an empty VALUE both had
+to keep working; both are tested.
+
+**The whole self-hosted compiler is the regression test.**
+`bootstrap/` is about 58,000 lines of Festina doing constant string
+comparison, much of it against `''` on values that can be null -- so if
+this change were going to break anything subtle, it would break there.
+Every harness is byte-identical: 127 files, 422,239 of 422,239 IR
+lines, unchanged. That is a stronger result than the tests, and it was
+the thing actually worth checking.
+
+**No `cases/` file and no canary for this one, and that is not an
+oversight.** Both measure emitted IR, and this change emits none -- it
+is a runtime semantic with no codegen footprint. The 13 tests in
+tests/test_text_null.py are the whole of the evidence, which is worth
+saying out loud rather than leaving the registry's silence to imply
+coverage that is not there.

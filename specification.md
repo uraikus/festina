@@ -655,7 +655,11 @@ undefined. A `table`-row local must be declared with an initializer
 The representation of `null` for a scalar is implementation-defined but
 must be distinguishable from every valid value: a null `int` or `bool`
 compares equal to `null` with `==`; a null `float` is an IEEE 754 NaN,
-so `x == null` and `x != null` are both `false` for it (§9.8). [#57, #143]
+so `x == null` and `x != null` are both `false` for it (§9.8). The same
+requirement binds `text`: **`''` is a value and `null` is its absence**,
+so `'' == null` is `false` and a null `text` is equal to no `text` but
+`null` itself. `ascii` has always behaved this way and `text` now agrees
+with it. [#57, #143, #334]
 
 ### 8.3 Numeric types
 
@@ -708,9 +712,10 @@ code points, never bytes or UTF-16 units. [#150, #249, #251]
 - `s[i]` yields the `i`-th code point as a fresh one-character `text`,
   or `null` when `i` is negative or past the end; it is read-only.
 - `.length` is the code-point count, computed by a scan; `null` reads 0.
-- `a == b` and `a != b` compare content. `a + b` concatenates two
-  `text` values. A template literal builds text from any values with a
-  text form.
+- `a == b` and `a != b` compare content, and **`null` is not the empty
+  string**: a null `text` equals `null` and equals no other `text`,
+  including `''`. `a + b` concatenates two `text` values. A template
+  literal builds text from any values with a text form.
 - Every `text` binding owns a private copy of its buffer (§13.2); no
   two bindings share one, so assignment is always a copy.
 - Methods: §16.3.

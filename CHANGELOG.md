@@ -362,6 +362,20 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **`'' == null` was `true`** — in a local, a struct field, an array
+  element, a map value, and for a computed empty string too, so a
+  program could not tell an attribute whose value is empty
+  (`<input checked>`) from one that is absent. The cause was not the
+  representation: an empty `text` is already a real heap pointer,
+  distinct from a null one. `festina_str_eq` coerced both sides to `""`
+  before comparing, and `x == null` reaches it identically to
+  `x == someEmptyString`, so that coercion decided both. `ascii` had
+  always been null-strict, so this was the two string types disagreeing;
+  `text` now agrees. The mirror direction goes with it — `null == ''` is
+  `false` too, and `null` equals `null` and nothing else. `.length` on a
+  null text still reads 0. Reported by
+  [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser).
+  (decisions.md #334)
 - **A struct-typed field could never read as `null`.** Auto-vivification
   creates a struct, array or map field the first time it is reached, and
   a plain read counted as a reach — so the test that asked whether
