@@ -193,6 +193,27 @@ gameplay and sampling — **not** for anything security-related. It
 returns a value in `[0, 1)`, so `Math.floor(Math.random() * n)` is
 always a valid index.
 
+`Math` is a **namespace, not a value**. `Math.sqrt(x)` is resolved by
+the name `Math` itself, before anything in scope is consulted — which
+is what makes it mean the same thing in every function in every file.
+The two consequences are worth knowing:
+
+```festina
+log(Math)                   // error: Math is a namespace -- use Math.NAME
+text Math = 'hello'         // error: Math is the built-in math namespace
+```
+
+A bare `Math` has no value to print, and a variable, constant,
+parameter, function or thread called `Math` is rejected at its
+declaration rather than silently ignored — it could never be read back
+through `Math.something`, since that always finds the built-in. The
+rule applies to locals and parameters too, not just globals. A
+`struct`, `table` or `enum` may still be called `Math`: a type name is
+never read as a value, so it conflicts with nothing.
+
+`environment` is the other namespace and behaves the same way in every
+respect (see [Environment variables](#environment-variables)).
+
 Division/modulo by zero return `null` (for both `int` and `float`)
 rather than crashing:
 
@@ -1556,6 +1577,11 @@ Returns the named environment variable as `text`, or `null` if it
 isn't set. Read-only (assigning to `environment.NAME` is a compile-time
 error) and can't be used by itself without a `.NAME`/`[keyExpr]` — both
 are also compile-time errors, not runtime ones.
+
+Like [`Math`](#types), `environment` is a namespace rather than a
+value, so it can't be declared either — as a global, a local, a
+parameter, a function or a thread. A `struct`, `table` or `enum` named
+`environment` is still fine; type names and value names are separate.
 
 ## Command-line arguments
 

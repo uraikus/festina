@@ -53,13 +53,17 @@
 //      instruction. A language that answers null for division by zero
 //      cannot answer a stack address for the floor of that same null.
 //
-//   4. **The `Math` namespace is chosen per METHOD NAME, not per
-//      receiver.** `Math.sqrt()` is the namespace even when a variable
-//      called `Math` is in scope; `Math.toText()` is that variable's
-//      own method, because `toText` is in no Math table. That is the
-//      shipped compiler's behavior rather than a design anyone argued
-//      for, and a port that tidied it would disagree with the thing it
-//      exists to agree with.
+//   4. **`Math` is a namespace, not a receiver.** claude.md #339 makes
+//      a binding called `Math` a compile error, so `Math.sqrt()` can
+//      only ever be the intrinsic -- there is no scope for it to lose
+//      to. This file used to declare `float Math = 1.5` and pin the
+//      opposite: that the namespace was chosen per METHOD NAME, so
+//      `Math.sqrt()` was the namespace while `Math.toText()` was the
+//      binding's own method. That was never a design anyone argued
+//      for, and the rule that replaced it is in specification.md 6.7.
+//      What the file still needs from that slice is the two SHAPES of
+//      method call side by side: one name that never reaches a scope
+//      and one that always does.
 
 // ---- 1. the fold, against its own runtime twin --------------------
 
@@ -140,8 +144,10 @@ log(Math.round(2.5))
 log(Math.trunc(0.0 - 2.9))
 log(Math.floor(1.0 / 0.0))
 
-// Mechanism 4: a binding called `Math`. `.sqrt()` ignores it and
-// `.toText()` does not.
-float Math = 1.5
+// Mechanism 4: the two shapes of method call, one line apart.
+// `Math.sqrt` is dispatched on the receiver's NAME, before any scope is
+// consulted, and lowers to an intrinsic; `half.toText()` is dispatched
+// on the receiver's TYPE and lowers to a runtime call.
+float half = 1.5
 log(Math.sqrt(9.0))
-log(Math.toText())
+log(half.toText())

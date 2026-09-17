@@ -252,16 +252,16 @@ included:
 
 | | |
 |---|---|
-| lexer | 127 match, 0 differ |
-| parser | 127 match, 0 differ, 0 unported |
-| semantic | 127 match, 0 differ, 0 unported |
+| lexer | 129 match, 0 differ |
+| parser | 129 match, 0 differ, 0 unported |
+| semantic | 129 match, 0 differ, 0 unported |
 | escape analysis | 116 match, 0 differ, 0 unported — 2,258 of 2,258 records |
-| codegen | 116 match, 0 differ, 0 unported — 423,678 of 423,678 IR lines |
+| codegen | 116 match, 0 differ, 0 unported — 424,234 of 424,234 IR lines |
 | canaries | 156 registered, 0 missed — 149 caught, 7 via the ratchet |
 
 All ten of the bootstrap's own files reproduce their own compilation
 byte for byte, and the second-generation binary built from that IR is
-identical to the first. The eleven files neither side compiles are
+identical to the first. The thirteen files neither side compiles are
 deliberately ill-formed sources the corpus keeps so that both
 implementations are checked on the rejection too.
 
@@ -289,15 +289,6 @@ written, which is what `bootstrap/canary.py` exists to say out loud.
   would require the *reverse* conversion to be exact for every literal
   too, and the fast path there refuses values like
   `0.30000000000000004`.
-
-- **`Math` is a namespace per method name, not per receiver.** With a
-  variable called `Math` in scope, `Math.sqrt(9.0)` is still
-  `llvm.sqrt.f64` and answers 3, while `Math.toText()` is that
-  variable's own method. Nothing warns; the binding is simply ignored
-  for any name in a Math table. Both implementations agree on it
-  (decisions.md #306 reproduces it deliberately rather than tidying
-  it), so this is a diagnostics question rather than a correctness one
-  -- a shadowing declaration should say something.
 
 ## Deliberate behavior (documented, not planned work)
 

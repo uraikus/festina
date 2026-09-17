@@ -801,6 +801,24 @@ MATH_FUNCTIONS = (MATH_ROUNDING_FUNCTIONS | MATH_FLOAT_FUNCTIONS
 # 3.14159... is exactly the kind of thing a standard library exists to
 # prevent.
 MATH_CONSTANTS = {"PI": math.pi, "E": math.e}
+# claude.md #339: specification.md 6.7/16.2 -- Math is a NAMESPACE, and
+# every branch that reads one of its members (_infer_member and
+# _infer_call, both below) matches the literal identifier `Math` before
+# any scope is consulted. That is what makes `Math.sqrt(x)` mean the
+# same thing everywhere; it also means a value named `Math` could never
+# be read through `Math.something`, so declaring one has to be refused
+# rather than silently ignored. Enforced by name in Scope.define, not
+# by pre-registering the name in global_scope the way `argv` and
+# `environment` are: a pre-registration only collides in the scope it
+# sits in, and a LOCAL named Math is the same bug in a child scope.
+_MATH_NAME = "Math"
+_MATH_RESERVED_MESSAGE = (
+    f"'{_MATH_NAME}' is the built-in math namespace ({_MATH_NAME}.sqrt, "
+    f"{_MATH_NAME}.PI) and cannot be declared as a variable, constant, "
+    f"parameter, function or thread -- every '{_MATH_NAME}.NAME' in the "
+    f"program resolves to the built-in instead, so the declaration would "
+    f"be unreachable"
+)
 
 # claude.md #40: these five event names are the only ones with a real
 # runtime source (an X11 event of some kind -- see festina_runtime.h's
@@ -1112,6 +1130,18 @@ _READONLY_SCALAR_GLOBALS = _SIZE_GLOBALS + _DEVICE_PIXEL_RATIO_GLOBALS
 # bare `environment` reference is deliberately rejected (see the
 # Identifier branch in infer()).
 _ENVIRONMENT_NAME = "environment"
+# claude.md #339: one message, raised from two places in Scope.define --
+# the global collision with the pre-registration above, and the
+# name-based guard that covers every scope below it. It used to end
+# "a variable, constant, function, struct, or table", which was not
+# true: 6.7 keeps type names and value names apart, and `struct
+# environment` compiles today and always did. The list now names what
+# is actually checked, and matches _MATH_RESERVED_MESSAGE's.
+_ENVIRONMENT_RESERVED_MESSAGE = (
+    f"'{_ENVIRONMENT_NAME}' is reserved for reading environment "
+    f"variables ({_ENVIRONMENT_NAME}.NAME) and cannot be declared as a "
+    f"variable, constant, parameter, function or thread"
+)
 
 
 class _NullType:
@@ -1139,6 +1169,31 @@ class Scope:
         self.parent = parent
 
     def define(self, name, symbol, err_node, filename):
+        # claude.md #339: checked by NAME, before the collision check
+        # below, and so in every scope rather than only the global one.
+        # See _MATH_RESERVED_MESSAGE.
+        if name == _MATH_NAME:
+            raise CompileError(
+                _MATH_RESERVED_MESSAGE,
+                file=filename, line=getattr(err_node, "line", 0),
+                column=getattr(err_node, "column", 0),
+                category="duplicate declaration",
+            )
+        # claude.md #339: `environment` is the other built-in namespace,
+        # and it had the same hole one scope down. Pre-registering it in
+        # global_scope (see analyze()) only ever collided with a GLOBAL
+        # declaration; a local named `environment` was accepted, and the
+        # error arrived later, at the first attempt to read it -- or
+        # never, if it was written and not read. `self.parent is None`
+        # is exactly global_scope, which is where the pre-registration
+        # itself lands and must keep being allowed to.
+        if name == _ENVIRONMENT_NAME and self.parent is not None:
+            raise CompileError(
+                _ENVIRONMENT_RESERVED_MESSAGE,
+                file=filename, line=getattr(err_node, "line", 0),
+                column=getattr(err_node, "column", 0),
+                category="duplicate declaration",
+            )
         if name in self.vars:
             if name == _ENVIRONMENT_NAME:
                 # claude.md #71: environment is pre-registered into
@@ -1150,9 +1205,7 @@ class Scope:
                 # (there's no earlier `environment` declaration in this
                 # program to point a user back to).
                 raise CompileError(
-                    f"'{_ENVIRONMENT_NAME}' is reserved for reading environment "
-                    f"variables ({_ENVIRONMENT_NAME}.NAME) and cannot be "
-                    f"declared as a variable, constant, function, struct, or table",
+                    _ENVIRONMENT_RESERVED_MESSAGE,
                     file=filename, line=getattr(err_node, "line", 0),
                     column=getattr(err_node, "column", 0),
                     category="duplicate declaration",
@@ -2040,6 +2093,20 @@ def analyze(program, filename="<string>"):
                 raise CompileError(
                     f"'{_ENVIRONMENT_NAME}' must be accessed as {_ENVIRONMENT_NAME}.NAME "
                     f"(e.g. {_ENVIRONMENT_NAME}.DATABASE_URL), not used by itself",
+                    file=filename, line=expr.line, column=expr.column,
+                    category="invalid field access",
+                )
+            # claude.md #339: same shape, same reason. Math is a
+            # namespace, not a value -- and since Scope.define now
+            # refuses the name outright, a bare `Math` can only ever be
+            # the namespace used wrongly. "unknown variable 'Math'",
+            # which is what the generic lookup below used to say, was
+            # untrue: Math is not unknown.
+            if expr.name == _MATH_NAME:
+                raise CompileError(
+                    f"'{_MATH_NAME}' is a namespace and must be used as "
+                    f"{_MATH_NAME}.NAME (e.g. {_MATH_NAME}.sqrt(2.0), "
+                    f"{_MATH_NAME}.PI), not used by itself",
                     file=filename, line=expr.line, column=expr.column,
                     category="invalid field access",
                 )
@@ -5370,6 +5437,23 @@ def analyze(program, filename="<string>"):
                     f"declare a function -- a function declared with this name would be "
                     f"permanently unreachable, since every call to '{stmt.name}(...)' "
                     f"resolves to the builtin instead",
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="duplicate declaration",
+                )
+            # claude.md #339: a thread's private functions are written
+            # straight into thread_functions_scope.vars just below,
+            # never through Scope.define -- so these are the one value
+            # name each that the guards there cannot see, and need their
+            # own check.
+            if stmt.name == _MATH_NAME:
+                raise CompileError(
+                    _MATH_RESERVED_MESSAGE,
+                    file=filename, line=stmt.line, column=stmt.column,
+                    category="duplicate declaration",
+                )
+            if stmt.name == _ENVIRONMENT_NAME:
+                raise CompileError(
+                    _ENVIRONMENT_RESERVED_MESSAGE,
                     file=filename, line=stmt.line, column=stmt.column,
                     category="duplicate declaration",
                 )

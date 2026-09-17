@@ -769,10 +769,18 @@ class TestTheCoverageNumberIsHonest:
         currently matches calls a method.
 
         One of those four fires through the coverage RATCHET rather than
-        as a diff: with `Math` shadowed, the port reports the file
-        unported instead of emitting different IR, and "unported" is how
-        this harness spells "not implemented yet". The line count still
-        falls, which is what catches it.
+        as a diff: the port reports the file unported instead of
+        emitting different IR, and "unported" is how this harness spells
+        "not implemented yet". The line count still falls, which is what
+        catches it.
+
+        claude.md #339 changed what the fourth one can be. It used to
+        need a binding called `Math` in this file, and that is a compile
+        error now; the canary is `math-dispatches-on-the-name` instead,
+        breaking the name-based dispatch itself. What this test asserts
+        is unchanged in substance -- both shapes of method call are
+        present -- but the second one is an ordinary float binding
+        rather than one that shadows the namespace.
         """
         dump = irdump.dump_file("bootstrap/cases/conversions.f")
         assert not dump[0].startswith("SEMERR"), (
@@ -801,12 +809,13 @@ class TestTheCoverageNumberIsHonest:
             assert frag in body, (
                 f"{why} is missing, so claude.md #102's guard against "
                 f"fptosi's undefined behaviour is unmeasured")
-        # 4: both halves of the Math-name rule, which needs a binding
-        # called Math to be visible at all.
+        # 4: both shapes of method call -- one dispatched on the
+        # receiver's NAME (the namespace, straight to an intrinsic) and
+        # one on its TYPE (an ordinary runtime call).
         assert "@llvm.sqrt.f64(" in body, "no Math namespace call"
         assert "@festina_str_from_float(" in body, (
-            "no .toText() on the binding called Math, so only half of "
-            "the per-method-name rule is measured")
+            "no .toText() on a float binding, so only the name-based "
+            "half of method dispatch is measured")
 
     @pytest.mark.parametrize("case", ["indexing.f", "array_literals.f", "maps.f",
                                       "conversions.f",

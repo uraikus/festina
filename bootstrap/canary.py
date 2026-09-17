@@ -278,11 +278,21 @@ CANARIES = [
     text isNan = cgTmp()
     cgOut(`  ${isNan} = fcmp uno double ${v}, ${v}`)""",
     ),
+    # claude.md #339 retired this canary's predecessor,
+    # "math-yields-to-binding": it broke the Math branch by making it
+    # yield to a variable called `Math`, and `cases/conversions.f`
+    # caught it because the file declared one. A binding of that name is
+    # a compile error now, so nothing could declare one and the break
+    # became undetectable -- an anchor that still applies cleanly while
+    # pinning nothing, which is the worst state a canary can be in. The
+    # invariant that replaced it is the one the rule rests on: a Math
+    # method is dispatched on the receiver's NAME, so it reaches the
+    # intrinsic rather than the ordinary method path.
     Canary(
-        "math-yields-to-binding", "#306",
-        "the Math namespace is chosen per METHOD NAME, not per receiver",
-        "            if rawText(recv, 'name') == 'Math' && cgIsMathMethod(prop) {",
-        "            if rawText(recv, 'name') == 'Math' && cgIsMathMethod(prop) && cgSlotOf('Math') == '' {",
+        "math-dispatches-on-the-name", "#339",
+        "a float-returning Math method reaches the namespace, not cgMethodCall",
+        "    if cgMathFloatFn(m) != '' { return true }",
+        "",
     ),
     Canary(
         "string-const-byte-rule", "#306",

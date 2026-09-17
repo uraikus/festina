@@ -446,7 +446,20 @@ A struct named `User` and a variable named `User` may coexist.
 Redeclaring a name within its namespace in the same scope is a compile
 error. A user function or variable must not take the name of a built-in
 function (§16.1) or a built-in global (§16.2); doing so is a compile
-error. [#89, #131, #195]
+error. That rule holds at **every** scope, not only the global one: a
+local, a `for` or `catch` variable, a parameter, and a thread's own
+private function are each a value name, and each is rejected. It does
+not reach the type namespace — a `struct`, `table` or `enum` may take
+such a name, since a type name is never read as a value. [#89, #131,
+#195, #339]
+
+The rule is load-bearing for the two built-in **namespaces**, `Math`
+and `environment`. A member of either is resolved by the namespace's
+own name before any scope is consulted (§16.2), so `Math.sqrt(x)` and
+`environment.HOME` mean what they always mean no matter what is in
+scope. A binding of either name could therefore never be read through
+`NAME.member`, and rejecting the declaration is what keeps it from
+being silently ignored. [#339]
 
 A thread body is its own scope with its own visibility rules (§20.3).
 
@@ -2158,8 +2171,8 @@ A user declaration may not reuse any of these names (§6.7).
 
 | Name | Type | Description |
 |---|---|---|
-| `Math` | namespace | `floor`, `ceil`, `round`, `trunc` (`float → int`); `floorDiv(int, int):int`; `sqrt`, `abs`, `exp`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `log`, `log2`, `log10` (`float → float`); `pow`, `min`, `max`, `atan2` (`(float, float) → float`); `random():float` in `[0, 1)`; constants `PI`, `E`. Rounding a null, infinite or out-of-range float yields null. `random()` is not cryptographic. [#56, #93, #102, #188] |
-| `environment` | read-only | `environment.NAME` or `environment['NAME']` is the environment variable as `text`, or `null`. Bare `environment` is a compile error. [#71] |
+| `Math` | namespace | `floor`, `ceil`, `round`, `trunc` (`float → int`); `floorDiv(int, int):int`; `sqrt`, `abs`, `exp`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `log`, `log2`, `log10` (`float → float`); `pow`, `min`, `max`, `atan2` (`(float, float) → float`); `random():float` in `[0, 1)`; constants `PI`, `E`. Rounding a null, infinite or out-of-range float yields null. `random()` is not cryptographic. Bare `Math` is a compile error, and `Math` may not be declared (§6.7). [#56, #93, #102, #188, #339] |
+| `environment` | read-only | `environment.NAME` or `environment['NAME']` is the environment variable as `text`, or `null`. Bare `environment` is a compile error, and `environment` may not be declared (§6.7). [#71, #339] |
 | `argv` | `arr[text]` | the process arguments, `argv[0]` being the program path; an ordinary mutable array. [#150] |
 | `clientWidth`, `clientHeight` | `int`, read-only | the canvas size (§17.2) |
 | `screenWidth`, `screenHeight` | `int`, read-only | the physical display size; needs a display [#139] |

@@ -535,6 +535,31 @@ bool func known(s:Scope, name:text) {
 }
 
 void func define(s:Scope, name:text, t:Ty, kind:text, line:int, col:int) {
+    // claude.md #339: specification.md 6.7 -- `Math` is a built-in
+    // NAMESPACE, resolved by name before any scope is consulted, so a
+    // value of that name could never be read through `Math.something`.
+    // Checked here rather than by pre-registering the name in the
+    // global scope the way defineBuiltins does for `argv` and
+    // `environment`: a pre-registration only collides in the scope it
+    // sits in, and a LOCAL named Math is the same bug one scope down.
+    // The original's matching message names the namespace; this side
+    // only reports the position, which is all the dump compares.
+    if name == 'Math' {
+        semFail(line, col)
+        return
+    }
+    // claude.md #339: `environment` is the other built-in namespace and
+    // had the same hole one scope down. defineBuiltins registers it in
+    // the GLOBAL scope, so only a global declaration ever collided with
+    // it; `depth > 0` is every scope below that one, which is where a
+    // local, a parameter or a catch variable lands. The registration
+    // itself is at depth 0 and must keep going through.
+    if s.depth > 0 {
+        if name == 'environment' {
+            semFail(line, col)
+            return
+        }
+    }
     if s.names[name] != null {
         semFail(line, col)
         return
@@ -658,6 +683,21 @@ void func analyzeFuncDecl(s:Scope, n:Node) {
     // body is analysed normally.
     if !IN_THREAD {
         define(s, rawText(n, 'name'), returnTypeOf(n), 'function', line, col)
+    }
+    // claude.md #339: which leaves a thread-private function as the one
+    // value name define()'s Math guard never sees, exactly as it is the
+    // one name the original's Scope.define never sees. Both sides make
+    // the same exception in the same place, and so both need the same
+    // second check.
+    if IN_THREAD {
+        if rawText(n, 'name') == 'Math' {
+            semFail(line, col)
+            return
+        }
+        if rawText(n, 'name') == 'environment' {
+            semFail(line, col)
+            return
+        }
     }
     Scope inner = childScope(s)
     defineParams(inner, listOf(n, 'params'), line, col)

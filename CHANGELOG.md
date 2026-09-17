@@ -75,11 +75,11 @@ round-by-round design and implementation record predating 0.1 lives in
 - **The bootstrap compiler is complete.** `bootstrap/` holds Festina's
   own compiler, written in Festina, and every one of its five passes
   now agrees with the Python implementation it mirrors on **every file
-  of the 127-file corpus** — including its own source, which is
-  122,000 lines of IR on its own. Lexer, parser and analyzer: 127
+  of the 129-file corpus** — including its own source, which is
+  122,000 lines of IR on its own. Lexer, parser and analyzer: 129
   match, 0 differ each. Escape analysis: 2,258 of 2,258 records.
-  Codegen: 423,678 of 423,678 file-specific IR lines, byte for byte.
-  The eleven files neither side compiles are deliberately ill-formed
+  Codegen: 424,234 of 424,234 file-specific IR lines, byte for byte.
+  The thirteen files neither side compiles are deliberately ill-formed
   sources the corpus keeps so that both implementations are checked on
   the rejection as well as the acceptance.
 
@@ -361,6 +361,35 @@ round-by-round design and implementation record predating 0.1 lives in
   keep running on every platform (decisions.md #287).
 
 ### Fixed
+
+- **A variable named `Math` was silently ignored.** `Math` is a
+  namespace, resolved by name before anything in scope is consulted, so
+  `text Math = 'hello'` compiled and then lost every name reached
+  through `Math.` — `Math.sqrt(9.0)` was still the built-in and
+  answered 3, and `Math.toText()` reported `Math has no member
+  'toText'`, a sentence about the namespace for a method the variable
+  really had. Worse with a struct: `Thing Math` followed by `Math.n = 7`
+  said `Math has no member 'n'` about a field `Thing` plainly declares.
+  specification.md §6.7 had said since #89 that a user variable or
+  function must not take the name of a built-in global; `Math` had been
+  left out of the enforcement. It is now rejected at the declaration, in
+  **every** scope — global, local, `for`, `catch`, parameter, function,
+  thread and a thread's own private functions — rather than only where a
+  pre-registered global would have collided, and bare `Math` now says it
+  is a namespace instead of `unknown variable 'Math'`. A `struct`,
+  `table` or `enum` named `Math` stays legal: a type name is never read
+  as a value. Ported to `bootstrap/semantic.f`. (decisions.md #339)
+
+- **A local named `environment` had the same hole.** `environment` is
+  the other built-in namespace and was pre-registered as a global, so
+  only a global declaration ever collided with it — a local, parameter,
+  `catch` variable or thread-private function of that name was accepted,
+  and the error arrived at the first attempt to read it, or never if the
+  binding was written and not read. It is now rejected at the
+  declaration in every scope, like `Math`. Its message also stopped
+  claiming a rule the compiler does not have: it used to say a `struct`
+  or `table` of that name was refused, and `struct environment` compiles
+  today and always did. (decisions.md #339)
 
 - **An expression inside a template literal had no source position.**
   Every diagnostic about one pointed at the first character of the

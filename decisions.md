@@ -7292,3 +7292,140 @@ is pushed down the file, and it caught my own miscount of the blank
 lines rather than a compiler bug -- the compiler said 14 and 14 was
 right. All 127 corpus files still lex identically on both sides, which
 is the check that a rebasing off-by-one would fail.
+
+339. A VARIABLE NAMED `Math` WAS SILENTLY IGNORED
+
+**`Math` is a namespace, not an object, and nothing said so.** todo.md
+carried this as a diagnostics complaint: with a variable called `Math`
+in scope, `Math.sqrt(9.0)` was still `llvm.sqrt.f64` and answered 3,
+and nothing warned. Measured rather than assumed, which was worth
+doing, because the shape is worse than "the binding is ignored":
+
+    text Math = 'hello'
+    log(Math.toUpperCase())    // HELLO   -- the binding
+    log(Math.sqrt(9.0))        // 3       -- the namespace
+    log(Math.length)           // error: Math has no member 'length'
+
+One identifier, three lines, three different answers. A CALL falls
+through to the binding when the method name is in no Math table, so
+`Math` is the variable on the first line and the namespace on the
+second. A member read that is not a call never falls through at all,
+so the third line is an error -- and the error is a sentence about the
+namespace, for a member the user never claimed the namespace had. The
+worst shape of that is the struct case:
+
+    struct Thing { n:int }
+    Thing Math
+    Math.n = 7                 // error: Math has no member 'n'
+
+`Thing` really does have `n`. The declaration on the line above is the
+thing being ignored, and the error points two lines past it.
+
+**Which is why this is not a message to reword.** No wording of a
+message about `Math.n` can be right, because the program means two
+irreconcilable things by `Math` and the compiler has already picked
+one. specification.md 6.7 had the answer written down since #89: "a
+user function or variable must not take the name of a built-in
+function (16.1) or a built-in global (16.2)". `Math` is a 16.2
+built-in global. The declaration was always supposed to be the error.
+
+**The enforcement existed and `Math` had been left out of it.** Every
+other reserved global -- `argv`, `clientWidth`, `screenHeight`,
+`devicePixelRatio`, `environment` -- is pre-registered into
+`global_scope` at startup, purely so that redeclaring it collides.
+`Math` never was, because it has no value to register: it is resolved
+structurally, by matching the literal identifier in `_infer_member`
+and `_infer_call` before either one infers a type for the receiver.
+
+**Pre-registration would not have been enough anyway.** A name sitting
+in `global_scope` only collides with a declaration in `global_scope`,
+and a local is a child scope:
+
+    void func f() {
+        text Math = 'hello'
+        log(`${Math.sqrt(9.0)}`)   // 3, still
+    }
+
+So the guard is by NAME, at the top of `Scope.define`, ahead of the
+collision check -- which puts it in front of globals, locals, `for` and
+`catch` variables, parameters, function names and thread names alike,
+since every one of those goes through that one function.
+
+**Looking for that hole found `environment` sitting in it.** It is the
+only other built-in namespace, it is pre-registered exactly the way
+`argv` and `clientWidth` are, and so it was global-only in exactly the
+same way: `text environment = 'x'` inside a function compiled, and the
+error came at the first attempt to READ it -- or never, if the local
+was written and not read. Less bad than Math's, since the read is
+caught, and the same defect. Guarded the same way, at the same place,
+with `self.parent is not None` standing for "any scope but the global
+one", since the pre-registration itself has to keep going through.
+
+**Its message was also claiming a rule the compiler does not have.** It
+ended "cannot be declared as a variable, constant, function, struct, or
+table", and `struct environment` compiles today and always did -- 6.7
+keeps type names and value names apart, for `environment` exactly as
+for `Math`. A message naming a rule that is not enforced sends a reader
+looking for a bug that is not there, so it now lists what is actually
+checked: variable, constant, parameter, function or thread. There is a
+test for that sentence, and one asserting `struct environment` stays
+legal.
+
+**Every one of those except a thread's own private functions.**
+`analyze_thread` writes them straight into `thread_functions_scope.vars`
+rather than calling `define`, because it does its own duplicate check
+first, so that path needs both checks written out a second time. The
+bootstrap port has the identical exception in the identical place --
+`analyzeFuncDecl` skips `define` when `IN_THREAD` -- and now carries
+the identical second check, which is the kind of agreement the port is
+for.
+
+**The type namespace is deliberately untouched.** 6.7 keeps type names
+and value names apart, and `struct Math` conflicts with nothing: a type
+name is never read as a value, so `Math m` declares `m` and
+`Math.sqrt(9.0)` still means what it always did. Rejecting it would
+have been a change to the language rather than a fix to this bug, so
+there are tests asserting it stays legal.
+
+**Bare `Math` said something untrue as well.** `log(Math)` answered
+`unknown variable 'Math'`. It is not unknown; it is a namespace being
+used as a value, and `environment` has said so since #71. It now says
+the same: "'Math' is a namespace and must be used as Math.NAME".
+
+**A corpus file was pinning the old behaviour, and a canary was
+guarding it.** `cases/conversions.f` declared `float Math = 1.5` as its
+fourth mechanism, deliberately, on #306's reasoning that a port which
+tidied the quirk away would disagree with the thing it exists to agree
+with. That reasoning was right about the PORT and is what this entry
+changes about the LANGUAGE: the two implementations still have to
+agree, and now they agree on rejecting it. `canary.py`'s
+`math-yields-to-binding` broke the compiler
+by making the namespace yield to that binding, with that file as the
+witness. Both are gone with the behaviour. The canary was replaced
+rather than deleted: a Math method is still dispatched on the
+receiver's NAME, and `math-dispatches-on-the-name` breaks exactly that,
+verified caught (through the ratchet, like its predecessor). An anchor
+that still applies cleanly while pinning nothing is the worst state a
+canary can be in, and leaving the old one in place would have produced
+one.
+
+**Two rejection cases, because that is the only way to measure the
+port.** A program that is refused cannot be a running corpus file, and
+`semdiff` compares the POSITION of a rejection -- so
+`cases/err_math_shadowed.f` and `cases/err_environment_shadowed.f` each
+declare their name as a LOCAL, where neither pre-registration would
+have caught it, and each is one line of dump on both sides. They earned
+their place immediately: reverting `bootstrap/semantic.f` alone makes
+those two files, and only those two, differ out of 129.
+
+**The test that mattered is the position one.** The old failure was
+reported at the USE, and the point of the fix is that it moves to the
+DECLARATION -- so a test puts the declaration on line 4 and the use on
+line 5 and asserts 4. Running the whole file against the compiler with
+`_MATH_NAME` pointed at a name no program uses put the bug back: nine
+declaration tests, the position test and the bare-reference test all
+failed, and the five tests asserting `Math.sqrt`/`Math.PI` still work
+all passed either way, which is what they are for. The `environment`
+half was put back the same way, by reverting `festina/semantic.py`
+alone: its five new tests failed and its twelve existing ones did
+not.

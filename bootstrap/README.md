@@ -55,38 +55,42 @@ python bootstrap/canary.py                          # can the corpus still TELL?
 python bootstrap/canary.py --list
 ```
 
-Over the 127-file repository corpus, **every pass reproduces every
+Over the 129-file repository corpus, **every pass reproduces every
 file**:
 
-- **lexer: 127 match, 0 differ.**
-- **parser: 127 match, 0 differ, 0 unported.**
-- **semantic: 127 match, 0 differ, 0 unported.**
-- **escape analysis: 116 match, 0 differ, 0 unported, 11 rejected by
+- **lexer: 129 match, 0 differ.**
+- **parser: 129 match, 0 differ, 0 unported.**
+- **semantic: 129 match, 0 differ, 0 unported.**
+- **escape analysis: 116 match, 0 differ, 0 unported, 13 rejected by
   both** — 2,258 of 2,258 records.
-- **codegen: 116 match, 0 differ, 0 unported, 11 rejected by both** —
-  423,678 of 423,678 file-specific IR lines.
+- **codegen: 116 match, 0 differ, 0 unported, 13 rejected by both** —
+  424,234 of 424,234 file-specific IR lines.
 - **canaries: 156 registered, 0 missed** — 149 caught outright, 7 via
   the ratchet. The sweep found one that had stopped being a breakage
   rather than one the corpus could not see; the note below says which
   and why the two look identical in the report.
 
-The eleven "rejected by both" are programs the front end refuses —
+The thirteen "rejected by both" are programs the front end refuses —
 deliberately ill-formed sources the corpus keeps so that both
 implementations are checked on the rejection as well as on the
 acceptance. There is nothing left that one implementation compiles and
-the other declines to.
+the other declines to. Two of them are new with claude.md #339
+(`cases/err_math_shadowed.f`, `cases/err_environment_shadowed.f`) and
+are the only evidence that the port agrees about a built-in namespace
+being shadowed: reverting `semantic.f`'s half of that fix makes those
+two files, and only those two, differ.
 
 **The bootstrap compiler reproduces its own compilation.** All ten of
 its files — the five passes and the five command-line drivers — emit
-byte-identical IR, 377,285 file-specific lines in total:
+byte-identical IR, 377,841 file-specific lines in total:
 
 | file | file-specific IR lines | | file | file-specific IR lines |
 | --- | --- | --- | --- | --- |
 | `lexer.f` | 5,073 | | `lexdump.f` | 5,314 |
 | `parser.f` | 13,968 | | `astdumpf.f` | 14,184 |
-| `semantic.f` | 22,081 | | `semdumpf.f` | 22,376 |
-| `escape.f` | 23,636 | | `escdumpf.f` | 25,494 |
-| `codegen.f` | 122,379 | | `irdumpf.f` | 122,780 |
+| `semantic.f` | 22,174 | | `semdumpf.f` | 22,469 |
+| `escape.f` | 23,729 | | `escdumpf.f` | 25,587 |
+| `codegen.f` | 122,471 | | `irdumpf.f` | 122,872 |
 
 **And the fixed point closes.** Linking the IR the self-hosted compiler
 emits for `bootstrap/irdumpf.f` gives a second-generation binary that
@@ -329,7 +333,7 @@ one that holds.
 `FESTINA_BOOTSTRAP_EVERYWHERE=1` runs them anyway, for confirming by
 hand that the ports are not somehow platform-dependent.
 
-## Codegen: 423,678 of 423,678 file-specific IR lines
+## Codegen: 424,234 of 424,234 file-specific IR lines
 
 About 14,500 lines of Python, more than everything else ported put
 together — and now complete. Every compilable file in the corpus has
@@ -400,9 +404,9 @@ times and so could not have varied either way.
 
 **The proportion turned over, and then kept going.** Four slices ago it
 was 3,715 of 4,849 — three quarters from `cases/` files written for the
-slices that claimed them. It is now **15,884 of 423,678, a little over
+slices that claimed them. It is now **15,884 of 424,234, a little over
 three per cent**, because the bootstrap's own ten files contribute
-377,285 lines between them of programs written to be a compiler rather
+377,841 lines between them of programs written to be a compiler rather
 than to be measured.
 
 That is a ratio to read carefully rather than to be pleased by. A
@@ -530,7 +534,7 @@ are the ones worth knowing about.
 
 The **bootstrap's own ten files** — `lexer.f`, `parser.f`,
 `semantic.f`, `codegen.f`, `escape.f` and the five entry points — are
-**377,285 of the 423,678 file-specific IR lines**, and they need none
+**377,841 of the 424,234 file-specific IR lines**, and they need none
 of the graphics, audio, HTTP, thread, sqlite, regex or table
 machinery. Getting them to match means the compiler reproduces its own
 compilation: a crisp milestone, and a much smaller target than the

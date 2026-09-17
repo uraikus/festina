@@ -6963,12 +6963,14 @@ Val func cgCall(e:Node, wantValue:bool) {
             }
         }
         if recv != null && recv.kind == 'Identifier' {
-            // The namespace path is taken per METHOD NAME, not per
-            // receiver: `Math.sqrt()` is the namespace even when a
-            // variable called `Math` is in scope, while `Math.toText()`
-            // is that variable's own method, because `toText` is in no
-            // Math table. Both halves are the original's, quirk
-            // included.
+            // specification.md 6.7/16.2: `Math` is a NAMESPACE, taken
+            // on the receiver's NAME before any scope is consulted --
+            // which is exactly why claude.md #339 makes a binding of
+            // that name a compile error, so nothing can ever be lost to
+            // this branch. The `cgIsMathMethod` test is what it always
+            // was and stays: semantic analysis has already rejected any
+            // other `prop`, and matching the original's shape here
+            // matters more than shortening it.
             if rawText(recv, 'name') == 'Math' && cgIsMathMethod(prop) {
                 return cgMathCall(e, prop)
             }
