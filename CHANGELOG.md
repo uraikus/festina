@@ -129,10 +129,10 @@ round-by-round design and implementation record predating 0.1 lives in
 - **The bootstrap compiler is complete.** `bootstrap/` holds Festina's
   own compiler, written in Festina, and every one of its five passes
   now agrees with the Python implementation it mirrors on **every file
-  of the 130-file corpus** — including its own source, which is
-  122,000 lines of IR on its own. Lexer, parser and analyzer: 130
-  match, 0 differ each. Escape analysis: 2,265 of 2,265 records.
-  Codegen: 425,103 of 425,103 file-specific IR lines, byte for byte.
+  of the 131-file corpus** — including its own source, which is
+  122,000 lines of IR on its own. Lexer, parser and analyzer: 131
+  match, 0 differ each. Escape analysis: 2,275 of 2,275 records.
+  Codegen: 426,716 of 426,716 file-specific IR lines, byte for byte.
   The thirteen files neither side compiles are deliberately ill-formed
   sources the corpus keeps so that both implementations are checked on
   the rejection as well as the acceptance.

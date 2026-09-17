@@ -167,12 +167,12 @@ included:
 
 | | |
 |---|---|
-| lexer | 130 match, 0 differ |
-| parser | 130 match, 0 differ, 0 unported |
-| semantic | 130 match, 0 differ, 0 unported |
-| escape analysis | 117 match, 0 differ, 0 unported — 2,265 of 2,265 records |
-| codegen | 117 match, 0 differ, 0 unported — 425,103 of 425,103 IR lines |
-| canaries | 159 registered, 0 missed — 152 caught, 7 via the ratchet |
+| lexer | 131 match, 0 differ |
+| parser | 131 match, 0 differ, 0 unported |
+| semantic | 131 match, 0 differ, 0 unported |
+| escape analysis | 118 match, 0 differ, 0 unported — 2,275 of 2,275 records |
+| codegen | 118 match, 0 differ, 0 unported — 426,716 of 426,716 IR lines |
+| canaries | 161 registered, 0 missed — 154 caught, 7 via the ratchet |
 
 All ten of the bootstrap's own files reproduce their own compilation
 byte for byte, and the second-generation binary built from that IR is
