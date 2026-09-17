@@ -7725,6 +7725,46 @@ error, and exactly the kind this project's own rule about measuring
 rather than extrapolating exists to prevent; the number was available
 twenty minutes later for the asking.
 
+**A test build for the bootstrap, and the self-hosting rule it taught
+me.** `bootstrap/irdumpf.f` could only ever produce an ordinary build,
+so the emitting half of this feature had no differential at all -- the
+group registration, the per-type comparison, the rendered source line,
+`.near`, and the report in main were unmeasured however carefully they
+were written. `--tests` makes them comparable, and the comparison is a
+SEPARATE one rather than a widening of `irdiff.compare`: every canary
+calls that function, and the sweep is already the longest-running thing
+here, so doubling its work to cover one mechanism would be a bad trade.
+It runs over the whole corpus rather than only the file that declares a
+group, because with assertions enabled every file's `main` grows the
+report call and the exit-code select -- 131 witnesses for that part
+instead of one.
+
+**Writing it broke the compiler's ability to compile itself, and almost
+nothing noticed.** `cgUnescapeDumpText` was written with `text ch =
+v[i]`. This compiler does not implement indexing a text, so
+`bootstrap/codegen.f` became a file it could no longer compile, and
+`irdumpf.f` with it. The rest of the directory uses
+`charCodeAt`/`toChar` and nothing said whether that was style or
+necessity. It is necessity: code in `bootstrap/` has to stay inside the
+subset the thing it builds supports, which is now written at the site.
+
+**Every per-file comparison still passed.** All 131 corpus files
+matched, because what stopped compiling was the compiler's own SOURCE
+rather than anything it emits for a case. The only test that could see
+it was the coverage ratchet, which counts lines rather than files:
+245,801 vanished, exactly `codegen.f` plus `irdumpf.f`. And it ran only
+because the new test class inherits from the one that owns it, which
+was not deliberate -- my first reading of the failure was that the
+inheritance was an artifact. The accident was the whole signal.
+
+**The check takes 32 seconds and the commit went out without it.** The
+differential reports this the moment the compiler is built. It was
+pushed with the bootstrap half entirely unverified, and it was wrong.
+Recorded because the two facts belong together: a cheap check that is
+not run is not a check, and every other verification in this session
+that was skipped happened to come back green, which is luck rather than
+method.
+
 **And a test that skipped silently, which looks exactly like one that
 passes.** The ASan check for the report path probed for a sanitizer
 with `shutil.which("clang") or shutil.which("gcc")` and took clang

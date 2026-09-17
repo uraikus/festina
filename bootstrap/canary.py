@@ -342,24 +342,25 @@ CANARIES = [
     ),
     # --- decisions.md #341: the test type ----------------------------
     #
-    # Only the STRIPPING half can be canaried, and that is the honest
-    # shape of it rather than a gap: `bootstrap/irdumpf.f` compiles the
-    # way `festina compile` does, with assertions off, so an ordinary
-    # build removing them is the whole of what this compiler ever does
-    # with the feature. `bootstrap/cases/test_groups.f` is the witness.
+    # Only the STRIPPING half can be canaried, and that is a real limit
+    # rather than a choice. A canary is judged through `irdiff.compare`,
+    # which is the ORDINARY build -- so a breakage inside `cgAssertion`
+    # or `cgTestDecl` is invisible to the sweep, because an ordinary
+    # build never calls either. What covers the emitting half is
+    # `TestTheTestBuildMatchesPython`, a byte-exact differential of its
+    # own; what covers the gate between them is these two.
+    # `bootstrap/cases/test_groups.f` is the witness for both.
     Canary(
         "assertion-is-stripped", "#341",
         "an ordinary build removes an assertion rather than emitting a call",
-        """    if TEST_NAMES[name] != null {
-        return cgVal('1', 'i8', 'bool')
-    }""",
-        "",
+        "        if CG_TESTS { return cgAssertion(e, name) }",
+        "        if true { return cgAssertion(e, name) }",
     ),
     Canary(
         "test-decl-emits-nothing", "#341",
         "a test declaration contributes nothing to an ordinary build",
-        "    if s.kind == 'TestDecl' { return }",
-        "",
+        "        if CG_TESTS { cgTestDecl(s) }",
+        "        if true { cgTestDecl(s) }",
     ),
 
     # --- decisions.md #340: the deferred-root buffer -----------------
