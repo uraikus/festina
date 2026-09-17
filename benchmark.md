@@ -34,6 +34,22 @@ Each language uses its own normal toolchain and optimization settings
 Bun has no separate build step, it's a JIT). All four are checked to
 produce byte-identical stdout before a run is trusted.
 
+**One asymmetry to know about before reading the table.** Festina is
+built here with `FESTINA_TARGET_CPU=native` (the runner sets it), so it
+targets the benchmarking machine's own CPU — that is what you get when
+you build something for yourself, and it is what a benchmark should
+measure. `rustc -O` and `go build` target their own *architecture
+baselines* rather than the host, so they are not getting the same
+treatment. For a like-for-like comparison, build them with
+`-C target-cpu=native` and `GOAMD64=v3` respectively.
+
+How much this is worth varies by workload and is smaller than it
+sounds: on this repository's three core benchmarks, measured with the
+runs interleaved so machine noise hits both builds equally, `char_scan`
+is about 17% faster native and `fib` and `array_sum` are unchanged
+within noise. The gap is in byte scanning, where the host's vector
+instructions actually get used.
+
 Every benchmark is timed with 1 untimed warmup run (page cache, dynamic
 linker resolution, ...) followed by 7 timed runs, keeping the *minimum*
 — the standard way to reduce OS scheduling noise without pulling in a

@@ -2789,21 +2789,31 @@ project's own WASI host. [#148, #237, #242, #263]
 
 ### 21.7 What a compiled binary targets
 
-**By default a binary is built for the machine that compiled it** — the
-host's exact CPU model and its full feature set. That is the fastest
-code for the build machine and it is not portable: a binary built on a
-processor with AVX-512 will not start on one without it, and tools that
-implement only part of a very new instruction set (valgrind, for one)
-may fail on it before `main` runs.
+**A compiled binary targets the architecture's portable baseline.** It
+runs on any machine of the same architecture, not only the one that
+built it. This is the default because a native executable is something
+a program's author hands to someone else, and a binary that starts only
+on its build machine is not that.
 
-`FESTINA_TARGET_CPU` overrides that. `generic` builds for the
-architecture's portable baseline; any other value is used as a CPU
-name, so a known floor can be named (`x86-64-v2`, `haswell`) rather
-than dropping all the way down. Setting it at all also clears the
-host's feature set, since a named CPU carries its own. An
-implementation that does not build through LLVM may ignore the
-variable, but must not silently produce host-specific code when it is
-set to `generic`. [#335]
+`FESTINA_TARGET_CPU` selects a different target:
+
+| Value | Target |
+|---|---|
+| unset | the architecture baseline (portable) |
+| `native` | the build machine's own CPU model and full feature set |
+| any other | used as a CPU name (`x86-64-v2`, `haswell`, …) |
+
+`native` produces the fastest code for the machine that compiled it and
+a binary that may fault with an illegal instruction anywhere else; it is
+the right choice for a program that is not leaving that machine, and is
+what a benchmark should use. Every value but `native` also clears the
+host's feature set, since a named CPU carries its own — without that,
+the host's features would override the name and the setting would do
+nothing.
+
+An implementation that does not build through LLVM may ignore the
+variable, but must not produce host-specific code unless it is set to
+`native`. [#335, #336]
 
 ---
 

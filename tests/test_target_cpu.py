@@ -1,19 +1,21 @@
-"""claude.md #335: `FESTINA_TARGET_CPU`, the escape hatch from building
-for the build machine's exact CPU.
+"""claude.md #335/#336: `FESTINA_TARGET_CPU`, and what a binary targets
+when nobody says.
 
 festina/llvm_backend.py built its target machine from
 `LLVMGetHostCPUName()` and `LLVMGetHostCPUFeatures()`, so an object
-emitted here is tuned for -- and may only run on -- the processor that
-compiled it. On the machine this was written on that is
-`emeraldrapids` with twelve AVX-512 feature flags enabled.
+emitted here was tuned for -- and might only run on -- the processor
+that compiled it. On the machine this was written on that is
+`emeraldrapids` with twelve AVX-512 feature flags enabled. #335 added
+the escape hatch; #336 made portable the DEFAULT and `native` the way
+to ask for the old behaviour.
 
-Two harms, and the reported one is the smaller. A binary built on a
-recent chip refuses to start on an older one, which is a strange
-default for a compiler whose output you would distribute. And valgrind
-dies with SIGILL before `main` on an AVX-512 host, which matters more
-than it sounds: valgrind is how two of the other bugs from the same
-report were found, so the tool that finds memory bugs was unusable on
-exactly the machines that have the newest instructions.
+Two harms drove it, and the reported one is the smaller. A binary built
+on a recent chip refuses to start on an older one, which is a strange
+thing to get from a compiler whose output you would hand to someone.
+And valgrind dies with SIGILL before `main` on an AVX-512 host, which
+matters more than it sounds: valgrind is how two of the other bugs from
+the same report were found, so the tool that finds memory bugs was
+unusable on exactly the machines with the newest instructions.
 
 Reported by uraikus/archtelos-browser, who had to monkeypatch the
 compiler to get this.
@@ -42,12 +44,26 @@ class TestTheSelection:
     """Unit-level: what CPU and features the backend asks LLVM for. No
     compiler run, so these are the checks that hold on any host."""
 
-    def test_unset_means_the_host(self):
+    def test_unset_means_the_portable_baseline(self):
+        # claude.md #336: the flip. A binary you hand to someone has to
+        # start on their machine, so that is what an unset variable
+        # gets.
         cpu, features = llvm_backend.target_cpu_and_features(environ={})
-        assert cpu, "an unset variable must still name a CPU"
-        # Not asserting WHICH host -- that is whatever machine this runs
-        # on. The claim is that it asks for a real one and its features.
+        assert cpu == b"generic"
+        assert features == b""
+
+    def test_native_asks_for_the_build_machine(self):
+        # The opt-in, and the only value that reads the processor. Not
+        # asserting WHICH cpu -- that is whatever machine this runs on;
+        # the claim is that it names a real one and carries its
+        # features, which no other value does.
+        cpu, features = llvm_backend.target_cpu_and_features(
+            environ={"FESTINA_TARGET_CPU": "native"})
+        assert cpu and cpu != b"generic"
         assert isinstance(features, bytes)
+        assert features != b"", (
+            "native must carry the host feature string; without it the "
+            "CPU name alone is most of the point but not all of it")
 
     def test_generic_clears_the_host_features(self):
         # The load-bearing half. LLVM derives a named CPU's features from
@@ -75,10 +91,9 @@ class TestTheSelection:
         assert blank == unset
 
     def test_the_real_environment_is_the_default_source(self, monkeypatch):
-        monkeypatch.setenv("FESTINA_TARGET_CPU", "generic")
-        cpu, features = llvm_backend.target_cpu_and_features()
-        assert cpu == b"generic"
-        assert features == b""
+        monkeypatch.setenv("FESTINA_TARGET_CPU", "native")
+        cpu, _ = llvm_backend.target_cpu_and_features()
+        assert cpu != b"generic"
 
 
 def _compile(tmp_path, name, env_extra):
@@ -102,9 +117,9 @@ class TestEndToEnd:
     set it -- the unit checks above cannot catch a wiring mistake
     between `target_cpu_and_features` and the target machine."""
 
-    def test_a_generic_build_runs_and_agrees(self, tmp_path):
-        native = _compile(tmp_path, "native", {})
-        generic = _compile(tmp_path, "generic", {"FESTINA_TARGET_CPU": "generic"})
+    def test_a_native_build_runs_and_agrees_with_the_default(self, tmp_path):
+        native = _compile(tmp_path, "native", {"FESTINA_TARGET_CPU": "native"})
+        generic = _compile(tmp_path, "generic", {})
         got_native = subprocess.run([str(native)], capture_output=True, text=True,
                                     timeout=120)
         got_generic = subprocess.run([str(generic)], capture_output=True, text=True,
@@ -119,8 +134,8 @@ class TestEndToEnd:
     def test_the_setting_actually_reaches_the_object(self, tmp_path):
         # If the wiring broke, both builds would be byte-identical and
         # every other test here would still pass.
-        native = _compile(tmp_path, "native2", {})
-        generic = _compile(tmp_path, "generic2", {"FESTINA_TARGET_CPU": "generic"})
+        native = _compile(tmp_path, "native2", {"FESTINA_TARGET_CPU": "native"})
+        generic = _compile(tmp_path, "generic2", {})
         assert native.read_bytes() != generic.read_bytes()
 
 
@@ -145,17 +160,17 @@ class TestTheInstructionsThemselves:
         if " avx " not in cpuinfo and "\navx " not in cpuinfo and " avx\n" not in cpuinfo:
             pytest.skip("this host has no AVX, so both builds agree by rights")
 
-        native = self._disassemble(_compile(tmp_path, "native3", {}))
-        generic = self._disassemble(
-            _compile(tmp_path, "generic3", {"FESTINA_TARGET_CPU": "generic"}))
+        native = self._disassemble(
+            _compile(tmp_path, "native3", {"FESTINA_TARGET_CPU": "native"}))
+        generic = self._disassemble(_compile(tmp_path, "generic3", {}))
 
         # VEX-encoded scalar float ops -- `vmulsd`/`vdivsd` against plain
         # `mulsd`/`divsd`. The host build uses them because the host has
         # AVX; the baseline x86-64 build cannot.
         assert "vmulsd" in native or "vaddsd" in native or "vdivsd" in native, (
-            "expected the host build to use VEX-encoded float ops on an "
-            "AVX machine; if this fails the default stopped targeting the "
-            "host, which is a change worth noticing deliberately")
+            "expected FESTINA_TARGET_CPU=native to use VEX-encoded float "
+            "ops on an AVX machine -- if this fails, `native` has stopped "
+            "reaching the target machine and the opt-in does nothing")
         assert "vmulsd" not in generic
         assert "vdivsd" not in generic
         assert "vaddsd" not in generic

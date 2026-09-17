@@ -191,39 +191,52 @@ def available():
     return _binding().lib is not None
 
 
-# claude.md #335: the env var that decides what CPU the object is built
-# for. Unset keeps the historical behaviour; `generic` is the documented
-# portable value, and any other value is passed to LLVM as a CPU name.
+# claude.md #335/#336: the env var that decides what CPU the object is
+# built for. Unset is the PORTABLE baseline; `native` opts into the
+# build machine's own CPU; any other value is an LLVM CPU name.
 TARGET_CPU_ENV = "FESTINA_TARGET_CPU"
+
+# claude.md #336: what an unset variable means. `generic` is LLVM's own
+# name for "the architecture's baseline", which on x86-64 is the
+# original x86-64 feature set -- SSE2 and nothing newer.
+DEFAULT_TARGET_CPU = b"generic"
+
+# The one value that asks for the build machine's own processor.
+# Spelled to match `-march=native`, which is what anyone reaching for
+# this will already have in their fingers.
+NATIVE_TARGET_CPU = "native"
 
 
 def target_cpu_and_features(environ=None, binding=None):
     """(cpu, features) to build the target machine with, as bytes.
 
-    claude.md #335: unset means the HOST's exact CPU and its full
-    feature set, which is what this has always done and what makes a
-    binary built here refuse to start on an older machine -- and what
-    makes valgrind die with SIGILL before `main` on an AVX-512 host,
-    which matters because valgrind is how two of the bugs above this one
-    in todo.md were found.
+    claude.md #336: **unset means PORTABLE.** A compiled binary is
+    something you hand to someone, and building it for the exact
+    processor that happened to compile it made that the one thing it was
+    not -- a binary built on a 2023 Xeon would not start on a 2015
+    laptop, and valgrind died with SIGILL before `main` on any AVX-512
+    host. Neither is a reasonable thing to get without asking for it.
 
-    Setting the variable pins the CPU instead. `generic` is the portable
-    baseline for the triple; anything else is handed to LLVM as a CPU
-    name (`x86-64-v2`, `haswell`, ...), so this is an escape hatch with
-    a dial rather than a switch.
+    `native` asks for it: the host's exact CPU and full feature set,
+    which is what this did unconditionally until #336. Any other value
+    is handed to LLVM as a CPU name (`x86-64-v2`, `haswell`, ...), so a
+    project with a known floor can name it rather than choosing between
+    the baseline and the build machine.
 
-    FEATURES ARE CLEARED whenever the variable is set, and that is the
+    FEATURES ARE CLEARED for every value but `native`, and that is the
     load-bearing half. LLVM derives a named CPU's features from the name
     itself, so passing the host's feature string alongside `generic`
     would put every AVX-512 flag straight back and the setting would
     appear to do nothing at all."""
     if environ is None:
         environ = os.environ
-    b = binding if binding is not None else _binding()
     requested = (environ.get(TARGET_CPU_ENV) or "").strip()
-    if not requested:
+    if requested == NATIVE_TARGET_CPU:
+        b = binding if binding is not None else _binding()
         return b.host_cpu_name(), b.host_cpu_features()
-    return requested.encode("utf-8"), b"".strip()
+    if not requested:
+        return DEFAULT_TARGET_CPU, b""
+    return requested.encode("utf-8"), b""
 
 
 def emit_object_file(ir_text, out_path, filename="<ir>"):

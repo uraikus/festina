@@ -94,6 +94,35 @@ Or skip the intermediate binary and just run it:
 bin/festina run examples/hello.f
 ```
 
+### Building for the machine you are on
+
+A compiled binary is portable by default — it targets the architecture's
+baseline, so it runs on any x86-64 machine, not just the one that built
+it.
+
+**If the binary is for this machine, say so and take the speed:**
+
+```bash
+FESTINA_TARGET_CPU=native bin/festina compile examples/hello.f -o hello
+```
+
+That builds for your CPU's exact feature set. On a machine with AVX, one
+of this repository's three benchmarks (`char_scan`) runs about 17% faster
+that way; the other two are unchanged. Use it for anything you are
+running locally — a tool you wrote for yourself, a benchmark, anything
+you will not be handing to someone else.
+
+Between the two extremes you can name a floor instead, and get most of
+the benefit while still running on anything that recent:
+
+```bash
+FESTINA_TARGET_CPU=x86-64-v2 bin/festina compile app.f -o app
+```
+
+Any LLVM CPU name works (`haswell`, `znver3`, `x86-64-v3`, …). Only
+`native` reads your processor; every other value, and the default, is a
+fixed target you choose.
+
 Not sure your machine has everything Festina needs? `bin/festina doctor`
 checks every dependency above and tells you exactly what's missing and
 how to install it — including whether `festina` itself is on `PATH` yet.

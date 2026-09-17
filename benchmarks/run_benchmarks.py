@@ -99,8 +99,28 @@ class FestinaToolchain(Toolchain):
 
         src = os.path.join(BENCH_DIR, f"{name}.f")
         out = os.path.join(workdir, name)
+        # claude.md #336: benchmark the compiler at its best. The DEFAULT
+        # is now the portable baseline -- a binary you hand to someone
+        # should start on their machine -- and measuring that default
+        # here would report a number nobody optimising for their own
+        # hardware would ever see.
+        #
+        # Read the table knowing what it compares: this is Festina built
+        # FOR THIS MACHINE, against `rustc -O` and `go build`, both of
+        # which target their own architecture baseline rather than the
+        # host. For like-for-like, build those with
+        # `-C target-cpu=native` and `GOAMD64=v3`. benchmark.md says so
+        # too.
+        prev = os.environ.get("FESTINA_TARGET_CPU")
+        os.environ["FESTINA_TARGET_CPU"] = "native"
         t0 = time.perf_counter()
-        cli_mod.compile_file(src, out)
+        try:
+            cli_mod.compile_file(src, out)
+        finally:
+            if prev is None:
+                os.environ.pop("FESTINA_TARGET_CPU", None)
+            else:
+                os.environ["FESTINA_TARGET_CPU"] = prev
         return out, time.perf_counter() - t0
 
     def run_cmd(self, name, built_path):

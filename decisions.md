@@ -7154,3 +7154,55 @@ side effect of adding an escape hatch. It is now written down in
 specification.md 21.7 -- previously the behaviour was undocumented,
 which is the part that made it a trap rather than a tradeoff -- and
 todo.md carries the question of whether the default should flip.
+
+336. PORTABLE BY DEFAULT
+
+**The default now targets the architecture baseline, and `native` asks
+for the build machine.** #335 added `FESTINA_TARGET_CPU` and
+deliberately left the default alone, on the grounds that flipping it
+trades speed for portability and deserved its own decision. This is
+that decision.
+
+**The argument is about what a native executable IS.** It is the thing
+a program's author hands to someone else -- that is the whole reason to
+compile ahead of time rather than ship a script. A binary that starts
+only on the machine that built it is not that, and getting it without
+having asked is the kind of default that is discovered by a bug report
+rather than by reading. The two failure modes are a stranger's machine
+dying with an illegal instruction, and valgrind dying with SIGILL
+before `main`; neither reads as "you chose this".
+
+**What it costs, measured rather than asserted.** Interleaved runs of
+each build, so a slow patch of machine hits both equally, taking both
+the minimum and the median and requiring them to agree:
+
+    array_sum   native 0.0679s   generic 0.0680s    +0.1%
+    char_scan   native 0.0075s   generic 0.0088s   +17.1%
+    fib         native 0.0050s   generic 0.0050s    -0.2%
+
+So the price is real and narrow: byte scanning, where the host's vector
+instructions actually get used, and nothing measurable elsewhere. Worth
+recording that a first pass at this -- seven runs, not interleaved --
+reported +21.5% on `array_sum`, which the interleaved run shows was
+machine noise. A benchmark that is not interleaved on a shared machine
+is measuring the machine.
+
+**`native` rather than a boolean**, so the variable keeps one meaning:
+the name of a target. `generic`, `x86-64-v2`, `haswell` and `native`
+are all answers to the same question, and only one of them reads the
+processor.
+
+**The benchmark runner sets `native` itself.** Leaving it on the new
+default would have quietly re-measured Festina at its baseline and
+reported a number nobody optimising for their own hardware would ever
+see. It also introduces an asymmetry worth stating rather than
+hiding: `rustc -O` and `go build` target their own baselines, so the
+table now compares a host-tuned Festina against baseline Rust and Go.
+benchmark.md says so, and says what flags make it like-for-like.
+
+**Documented where someone building something would actually look.**
+README's get-started section and setup.md both carry the one-line
+`FESTINA_TARGET_CPU=native` form and encourage it for anything staying
+on the machine, including how to export it for a shell. The previous
+round's failure here was not the default -- it was that the behaviour
+was undocumented, so nobody could have chosen either way.

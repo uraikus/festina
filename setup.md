@@ -228,6 +228,43 @@ standalone `wasm32-wasi` binary instead of a native executable — see
 [wasm.md](wasm.md) for the full design writeup, setup, and known
 limitations (graphics/audio aren't available under WASI at all).
 
+## Choosing what CPU your binaries target
+
+Festina compiles for the **portable baseline** by default: a binary
+built here starts on any machine of the same architecture, which is what
+you want for anything you distribute.
+
+**Building for this machine is one variable, and worth doing whenever
+the binary is not leaving it:**
+
+```bash
+FESTINA_TARGET_CPU=native bin/festina compile app.f -o app
+```
+
+Make it the default for your own shell if most of what you build is for
+local use:
+
+```bash
+export FESTINA_TARGET_CPU=native        # this shell
+echo 'export FESTINA_TARGET_CPU=native' >> ~/.bashrc   # every shell
+```
+
+| Value | What you get |
+|---|---|
+| unset | the architecture baseline — runs anywhere, the safe default |
+| `native` | this machine's exact CPU and features — fastest here, may not start elsewhere |
+| any LLVM CPU name | that CPU exactly (`x86-64-v2`, `haswell`, `znver3`, …) |
+
+Two things worth knowing. **`native` binaries are not portable** — one
+built on a recent Xeon will die with an illegal-instruction fault on an
+older laptop, which is exactly why it is not the default. And **valgrind
+and some sanitizers do not implement every instruction of the very
+newest chips**, so if you are debugging memory under valgrind on an
+AVX-512 machine, leave the variable unset for that build.
+
+The benchmark runner sets `native` itself (`benchmarks/`), so you do not
+need to.
+
 ## Running the test suite
 
 ```bash

@@ -27,19 +27,24 @@ that the report suggested, which would have left a list walk still
 non-terminating; `'' == null` is fixed in #334, where the cause turned
 out to be one line of the runtime's text comparison rather than the
 representation the report suspected; and the host-CPU targeting is
-fixed in #335. **Every bug from that report is now closed.** What
-follows is a design question the last of them raised rather than a
-defect.
+fixed in #335, and in #336 the default flipped to portable with
+`FESTINA_TARGET_CPU=native` as the opt-in. **Every bug from that report
+is now closed, and nothing is open here.**
 
-- **Should a binary target the build machine by default?** The escape
-  hatch exists now (`FESTINA_TARGET_CPU`, decisions.md #335) and the
-  behaviour is specified (§21.7), but the default still builds for the
-  host's exact CPU — so a binary built on a recent chip does not start
-  on an older one. That is fast and surprising in equal measure.
-  Flipping the default to `generic` trades measurable speed for
-  portability and should be decided deliberately, not as a side effect
-  of adding the hatch. Nothing in this repository depends on either
-  answer.
+
+## Known-flaky test
+
+- **`test_audio_demo_plays_through_the_null_alsa_device` races under
+  heavy parallelism.** `examples/audio.f` plays the clip on channels 0,
+  1 and 2, stops channel 0, and expects `isPlaying()` — which asks "is
+  this CLIP playing anywhere" — to be false, which needs channels 1 and
+  2 to have finished on their own by then. Under real contention they
+  sometimes have not. Measured at 24-way parallelism: **5 of 120 runs
+  fail with a host-native binary and 6 of 120 with a portable one**, so
+  it is a wall-clock race and not a consequence of decisions.md #336.
+  `stopAudioPlayer` itself is synchronous — it joins the channel thread
+  — so the fix belongs in the demo or the assertion, not the runtime.
+  Surfaced by a full-suite run; passes alone every time.
 
 ## Platforms
 
