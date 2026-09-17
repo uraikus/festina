@@ -59,7 +59,7 @@ def _reset_uid():
     codegen_mod.CodeGen._uid = 0
 
 
-def dump_file(path):
+def dump_file(path, tests=False):
     """The IR for one file, as a list of lines.
 
     A rejected program answers a single `SEMERR|line|col` record, so a
@@ -70,7 +70,8 @@ def dump_file(path):
     try:
         program = imports_mod.build_program(path)
         analyzed = semantic_mod.analyze(program, filename=path)
-        text = codegen_mod.generate_ir(program, analyzed, filename=path)
+        text = codegen_mod.generate_ir(program, analyzed, filename=path,
+                                       tests_enabled=tests)
     except CompileError as exc:
         return [f"SEMERR|{getattr(exc, 'line', 0)}|{getattr(exc, 'column', 0)}"]
     lines = text.split("\n")

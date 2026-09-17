@@ -86,6 +86,15 @@ if SEM_FAILED {
     close(0)
 }
 
+// claude.md #341: `--tests` asks for the build `festina test` makes,
+// with the assertions compiled IN. Without it this driver could only
+// ever produce an ordinary build, which left the emitting half of the
+// test type with no differential at all -- the stripping half was the
+// only thing a corpus file could measure.
+if argv.length > 2 {
+    if argv[2] == '--tests' { CG_TESTS = true }
+}
+
 cgProgram(merged, argv[1])
 
 if CG_UNPORTED {

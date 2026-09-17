@@ -15434,8 +15434,13 @@ def _parse_int_like_strtoll(text):
     return max(i64_min, min(i64_max, value))
 
 
-def generate_ir(program, analyzed, filename="main.f"):
-    gen = CodeGen(analyzed, filename)
+def generate_ir(program, analyzed, filename="main.f", tests_enabled=False):
+    # claude.md #341: `tests_enabled` exists here, and not only on
+    # CodeGen itself, so bootstrap/irdump.py can ask for a test build --
+    # which is what puts the EMITTING half of the test type under the
+    # same byte-exact differential as everything else. Without it the
+    # only half with a harness was the one that removes assertions.
+    gen = CodeGen(analyzed, filename, tests_enabled=tests_enabled)
     return gen.generate(program)
 
 

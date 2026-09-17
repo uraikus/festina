@@ -68,8 +68,17 @@ def build_codegen(out_path):
     return out_path
 
 
-def festina_dump(binary, path):
-    result = run_text([binary, relative(path)], timeout=300, cwd=REPO_ROOT)
+def festina_dump(binary, path, tests=False):
+    argv = [binary, relative(path)]
+    if tests:
+        # claude.md #341: the build `festina test` makes. A separate
+        # argument rather than a second binary, and a separate COMPARE
+        # below rather than a widening of the ordinary one -- every
+        # canary calls compare(), and the sweep is already the longest
+        # thing in this repository. Doubling its work to cover one
+        # mechanism would be a bad trade; a test of its own is not.
+        argv.append("--tests")
+    result = run_text(argv, timeout=300, cwd=REPO_ROOT)
     if result.returncode != 0:
         raise RuntimeError(
             f"{binary} {path} exited {result.returncode}: {result.stderr}")
@@ -78,6 +87,42 @@ def festina_dump(binary, path):
     if lines and lines[-1] == "":
         lines.pop()
     return lines
+
+
+def compare_tests(binary, path):
+    """(status, detail) for one file's TEST build -- claude.md #341.
+
+    The same comparison `compare` makes, over the IR a `festina test`
+    build produces: group registration, the per-type comparison, the
+    rendered source line, `.near`, and the report and exit code in
+    main. Without it the only half of the test type with a differential
+    was the half that REMOVES assertions, and every line above was
+    unmeasured however carefully it was written.
+
+    Worth running over the whole corpus rather than only the files that
+    declare a group: with assertions enabled every file's `main` grows
+    the report call and the exit-code select, so this puts that part
+    under 131 witnesses instead of one.
+    """
+    want = irdump.dump_file(relative(path), tests=True)
+    if len(want) == 1 and want[0].startswith("SEMERR"):
+        got = festina_dump(binary, path, tests=True)
+        return ("rejected", None) if got == want else ("differ", (0, want[0], got[0] if got else ""))
+    got = festina_dump(binary, path, tests=True)
+    unported = sorted({
+        line.split("|", 1)[1] for line in got if line.startswith("UNPORTED|")
+    })
+    if unported:
+        return "unported", "; ".join(unported)
+    for i, (w, g) in enumerate(zip(want, got)):
+        if w != g:
+            return "differ", (i, w, g)
+    if len(want) != len(got):
+        i = min(len(want), len(got))
+        return "differ", (i,
+                          want[i] if i < len(want) else "<end>",
+                          got[i] if i < len(got) else "<end>")
+    return "match", None
 
 
 def compare(binary, path):

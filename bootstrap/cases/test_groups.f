@@ -38,6 +38,12 @@ kinds('a', 'a')
 kinds(1, null)
 kinds.near(0.1 + 0.2, 0.3, 0.0001)
 
+// A template literal as an assertion argument, so 11.7.4's rendering
+// of one is exercised rather than merely written: the report spells the
+// call back out with its `${...}` intact, which on the port's side
+// means coming back through the AST dump's own escaping.
+described(`Hello, ${name}!`, greeting)
+
 // An assertion is an EXPRESSION of type bool (11.7.1), which is a
 // separate thing for a port to get right: the call has to type as bool
 // wherever a bool belongs, not only as a bare statement.

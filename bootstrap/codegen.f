@@ -1568,6 +1568,12 @@ bool CG_HAS_TRY = false
 // build has to RECOGNISE one in order to remove it rather than fail on
 // a callee it cannot resolve.
 map[bool] TEST_NAMES = {}
+// claude.md #341: whether this is the build `festina test` makes, with
+// the assertions compiled IN. False for an ordinary build, where
+// specification.md 11.7.3 removes every one of them. Set by
+// irdumpf.f's own `--tests` argument, which is what gives the emitting
+// half a differential at all.
+bool CG_TESTS = false
 
 // Set only while a THROW emits its own scope walk, so a try-frame
 // marker in the range is left alone. See cgFreeOne.
@@ -6986,6 +6992,7 @@ Val func cgCall(e:Node, wantValue:bool) {
             // assertion, and for the same reason: this compiler only
             // ever produces an ordinary build.
             if TEST_NAMES[rawText(recv, 'name')] != null {
+                if CG_TESTS { return cgAssertionNear(e, rawText(recv, 'name')) }
                 return cgVal('1', 'i8', 'bool')
             }
         }
@@ -7004,6 +7011,7 @@ Val func cgCall(e:Node, wantValue:bool) {
     // a `test` binding may not take a builtin's name in the first place
     // (6.7) and so can never shadow one.
     if TEST_NAMES[name] != null {
+        if CG_TESTS { return cgAssertion(e, name) }
         return cgVal('1', 'i8', 'bool')
     }
     // claude.md #208: the bare, context-implicit send -- FROM the
@@ -7735,6 +7743,216 @@ void func cgLog(args:arr[Node]) {
     cgUnported(`log(${a.fty})`)
 }
 
+// claude.md #341: specification.md 11.7.4 -- the assertion as the
+// report prints it, rendered from its own syntax tree.
+//
+// Defined over the tree rather than the source text on purpose: the
+// alternative is carrying byte offsets through the lexer and onto every
+// node, which buys a difference only an unusually spelled program could
+// observe. Binary operators are spaced and nothing is parenthesised
+// that the tree does not require, so for the expressions an assertion
+// contains this IS the source spelling.
+text func cgRenderExprSource(e:Node) {
+    if e == null { return 'null' }
+    text k = e.kind
+    if k == 'NumberLit' { return fieldOf(e, 'value').raw }
+    if k == 'StringLit' {
+        text v = rawText(e, 'value')
+        return `'${cgRenderEscapeQuotes(v)}'`
+    }
+    if k == 'BoolLit' { return fieldOf(e, 'value').raw }
+    if k == 'NullLit' { return 'null' }
+    if k == 'Identifier' { return rawText(e, 'name') }
+    if k == 'BinOp' || k == 'LogicalOp' {
+        text l = cgRenderExprSource(childOf(e, 'left'))
+        text r = cgRenderExprSource(childOf(e, 'right'))
+        return `${l} ${rawText(e, 'op')} ${r}`
+    }
+    if k == 'UnaryOp' {
+        return rawText(e, 'op') + cgRenderExprSource(childOf(e, 'operand'))
+    }
+    if k == 'Member' {
+        text o = cgRenderExprSource(childOf(e, 'obj'))
+        if rawBool(e, 'computed') {
+            return `${o}[${cgRenderExprSource(childOf(e, 'prop'))}]`
+        }
+        return `${o}.${rawText(e, 'prop')}`
+    }
+    if k == 'Call' {
+        text c = cgRenderExprSource(childOf(e, 'callee'))
+        arr[Node] as = listOf(e, 'args')
+        text out = ''
+        int i = 0
+        while i < as.length {
+            if i > 0 { out = out + ', ' }
+            out = out + cgRenderExprSource(as[i])
+            i++
+        }
+        return `${c}(${out})`
+    }
+    if k == 'TemplateLit' {
+        arr[Node] parts = listOf(e, 'parts')
+        arr[Node] exprs = listOf(e, 'exprs')
+        text out = ''
+        int i = 0
+        while i < parts.length {
+            // A template's literal chunks are '#str' marker nodes, and
+            // their text is stored ESCAPED for the AST dump (parser.f's
+            // addStr). The report wants the characters, not the dump's
+            // spelling of them, so it comes back through.
+            out = out + cgUnescapeDumpText(rawText(parts[i], 'v'))
+            if i < exprs.length {
+                out = out + '${' + cgRenderExprSource(exprs[i]) + '}'
+            }
+            i++
+        }
+        return '`' + out + '`'
+    }
+    // Anything else names its own kind rather than guessing: a report
+    // line that says less is better than one that lies.
+    return `<${k}>`
+}
+
+// The inverse of parser.f's addStr, for the one place a stored string
+// is wanted as characters rather than as the dump spells them.
+text func cgUnescapeDumpText(v:text) {
+    text out = ''
+    int i = 0
+    while i < v.length {
+        text ch = v[i]
+        if ch == '\\' && i + 1 < v.length {
+            text nx = v[i + 1]
+            if nx == 'n' { out = out + '\n'  i = i + 2  continue }
+            if nx == 't' { out = out + '\t'  i = i + 2  continue }
+            if nx == 'r' { out = out + '\r'  i = i + 2  continue }
+            if nx == 'q' { out = out + '"'  i = i + 2  continue }
+            if nx == '\\' { out = out + '\\'  i = i + 2  continue }
+        }
+        out = out + ch
+        i++
+    }
+    return out
+}
+
+text func cgRenderEscapeQuotes(v:text) {
+    text out = ''
+    int i = 0
+    while i < v.length {
+        text ch = v[i]
+        if ch == "'" { out = out + "\\'" } else { out = out + ch }
+        i++
+    }
+    return out
+}
+
+// claude.md #341: specification.md 11.7.1 -- compare the two arguments
+// and record the result in the group `name` denotes.
+//
+// A bare `null` against a concretely-typed operand needs that operand's
+// own null SENTINEL, not LLVM's `null` keyword, which is only valid IR
+// for a pointer: `icmp eq i64 1, null` does not parse. The same shape
+// cgBinOp already uses for `x == null`, and an assertion is one more
+// position with a type on the other side to read the encoding from.
+Val func cgAssertion(e:Node, name:text) {
+    Val none
+    arr[Node] args = listOf(e, 'args')
+    Node an = args[0]
+    Node en = args[1]
+    Val a
+    Val b
+    if en.kind == 'NullLit' && an.kind != 'NullLit' {
+        a = cgExpr(an)
+        if CG_STUCK { return none }
+        b = cgExprExpecting(en, a.fty, '')
+    } else if an.kind == 'NullLit' && en.kind != 'NullLit' {
+        b = cgExpr(en)
+        if CG_STUCK { return none }
+        a = cgExprExpecting(an, b.fty, '')
+    } else {
+        a = cgExpr(an)
+        if CG_STUCK { return none }
+        b = cgExpr(en)
+    }
+    if CG_STUCK { return none }
+    text passed = cgTestEquality(a, b, a.fty)
+    Val rendered = cgToText(a)
+    text src = cgStringConst(cgRenderExprSource(e))
+    text gid = cgTmp()
+    cgOut(`  ${gid} = load i64, ptr @__festina_test_${name}`)
+    cgOut(`  call void @festina_test_assert(i64 ${gid}, i8 ${passed}, ptr ${src}, ptr ${rendered.v})`)
+    // The runtime copies what it keeps, so a fresh rendering is ours to
+    // dispose of. A text argument's rendering IS the value, and freeing
+    // that would free whatever the program still owns.
+    if a.fty != 'text' { cgOut(`  call void @free(ptr ${rendered.v})`) }
+    return cgVal(passed, 'i8', 'bool')
+}
+
+// specification.md 11.7.2: |actual - expected| <= tolerance, in the
+// same group a plain call records in. `ole` is the ORDERED comparison,
+// so a NaN anywhere makes it false -- which is the answer the clause
+// specifies for a null actual, expected or tolerance, with no branch of
+// its own, since null IS the NaN payload for float (8.2).
+Val func cgAssertionNear(e:Node, name:text) {
+    Val none
+    arr[Node] args = listOf(e, 'args')
+    Val a = cgExprExpecting(args[0], 'float', '')
+    if CG_STUCK { return none }
+    Val b = cgExprExpecting(args[1], 'float', '')
+    if CG_STUCK { return none }
+    Val t = cgExprExpecting(args[2], 'float', '')
+    if CG_STUCK { return none }
+    text diff = cgTmp()
+    text mag = cgTmp()
+    text bit = cgTmp()
+    text passed = cgTmp()
+    cgOut(`  ${diff} = fsub double ${a.v}, ${b.v}`)
+    cgOut(`  ${mag} = call double @llvm.fabs.f64(double ${diff})`)
+    cgOut(`  ${bit} = fcmp ole double ${mag}, ${t.v}`)
+    cgOut(`  ${passed} = zext i1 ${bit} to i8`)
+    Val rendered = cgToText(a)
+    text src = cgStringConst(cgRenderExprSource(e))
+    text gid = cgTmp()
+    cgOut(`  ${gid} = load i64, ptr @__festina_test_${name}`)
+    cgOut(`  call void @festina_test_assert(i64 ${gid}, i8 ${passed}, ptr ${src}, ptr ${rendered.v})`)
+    cgOut(`  call void @free(ptr ${rendered.v})`)
+    return cgVal(passed, 'i8', 'bool')
+}
+
+// claude.md #341: specification.md 11.7 -- register one group and
+// store the runtime id in the global the pre-pass already declared.
+// The global, not a local, because a `test` binding is reachable from
+// anywhere an ordinary global value name is: a function body, a
+// handler, a thread.
+void func cgTestDecl(s:Node) {
+    text name = rawText(s, 'name')
+    Val d = cgExprExpecting(childOf(s, 'description'), 'text', '')
+    if CG_STUCK { return }
+    Val dt = cgToText(d)
+    text gid = cgTmp()
+    cgOut(`  ${gid} = call i64 @festina_test_group(ptr ${dt.v})`)
+    cgOut(`  store i64 ${gid}, ptr @__festina_test_${name}`)
+}
+
+// The comparison an assertion means, for the types 11.7.1 allows:
+// VALUE equality, never identity. Semantic analysis has already refused
+// every type whose `==` is identity, so there is no struct or container
+// case to get wrong here.
+text func cgTestEquality(a:Val, b:Val, fty:text) {
+    text out = cgTmp()
+    if fty == 'text' || fty == 'ascii' {
+        cgOut(`  ${out} = call i8 @festina_str_eq(ptr ${a.v}, ptr ${b.v})`)
+        return out
+    }
+    text bit = cgTmp()
+    if fty == 'float' {
+        cgOut(`  ${bit} = fcmp oeq double ${a.v}, ${b.v}`)
+    } else {
+        cgOut(`  ${bit} = icmp eq ${a.lty} ${a.v}, ${b.v}`)
+    }
+    cgOut(`  ${out} = zext i1 ${bit} to i8`)
+    return out
+}
+
 void func cgStmt(s:Node) {
     // Pure type information: the definition was emitted with the
     // module's type section and nothing reaches main.
@@ -7772,7 +7990,10 @@ void func cgStmt(s:Node) {
     // since this compiler only ever builds one. The description is not
     // evaluated either, for the same reason its assertions' arguments
     // are not: it is part of what was removed.
-    if s.kind == 'TestDecl' { return }
+    if s.kind == 'TestDecl' {
+        if CG_TESTS { cgTestDecl(s) }
+        return
+    }
     // An event handler's body was emitted with the functions; nothing
     // reaches main where the declaration stands.
     if s.kind == 'EventHandler' { return }
@@ -14268,7 +14489,17 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // implementation on its first run.
     int tn = 0
     while tn < body.length {
-        if body[tn].kind == 'TestDecl' { TEST_NAMES[rawText(body[tn], 'name')] = true }
+        if body[tn].kind == 'TestDecl' {
+            text tgn = rawText(body[tn], 'name')
+            TEST_NAMES[tgn] = true
+            // The slot exists for the whole module, and starts at -1
+            // rather than 0 because 0 is a real group id: a slot read
+            // before its declaration ran would otherwise file
+            // assertions under whichever group happened to be first.
+            // festina_test_assert ignores a negative group, so the
+            // accident is a no-op instead of a wrong report.
+            if CG_TESTS { CG_EXTRA.push(`@__festina_test_${tgn} = global i64 -1`) }
+        }
         tn++
     }
     cgEmit('; ModuleID = "festina"')
@@ -14304,6 +14535,20 @@ void func cgProgram(body:arr[Node], srcPath:text) {
                 cgEmit('declare ptr @festina_weak_get(ptr)')
                 cgEmit('declare void @festina_weak_drop(ptr)')
                 cgEmit('declare void @festina_weak_died(ptr)')
+            }
+        }
+        // claude.md #341: declared only in a test build, because
+        // festina_runtime_test.c is linked only then -- a declare for a
+        // symbol no object provides would be a lie in the IR about what
+        // the program depends on, and 11.7.3's promise is exactly about
+        // what an ordinary build contains. The position is the
+        // original's: straight after festina_release_check.
+        if CG_PRE[i] == 'declare i8 @festina_release_check(ptr)' {
+            if CG_TESTS {
+                cgEmit('declare i64 @festina_test_group(ptr)')
+                cgEmit('declare void @festina_test_assert(i64, i8, ptr, ptr)')
+                cgEmit('declare void @festina_test_report()')
+                cgEmit('declare i64 @festina_test_failures()')
             }
         }
         i++
@@ -14905,7 +15150,23 @@ void func cgProgram(body:arr[Node], srcPath:text) {
     // state that is only complete once every release wrapper has been
     // generated.
     cgOut('  call void @festina_cycle_flush()')
-    cgOut('  ret i32 0')
+    // claude.md #341: specification.md 11.7.4 -- the report prints
+    // after the program's own execution ends, and the exit code is
+    // non-zero exactly when something failed, which is what makes
+    // `festina test` usable in a pipeline. Only in a test build; an
+    // ordinary one returns 0 as it always did.
+    if CG_TESTS {
+        cgOut('  call void @festina_test_report()')
+        text fails = cgTmp()
+        text failed = cgTmp()
+        text code = cgTmp()
+        cgOut(`  ${fails} = call i64 @festina_test_failures()`)
+        cgOut(`  ${failed} = icmp ne i64 ${fails}, 0`)
+        cgOut(`  ${code} = select i1 ${failed}, i32 1, i32 0`)
+        cgOut(`  ret i32 ${code}`)
+    } else {
+        cgOut('  ret i32 0')
+    }
     cgOut('}')
 
     // The section layout festina/codegen.py's own `generate` builds:

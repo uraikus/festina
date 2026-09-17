@@ -940,3 +940,40 @@ class TestBootstrapCodegenMatchesPython:
         assert reproduced >= 358118, (
             f"file-specific IR lines reproduced fell to {reproduced}; "
             f"the port previously emitted at least 358118")
+
+
+class TestTheTestBuildMatchesPython(TestBootstrapCodegenMatchesPython):
+    """claude.md #341: the same differential, over a `festina test`
+    build.
+
+    The port of the test type covered what an ordinary build does --
+    remove every assertion -- because that was the only thing
+    `bootstrap/irdumpf.f` could produce. Its `--tests` argument is what
+    makes the EMITTING half comparable at all: group registration, the
+    comparison per type, the rendered source line, `.near`, and the
+    report and exit code in main.
+
+    Deliberately a separate comparison from `irdiff.compare` rather
+    than a widening of it. Every canary in the registry calls that
+    function, and the sweep is already the longest-running thing here;
+    doubling its work to cover one mechanism would be a bad trade. This
+    runs the corpus once more instead, which is bounded and explicit.
+
+    Over the WHOLE corpus, not just the file that declares a group:
+    with assertions enabled every file's `main` grows the report call
+    and the exit-code select, so the part of this that is not about
+    `test` bindings gets 131 witnesses rather than one.
+    """
+
+    @pytest.mark.parametrize("rel", [
+        os.path.relpath(p, difftest.REPO_ROOT) for p in difftest.corpus()
+    ])
+    def test_test_build_matches_the_python_codegen(self, codegen_binary, rel):
+        path = os.path.join(difftest.REPO_ROOT, rel)
+        status, detail = irdiff.compare_tests(codegen_binary, path)
+        if status == "unported":
+            pytest.skip(f"not ported yet: {detail}")
+        assert status in ("match", "rejected"), (
+            f"{rel}: line {detail[0] + 1}\n"
+            f"  python:  {detail[1]}\n"
+            f"  festina: {detail[2]}")
