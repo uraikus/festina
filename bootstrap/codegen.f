@@ -1285,6 +1285,14 @@ map[int] SF_WEAK_TARGET = {}
 // paying nothing and paying something.
 bool CG_USES_WEAK = false
 
+// claude.md #333: whether the expression being emitted right now is
+// about to be used as a RECEIVER -- the base of a member access, read
+// or write. A struct-typed field is created when it is reached as a
+// receiver, which is what keeps `b.inner.n` working with nothing
+// assigned, and read as it stands when it is not, so a terminal read
+// answers null instead of creating the thing the question was about.
+bool CG_RECV_CTX = false
+
 // Structs every one of whose fields is a scalar. Only those can have a
 // LOCAL yet: a struct with a struct/arr/map/text field is released
 // through a generated per-type cascade wrapper rather than the plain
@@ -2882,7 +2890,15 @@ Val func cgFieldPtr(e:Node) {
         }
     }
     CG_FIELD_DIRECT = false
+    // claude.md #333: the base is a receiver. Saved and restored rather
+    // than set and cleared, because a receiver's own base is a receiver
+    // too and `a.b.c` nests -- by the time cgLoadFieldValue runs for
+    // THIS link the flag is back to whatever the caller's context was,
+    // which is exactly the question "is this link itself a receiver".
+    bool savedRecv = CG_RECV_CTX
+    CG_RECV_CTX = true
     Val obj = cgExpr(childOf(e, 'obj'))
+    CG_RECV_CTX = savedRecv
     if CG_STUCK { return none }
     // claude.md #92: img.width / img.height -- a runtime CALL rather
     // than a field read, because an img is a pointer to a box whose
@@ -3104,6 +3120,40 @@ Val func cgLoadFieldValue(fp:Val) {
         wv.sname = fp.sname
         wv.ety = fp.ety
         return wv
+    }
+    // claude.md #333: a terminal read of a STRUCT-typed field answers
+    // what the field holds. Creating the value here is what made such a
+    // field impossible to observe absent -- the question created its
+    // own answer, so `node.next != null` was true for every node in a
+    // list, `x.field = null` could not be read back, and `cur =
+    // cur.next` walked an endlessly self-extending list.
+    //
+    // AFTER the weak branch above, deliberately: a weak field is
+    // struct-typed too, and reaching this first turns its read into a
+    // plain load of the control block rather than an upgrade through
+    // it -- a pointer to the wrong thing entirely.
+    //
+    // Struct only. An arr[T]/map[T] field's zero value is a real empty
+    // container rather than an absent one, and a null array is worse
+    // than an empty one: `.length` on it reads past the null page
+    // instead of faulting.
+    if CG_RECV_CTX == false {
+        if fp.fty == 'struct' {
+            text sread = cgTmp()
+            cgOut(`  ${sread} = load ptr, ptr ${fp.v}`)
+            // fp.fty, not a hardcoded 'struct'. Only a struct reaches
+            // this branch today, so the two are the same -- but the
+            // original returns the field's own type here, and a copy
+            // that agrees only by never being asked is the kind of
+            // divergence a differential test cannot see. It also made
+            // the canary for this rule report a type confusion instead
+            // of the mechanism.
+            Val sv = cgVal(sread, 'ptr', fp.fty)
+            sv.sname = fp.sname
+            sv.ety = fp.ety
+            if fp.isAmor { sv.isAmor = true }
+            return sv
+        }
     }
     text payload = cgFieldPayload(fp)
     if payload == '' {

@@ -20,15 +20,12 @@ non-default port and a leak on a repeated query key, both found while
 verifying it; the thirty-second read is fixed in #331, where the cause
 turned out not to be the one reported; the quadratic cycle-collector
 walk is fixed in #332, by `weak` fields — checked on read rather than
-the uncounted raw pointer the report proposed, so they cannot dangle.
-These are what is left, most damaging first.
+the uncounted raw pointer the report proposed, so they cannot dangle;
+the struct field that could never read as `null` is fixed in #333, by a
+rule about terminal reads rather than the narrower one about null tests
+that the report suggested, which would have left a list walk still
+non-terminating. These are what is left, most damaging first.
 
-- **A struct-typed field can never read as `null`.** A struct, array or
-  map field is created empty the first time it is *reached*, including
-  by `== null`, so `if node.next != null` is always true and
-  `x.field = null` followed by `x.field == null` is `false`. Vivify on
-  write and on member access, not on a null test. Every workaround for
-  it is a parallel boolean or an id that is 0 when absent.
 - **`'' == null` is `true`,** in a local, a struct field, an array
   element and a map value — a NUL-terminated `char *` with no header
   cannot tell them apart. It matters immediately for HTML, where
@@ -261,12 +258,12 @@ included:
 
 | | |
 |---|---|
-| lexer | 126 match, 0 differ |
-| parser | 126 match, 0 differ, 0 unported |
-| semantic | 126 match, 0 differ, 0 unported |
-| escape analysis | 115 match, 0 differ, 0 unported — 2,240 of 2,240 records |
-| codegen | 115 match, 0 differ, 0 unported — 423,147 of 423,147 IR lines |
-| canaries | 153 registered, 0 missed — 146 caught, 7 via the ratchet |
+| lexer | 127 match, 0 differ |
+| parser | 127 match, 0 differ, 0 unported |
+| semantic | 127 match, 0 differ, 0 unported |
+| escape analysis | 116 match, 0 differ, 0 unported — 2,248 of 2,248 records |
+| codegen | 116 match, 0 differ, 0 unported — 422,239 of 422,239 IR lines |
+| canaries | 156 registered, 0 missed — 149 caught, 7 via the ratchet |
 
 All ten of the bootstrap's own files reproduce their own compilation
 byte for byte, and the second-generation binary built from that IR is

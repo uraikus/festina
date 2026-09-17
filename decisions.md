@@ -6980,3 +6980,73 @@ each on the case file written for it, which the report says out loud.
 Adding the weak-target exception to `cgReleaseFnFor` also went stale on
 `struct-cascade`'s anchor, which the registry reported as BROKEN rather
 than passing; re-aimed.
+
+333. A QUESTION THAT CREATED ITS OWN ANSWER
+
+**`if node.next != null` was true for every node in a list.** Reported
+by uraikus/archtelos-browser, whose every workaround for it was a
+parallel boolean or an id that is 0 when absent. specification.md 8.9.2
+creates a struct/array/map FIELD the first time it is reached -- which
+is what makes `b.inner.n` and `b.xs.push(1)` work with nothing assigned
+first -- and a plain read counted as a reach, so the test that asked
+whether anything was there created something for the question to be
+about.
+
+**Three shapes of it, and the second is the one that shows the size of
+the problem.** `x.field == null` was false for a never-assigned field.
+`x.field = null` followed by `x.field == null` was ALSO false, so a
+program could not read back its own write. And `cur = cur.next` walked a
+list that extended itself forever, which is why this was not merely
+untidy: the natural spelling of a list walk did not terminate.
+
+**The todo entry's own prescription was "vivify on write and on member
+access, not on a null test", and the narrow reading of that is not
+enough.** Implemented literally -- only a `== null` operand reads rather
+than creates -- the first two shapes are fixed and the third is not,
+because `cur = cur.next` is a plain binding rather than a null test. The
+rule that works is about TERMINAL reads: a struct field is created when
+it is reached as a RECEIVER, the base of a member access read or write,
+and otherwise answers what it holds. Found by writing the list-walk test
+first and watching it hang.
+
+**Struct only, and this was measured before it was decided.** The
+obvious symmetry is to give arr[T] and map[T] fields the same rule. They
+must not have it: their zero value is a real EMPTY container rather than
+an absent one, and a program handed a null array is worse off than one
+handed an empty one. `arr[int] xs = null` followed by `xs.length` does
+not fault -- it printed 94746664194904, reading whatever is eight bytes
+past the null page. Trading a papercut for that would have been a bad
+deal, so containers keep creating on every reach and are never null.
+
+**The flag is saved and restored rather than set and cleared**, because
+a receiver's own base is a receiver too. In `a.b.c`, `a.b` is reached
+through and `c` is not, so one link creates and the next does not;
+`cases/field_null.f`'s `nestedLinks` is the witness for exactly that.
+
+**Ordering bug, caught by the previous slice's own tests.** The
+terminal-read branch went in ahead of #332's weak-field branch, and a
+weak field is struct-typed too -- so a weak read became a plain load of
+the control block instead of an upgrade through it, handing back a
+pointer to the wrong object entirely. `weak_fields.f`'s "reads back as
+its target" test failed immediately. The two branches are order-
+dependent and now say so.
+
+**And the copy agreed only by never being asked.** `bootstrap/codegen.f`
+hardcoded `'struct'` as the result type of this branch where the
+original returns the field's own type. Identical today, since only a
+struct reaches it -- but the canary written for the container half then
+reported a type confusion rather than the mechanism, which is how it
+was noticed. A differential test cannot see a divergence in a path
+neither side takes.
+
+**Verified.** 10 tests in tests/test_field_null.py, written before the
+implementation, covering both halves: the terminal read answering null,
+and every receiver use still creating. Three canaries, one per
+independent half of the rule -- creating on a terminal read (the
+original bug), NOT creating on a receiver read (which would fault
+reaching through an untouched field), and applying it to containers
+(which would hand a program a null array). All caught. Corpus is 127
+files; every harness green, and the codegen figure went DOWN, from
+423,147 to 422,239 file-specific lines, despite the case file adding
+about 1,400: the fix deletes a branch and an allocation from every
+terminal struct-field read in the corpus.

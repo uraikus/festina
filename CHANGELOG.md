@@ -75,10 +75,10 @@ round-by-round design and implementation record predating 0.1 lives in
 - **The bootstrap compiler is complete.** `bootstrap/` holds Festina's
   own compiler, written in Festina, and every one of its five passes
   now agrees with the Python implementation it mirrors on **every file
-  of the 126-file corpus** — including its own source, which is
-  122,000 lines of IR on its own. Lexer, parser and analyzer: 126
-  match, 0 differ each. Escape analysis: 2,240 of 2,240 records.
-  Codegen: 423,147 of 423,147 file-specific IR lines, byte for byte.
+  of the 127-file corpus** — including its own source, which is
+  122,000 lines of IR on its own. Lexer, parser and analyzer: 127
+  match, 0 differ each. Escape analysis: 2,248 of 2,248 records.
+  Codegen: 422,239 of 422,239 file-specific IR lines, byte for byte.
   The eleven files neither side compiles are deliberately ill-formed
   sources the corpus keeps so that both implementations are checked on
   the rejection as well as the acceptance.
@@ -88,8 +88,8 @@ round-by-round design and implementation record predating 0.1 lives in
   against its original. Reaching the end of the blocker table is a
   statement about this corpus rather than about the language — a
   construct no file exercises is unmeasured however carefully both
-  sides were written, which is what `bootstrap/canary.py`'s 153
-  deliberate breakages exist to say out loud. All 153 are caught — 146
+  sides were written, which is what `bootstrap/canary.py`'s 156
+  deliberate breakages exist to say out loud. All 156 are caught — 149
   outright, 7 through the coverage ratchet. The sweep also turned up a
   failure mode the report cannot distinguish on its own: one canary had
   stopped being a breakage rather than stopped being visible, because
@@ -362,6 +362,21 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Fixed
 
+- **A struct-typed field could never read as `null`.** Auto-vivification
+  creates a struct, array or map field the first time it is reached, and
+  a plain read counted as a reach — so the test that asked whether
+  anything was there created something for the question to be about.
+  `if node.next != null` was true for every node in a list,
+  `x.field = null` followed by `x.field == null` was `false`, and
+  `cur = cur.next` walked a list that extended itself forever. A struct
+  field is now created only when it is reached **as a receiver** (the
+  base of a member access, read or write, which is what `b.inner.n`
+  needs) and otherwise answers what it holds. `arr[T]`/`map[T]` fields
+  are deliberately unchanged: their zero value is a real *empty*
+  container, and a null array would be worse than an empty one. Reported
+  by
+  [uraikus/archtelos-browser](https://github.com/uraikus/archtelos-browser).
+  (decisions.md #333)
 - **A large response waited for the read timeout instead of finishing.**
   A 640 KB page took 15 seconds against this project's own server, where
   `curl` fetched it in 7 milliseconds. The read loop cached the end of

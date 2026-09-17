@@ -1737,6 +1737,39 @@ CANARIES = [
         cgOut('  call void @festina_weak_died(ptr %payload)')
     }""",
     ),
+    # claude.md #333: the terminal-read rule. Three canaries because the
+    # rule has three independent halves and breaking any one of them
+    # produces a different wrong compiler: creating on a terminal read
+    # (the original bug), NOT creating on a receiver read (which would
+    # fault reaching through an untouched field), and applying it to
+    # containers (which would hand a program a null array).
+    Canary(
+        "a-terminal-field-read-does-not-create", "#333",
+        "reading a struct field without reaching through it answers "
+        "what the field holds rather than creating a value",
+        """    if CG_RECV_CTX == false {
+        if fp.fty == 'struct' {""",
+        """    if false {
+        if fp.fty == 'struct' {""",
+    ),
+    Canary(
+        "a-receiver-field-read-still-creates", "#333",
+        "a field reached THROUGH is still created, which is the whole "
+        "reason auto-vivification exists",
+        """    bool savedRecv = CG_RECV_CTX
+    CG_RECV_CTX = true""",
+        """    bool savedRecv = CG_RECV_CTX
+    CG_RECV_CTX = false""",
+    ),
+    Canary(
+        "container-fields-are-not-covered-by-the-null-rule", "#333",
+        "an arr[T]/map[T] field's zero value is an empty container, not "
+        "an absent one, so it is still created on a terminal read",
+        """        if fp.fty == 'struct' {
+            text sread = cgTmp()""",
+        """        if fp.fty == 'struct' || fp.fty == 'arr' || fp.fty == 'map' {
+            text sread = cgTmp()""",
+    ),
 ]
 BY_NAME = {c.name: c for c in CANARIES}
 

@@ -640,11 +640,14 @@ anything is assigned to it:
 | `bool` | `false` |
 | `text`, `ascii`, handles, `enum`, `func`, `table` rows | `null` |
 | `color` | `null` (the same value as `none`) |
-| `struct`, `arr[T]`, `map[T]` | an empty value, created on first reach (§8.9.2) |
+| `struct` | `null` for a FIELD until something creates it (§8.9.2); an empty value for a local or global |
+| `arr[T]`, `map[T]` | an empty value, created on first reach (§8.9.2) |
 
-A struct field, a global, or a local of struct, array or map type reads
-as a fresh empty value the first time it is reached, and that value
-persists. An `int`, `float` or `bool` local declared without an
+A global or a local of struct, array or map type, and an array- or
+map-typed field, reads as a fresh empty value the first time it is
+reached, and that value persists. **A struct-typed FIELD is different**:
+it is created when it is reached as a receiver, and otherwise reads as
+whatever it holds — `null` until something puts a value there (§8.9.2). An `int`, `float` or `bool` local declared without an
 initializer must be assigned before it is read; reading it first is
 undefined. A `table`-row local must be declared with an initializer
 (§8.10). [#97, #178, #191]
@@ -853,8 +856,31 @@ A never-assigned field reads as its type's zero value (§8.2). A field,
 local or global whose type is a struct, array or map is created empty
 on first reach — read or write — once, and keeps its identity
 afterwards, so `b.inner.n` and `b.xs.push(1)` work with nothing assigned
-first. A `weak` field is the one exception: it is never vivified, and
-reads as `null` until something is assigned to it (§13.5). [#97, #332]
+first.
+
+**A struct-typed FIELD is created only when it is reached as a
+receiver** — as the base of a member access, read or write, which is
+what `b.inner.n` and `o.inner.n = 5` need. Read any other way — bound,
+compared, passed, returned — it answers what it holds, which is `null`
+until something puts a value there, and `null` again after `x.f = null`.
+
+Without this a struct field could never be observed absent: the test
+that asked created the thing it was asking about. `if node.next != null`
+was true for every node in a list, `x.field = null` followed by
+`x.field == null` was `false`, and `cur = cur.next` walked a list that
+extended itself forever.
+
+**This is struct-only, deliberately.** An `arr[T]` or `map[T]` field's
+zero value is a real *empty* container rather than an absent one, so
+those are still created on any reach and are never `null`; a program
+handed a null array would be worse off than one handed an empty one,
+since `.length` on it reads past the null page rather than faulting. It
+applies to a FIELD only: a local or global of any of the three is
+created at its declaration and is never `null`.
+
+A `weak` field goes further: it is never created at all, on any use, and
+reads as `null` until something is assigned to it (§13.5). [#97, #332,
+#333]
 
 #### 8.9.3 Structs as query targets
 

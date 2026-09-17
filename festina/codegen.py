@@ -1007,6 +1007,14 @@ class CodeGen:
         # claude.md #332: name -> frozenset of `weak` field names.
         self.weak_fields = getattr(analyzed, "weak_fields", {}) or {}
         self._weak_target_cache = None     # struct names some weak field targets
+        # claude.md #333: whether the expression being emitted right now
+        # is about to be used as a RECEIVER -- the base of a member
+        # access, read or write. A struct-typed field is created when it
+        # is reached as a receiver (which is what keeps `b.inner.n`
+        # working with nothing assigned) and read as it stands when it
+        # is not, so a terminal read answers null instead of creating
+        # the thing the question was about.
+        self._receiver_ctx = False
         self.struct_order = list(analyzed.structs.keys())
         self.tables = analyzed.tables          # name -> {field: festina-type-name}
         self.enums = analyzed.enums            # claude.md #176: name -> semantic._EnumInfo
@@ -6405,7 +6413,8 @@ class CodeGen:
                 # which would run any side effects in it twice.
                 ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
                 return self._load_field_value(
-                    ptr, ftype, lines, weak=self._is_weak_field(obj_type, expr))
+                    ptr, ftype, lines, weak=self._is_weak_field(obj_type, expr),
+                    no_vivify=not self._receiver_ctx)
             if not expr.computed and expr.prop in ("port", "method", "path", "headers", "state"):
                 obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
                 result = self._emit_http_socket_field(expr, obj_val, obj_type, lines)
@@ -6416,7 +6425,8 @@ class CodeGen:
                 # fallthrough just above) -- resolves the ordinary way.
                 ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
                 return self._load_field_value(
-                    ptr, ftype, lines, weak=self._is_weak_field(obj_type, expr))
+                    ptr, ftype, lines, weak=self._is_weak_field(obj_type, expr),
+                    no_vivify=not self._receiver_ctx)
             if not expr.computed and expr.prop == "length":
                 # claude.md #79: an arr[T] value is a `ptr` to its own
                 # {i64, ptr} storage now, so .length is a GEP+load of
@@ -8750,7 +8760,7 @@ class CodeGen:
         state = self._begin_member_chain(expr)
         handled = None
         try:
-            obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+            obj_val, obj_type = self._emit_receiver(expr.obj, env, lines)
             if not expr.computed:
                 handled = self._emit_http_socket_field(expr, obj_val, obj_type, lines)
             if handled is not None:
@@ -8758,7 +8768,8 @@ class CodeGen:
             else:
                 ptr, ftype = self._member_ptr_from(obj_val, obj_type, expr, lines)
                 out, ftype = self._load_field_value(
-                    ptr, ftype, lines, weak=self._is_weak_field(obj_type, expr))
+                    ptr, ftype, lines, weak=self._is_weak_field(obj_type, expr),
+                    no_vivify=not self._receiver_ctx)
         finally:
             pending = self._end_member_chain(state)
         if handled is not None:
@@ -8994,7 +9005,23 @@ class CodeGen:
             return False
         return expr.prop in self.weak_fields.get(obj_type.name, frozenset())
 
-    def _load_field_value(self, ptr, ftype, lines, weak=False):
+    def _emit_receiver(self, node, env, lines):
+        """claude.md #333: emit `node` as the BASE of a member access.
+
+        The only difference from _emit_expr is the flag, which tells a
+        struct-typed field load at the end of `node` to create its value
+        rather than answer null -- `b.inner.n` has to keep working with
+        nothing assigned, and that is the whole reason auto-vivification
+        exists. Saved and restored rather than set and cleared, because
+        a receiver's own base is a receiver too and `a.b.c` nests."""
+        prev = self._receiver_ctx
+        self._receiver_ctx = True
+        try:
+            return self._emit_expr(node, env, lines)
+        finally:
+            self._receiver_ctx = prev
+
+    def _load_field_value(self, ptr, ftype, lines, weak=False, no_vivify=False):
         """Loads one field, giving a struct/arr[T]/map[T]-typed one real
         storage the first time it is reached.
 
@@ -9031,6 +9058,34 @@ class CodeGen:
             lines.append(f"  {blk} = load ptr, ptr {ptr}")
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_weak_get(ptr {blk})")
+            return out, ftype
+
+        if no_vivify and isinstance(ftype, types_mod.StructType):
+            # AFTER the weak branch above, deliberately: a weak field is
+            # struct-typed too, and reaching this first turned its read
+            # into a plain load of the control block rather than an
+            # upgrade through it -- a pointer to the wrong thing
+            # entirely. Caught by cases/weak_fields.f's own test.
+            #
+            # claude.md #333: a terminal read of a STRUCT-typed field
+            # answers what the field holds. Creating the value here is
+            # what made such a field impossible to observe absent -- the
+            # question created its own answer, so `node.next != null`
+            # was true for every node in a list, `x.field = null` could
+            # not be read back, and `cur = cur.next` walked an endlessly
+            # self-extending list. Reaching the field AS A RECEIVER
+            # still creates it, which is what keeps `b.inner.n` working
+            # with nothing assigned first.
+            #
+            # Struct only, deliberately. An arr[T]/map[T] field's zero
+            # value is a real empty container, not an absent one, and
+            # handing a program a null array would be a worse bug than
+            # the one this fixes: `.length` on one reads whatever is
+            # eight bytes past the null page -- measured, it printed
+            # 94746664194904 rather than faulting. specification.md
+            # 8.9.2 says so explicitly.
+            out = self.tmp()
+            lines.append(f"  {out} = load ptr, ptr {ptr}")
             return out, ftype
 
         if not isinstance(ftype, (types_mod.StructType, types_mod.ArrayType,
@@ -9113,7 +9168,7 @@ class CodeGen:
         # type (map vs array), which delegating to this function
         # (re-emitting expr.obj from scratch every time it's called)
         # can't guarantee.
-        obj_val, obj_type = self._emit_expr(expr.obj, env, lines)
+        obj_val, obj_type = self._emit_receiver(expr.obj, env, lines)
         return self._member_ptr_from(obj_val, obj_type, expr, lines)
 
     def _member_ptr_from(self, obj_val, obj_type, expr, lines):
@@ -11151,7 +11206,7 @@ class CodeGen:
                 # the owner's TYPE survives the call -- weakness is a
                 # property of the field and `ftype` alone cannot report
                 # it. expr.target.obj is still emitted exactly once.
-                tobj_val, tobj_type = self._emit_expr(expr.target.obj, env, lines)
+                tobj_val, tobj_type = self._emit_receiver(expr.target.obj, env, lines)
                 ptr, ftype = self._member_ptr_from(tobj_val, tobj_type,
                                                    expr.target, lines)
                 weak_target = self._is_weak_field(tobj_type, expr.target)
