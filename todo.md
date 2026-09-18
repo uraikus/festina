@@ -125,16 +125,6 @@ larger than they look.
   its own answers for cycles, map ordering and NaN first, and nothing
   has asked for it yet.
 
-- **A test build for `bootstrap/`.** The port of #341 covers what a
-  corpus file can measure: the declaration parses and analyses the same
-  on both sides, and an ordinary build removes every assertion. What has
-  no harness is the EMITTING half, because `bootstrap/irdumpf.f`
-  compiles the way `festina compile` does. Giving it a `festina test`
-  mode of its own would put the group registration, the comparison per
-  type, the rendered source line and the report under the same
-  byte-exact differential as everything else — worth doing before the
-  `test` type grows any further.
-
 - **Research a `gguf` type, for talking to a model directly.** The
   open questions are what the value actually owns (a memory-mapped
   file? a loaded context?), what the call surface is, and whether the
@@ -185,25 +175,32 @@ statement about this corpus, not about the language: a construct no
 file exercises is unmeasured however carefully both sides were
 written, which is what `bootstrap/canary.py` exists to say out loud.
 
-- **`bootstrap/lexer.f` does not follow Python's `repr()` into
-  scientific notation.** The canonical token dump renders a float with
-  Python's `str()`, which switches to exponent form below 1e-4 and at
-  1e17 and above (`0.0000000001` prints as `1e-10`); the Festina lexer
-  reproduces the trailing-zero half of `repr()` but keeps the source
-  spelling otherwise, so it emits `0.0000000001`. No corpus file
-  contains a literal outside the plain-decimal range, so the
-  differential test has never seen it — found by adding
-  `cases/float_bits.f` for the codegen port (decisions.md #290), whose
-  small value is `0.0001` for exactly this reason.
+- **`cgParseFloat`'s exact-conversion window is narrow, and it is now
+  the only float gap left.** decisions.md #342 fixed the DUMPS: a float
+  compares by its IEEE-754 bit pattern, so the token dump and the AST
+  dump both render the double a literal actually denotes, and both
+  implementations agree over 652 generated literals including
+  subnormals. What is still narrow is `bootstrap/codegen.f`'s own
+  decimal→double conversion, which is exact only for at most 18
+  significant digits with the digit string below 2^53, and reports
+  anything else **unported**.
 
-  Fixing it properly means shortest-round-trip float formatting in
-  Festina (Grisu/Ryū), which is its own piece of work. The alternative
-  worth weighing first is changing what the dump renders: the IEEE-754
-  bit pattern is exact, machine-independent, and something both sides
-  can already produce — `bootstrap/codegen.f` has the encoder — but it
-  would require the *reverse* conversion to be exact for every literal
-  too, and the fast path there refuses values like
-  `0.30000000000000004`.
+  So these compile in the shipped compiler and not in the port:
+
+  ```festina
+  float big = 10000000000000000.0       // 1e16, 17 digits, >= 2^53
+  float excess = 1.23456789012345678901 // 21 significant digits
+  float past = 9007199254740993.0       // the nearest double ends ...992
+  ```
+
+  The window is not arbitrary — `d / 10^k` is a single correctly-rounded
+  division exactly when `d < 2^53` and `10^k` is representable (k ≤ 22),
+  which is why it stops there. Widening it means a real correctly-
+  rounded decimal→binary conversion in Festina (the Clinger/Eisel-Lemire
+  problem), which is its own piece of work and the reason the roadmap
+  used to point at Grisu/Ryū for the other direction. Nothing needs it
+  yet: no program in the repository carries such a literal, and a
+  corpus file cannot contain one without the port reporting it unported.
 
 ## Deliberate behavior (documented, not planned work)
 

@@ -171,7 +171,18 @@ text func dumpNode(n:Node) {
     while i < n.fields.length {
         Field f = n.fields[i]
         out = out + ' :' + f.name + '='
-        if f.tag == 'raw' { out = out + f.raw }
+        if f.tag == 'raw' {
+            // claude.md #342: a NumberLit's float value renders as its
+            // IEEE-754 bit pattern, matching bootstrap/astdump.py. The
+            // node itself keeps the DECIMAL, which is what codegen
+            // converts -- only the dump renders bits, because only the
+            // dump is the thing being compared.
+            if n.kind == 'NumberLit' && f.name == 'value' && hasDot(f.raw) {
+                out = out + doubleHex(f.raw.toFloat())
+            } else {
+                out = out + f.raw
+            }
+        }
         else if f.tag == 'node' { out = out + dumpNode(f.node) }
         else {
             // A list may hold '#str' markers rather than real nodes --

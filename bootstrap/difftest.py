@@ -20,6 +20,7 @@ tests/test_bootstrap_lexer.py drives the same functions from pytest.
 """
 import ast
 import os
+import struct
 import subprocess
 import sys
 
@@ -90,11 +91,30 @@ KNOWN_DIVERGENCES = {}
 def _number_value(value):
     """NUMBER carries its kind alongside its value, because `1` and `1.0`
     are different tokens to the parser and would otherwise render the
-    same. Floats go through repr(), which bootstrap/lexer.f's
-    normalizeFloat() matches by stripping trailing zeros down to (but
-    never past) one digit after the point."""
+    same.
+
+    claude.md #342: a float renders as its IEEE-754 BIT PATTERN rather
+    than as `repr()`. What a lexer produces for a float literal is a
+    double, and the bit pattern is that double exactly -- so this
+    compares the thing the two lexers can actually disagree about, and
+    each side can produce it from the same source without implementing
+    shortest-round-trip decimal formatting.
+
+    `repr()` was the obvious choice and it asked the port for something
+    `bootstrap/lexer.f` does not do at all: that lexer echoes the source
+    text with trailing zeros stripped, which agrees with `repr()` only
+    when the source spelling already IS the shortest round-trip form.
+    Six of eight measured probes diverged -- not only the exponent-form
+    thresholds the roadmap recorded, but every literal carrying more
+    precision than a double can hold.
+
+    Equally discriminating, not less: `repr()` round-trips a double
+    exactly, so two doubles share a repr precisely when they share a bit
+    pattern. Less readable, which is the price.
+    """
     if isinstance(value, float):
-        return "float " + repr(value)
+        bits = struct.unpack("<Q", struct.pack("<d", value))[0]
+        return f"float 0x{bits:016X}"
     return "int " + str(value)
 
 

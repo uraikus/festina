@@ -40,6 +40,12 @@ while i < toks.length {
     Tok t = toks[i]
     if t.kind == 'REGEX' {
         out = out + `${t.line}:${t.col}|REGEX|${esc(t.val)}|${esc(t.extra)}`
+    } else if isFloatToken(t) {
+        // claude.md #342: a float compares by its IEEE-754 bit pattern.
+        // Converted HERE rather than in the lexer, because the token
+        // value is what the parser reads and codegen converts -- the
+        // bits are an oracle artifact, not a compiler datum.
+        out = out + `${t.line}:${t.col}|${t.kind}|float ${doubleHex(floatTokenValue(t).toFloat())}`
     } else {
         out = out + `${t.line}:${t.col}|${t.kind}|${esc(t.val)}`
     }

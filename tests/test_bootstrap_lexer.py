@@ -131,3 +131,88 @@ class TestTheDifferentialTestCanFail:
         assert two_slash_lines, (
             "division_vs_regex.f has no line with two '/' on it, so it no "
             "longer tests regex-vs-division disambiguation at all")
+
+
+class TestFloatLiteralsAgreeOutsideTheCorpus:
+    """claude.md #342: the float ranges no corpus file can contain.
+
+    A float token compares by its IEEE-754 bit pattern, because that is
+    what a float literal is. The old rule compared Python's `repr()`,
+    which `bootstrap/lexer.f` could only match when the source spelling
+    already was the shortest round-trip form -- so every literal
+    carrying more precision than a double holds diverged, as did every
+    one outside the plain-decimal range where `repr()` switches to
+    exponent form.
+
+    `cases/float_extremes.f` covers what it can, and that is bounded:
+    `cgParseFloat` in `bootstrap/codegen.f` converts a decimal exactly
+    only inside a window (at most 18 significant digits, digit string
+    below 2^53) and reports anything else unported, so the
+    large-magnitude and excess-precision halves cannot appear in a
+    corpus file at all. They are real all the same, and this is where
+    they are measured -- generated rather than checked in, because
+    thousands of literals belong in a loop rather than in a source file.
+    """
+
+    LITERALS = None
+
+    @classmethod
+    def _literals(cls):
+        if cls.LITERALS is not None:
+            return cls.LITERALS
+        import random
+        lits = [
+            # Plain, and the trailing-zero case the old rule existed for.
+            "1.0", "0.5", "1.50", "127.0", "2.718281828459045",
+            # repr() switches to exponent form below 1e-4 ...
+            "0.00001", "0.0000000001",
+            # ... and at 1e16, which the roadmap recorded as 1e17.
+            "10000000000000000.0", "123456789012345680.0",
+            # More precision than a double holds -- the larger half of
+            # the divergence, and nothing to do with exponents.
+            "1.23456789012345678901", "3.14159265358979311600",
+            "1.0000000000000000055511151231257827",
+            # An integer past 2^53: the nearest double ends ...992.
+            "9007199254740993.0",
+            # Values whose shortest form is famously not their arithmetic.
+            "0.30000000000000004", "1.0000000000000002",
+        ]
+        rng = random.Random(4242)
+        for _ in range(600):
+            whole = rng.randint(0, 10 ** rng.randint(1, 17))
+            frac = rng.randint(0, 10 ** rng.randint(1, 18))
+            lits.append(f"{whole}.{frac}")
+        # Every decade down to and past the smallest subnormal. The
+        # encoder has a separate branch for those, and its first version
+        # returned zero for all of them -- a constant written as 2^537
+        # that was not a power of two. Nothing in the corpus reaches
+        # this far, so only a probe aimed here could say so.
+        for zeros in range(0, 330, 3):
+            lits.append("0." + "0" * zeros + "13")
+        cls.LITERALS = lits
+        return lits
+
+    def test_every_generated_literal_agrees(self, lexer_binary, tmp_path):
+        lits = self._literals()
+        source = "\n".join(f"float v{i} = {lit}" for i, lit in enumerate(lits)) + "\n"
+        path = tmp_path / "floats.f"
+        path.write_text(source, encoding="utf-8")
+        status, detail = difftest.compare(lexer_binary, str(path))
+        assert status == "match", (
+            f"token {detail[0]}\n  python:  {detail[1]}\n  festina: {detail[2]}")
+
+    def test_the_sample_really_spans_the_hard_ranges(self):
+        """A generated sample that quietly stopped covering the ranges it
+        was written for would pass while measuring nothing -- the
+        `cases/float_bits.f` lesson (decisions.md #290), where a literal
+        outside its intended range made the case file vacuous."""
+        vals = [float(x) for x in self._literals()]
+        tiny = sum(1 for v in vals if 0 < v < 1e-4)
+        huge = sum(1 for v in vals if v >= 1e16)
+        subnormal = sum(1 for v in vals if 0 < v < 2.2250738585072014e-308)
+        excess = sum(1 for x in self._literals()
+                     if len(x.replace(".", "").lstrip("0")) > 17)
+        assert tiny >= 20, f"only {tiny} literals below the 1e-4 threshold"
+        assert huge >= 2, f"only {huge} literals at or above 1e16"
+        assert subnormal >= 5, f"only {subnormal} subnormals"
+        assert excess >= 3, f"only {excess} literals with excess precision"

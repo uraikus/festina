@@ -25,6 +25,7 @@ port that quietly loses them would still pass a structural-only
 comparison.
 """
 import os
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -58,7 +59,14 @@ def dump_value(value):
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
-        return repr(value)
+        # claude.md #342: the IEEE-754 bit pattern, for the reason
+        # bootstrap/difftest.py's _number_value gives -- a float literal
+        # IS a double, and repr() asks the port to reproduce a decimal
+        # spelling it has no way to compute. Same divergence as the
+        # token dump had, one layer up, and latent only because no
+        # corpus file carried a literal that triggers it.
+        bits = struct.unpack("<Q", struct.pack("<d", value))[0]
+        return f"0x{bits:016X}"
     if isinstance(value, str):
         return '"' + _esc(value) + '"'
     if isinstance(value, ast_mod.Node):

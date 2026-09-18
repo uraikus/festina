@@ -83,6 +83,112 @@ bool func isWs(c:int) {
 }
 
 // ---------------------------------------------------------------------
+// claude.md #342: a double as its IEEE-754 bit pattern, which is what
+// the canonical token dump compares for a float literal.
+//
+// The same arithmetic recovery codegen.f's own cgDoubleHex uses --
+// Festina has no bitwise operators and no float-bit access, so the
+// fields come out by normalizing into [1, 2) while counting the
+// exponent, then scaling the mantissa by 2^52. Sign and exponent print
+// as three hex digits and the mantissa as thirteen, rather than being
+// assembled into one integer, because setting bit 63 would overflow a
+// signed i64.
+//
+// Unlike cgDoubleHex this handles SUBNORMALS rather than refusing them.
+// A codegen can report a construct unported; a lexer has no such
+// answer, and `0.000...1` with enough zeros is an ordinary literal
+// somebody may write. The scale is done in two steps because 2^1074 is
+// not itself representable.
+
+text HEXDIGITS = '0123456789ABCDEF'
+
+text func hexN(value:int, digits:int) {
+    text out = ''
+    int v = value
+    int i = 0
+    while i < digits {
+        int d = v % 16
+        out = HEXDIGITS.charCodeAt(d).toChar() + out
+        // Math.floorDiv, not `/`: `/` always answers float (claude.md
+        // #61), so plain division would turn the running value into a
+        // double and lose the low bits of a 52-bit mantissa.
+        v = Math.floorDiv(v, 16)
+        i++
+    }
+    return out
+}
+
+// claude.md #342: whether a token is a float literal, and the decimal
+// text inside it. Both dumps need the same two answers, and `text` has
+// no .slice() (claude.md #273), so the split is done once here rather
+// than spelled out at each site.
+// claude.md #342: whether a literal's text is a float, which is the
+// same '.' test codegen uses to recover the lexer's int/float tag from
+// a NumberLit that no longer carries it.
+bool func hasDot(v:text) {
+    int i = 0
+    while i < v.length {
+        if v.charCodeAt(i) == 46 { return true }
+        i++
+    }
+    return false
+}
+
+bool func isFloatToken(t:Tok) {
+    if t.kind != 'NUMBER' { return false }
+    arr[text] ps = t.val.split(' ')
+    return ps[0] == 'float'
+}
+
+text func floatTokenValue(t:Tok) {
+    arr[text] ps = t.val.split(' ')
+    return ps[1]
+}
+
+text func doubleHex(v:float) {
+    if v == 0.0 { return '0x0000000000000000' }
+    int sign = 0
+    float av = v
+    if v < 0.0 {
+        sign = 1
+        av = 0.0 - v
+    }
+    int e = 0
+    while av >= 2.0 {
+        av = av / 2.0
+        e++
+    }
+    while av < 1.0 {
+        av = av * 2.0
+        e = e - 1
+    }
+    if e < 0 - 1022 {
+        // Subnormal: no implicit leading 1, and a zero exponent field.
+        // The encoding is frac * 2^-1074, and the loops above already
+        // left av in [1, 2) with value = av * 2^e -- so frac is
+        // av * 2^(e + 1074), and e + 1074 is at most 51 here. A short
+        // doubling loop, every step exact.
+        //
+        // The first version reached for a constant 2^537 to apply twice
+        // (2^1074 not being representable) and wrote a number that was
+        // not a power of two at all, which made every subnormal encode
+        // as zero. Nothing in the corpus has one, so only a test aimed
+        // at this branch could have said so.
+        int shift = e + 1074
+        float sc = av
+        int k = 0
+        while k < shift {
+            sc = sc * 2.0
+            k++
+        }
+        int sfrac = Math.round(sc)
+        return `0x${hexN(sign * 2048, 3)}${hexN(sfrac, 13)}`
+    }
+    int frac = Math.round((av - 1.0) * 4503599627370496.0)
+    return `0x${hexN(sign * 2048 + e + 1023, 3)}${hexN(frac, 13)}`
+}
+
+// ---------------------------------------------------------------------
 // Keyword tables, mirroring festina/lexer.py's KEYWORDS (SPEC_KEYWORDS
 // plus _EXTRA_KEYWORDS) and its _EXPR_ENDING_TOKEN_TYPES.
 
@@ -590,10 +696,23 @@ arr[Tok] func tokenize(src:blob, from:int, to:int) {
             Tok t
             t.kind = 'NUMBER'
             if isFloat {
-                // A float is compared against Python's repr(), so 1.50
-                // and 1.5 have to agree. Trailing zeros go, but never
-                // the last digit: 127.0 stays 127.0, matching
-                // repr(127.0) rather than becoming "127.".
+                // claude.md #342: the canonical dump compares a float
+                // by its IEEE-754 BIT PATTERN, not by a decimal
+                // spelling. It used to compare Python's repr(), which
+                // this could only match when the source spelling
+                // already was the shortest round-trip form -- every
+                // literal carrying more precision than a double holds
+                // diverged, as did every one outside the plain-decimal
+                // range where repr() switches to exponent form.
+                //
+                // The token keeps the DECIMAL: the parser reads this
+                // text and codegen converts it, so the compiler's own
+                // data stays what it always was. Only the dumps render
+                // bits, which is where the comparison happens --
+                // `doubleHex` below is for them, not for this.
+                //
+                // Trailing zeros still go, but never the last digit:
+                // 127.0 stays 127.0 rather than becoming "127.".
                 int end = i
                 while end > pos && src.byteAt(from + end - 1) == 48 { end = end - 1 }
                 if end > pos && src.byteAt(from + end - 1) == 46 { end = end + 1 }
