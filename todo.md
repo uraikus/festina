@@ -152,17 +152,23 @@ open:
 ## The bootstrap compiler
 
 **The port is complete.** Every pass agrees with its original on every
-file of the corpus, the bootstrap's own 122,000-line-of-IR source
+file of the corpus, the bootstrap's own 125,769-line-of-IR source
 included:
 
 | | |
 |---|---|
-| lexer | 131 match, 0 differ |
-| parser | 131 match, 0 differ, 0 unported |
-| semantic | 131 match, 0 differ, 0 unported |
-| escape analysis | 118 match, 0 differ, 0 unported — 2,275 of 2,275 records |
-| codegen | 118 match, 0 differ, 0 unported — 426,716 of 426,716 IR lines |
+| lexer | 132 match, 0 differ |
+| parser | 132 match, 0 differ, 0 unported |
+| semantic | 132 match, 0 differ, 0 unported |
+| escape analysis | 119 match, 0 differ, 0 unported — 2,340 of 2,340 records |
+| codegen | 119 match, 0 differ, 0 unported — 434,471 of 434,471 IR lines |
 | canaries | 161 registered, 0 missed — 154 caught, 7 via the ratchet |
+
+The corpus is 132 files, of which 119 compile and 13 are rejected by
+both implementations, so the two column shapes above are the whole of
+it either way. The 434,471 is file-specific IR: `irdiff`'s shared
+preamble is subtracted per file, which is why it is smaller than 119
+whole dumps added together.
 
 All ten of the bootstrap's own files reproduce their own compilation
 byte for byte, and the second-generation binary built from that IR is

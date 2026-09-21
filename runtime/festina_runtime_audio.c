@@ -504,6 +504,49 @@ static int festina_pool_limit(void) {
     return limit;
 }
 
+/* How far ahead of real time the streaming thread may run before it
+ * waits. A real device paces playback by itself: snd_pcm_writei (and
+ * the AudioQueue/waveOut shims above) block once the device's buffer
+ * is full, so the writes themselves take about as long as the audio
+ * lasts. A device that accepts everything instantly -- ALSA's own null
+ * plugin, which is what a machine with no sound hardware gets, and the
+ * FESTINA_AUDIO_NULL sink -- paces nothing, and the thread then
+ * "plays" a two-second clip in microseconds. specification.md says
+ * `clip.isPlaying()` is "true while any channel plays this clip", and
+ * on such a device that was true for less time than it takes to reach
+ * the next statement.
+ *
+ * So the thread waits for real time to catch up. The lead matches the
+ * 500ms buffer festina_pcm_dev_open configures, which is what a real
+ * device is allowed to be filled ahead by -- so on real hardware the
+ * writes are already slower than this and nothing here ever sleeps.
+ * It is the non-pacing sinks that this brings back to real time. */
+#define FESTINA_AUDIO_LEAD_NS 500000000LL
+
+/* Waits until `frames_streamed` frames' worth of real time has passed
+ * since `started`, less the lead above. Returns immediately -- without
+ * a syscall -- whenever the device has already taken at least that
+ * long, which is the real-hardware case. */
+static void festina_audio_pace(const struct timespec *started,
+                               uint64_t frames_streamed, unsigned int rate) {
+    if (rate == 0) return;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
+    int64_t elapsed_ns = (int64_t)(now.tv_sec - started->tv_sec) * 1000000000LL
+                       + (int64_t)(now.tv_nsec - started->tv_nsec);
+    int64_t due_ns = (int64_t)((frames_streamed * 1000000000ULL) / rate)
+                   - FESTINA_AUDIO_LEAD_NS;
+    int64_t ahead_ns = due_ns - elapsed_ns;
+    if (ahead_ns <= 0) return;
+    struct timespec wait;
+    wait.tv_sec = (time_t)(ahead_ns / 1000000000LL);
+    wait.tv_nsec = (long)(ahead_ns % 1000000000LL);
+    /* EINTR just means a signal arrived; the loop re-checks
+     * stop_requested at the top either way, so a short sleep is not
+     * worth restarting. */
+    nanosleep(&wait, NULL);
+}
+
 /* The playback thread's whole job: stream already-decoded PCM to ALSA
  * in small chunks, checking stop_requested between each one so a stop
  * gets a prompt response rather than waiting for the entire clip to
@@ -518,6 +561,14 @@ static void *festina_audio_thread_main(void *arg) {
     FestinaAudio *a = ch->clip;
     const size_t chunk_frames = 4096;
     size_t frame = 0;
+    /* Pacing (see festina_audio_pace): counted across repetitions, not
+     * reset per loop, because real time does not reset either. */
+    struct timespec started;
+    uint64_t frames_streamed = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) {
+        started.tv_sec = 0;
+        started.tv_nsec = 0;
+    }
 
     for (;;) {
         pthread_mutex_lock(&g_audio_lock);
@@ -553,6 +604,8 @@ static void *festina_audio_thread_main(void *arg) {
             ch->pcm, a->samples + frame * (size_t)a->channels, this_chunk);
         if (written < 0) break;
         frame += (size_t)written;
+        frames_streamed += (uint64_t)written;
+        festina_audio_pace(&started, frames_streamed, a->sample_rate);
     }
 
     pthread_mutex_lock(&g_audio_lock);

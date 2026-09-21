@@ -4570,6 +4570,17 @@ alternative would be breaking a reservation you asked for.
 while any channel is playing that clip. To ask about a single
 playback, name its channel with `isAudioPlayerPlaying(n)` instead.
 
+It stays true for the clip's real duration even when nothing can be
+heard. A machine with no sound hardware, and `FESTINA_AUDIO_NULL=1`,
+both give you a device that accepts audio as fast as it is handed over
+— so without care a two-second clip would finish "playing" before the
+next statement ran, and `isPlaying()` would answer `false` from a clip
+that had only just started. Playback is paced to the clip's own sample
+rate instead, so a silent device behaves like a real one and timing
+built on `isPlaying()` works the same on a developer machine with no
+speakers as on a user's. A real device already paces itself and is
+unaffected.
+
 ## `log()` / `fail()` / `close()`
 
 ```festina

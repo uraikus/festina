@@ -6968,6 +6968,36 @@ class TestAudio:
         assert result.returncode == 0
         assert result.stdout.strip() == "true"
 
+    def test_a_clip_is_still_playing_part_way_through_its_own_duration(
+        self, compile_and_run, tmp_path, audio_null_env
+    ):
+        """specification.md's `clip.isPlaying()`: "true while any channel
+        plays this clip". A two-second clip is therefore still playing
+        half a second in, and that is the whole assertion.
+
+        The two tests above assert the same property at a moment the
+        main thread reaches within microseconds of play(), so they hold
+        whenever the main thread wins a race against the streaming
+        thread -- which, on a device that accepts PCM as fast as it can
+        be handed over, is the only reason they ever passed. Running
+        them under `-n` loses that race and both go red. This one
+        cannot be won by luck: half a second is not a scheduling
+        margin, and before the pacing in festina_runtime_audio.c it
+        reported `false` every single time.
+        """
+        _write_wav(tmp_path / "clip.wav", duration_s=2.0)
+        source = (
+            "aud music = 'clip.wav'\n"
+            "void func check() {\n"
+            "    log(music.isPlaying())\n"
+            "}\n"
+            "music.play()\n"
+            "setTimeout(check, 500)\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
     def test_max_audio_players_is_readable_and_clamped(self, compile_and_run):
         # claude.md #98: the limit is a tuning knob, so an unreasonable
         # value is clamped into [1, 64] rather than failing the program.

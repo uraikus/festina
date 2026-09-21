@@ -7777,3 +7777,55 @@ with `-fsanitize=address`), and copying it made the check run and pass:
 AddressSanitizer and LeakSanitizer. The check had already been run by
 hand before that; a check that ran once and was not kept is not
 coverage, which is why it is a test.
+
+343. A SILENT AUDIO DEVICE PLAYED A TWO-SECOND CLIP IN MICROSECONDS
+
+specification.md's audio table says `clip.isPlaying()` is "true while
+any channel plays this clip". On a machine with no sound hardware it
+was true for about as long as a memcpy.
+
+**The mechanism.** The playback thread writes decoded PCM to the
+device in 4,096-frame chunks and exits when it runs out. A real device
+paces that by itself: `snd_pcm_writei` blocks once the buffer is full,
+so writing two seconds of audio takes about two seconds. A device that
+accepts everything instantly paces nothing -- ALSA's own null plugin,
+which is what `$HOME/.asoundrc` gives a machine with no `/dev/snd` at
+all, and the `FESTINA_AUDIO_NULL` sink, whose own comment called it an
+"instant sink". The thread drained the whole clip immediately and
+cleared `active`, so `isPlaying()` could answer `false` about a clip
+that had started microseconds earlier.
+
+**So the thread waits for real time to catch up.** `festina_audio_pace`
+sleeps for the difference between the audio streamed so far and the
+wall clock, less a 500ms lead that matches the buffer
+`festina_pcm_dev_open` configures. On real hardware the writes are
+already slower than that, the computed wait is negative, and nothing
+sleeps -- no syscall, no behaviour change. It is only the non-pacing
+sinks this brings back to real time. The include comment at the top of
+the file has referred to "nanosleep -- the null device's pacing stub"
+for a long time; there was no `nanosleep` anywhere in the file.
+
+**Found by an unrelated change, which is the part worth recording.**
+Two tests asserted this property -- `isPlaying()` immediately after
+`play()` -- and both passed, every time, for as long as they had
+existed. They were racing the streaming thread and winning: the main
+thread usually reaches the next statement before a thread that has to
+be scheduled at all. Running the suite under `pytest -n` lost that
+race and both went red, three runs out of three.
+
+That looked exactly like a test broken by parallelism, and the first
+guess was the obvious one: a shared audio device. It is not, and
+checking took one look -- `audio_null_env` builds a private `HOME` and
+`.asoundrc` under `tmp_path`, so each test has a device of its own.
+Parallelism changed nothing about the audio stack; it only changed who
+won a race that should never have been one.
+
+**The test that replaced them does not race.** A two-second clip,
+`setTimeout(check, 500)`, and `isPlaying()` must be true half a second
+in -- which is what the specification sentence means, stated as an
+assertion. Half a second is not a scheduling margin. It reported
+`false` every single time before the fix, serially, with no
+parallelism involved, which is how a latent flake should have been
+written in the first place. The two original tests are kept: they
+assert the same property at a different moment, and now they hold
+because the property holds rather than because the scheduler was kind.
