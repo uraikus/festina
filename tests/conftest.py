@@ -5,7 +5,7 @@ doesn't exist yet, and what its assumed API looks like.
 """
 import importlib
 import os
-import random
+import select
 import shutil
 import subprocess
 import sys
@@ -255,24 +255,37 @@ def ir_of(parser, semantic, codegen):
     return _ir
 
 
-def _free_tcp_port():
+def _reserve_tcp_port():
     """claude.md #151: an OS-assigned free port, for openPort()'s own
     literal (Festina's source text, not the running process, decides
     what port to listen on -- there's no way to hand a compiled
     program a port at runtime the way an env var could, so the source
-    itself has to name a real, currently-unused one). Binding to port
-    0 and reading back what the OS actually chose, then closing
-    immediately, is the standard TOCTOU-accepting way to pick one --
-    another process could in principle grab it in the gap before this
-    fixture's own compiled binary opens it, but that race is the same
-    one every "find a free port for a test" fixture anywhere already
-    accepts, not something specific to this feature."""
+    itself has to name a real, currently-unused one).
+
+    Returns `(port, sock)` and leaves `sock` BOUND. The caller closes it
+    immediately before starting the compiled program. Holding the
+    reservation is what makes this usable under `pytest -n`: this used
+    to bind, read the port, and close at once, which left the port
+    unclaimed for the whole compile-and-link that follows -- about a
+    second -- and with four workers each doing this a hundred-odd times
+    the kernel handed the same port to two of them often enough to be
+    seen (`could not connect to '127.0.0.1:18313'`). While the socket
+    stays bound the kernel will not hand that port to another bind(0),
+    so workers cannot collide with each other at all.
+
+    What remains is the residual TOCTOU every "find a free port" helper
+    anywhere accepts: between this close and the program's own bind,
+    an unrelated process could take it. That window is now milliseconds
+    instead of a compile, and it is the same risk this had when the
+    suite ran serially.
+
+    Binding and closing without ever accepting a connection leaves no
+    TIME_WAIT behind, so the program's own bind is not refused.
+    """
     import socket as _socket
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    return s.getsockname()[1], s
 
 
 @pytest.fixture
@@ -392,7 +405,7 @@ def compile_and_run_server(tmp_path, codegen, cli_mod):
             self.sock.close()
 
     def _run(source_template, filename="main.f"):
-        port = _free_tcp_port()
+        port, reservation = _reserve_tcp_port()
         # claude.md #151: NOT str.format() -- Festina source is full of
         # its own bare `{`/`}` (every block body, every map literal),
         # which .format() would misread as format-spec placeholders.
@@ -402,6 +415,9 @@ def compile_and_run_server(tmp_path, codegen, cli_mod):
         src_path.write_text(source, encoding="utf-8")
         out_path = tmp_path / "program"
         compile_file_or_skip(cli_mod, str(src_path), str(out_path), cc=cc)
+        # Held all the way through the compile above, so no other worker
+        # can be handed this port meanwhile -- see _reserve_tcp_port.
+        reservation.close()
         process = subprocess.Popen(
             [str(out_path)], cwd=tmp_path,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -506,7 +522,7 @@ def compile_and_run_secure_server(tmp_path, codegen, cli_mod):
             return _socket.create_connection(("127.0.0.1", self.port), timeout=timeout)
 
     def _run(source_template, filename="main.f"):
-        port = _free_tcp_port()
+        port, reservation = _reserve_tcp_port()
         cert_path = tmp_path / "combined.pem"
         key_pem = tmp_path / "key.pem"
         crt_pem = tmp_path / "crt.pem"
@@ -524,6 +540,9 @@ def compile_and_run_secure_server(tmp_path, codegen, cli_mod):
         src_path.write_text(source, encoding="utf-8")
         out_path = tmp_path / "program"
         compile_file_or_skip(cli_mod, str(src_path), str(out_path), cc=cc)
+        # Held through the certificate generation and the compile above
+        # -- see _reserve_tcp_port.
+        reservation.close()
         process = subprocess.Popen(
             [str(out_path)], cwd=tmp_path,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -750,34 +769,102 @@ def x_display():
         pytest.skip("no DISPLAY set and Xvfb isn't installed -- needed to test "
                      "claude.md #37/#39's graphics functions against a real window")
 
-    display_num = f":{random.randint(100, 9999)}"
-    proc = subprocess.Popen(
-        [xvfb, display_num, "-screen", "0", "1024x768x24"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    # Poll for the server actually accepting connections (via xdotool,
-    # already required by anything using this fixture) rather than a
-    # fixed sleep -- a flat 0.5s was reliable running this file alone
-    # but flaky as part of the full suite (more system load, presumably
-    # a slower Xvfb startup), so wait for a real readiness signal
-    # instead of guessing a longer constant.
-    deadline = time.time() + 10
-    ready = False
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            pytest.fail(f"Xvfb on {display_num} exited immediately (see its exit code: {proc.returncode})")
-        probe = subprocess.run(
-            ["xdotool", "getdisplaygeometry"],
-            env=dict(os.environ, DISPLAY=display_num),
-            capture_output=True, text=True,
-        )
-        if probe.returncode == 0:
-            ready = True
+    # The SERVER picks the display number and tells us which it took,
+    # via -displayfd. Choosing one here instead -- which this fixture
+    # used to do, with random.randint(100, 9999) -- cannot be made
+    # correct, and under `-n` it is not even rare: two workers draw the
+    # same number, the second Xvfb exits with "server already active",
+    # and the readiness probe passes anyway because the FIRST worker's
+    # server is answering on that number. The second worker then
+    # silently borrows the first's display, and when the first test
+    # finishes and tears it down, the second's compiled program dies
+    # with "could not open the X display". A probe cannot tell "my
+    # server is up" from "someone else's server is up here", so the
+    # guess has to go rather than the probe.
+    #
+    # -displayfd also IS the readiness signal: the number is written
+    # when the server is ready to accept connections, which is exactly
+    # what the old xdotool poll was approximating.
+    # Retried, because -displayfd fixes the COLLISION above but not
+    # everything: under `-n` these servers are started and torn down
+    # constantly, the search always starts at 0, and low display numbers
+    # get recycled between processes within milliseconds of each other.
+    # One run in 3,877 tests came back with a display Xvfb had reported
+    # as ready and whose socket was gone by the time the compiled
+    # program tried to open it. The mechanism is NOT established -- the
+    # likeliest reading is an exiting server unlinking a socket path a
+    # new one had just taken over, but nothing here proves that. So
+    # rather than write a fix for a cause I cannot demonstrate, the
+    # display is checked for real before it is handed out, and a dud is
+    # thrown away and retried. That cannot hide a Festina bug: it only
+    # governs whether this fixture's own X server is usable.
+    def _spawn():
+        read_fd, write_fd = os.pipe()
+        try:
+            proc = subprocess.Popen(
+                [xvfb, "-displayfd", str(write_fd), "-screen", "0", "1024x768x24"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                pass_fds=(write_fd,),
+            )
+        finally:
+            os.close(write_fd)      # so the read below sees EOF if Xvfb dies
+
+        chunks = []
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not select.select([read_fd], [], [], 0.1)[0]:
+                if proc.poll() is not None:
+                    break
+                continue
+            chunk = os.read(read_fd, 64)
+            if not chunk:
+                break               # EOF: the server is gone
+            chunks.append(chunk)
+            if b"\n" in chunk:
+                break
+        os.close(read_fd)
+        reported = b"".join(chunks).decode("ascii", "replace").strip()
+        return proc, reported
+
+    def _answers(reported):
+        """Whether that display's socket actually accepts a connection.
+
+        A plain AF_UNIX connect rather than xdotool: this only has to
+        establish that the endpoint is there, and -displayfd already
+        replaced the readiness poll xdotool used to do, so depending on
+        it again here would be reintroducing a tool this no longer
+        needs.
+        """
+        import socket as _socket
+        probe = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        try:
+            probe.settimeout(2)
+            probe.connect(f"/tmp/.X11-unix/X{reported}")
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+
+    proc = None
+    display_num = None
+    failures = []
+    for _ in range(3):
+        proc, reported = _spawn()
+        if reported.isdigit() and _answers(reported):
+            display_num = f":{reported}"
             break
-        time.sleep(0.1)
-    if not ready:
+        failures.append(reported or f"exit code {proc.returncode}")
         proc.terminate()
-        pytest.fail(f"Xvfb on {display_num} never became ready to accept connections")
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    if display_num is None:
+        pytest.fail(
+            "Xvfb never gave a usable display over three attempts "
+            f"(got {failures!r}) -- it did not become ready to accept "
+            "connections")
 
     try:
         yield display_num

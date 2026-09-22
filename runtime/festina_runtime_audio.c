@@ -528,14 +528,15 @@ static int festina_pool_limit(void) {
  * a syscall -- whenever the device has already taken at least that
  * long, which is the real-hardware case. */
 static void festina_audio_pace(const struct timespec *started,
-                               uint64_t frames_streamed, unsigned int rate) {
+                               uint64_t frames_streamed, unsigned int rate,
+                               int64_t lead_ns) {
     if (rate == 0) return;
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
     int64_t elapsed_ns = (int64_t)(now.tv_sec - started->tv_sec) * 1000000000LL
                        + (int64_t)(now.tv_nsec - started->tv_nsec);
     int64_t due_ns = (int64_t)((frames_streamed * 1000000000ULL) / rate)
-                   - FESTINA_AUDIO_LEAD_NS;
+                   - lead_ns;
     int64_t ahead_ns = due_ns - elapsed_ns;
     if (ahead_ns <= 0) return;
     struct timespec wait;
@@ -605,7 +606,24 @@ static void *festina_audio_thread_main(void *arg) {
         if (written < 0) break;
         frame += (size_t)written;
         frames_streamed += (uint64_t)written;
-        festina_audio_pace(&started, frames_streamed, a->sample_rate);
+        festina_audio_pace(&started, frames_streamed, a->sample_rate,
+                           FESTINA_AUDIO_LEAD_NS);
+    }
+
+    /* Drain before declaring the channel idle. Writing the last frame
+     * is not the same as having played it: a real device still holds up
+     * to a buffer's worth, and the lead above is exactly how far ahead
+     * of audible reality this thread is allowed to get. Without this a
+     * clip SHORTER than the lead is never paced at all -- it fits
+     * entirely inside the allowance, so the loop above never waits once
+     * -- and `isPlaying()` goes false almost immediately, which is what
+     * examples/beep.wav (0.35s) did. A stop() is not drained: the point
+     * of stopping is to be silent now. */
+    pthread_mutex_lock(&g_audio_lock);
+    int stopped = ch->stop_requested;
+    pthread_mutex_unlock(&g_audio_lock);
+    if (!stopped) {
+        festina_audio_pace(&started, frames_streamed, a->sample_rate, 0);
     }
 
     pthread_mutex_lock(&g_audio_lock);

@@ -75,7 +75,13 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
       - name: Run the test suite
-        run: python -m pytest tests/ -q
+        # decisions.md #344: the bootstrap differential in parallel,
+        # everything else serially. 43m44s against 1:49:52 for a plain
+        # serial run. The macOS and Windows jobs below keep using
+        # `pytest tests/` directly: the bootstrap harnesses are
+        # Linux-only (decisions.md #287) and skip there, so the split
+        # would buy them nothing.
+        run: scripts/run_tests.sh -q
       - name: Compile and run a WASM example
         # claude.md #148/wasm.md's own exit criterion: a real .wasm
         # binary, built via `festina compile --target=wasm32-wasi`,

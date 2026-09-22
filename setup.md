@@ -268,9 +268,29 @@ need to.
 ## Running the test suite
 
 ```bash
-pip install -r requirements-dev.txt   # pytest
-pytest tests/                         # see counts below
+pip install -r requirements-dev.txt   # pytest, pytest-xdist
+pytest tests/                         # serial; see counts below
+scripts/run_tests.sh -q               # the same tests, 2.5x faster
 ```
+
+`pytest tests/` runs everything serially and takes about 1h50m. Almost
+all of that — 92.8%, measured — is the bootstrap differential, whose
+161 canaries each build a whole compiler. Those builds share nothing,
+so `scripts/run_tests.sh` runs them one per CPU and runs the rest of
+the suite serially, finishing in about 44 minutes. See
+[decisions.md](decisions.md) #344 for why the split is drawn there
+instead of parallelising everything.
+
+For a single harness by hand, the one worth knowing is:
+
+```bash
+pytest tests/test_bootstrap_canary.py -n auto --dist worksteal
+```
+
+`--dist worksteal` matters: xdist's default hands each worker a
+consecutive block of tests, which lands every canary on one worker.
+Stay serial when you are reading a failure rather than waiting on a
+suite — output comes out in source order.
 
 Some tests need extra tools that aren't Python packages, so they're not
 in any requirements file:

@@ -1,1 +1,16 @@
 pytest>=7
+pytest-xdist>=3
+
+# pytest-xdist takes the suite from 1:49:52 to 43m44s. 92.8% of
+# its wall time is tests/test_bootstrap_canary.py and
+# tests/test_bootstrap_codegen.py (measured: 6,116s of 6,593s), and
+# nearly all of that is 161 canaries, each of which builds a whole
+# compiler from a deliberately broken copy of bootstrap/ and scans the
+# corpus with it. Those builds are independent -- `canary.build_patched`
+# copies the tree into its own TemporaryDirectory and never writes to
+# the repository, which tests/test_bootstrap_canary.py asserts directly
+# -- so they are the textbook case for running N at once.
+#
+# scripts/run_tests.sh is what uses it. pytest.ini deliberately does NOT
+# turn it on for the whole suite: the rest of the tests each want a
+# singleton the machine has one of, and stay serial (decisions.md #344).

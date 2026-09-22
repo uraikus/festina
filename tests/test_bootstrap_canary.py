@@ -22,12 +22,22 @@ single test turning red. `bootstrap/canary.py` holds the registry; this
 drives it.
 
 Each case builds a compiler from a deliberately broken copy of
-`bootstrap/` (never the repository itself -- see `build_patched`), so
-the whole module costs about ninety seconds. It is not marked slow and
-not deselected: a canary suite nobody runs is exactly the prose in a
+`bootstrap/` (never the repository itself -- see `build_patched`, and
+`repository_is_not_written_to` below, which checks it per canary
+rather than trusting that sentence). It is not marked slow and not
+deselected: a canary suite nobody runs is exactly the prose in a
 commit message this replaced. Linux-only, like every other bootstrap
 harness and for the same reason (decisions.md #287).
+
+It is also, by a wide margin, the most expensive thing in this
+repository: 161 whole-compiler builds, measured at 6,116s of a 6,593s
+serial suite -- 92.8%. That is what `scripts/run_tests.sh` runs in
+parallel (decisions.md #344), and these builds sharing no state is the
+only reason it is allowed. The docstring above used to say "about
+ninety seconds"; it was written when there were fifty-five canaries
+and `bootstrap/codegen.f` was not yet in the corpus.
 """
+import hashlib
 import os
 import sys
 
@@ -37,6 +47,25 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bootstrap import canary as canary_mod   # noqa: E402
 from bootstrap import irdiff                 # noqa: E402
+
+
+def _bootstrap_tree_digest():
+    """A digest of every Festina source under `bootstrap/`.
+
+    The canaries patch `bootstrap/codegen.f`, `bootstrap/lexer.f` and
+    `bootstrap/parser.f`, so those are what a bug would disturb -- but
+    digesting the whole directory costs the same and does not have to
+    be revisited when a canary is aimed somewhere new.
+    """
+    src_dir = os.path.join(irdiff.REPO_ROOT, "bootstrap")
+    h = hashlib.sha256()
+    for name in sorted(os.listdir(src_dir)):
+        if not name.endswith(".f"):
+            continue
+        h.update(name.encode("utf-8"))
+        with open(os.path.join(src_dir, name), "rb") as fh:
+            h.update(fh.read())
+    return h.hexdigest()
 
 
 class TestTheRegistryIsWellFormed:
@@ -90,7 +119,20 @@ class TestTheCorpusCanStillSeeEachMechanism:
     round: those are the ones worth knowing about.
     """
 
-    @pytest.fixture(scope="module")
+    # SESSION-scoped, not module-scoped, and the difference is worth
+    # 2,750 seconds. Under `-n`, pytest-xdist hands each worker tests in
+    # scheduler order, freely interleaved across modules -- so a
+    # module-scoped fixture is torn down whenever a worker moves to
+    # another file and REBUILT when it comes back. With 161 canaries
+    # scattered among 3,716 other tests, each worker paid this
+    # baseline's ~148s bootstrap rebuild over and over: the full suite
+    # ran in 5,221s where the arithmetic said 2,475s, while this module
+    # ALONE ran at 3.66x parallel efficiency. Running the file by itself
+    # hides the whole effect, which is why it has to be said here.
+    # Nothing about the baseline is per-module: it is a clean compiler
+    # and the Python side's dump of every corpus file, and neither
+    # depends on which test asks.
+    @pytest.fixture(scope="session")
     def baseline(self, tmp_path_factory):
         from tests.conftest import _require_bootstrap_platform, _require_c_compiler
         _require_bootstrap_platform()
@@ -103,6 +145,33 @@ class TestTheCorpusCanStillSeeEachMechanism:
             "report 'undetected' for a reason that has nothing to do "
             "with the corpus")
         return base
+
+    @pytest.fixture(autouse=True)
+    def repository_is_not_written_to(self):
+        """Every canary, checked for the property parallelism rests on.
+
+        `canary.build_patched` copies the whole of `bootstrap/` into a
+        scratch directory and patches the COPY, so 161 canaries can be
+        built at once without colliding -- which is what pytest-xdist
+        does here (decisions.md #344), and the only reason this module
+        is affordable to run at all.
+
+        Patching in place would still pass every assertion below: the
+        canary would compile, the corpus would notice, and the verdict
+        would be identical. It would simply leave a deliberately broken
+        compiler checked out for whichever test ran next. So the
+        property has to be checked directly rather than inferred from a
+        green run, and checking it per canary costs a few hundred
+        microseconds against a build measured in tens of seconds.
+        """
+        before = _bootstrap_tree_digest()
+        yield
+        assert _bootstrap_tree_digest() == before, (
+            "a canary wrote to bootstrap/ in the repository instead of "
+            "to its own copy. Every later test in this session is now "
+            "running against a deliberately broken compiler, and under "
+            "-n that corruption is racing whatever the other workers "
+            "are building.")
 
     @pytest.mark.parametrize("name", [c.name for c in canary_mod.CANARIES])
     def test_breaking_it_on_purpose_is_noticed(self, baseline, name, tmp_path):

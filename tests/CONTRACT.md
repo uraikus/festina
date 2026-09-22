@@ -4125,11 +4125,40 @@ design, verified against a real (virtual) ALSA device via
 ## Running
 
 ```
-pip install -r requirements-dev.txt   # pytest
-pytest tests/                          # 605 passed, 323 skipped (needs a C compiler; 2 of
-                                        # those skips need `pip install pyinstaller` too,
-                                        # 15 need Xvfb + xdotool installed too, 1 of those
-                                        # also needs `openbox` and 4 need `xwd`) given a
-                                        # working C compiler,
-                                        # all 1061 pass
+pip install -r requirements-dev.txt   # pytest, pytest-xdist
+pytest tests/                          # 3,826 passed, 51 skipped on this Linux container,
+                                        # with a C compiler, Xvfb + xdotool + xwd, openbox
+                                        # and the WASM toolchain all present. Each missing
+                                        # tool turns its own tests into skips rather than
+                                        # failures -- see setup.md's table for which.
+                                        # Serial: 1:49:52.
+scripts/run_tests.sh -q                # the same tests in 43m44s: 2,040s parallel
+                                        # for the bootstrap half, 583s serial for the rest
 ```
+
+Serially this suite takes **1:49:52**, and 92.8% of that (6,116s of
+6,593s) is `tests/test_bootstrap_canary.py` and
+`tests/test_bootstrap_codegen.py`, where 161 canaries each build a
+whole compiler from a deliberately broken copy of `bootstrap/`.
+`scripts/run_tests.sh` runs those in parallel and everything else
+serially. decisions.md #344 has the measurement and the reason the
+split is drawn there; #343 records why running tests through an LLVM
+JIT was measured and rejected — it works, and it can only reach 2.5%
+of the clock.
+
+The property that makes the parallel half safe is that
+`canary.build_patched` copies `bootstrap/` into its own temporary
+directory and never writes to the repository. That is asserted per
+canary by an autouse fixture which digests every `.f` under
+`bootstrap/` before and after. It earns its place: with the bug put
+back, the canary's own assertion **passed**, against a repository it
+had just corrupted, and only the teardown digest failed.
+
+The serial half is serial for a reason of its own. Those tests each
+want a singleton the machine has one of — a TCP port named in a
+Festina literal, an X server, an audio device — and several passed
+only because nothing else was competing for it. Running them four-wide
+surfaced four separate latent races, three of which are now fixed on
+their merits (decisions.md #343, #344). That is what the split buys
+beyond speed: the fast half is the half that was provably independent
+all along.

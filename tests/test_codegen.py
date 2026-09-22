@@ -6998,6 +6998,38 @@ class TestAudio:
         assert result.returncode == 0
         assert result.stdout.strip() == "true"
 
+    def test_a_clip_shorter_than_the_device_buffer_is_still_paced(
+        self, compile_and_run, tmp_path, audio_null_env
+    ):
+        """The gap the first version of the pacing left open.
+
+        festina_audio_pace lets the thread run up to one device buffer
+        (500ms) ahead of real time, so that a real device -- which is
+        allowed to be filled that far ahead -- never waits. A clip
+        SHORTER than that allowance fits inside it entirely, so the
+        streaming loop never waited once and a 0.35s clip went back to
+        finishing instantly. examples/beep.wav is 0.35s, and
+        tests/test_examples.py's audio demo caught it; this pins the
+        property at the unit level, where the duration is written down
+        next to the assertion instead of living in a checked-in file.
+
+        Draining before the channel goes idle is what fixes it, and it
+        is the more faithful behaviour anyway: writing the last frame is
+        not the same as having played it.
+        """
+        _write_wav(tmp_path / "clip.wav", duration_s=0.3)
+        source = (
+            "aud beep = 'clip.wav'\n"
+            "void func check() {\n"
+            "    log(beep.isPlaying())\n"
+            "}\n"
+            "beep.play()\n"
+            "setTimeout(check, 100)\n"
+        )
+        result = compile_and_run(source, env=audio_null_env)
+        assert result.returncode == 0
+        assert result.stdout.strip() == "true"
+
     def test_max_audio_players_is_readable_and_clamped(self, compile_and_run):
         # claude.md #98: the limit is a tuning knob, so an unreasonable
         # value is clamped into [1, 64] rather than failing the program.

@@ -259,14 +259,17 @@ class TestThreadedHttpServerExample:
         import time
         import urllib.request
 
-        from tests.conftest import _free_tcp_port, _require_c_compiler, compile_file_or_skip
+        from tests.conftest import _reserve_tcp_port, _require_c_compiler, compile_file_or_skip
 
         cc = _require_c_compiler()
         src = os.path.join(EXAMPLES_DIR, "threaded_http_server.f")
         out = tmp_path / "threaded_http_server"
         compile_file_or_skip(cli_mod, str(src), str(out), cc=cc)
 
-        port = _free_tcp_port()
+        # This example takes its port on argv rather than baking it into
+        # the source, so the reservation is held right up to the launch.
+        port, reservation = _reserve_tcp_port()
+        reservation.close()
         proc = subprocess.Popen([str(out), str(port)], cwd=REPO_ROOT,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         try:

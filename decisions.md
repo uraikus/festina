@@ -7829,3 +7829,107 @@ parallelism involved, which is how a latent flake should have been
 written in the first place. The two original tests are kept: they
 assert the same property at a different moment, and now they hold
 because the property holds rather than because the scheduler was kind.
+
+344. THE SUITE WAS SERIAL, AND 92.8% OF IT WAS ONE FILE
+
+`scripts/run_tests.sh` now runs the bootstrap differential in parallel
+and everything else serially: **6,592.77s becomes 43m44s -- 2,040.34s
+for the parallel half and 583.13s for the serial one, 2.51x**. Three
+wrong diagnoses got there, and the wrong ones are the useful part.
+
+**Where the time was.** `pytest tests/ -q` is 6,592.77s (1:49:52),
+3,826 passed. Re-run without the six `tests/test_bootstrap_*.py` files
+it is 476.17s, so those are **6,116.6s -- 92.8%**. The forty slowest
+tests are 74.7% of the clock and all but one are bootstrap rebuilds; no
+behavioural test appears among them. That answered the question this
+started as -- whether tests could run through an LLVM JIT -- in the
+negative, and #343 records the JIT measurement itself.
+
+**The first parallel run returned 1.26%, with two tests red.** Not a
+typo for 1.26x: four workers on four idle cores, 6,400s of work, and
+5,221s of wall. Average parallelism 1.23 on a machine with no cgroup
+quota.
+
+**Two wrong explanations, both plausible, both checked and dead.**
+First: the canary `baseline` fixture was module-scoped, and xdist
+interleaves modules per worker, so it looked like each worker was
+rebuilding a 148s baseline repeatedly. Making it session-scoped was
+correct and changed the wall time by 35 seconds. Second: the shared
+`/tmp/festina-runtime-cache` object files, four workers racing one
+path. Also wrong -- `--durations=0` showed `test_codegen.py` costing
+150.6s in parallel against 125s serially, no meaningful contention at
+all.
+
+**What the measurement actually said**, once it was asked properly:
+
+| | test time | wall | |
+|---|---|---|---|
+| canary file alone | 5,634.7s | 1,516.9s | 3.71x |
+| canary file + test_codegen.py | 5,637.5s | 3,471.4s | 1.62x |
+
+Identical work, identical per-test costs, and the workers idle. That is
+a scheduling problem and nothing else, and reading xdist's source gives
+it exactly:
+
+```python
+items_per_node = len(self.collection) // len(self.node2pending)
+node_chunksize = min(items_per_node // 4, self.maxschedchunk)
+```
+
+`load` sends each worker a CONSECUTIVE chunk to preserve fixture
+locality. For the whole suite that is `3877 // 4 // 4 = 242`, and
+`tests/test_bootstrap_canary.py` collects first with about 167 tests --
+so **one worker got every canary** and ran them alone for 5,400s while
+the other three finished the short tests and idled. The arithmetic
+predicts all three runs: 10 per chunk for the canary file alone
+(balances, 3.71x), 79 for the mixed pair (splits across two workers,
+1.62x), 242 for the suite (one worker, 1.23x). `--dist worksteal` lets
+an idle worker take queued tests off a busy one; the mixed pair went
+from 3,471s to 1,542.68s, and the whole suite to 1,843.83s -- 3.58x.
+
+**So why is the shipped answer 2,624s rather than 1,844s?** Because the
+last 13 minutes cost the suite's honesty. Running everything
+four-wide surfaced four latent races, each a test that had only ever
+passed because nothing was competing with it:
+
+- `isPlaying()` immediately after `play()`, racing the streaming
+  thread. A real bug in the runtime, fixed in #343, and the one that
+  was worth finding.
+- `x_display` choosing its own display number with
+  `random.randint(100, 9999)`. Two workers draw the same one; the
+  loser's Xvfb exits, its readiness probe passes anyway against the
+  winner's server, and it borrows a display that is torn down under
+  it. Fixed with `-displayfd`: the server picks and reports, which is
+  also a true readiness signal, so the xdotool poll is gone.
+- `_free_tcp_port` binding, reading the port, and closing at once,
+  leaving it unclaimed for the whole compile that followed. Now the
+  reservation is held until the moment before the program starts, so
+  workers cannot be handed the same port at all.
+- a test whose Festina source has one thread `openPort` a hardcoded
+  port while another thread fetches it, with nothing ordering the two
+  `on load()` handlers. Not fixed, and not worth fixing: the race is in
+  the test's own setup rather than in what it verifies, and the
+  language has no primitive for waiting on another thread's load
+  (`drain()` waits on the inbound queue, which `on load` never enters).
+
+The first three are fixed on their own merits and stay fixed whether
+anything runs in parallel or not. The fourth is why the behavioural
+tests stay serial: they each want a singleton the machine has one of --
+a port named in a Festina literal, an X server, an audio device -- and
+they are 583s of the 2,624. Buying four minutes by making that population race is a
+bad trade, and the split falls on the natural line anyway. The fast
+half is the half that was provably independent all along, which
+`tests/test_bootstrap_canary.py` now asserts per canary rather than
+claiming in a docstring.
+
+**One display failure remains unexplained, and is recorded as such.**
+About one run in 3,877 tests, a display Xvfb reported ready had no
+socket by the time the compiled program opened it. The likeliest
+reading is an exiting server unlinking a path a new one had just taken
+over -- low display numbers get recycled within milliseconds under
+`-n` -- but nothing here demonstrates it. Rather than write a fix for a
+cause that cannot be shown, the fixture checks the display for real
+before handing it out and retries a dud, and says in a comment that the
+mechanism is unestablished. It cannot mask a compiler bug: it decides
+only whether this fixture's own X server is usable. Running the
+behavioural half serially means it should not arise at all.
