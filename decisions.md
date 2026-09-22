@@ -7833,8 +7833,13 @@ because the property holds rather than because the scheduler was kind.
 344. THE SUITE WAS SERIAL, AND 92.8% OF IT WAS ONE FILE
 
 `scripts/run_tests.sh` now runs the bootstrap differential in parallel
-and everything else serially: **6,592.77s becomes 43m44s -- 2,040.34s
-for the parallel half and 583.13s for the serial one, 2.51x**. Three
+and everything else serially: **6,592.77s becomes 36m40s to 43m44s
+across two runs -- 2.5x to 3.0x**. The spread is what a shared
+four-core machine does to a CPU-bound workload, and is the reason this
+quotes a range rather than the faster sample: #287's standing rule,
+that a wall-clock is a sample and a cost claim needs repeats or it is
+noise, applies to this machine exactly as it applies to a hosted
+runner. Three
 wrong diagnoses got there, and the wrong ones are the useful part.
 
 **Where the time was.** `pytest tests/ -q` is 6,592.77s (1:49:52),
@@ -7887,8 +7892,8 @@ predicts all three runs: 10 per chunk for the canary file alone
 an idle worker take queued tests off a busy one; the mixed pair went
 from 3,471s to 1,542.68s, and the whole suite to 1,843.83s -- 3.58x.
 
-**So why is the shipped answer 2,624s rather than 1,844s?** Because the
-last 13 minutes cost the suite's honesty. Running everything
+**So why is the shipped answer 2,200-2,600s rather than 1,844s?**
+Because the difference costs the suite's honesty. Running everything
 four-wide surfaced four latent races, each a test that had only ever
 passed because nothing was competing with it:
 
@@ -7907,10 +7912,19 @@ passed because nothing was competing with it:
   workers cannot be handed the same port at all.
 - a test whose Festina source has one thread `openPort` a hardcoded
   port while another thread fetches it, with nothing ordering the two
-  `on load()` handlers. Not fixed, and not worth fixing: the race is in
-  the test's own setup rather than in what it verifies, and the
-  language has no primitive for waiting on another thread's load
-  (`drain()` waits on the inbound queue, which `on load` never enters).
+  `on load()` handlers -- 20.2 starts every declared thread before the
+  first top-level statement and orders none of them against each
+  other. There is no primitive for waiting on another thread's load
+  (`drain()` waits on the inbound queue, which `on load` never
+  enters), so the waiting thread polls the port itself: `now()` for a
+  5s deadline, `try`/`catch` around the probe, giving up rather than
+  spinning forever. A bounded wait and not a masking retry -- if the
+  port never opens, the loop ends and the assertions still fail.
+  Verified for the property it depends on rather than assumed: a probe
+  program pointed at a port nothing listens on comes out of the loop
+  with `up=false`, a positive attempt count, and the program still
+  alive, which is what says the throw was caught inside `on load`
+  instead of ending the program.
 
 The first three are fixed on their own merits and stay fixed whether
 anything runs in parallel or not. The fourth is why the behavioural

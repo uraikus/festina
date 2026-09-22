@@ -270,14 +270,14 @@ need to.
 ```bash
 pip install -r requirements-dev.txt   # pytest, pytest-xdist
 pytest tests/                         # serial; see counts below
-scripts/run_tests.sh -q               # the same tests, 2.5x faster
+scripts/run_tests.sh -q               # the same tests, 2.5-3x faster
 ```
 
 `pytest tests/` runs everything serially and takes about 1h50m. Almost
 all of that — 92.8%, measured — is the bootstrap differential, whose
 161 canaries each build a whole compiler. Those builds share nothing,
 so `scripts/run_tests.sh` runs them one per CPU and runs the rest of
-the suite serially, finishing in about 44 minutes. See
+the suite serially, finishing in 35-45 minutes. See
 [decisions.md](decisions.md) #344 for why the split is drawn there
 instead of parallelising everything.
 

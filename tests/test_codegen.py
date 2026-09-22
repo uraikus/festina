@@ -20159,6 +20159,26 @@ class TestOutboundConnectionReuse:
 
         thread worker {
             on load() {
+                // specification.md 20.2: every declared thread starts
+                // before the first top-level statement, and nothing
+                // orders one thread's load handler against another's.
+                // `upstream`'s is what binds 18313, so this one has to
+                // wait for the port rather than assume it won the race
+                // -- under a busy machine it does not, and the whole
+                // program dies on "could not connect". A bounded wait,
+                // not a masking retry: if the port never opens this
+                // gives up and the assertions below still fail.
+                int deadline = now() + 5000
+                bool up = false
+                while up == false && now() < deadline {
+                    try {
+                        http probe = {'url': 'http://127.0.0.1:18313/', 'method': 'GET'}
+                        probe.send()
+                        up = true
+                    } catch (e:text) {
+                    }
+                }
+
                 int i = 0
                 while i < 5 {
                     http req = {'url': 'http://127.0.0.1:18313/', 'method': 'GET'}

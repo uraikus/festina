@@ -4132,8 +4132,8 @@ pytest tests/                          # 3,826 passed, 51 skipped on this Linux 
                                         # tool turns its own tests into skips rather than
                                         # failures -- see setup.md's table for which.
                                         # Serial: 1:49:52.
-scripts/run_tests.sh -q                # the same tests in 43m44s: 2,040s parallel
-                                        # for the bootstrap half, 583s serial for the rest
+scripts/run_tests.sh -q                # the same tests in 35-45 minutes: the bootstrap
+                                        # half parallel, everything else serial
 ```
 
 Serially this suite takes **1:49:52**, and 92.8% of that (6,116s of

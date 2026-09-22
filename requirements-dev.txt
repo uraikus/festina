@@ -1,7 +1,7 @@
 pytest>=7
 pytest-xdist>=3
 
-# pytest-xdist takes the suite from 1:49:52 to 43m44s. 92.8% of
+# pytest-xdist takes the suite from 1:49:52 to 35-45 minutes. 92.8% of
 # its wall time is tests/test_bootstrap_canary.py and
 # tests/test_bootstrap_codegen.py (measured: 6,116s of 6,593s), and
 # nearly all of that is 161 canaries, each of which builds a whole

@@ -17,12 +17,16 @@
 #       Festina literal, an X server, an ALSA device. Several of them
 #       only ever passed because nothing else was competing; running
 #       them four-wide turned up four separate latent races (see #343
-#       and #344). Three are fixed. Run serially.
+#       and #344). All four are fixed. Run serially anyway: the fixes
+#       removed the races that were found, not the shared singletons
+#       that make this population able to have them.
 #
-# Measured through this script: 2,040s for the parallel half and 583s
-# for the serial one, 43m44s all in, against 6,593s (1:49:52) for a
-# plain serial run -- 2.51x. Running EVERYTHING in parallel instead is
-# 1,844s, a further 13 minutes, bought by letting tests race for a
+# Measured through this script, twice: 36m40s and 43m44s (the parallel
+# half 1,685s and 2,040s, the serial one 515s and 583s), against
+# 6,592.77s (1:49:52) for a plain serial run -- 2.5x to 3.0x. The
+# spread is what a shared four-core machine does to a CPU-bound
+# workload; neither number is the number. Running EVERYTHING in
+# parallel instead measured 1,844s, bought by letting tests race for a
 # port, an X server and an audio device. Not worth it; #344 has the
 # reasoning.
 #
