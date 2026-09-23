@@ -371,3 +371,151 @@ class TestPngDecode:
         assert got == "0 0 5", (
             "an interlaced PNG must be refused with a reason, not "
             "decoded as if it were progressive")
+
+
+class TestJpegDecode:
+    """runtime.md phase 2, differential against the library it replaces.
+
+    The oracle is libjpeg itself, reached the only way a Festina
+    program can: `img photo = 'x.jpg'` decodes through libjpeg, drawing
+    it to the canvas and saving gives a real PNG, and this file's own
+    zlib is enough to read that back. So both decoders run on the same
+    file and the comparison is against what users get today.
+    """
+
+    FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fixtures", "gradient.jpg")
+
+    def _libjpeg_rgb(self, tmp_path, cli_mod, w, h):
+        """libjpeg's own decode of the fixture, as RGB triples."""
+        import struct
+        from tests.conftest import compile_file_or_skip, _require_c_compiler
+        (tmp_path / "gradient.jpg").write_bytes(open(self.FIXTURE, "rb").read())
+        src = tmp_path / "ref.f"
+        src.write_text("img photo = 'gradient.jpg'\n"
+                       "drawImage(photo, 0, 0)\n"
+                       "log(saveCanvas('ref.png'))\n", encoding="utf-8")
+        out = tmp_path / "refprog"
+        compile_file_or_skip(cli_mod, str(src), str(out), cc=_require_c_compiler())
+        env = dict(os.environ, DISPLAY="")
+        r = subprocess.run([str(out)], cwd=tmp_path, capture_output=True,
+                            text=True, timeout=60, env=env)
+        if r.returncode != 0 or not (tmp_path / "ref.png").exists():
+            pytest.skip("no offscreen canvas here -- libjpeg oracle unavailable")
+
+        d = (tmp_path / "ref.png").read_bytes()
+        i, idat, cw, ct = 8, b"", 0, 0
+        while i < len(d):
+            ln = struct.unpack(">I", d[i:i + 4])[0]
+            tag, body = d[i + 4:i + 8], d[i + 8:i + 8 + ln]
+            if tag == b"IHDR":
+                cw, _, _, ct = struct.unpack(">IIBB", body[:10])
+            if tag == b"IDAT":
+                idat += body
+            if tag == b"IEND":
+                break
+            i += 12 + ln
+        raw = zlib.decompress(idat)
+        bpp = {0: 1, 2: 3, 4: 2, 6: 4}[ct]
+        stride = cw * bpp
+
+        def paeth(a, b, c):
+            p = a + b - c
+            pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+            return a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+
+        flat = bytearray()
+        rows = len(raw) // (stride + 1)
+        for y in range(rows):
+            ft = raw[y * (stride + 1)]
+            row = raw[y * (stride + 1) + 1:y * (stride + 1) + 1 + stride]
+            for x in range(stride):
+                a = flat[y * stride + x - bpp] if x >= bpp else 0
+                b = flat[(y - 1) * stride + x] if y > 0 else 0
+                c = flat[(y - 1) * stride + x - bpp] if (x >= bpp and y > 0) else 0
+                v = row[x]
+                if ft == 1:
+                    v = (v + a) & 255
+                elif ft == 2:
+                    v = (v + b) & 255
+                elif ft == 3:
+                    v = (v + (a + b) // 2) & 255
+                elif ft == 4:
+                    v = (v + paeth(a, b, c)) & 255
+                flat.append(v)
+        ref = []
+        for y in range(h):
+            for x in range(w):
+                at = y * stride + x * bpp
+                ref += [flat[at], flat[at + 1], flat[at + 2]]
+        return ref
+
+    def test_it_agrees_with_libjpeg_to_within_one_unit(self, tmp_path, cli_mod):
+        """Every sample within 1 of libjpeg, and most of them exact.
+
+        Not byte-identical, and the reason is one decision rather than
+        an accumulation of sloppiness: libjpeg's triangular chroma
+        upsampling rounds in integers ((3a+b+1)>>2), this rounds a float
+        bilinear result. On the 4:2:0 fixture that is the ENTIRE
+        difference -- the luma path, the Huffman decode, the
+        dequantisation and the IDCT all agree exactly, which is visible
+        in the first pixel of the image matching bit for bit.
+
+        Nearest-neighbour upsampling scored max 5 here before this was
+        changed to bilinear, so the bound is load-bearing: it fails if
+        the resampling regresses, and it fails much harder if anything
+        upstream of it does.
+        """
+        _with_components(tmp_path, "jpeg")
+        raw = open(self.FIXTURE, "rb").read()
+        literal = ", ".join(str(b) for b in raw)
+        got = _run_festina(tmp_path, cli_mod,
+                           "import jpeg.f\n\n"
+                           f"arr[int] d = [{literal}]\n"
+                           "arr[int] px = jpgDecode(d)\n"
+                           "int i = 0\n"
+                           "text s = ''\n"
+                           "while i < px.length {\n"
+                           "    if (i % 4) != 3 { s = s + px[i].toText() + ' ' }\n"
+                           "    i = i + 1\n"
+                           "}\n"
+                           "log(`${JPG_W} ${JPG_H} ${JPG_ERR}`)\n"
+                           "log(s)\n")
+        head, body = got.splitlines()[0], got.splitlines()[1]
+        w, h, err = (int(v) for v in head.split())
+        assert (w, h, err) == (16, 16, 0)
+
+        mine = [int(v) for v in body.split()]
+        ref = self._libjpeg_rgb(tmp_path, cli_mod, w, h)
+        assert len(mine) == len(ref) == w * h * 3
+
+        diffs = [abs(a - b) for a, b in zip(mine, ref)]
+        assert max(diffs) <= 1, (
+            f"max deviation from libjpeg is {max(diffs)}, not <= 1 -- "
+            f"that is more than the upsampling rounding can account "
+            f"for, so something upstream of the resampling is wrong")
+        exact = sum(1 for d in diffs if d == 0)
+        assert exact >= len(diffs) // 2, (
+            f"only {exact}/{len(diffs)} samples are exact; the rounding "
+            f"difference should leave most of them untouched")
+
+    def test_a_progressive_jpeg_is_refused(self, tmp_path, cli_mod):
+        """SOF2 is a different algorithm, not a variation on this one.
+        Decoding its headers and then reading its scan as if it were
+        baseline produces an image, and the image is wrong."""
+        _with_components(tmp_path, "jpeg")
+        raw = bytearray(open(self.FIXTURE, "rb").read())
+        # Rewrite the SOF0 marker as SOF2 and change nothing else.
+        for i in range(len(raw) - 1):
+            if raw[i] == 0xFF and raw[i + 1] == 0xC0:
+                raw[i + 1] = 0xC2
+                break
+        else:
+            pytest.fail("fixture has no SOF0 to rewrite")
+        literal = ", ".join(str(b) for b in raw)
+        got = _run_festina(tmp_path, cli_mod,
+                           "import jpeg.f\n\n"
+                           f"arr[int] d = [{literal}]\n"
+                           "arr[int] px = jpgDecode(d)\n"
+                           "log(`${px.length} ${JPG_ERR}`)\n")
+        assert got == "0 5"

@@ -173,6 +173,61 @@ payloads including the empty one and all 256 byte values — the
 differential shape this plan wants for every decoder, at the smallest
 scale it applies to.
 
+## Phase 3 needs an oracle it does not have yet
+
+Phases 1 and 2 could be checked against the thing they replace: zlib
+is importable from the test harness, and libjpeg is reachable through
+`img` plus a canvas save. Neither trick works for MP3.
+
+`aud` exposes `.play()`, `.stop()`, `.isPlaying()` and `.save()`, and
+`.save()` round-trips the original bytes — so a Festina program cannot
+read decoded samples back, and there is no way to ask mpg123 what it
+produced. This container also has no `mpg123`, `ffmpeg`, `sox` or
+`lame` binary, and Python's standard library decodes WAV but not MP3.
+
+The fix is already this repository's own practice rather than a new
+dependency: `tests/test_cycle_buffer.py` compiles and runs a small C
+probe against the runtime. A probe that calls **libmpg123** — which is
+already required to build any audio-using program — and prints the
+samples it decodes is the same shape, and gives phase 3 exactly the
+oracle phases 1 and 2 had.
+
+Worth writing down because the alternative is a decoder verified
+against a plausible-looking waveform, which for a codec means very
+little: an MP3 decoder with a wrong scalefactor table still produces
+sound.
+
+## The gap this plan did not have: handing pixels back
+
+Phases 1 and 2 decode correctly and have nowhere to put the result.
+
+`img` is constructible from a path and from a database column, and
+from nothing else ([specification.md](specification.md) §7). There is
+no `img.fromPixels(arr, w, h)` and no builtin that takes a buffer, so
+a Festina component can produce a correct RGBA array and cannot make
+it an image. The sentence above — "`img x = 'photo.jpg'` pulls in
+`jpeg.f`" — says which component gets compiled in and silently assumes
+the handoff; the handoff does not exist.
+
+This was found by looking for it before writing a third decoder, which
+is the only reason it is written here rather than discovered after
+another thousand lines. It does not invalidate phases 1 and 2: the
+decoders are verified against zlib and libjpeg on their own terms, and
+that verification stands whatever consumes them. It does mean **no
+dependency is removed until this is closed**, and the plan's
+"removes: libjpeg" column is a promise about the end state rather than
+about the phase that writes the decoder.
+
+Closing it is a compiler and runtime change, not a component:
+a runtime entry point that takes a pixel buffer and answers an image
+handle, plus whatever codegen needs to pass an `arr[int]`'s data to
+it. That is a new builtin, so it is also a specification clause and a
+`bootstrap/` port — the ordinary price of a language change
+(todo.md says so about every capability on its list, and this is one).
+
+Sequenced next, before phases 3 to 5, because every one of them ends
+in the same place: a buffer that nothing can accept.
+
 ## Plan
 
 Each phase ends green, with the dependency it removes actually gone
@@ -182,7 +237,7 @@ from `setup.md`'s table rather than merely unused.
 |---|---|---|---|
 | 0 ✅ | conditional linking of Festina runtime sources | — | compiler change |
 | 1 ✅ | `inflate.f`, PNG decode | — | phase 0 |
-| 2 | `jpeg.f` | **libjpeg** | phase 0 |
+| 2 ✅ | `jpeg.f` | **libjpeg** | phase 0 |
 | 3 | `mp3.f` | **mpg123** | phase 0 |
 | 4 | `raster.f` — paths, AA fill, stroke, clip, gradients, compositing | — | phase 0 |
 | 5 | glyph rasterisation + the font-discovery decision | **Cairo** | phase 4 |
@@ -223,6 +278,32 @@ whichever filter the encoder happened to choose.
 Neither is wired to `img` yet. `RUNTIME_TRIGGERS` stays empty until
 that wiring, which is its own step and the one that makes the
 bootstrap differential care.
+
+### Phase 2, as built
+
+`runtime/festina/jpeg.f` is baseline JPEG (ITU T.81): marker parse,
+canonical Huffman, dequantisation, a separable inverse DCT over a
+cosine table, triangular chroma upsampling, YCbCr to RGB. Progressive
+(SOF2), arithmetic coding and 12-bit are refused with `JPG_ERR` set,
+the same stance `png.f` takes.
+
+**Measured against libjpeg itself**, which a Festina program can reach
+without any new machinery: `img photo = 'x.jpg'` decodes through
+libjpeg, drawing it and saving gives a real PNG, and the test harness
+reads that back. Over the 768 samples of `tests/fixtures/gradient.jpg`
+(4:2:0, the common case): **max deviation 1, 499 exact, mean 0.35**.
+
+The residual is one decision and not an accumulation. libjpeg's
+triangular upsampling rounds in integers, `(3a+b+1)>>2`; this rounds a
+float bilinear result. Everything upstream — Huffman, dequantisation,
+IDCT, the luma path — agrees exactly, which is visible in the image's
+first pixel matching bit for bit.
+
+That bound is load-bearing rather than decorative. The first version
+used nearest-neighbour upsampling and scored a max deviation of 5, with
+the first pixel still exact — which is what identified the resampling
+as the only thing wrong. A test asserting `<= 1` fails if the
+resampling regresses and fails far harder if anything before it does.
 
 ## Tests
 
