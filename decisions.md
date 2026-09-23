@@ -7986,6 +7986,25 @@ makes the macOS path testable from Linux at all -- and without the fix
 it raises exactly the link error macOS raised, reproduced here before
 the fix was written.
 
+**Windows was cancelled at its own cap in the same run.** 42:56 on the
+test suite, 45:15 for the job, against `timeout-minutes: 45` -- up from
+18:31 eleven days earlier. Nothing about that is this branch's doing
+beyond the suite growing; that runner spawns processes more slowly than
+any other, and spawning processes is most of what these tests do.
+
+`scripts/run_tests.sh` is the wrong tool there: the split it makes is
+bootstrap-versus-rest, and the bootstrap harnesses are Linux-only
+(#287) and skip on Windows, so the parallel half would be empty. What
+remains IS the population the script keeps serial on Linux -- and the
+four races that made that unsafe are fixed (#343, #344). So the
+Windows job runs the whole suite four-wide instead, `--dist worksteal`
+for the reason measured above. #238 raised that timeout once and
+recorded that a budget raised twice is a budget nobody is managing;
+this is the alternative to raising it again. It cannot be verified from
+a Linux container -- CI is the check, and a job that currently times
+out is already red, so a failure there would at least say something a
+timeout does not.
+
 **What the Linux job's clock now says.** 28m20s for the test suite,
 29m52s for the job, against a 30-minute timeout: eight seconds of
 headroom. #344 took it there from a serial run this container measures

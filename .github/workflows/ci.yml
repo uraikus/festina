@@ -238,7 +238,28 @@ jobs:
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Run the test suite
-        run: python -m pytest tests/ -q
+        # decisions.md #345: this job was CANCELLED at the 45-minute cap
+        # after 42:56, up from 18:31 eleven days earlier -- the suite
+        # grew and this runner spawns processes more slowly than any
+        # other, which is most of what these tests do.
+        #
+        # Not scripts/run_tests.sh: that splits out the bootstrap
+        # differential, which is Linux-only (decisions.md #287) and
+        # skips here, so the split would buy this job nothing. What is
+        # left IS the population that script deliberately keeps serial
+        # -- and the four races that made it unsafe to parallelise are
+        # fixed (#343, #344). Process-spawn cost is exactly what
+        # parallelism recovers, so this job runs the whole suite
+        # four-wide instead.
+        #
+        # --dist worksteal for the reason #344 measured: the default
+        # hands each worker a consecutive chunk and idles three of them
+        # behind one long tail.
+        #
+        # #238 raised this timeout once already and recorded that a
+        # budget raised twice is a budget nobody is managing. This is
+        # the alternative to raising it a second time.
+        run: python -m pytest tests/ -q -n auto --dist worksteal
       - name: Compile and run the core examples
         # windows.md Phase 0's exit criteria, verbatim: the four
         # windowless examples build and run natively as .exe.
