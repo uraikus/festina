@@ -65,6 +65,14 @@ stubs. Nothing open here.
 - **Media formats** stay PNG/JPEG + WAV/MP3, deliberately: each new
   format is a new system dependency for every machine that compiles a
   media-using program. Revisit only with a concrete need.
+- **The `blob` write half is now a prerequisite, not just an idea.**
+  [runtime.md](runtime.md) plans to rewrite Cairo's drawing, libjpeg
+  and mpg123 in Festina, and every one of those is a DECODER for the
+  same reason: `arr[int]` is mutable so a decoder can build its output,
+  while `blob`'s only writer is `.write(text)` and `text` stops at its
+  first NUL. So PNG *encode* — and any wire protocol — waits on this.
+  It is the same feature described just below, with a caller now.
+
 - **A raw byte-buffer type** — the *read* half of this shipped as
   `blob.byteAt(i)`/`blob.slice(a, b)` (claude.md #272), on the type that
   already is a file's bytes, rather than as a new primitive. What is
