@@ -197,36 +197,34 @@ against a plausible-looking waveform, which for a codec means very
 little: an MP3 decoder with a wrong scalefactor table still produces
 sound.
 
-## The gap this plan did not have: handing pixels back
+## Handing pixels back: what is actually true
 
-Phases 1 and 2 decode correctly and have nowhere to put the result.
+This section said twice that phases 1 and 2 "decode correctly and have
+nowhere to put the result", and that `img` is constructible from a
+path and a database column "and from nothing else". **Both were
+wrong**, and the correction matters because it changes what the next
+piece of work is for.
 
-`img` is constructible from a path and from a database column, and
-from nothing else ([specification.md](specification.md) §7). There is
-no `img.fromPixels(arr, w, h)` and no builtin that takes a buffer, so
-a Festina component can produce a correct RGBA array and cannot make
-it an image. The sentence above — "`img x = 'photo.jpg'` pulls in
-`jpeg.f`" — says which component gets compiled in and silently assumes
-the handoff; the handoff does not exist.
+`blankImage(w, h)` builds an image with no path
+([specification.md](specification.md) §17.3), `fillStyle(r, g, b)`
+takes runtime integers, and `img.drawPixel(x, y)` writes one pixel. So
+a Festina decoder can produce an `img` today, pixel by pixel, with no
+new builtin at all — checked, not reasoned about: a four-by-two image
+built that way reads back the colours it was given.
 
-This was found by looking for it before writing a third decoder, which
-is the only reason it is written here rather than discovered after
-another thousand lines. It does not invalidate phases 1 and 2: the
-decoders are verified against zlib and libjpeg on their own terms, and
-that verification stands whatever consumes them. It does mean **no
-dependency is removed until this is closed**, and the plan's
-"removes: libjpeg" column is a promise about the end state rather than
-about the phase that writes the decoder.
+And it is not slow in the way the second guess assumed. Measured:
+**90,000 pixels in 5ms**, about 18 million pixels a second. A
+1920x1080 photo hands off in roughly 115ms.
 
-Closing it is a compiler and runtime change, not a component:
-a runtime entry point that takes a pixel buffer and answers an image
-handle, plus whatever codegen needs to pass an `arr[int]`'s data to
-it. That is a new builtin, so it is also a specification clause and a
-`bootstrap/` port — the ordinary price of a language change
-(todo.md says so about every capability on its list, and this is one).
+So a bulk entry point is a **performance primitive, not an enabler**.
+115ms is real next to the ~2ms a buffer copy would cost, and it is
+paid on every image a program loads — worth removing, and worth
+removing for that reason rather than for a blocker that does not
+exist. The phases that follow are not gated on it.
 
-Sequenced next, before phases 3 to 5, because every one of them ends
-in the same place: a buffer that nothing can accept.
+What is still true: `img.save()` round-trips the original bytes, so
+PNG *encode* remains gated on the `blob` write half, exactly as the
+top of this document says.
 
 ## Plan
 

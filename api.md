@@ -1898,6 +1898,26 @@ from something that already exists. Useful for building up a
 procedural image (a generated icon, a variable-size paint brush) from
 nothing, without touching the real on-screen canvas along the way.
 
+`imageFromPixels(px, w, h)` builds one from a buffer instead: four
+`int` per pixel — red, green, blue, alpha — row-major from the
+top-left, with `px.length` required to be exactly `w * h * 4` and each
+component clamped to 0–255 exactly as `fillStyle(r, g, b)` clamps.
+
+```festina
+arr[int] px = [255,0,0,255,  0,255,0,255,
+               0,0,255,255,  255,255,0,255]
+img quad = imageFromPixels(px, 2, 2)     // red, green / blue, yellow
+```
+
+It adds nothing you could not already do: `blankImage(w, h)` plus a
+`fillStyle`/`drawPixel` per pixel builds the same image, and a test
+asserts the two agree pixel for pixel. What it saves is the loop —
+that runs at about 18 million pixels a second, so a 1920×1080 image
+spends roughly 115ms being handed over one pixel at a time. A
+mismatched length is a runtime failure rather than an image that is
+almost right, on the same reasoning `.clip()` rejects a non-positive
+size.
+
 `drawRect`/`drawCircle` (and their `img` method equivalents) each
 accept a further optional trailing `borderColor`, after the fill
 color — paints the border with it for that one call only, leaving the

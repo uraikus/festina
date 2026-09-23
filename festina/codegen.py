@@ -2219,6 +2219,8 @@ class CodeGen:
             "declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)",
             # claude.md #188 (uraikus/festina#76 item 4)
             "declare ptr @festina_blank_image(i64, i64)",
+            # claude.md #346
+            "declare ptr @festina_image_from_pixels(ptr, i64, i64)",
             # claude.md #189
             "declare i64 @festina_get_pixel_color(i64, i64)",
             "declare i64 @festina_image_get_pixel_color(ptr, i64, i64)",
@@ -12606,7 +12608,7 @@ class CodeGen:
             if name == "regex":
                 return self._emit_regex_call(expr, env, lines)
             if name in ("drawRect", "drawCircle", "drawText", "drawImage", "loadImage",
-                        "drawPixel", "blankImage", "getPixelColor",
+                        "drawPixel", "blankImage", "imageFromPixels", "getPixelColor",
                         "fillStyle", "borderColor", "lineWidth", "changeFont",
                         "measureTextWidth", "measureTextHeight"):
                 return self._emit_graphics_call(name, expr, env, lines)
@@ -14301,6 +14303,17 @@ class CodeGen:
         if name == "blankImage":
             out = self.tmp()
             lines.append(f"  {out} = call ptr @festina_blank_image(i64 {args[0]}, i64 {args[1]})")
+            return out, types_mod.ImageType()
+
+        # claude.md #346: imageFromPixels(px, w, h) -- the pixel buffer
+        # goes across as the array header itself, which is what
+        # festina_arr_join already takes, so no new calling convention
+        # is invented for it.
+        if name == "imageFromPixels":
+            out = self.tmp()
+            lines.append(
+                f"  {out} = call ptr @festina_image_from_pixels("
+                f"ptr {args[0]}, i64 {args[1]}, i64 {args[2]})")
             return out, types_mod.ImageType()
 
         # claude.md #189: getPixelColor(x, y) -> color. Reads the

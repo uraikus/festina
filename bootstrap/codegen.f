@@ -453,6 +453,7 @@ arr[text] CG_PRE = [
     'declare i64 @festina_image_height(ptr)',
     'declare ptr @festina_image_clip(ptr, i64, i64, i64, i64)',
     'declare ptr @festina_blank_image(i64, i64)',
+    'declare ptr @festina_image_from_pixels(ptr, i64, i64)',
     'declare i64 @festina_get_pixel_color(i64, i64)',
     'declare i64 @festina_image_get_pixel_color(ptr, i64, i64)',
     'declare void @festina_image_resize(ptr, i64, i64)',

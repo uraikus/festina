@@ -2061,6 +2061,75 @@ void *festina_blank_image(int64_t w, int64_t h) {
     return festina_image_box(out);
 }
 
+/* claude.md #346: an image from a pixel buffer, in one call.
+ *
+ * `arr` is a Festina arr[int]: header[0] is the length and header[1]
+ * the data pointer, exactly as festina_arr_join reads one. Four
+ * elements per pixel -- R, G, B, A -- row-major from the top-left.
+ *
+ * This adds no capability. The same image can be built with
+ * blankImage() and a fillStyle/drawPixel pair per pixel, which is what
+ * runtime.md's decoders would otherwise have to do; that loop runs at
+ * about 18 million pixels a second, so a 1920x1080 image spends ~115ms
+ * being handed over one pixel at a time. This is the copy instead.
+ *
+ * Cairo's ARGB32 is PREMULTIPLIED and native-endian, which is the only
+ * subtle part: a half-transparent red is (128, 0, 0, 128) here and
+ * (255, 0, 0, 128) in the straight-alpha buffer a decoder produces.
+ * Getting that backwards makes every partially transparent pixel too
+ * bright, and looks correct on every fully opaque one -- which is most
+ * test images. */
+void *festina_image_from_pixels(void *arr, int64_t w, int64_t h) {
+    festina_check_image_size("imageFromPixels", w, h);
+    int64_t want = w * h * 4;
+    int64_t n = 0;
+    int64_t *data = NULL;
+    if (arr) {
+        int64_t *header = (int64_t *)arr;
+        n = header[0];
+        memcpy(&data, &header[1], sizeof(int64_t *));
+    }
+    if (n != want) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "imageFromPixels: %lld pixels' worth of data given for a "
+                 "%lldx%lld image, which needs %lld",
+                 (long long)(n / 4), (long long)w, (long long)h,
+                 (long long)want);
+        festina_fail(msg);
+        return NULL;
+    }
+
+    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                                      (int)w, (int)h);
+    festina_surface_prefault(out);
+    unsigned char *dst = cairo_image_surface_get_data(out);
+    int stride = cairo_image_surface_get_stride(out);
+    for (int64_t y = 0; y < h; y++) {
+        uint32_t *row = (uint32_t *)(dst + (y * stride));
+        for (int64_t x = 0; x < w; x++) {
+            int64_t at = ((y * w) + x) * 4;
+            int64_t r = data[at];
+            int64_t g = data[at + 1];
+            int64_t b = data[at + 2];
+            int64_t a = data[at + 3];
+            /* Clamped exactly as fillStyle(r, g, b) clamps. */
+            if (r < 0) r = 0; if (r > 255) r = 255;
+            if (g < 0) g = 0; if (g > 255) g = 255;
+            if (b < 0) b = 0; if (b > 255) b = 255;
+            if (a < 0) a = 0; if (a > 255) a = 255;
+            /* Premultiply, rounding rather than truncating so that
+             * alpha 255 is exactly the original component. */
+            uint32_t pr = (uint32_t)(((r * a) + 127) / 255);
+            uint32_t pg = (uint32_t)(((g * a) + 127) / 255);
+            uint32_t pb = (uint32_t)(((b * a) + 127) / 255);
+            row[x] = ((uint32_t)a << 24) | (pr << 16) | (pg << 8) | pb;
+        }
+    }
+    cairo_surface_mark_dirty(out);
+    return festina_image_box(out);
+}
+
 /* claude.md #135: saveCanvas() with no path -> img, a SNAPSHOT of the
  * canvas at this instant rather than a live view of it -- built the
  * exact same way festina_image_clip just above builds any other fresh

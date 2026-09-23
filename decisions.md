@@ -8056,3 +8056,64 @@ by a margin that is not a margin. #238 raised that timeout once and
 recorded that a budget raised twice is a budget nobody is managing, so
 this entry records the number rather than quietly raising it again. The
 next thing added to the suite will need a decision about it.
+
+346. `imageFromPixels`, AND WHAT A DECLARATION COSTS
+
+[runtime.md](runtime.md)'s decoders produce an `arr[int]` of RGBA
+bytes. `imageFromPixels(px, w, h):img` turns one into an image in a
+single call: four `int` per pixel, row-major from the top-left,
+components clamped exactly as `fillStyle(r, g, b)` clamps, and a
+length that disagrees with the dimensions is a runtime failure rather
+than an image that is almost right.
+
+**It exists for speed, and this entry twice said otherwise.** The
+first claim was that phases 1 and 2 "decode correctly and have nowhere
+to put the result", because `img` is constructible from a path and a
+database column and nothing else. That is wrong: `blankImage(w, h)`
+plus `fillStyle(r, g, b)` and `drawPixel` builds any image at all,
+with no new builtin, which a four-by-two test confirmed in a minute.
+The second claim, implied rather than written, was that the per-pixel
+route was too slow to count. Also wrong: **90,000 pixels in 5ms**,
+about 18 million a second, so a 1920x1080 photo hands over in ~115ms.
+
+So this is a performance primitive. 115ms per image load against the
+~2ms a copy costs is worth removing, and nothing in runtime.md was
+ever gated on it. Both corrections are in that document, because a
+plan that justifies work by a blocker which does not exist will
+justify the next piece the same way.
+
+**Premultiplied alpha is the only subtle line, and a fully opaque test
+image cannot see it.** Cairo's ARGB32 stores white-at-half-alpha as
+(128,128,128,128); a decoder produces (255,255,255,128). The comment
+at the site says getting it backwards "looks correct on every fully
+opaque pixel -- which is most test images", and that was checked
+rather than asserted: with straight alpha stored instead, **nine of
+ten tests still pass** and only the premultiply one fails. It uses
+white at alpha 128 because that is a value which survives 8-bit
+premultiplied storage exactly; (200,100,50) returns (199,100,50),
+which is the format's precision and not a defect, and `color` has no
+`==` with a tolerance to express it.
+
+**The breakage this caused, and the reasoning that missed it.** Adding
+the builtin turned the bootstrap differential red on every one of the
+123 compiling corpus files, and the prediction here had been that
+nothing would break "because no `.f` file uses it". Wrong for a
+structural reason worth keeping: `_runtime_declares()` is
+UNCONDITIONAL. Every module emits the whole `declare` block whatever
+it uses, `bootstrap/codegen.f` emits its own copy, and one added line
+makes every dump differ. The coupling is in the declarations, not the
+call sites, and reasoning about call sites is what missed it.
+
+Fixed by porting the declare into `bootstrap/codegen.f` and moving
+`SHARED_PREAMBLE_LINES` 383 -> 384. That constant was also checked
+rather than incremented on faith, and the first check was wrong too:
+the longest common prefix of two dumps is 1, because line 2 is each
+file's own source path. Measured the way the constant's own comment
+defines it -- all 123 compiling files with that line removed -- it is
+386, and the constant has always been measured minus two: 383 against
+385 before, 384 against 386 now.
+
+todo.md says a capability that changes codegen has to land in both
+implementations or the differential goes red. It went red. The
+harness did its job in about four minutes; the reasoning that said it
+would not had already been written down as fact.

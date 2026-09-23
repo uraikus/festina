@@ -837,6 +837,9 @@ void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
  * fresh, fully-transparent img at a given size, with no existing image
  * to derive it from. See the .c doc comment. */
 void *festina_blank_image(int64_t w, int64_t h);
+/* claude.md #346: an img from an arr[int] of RGBA bytes, four per
+ * pixel, row-major from the top-left. */
+void *festina_image_from_pixels(void *arr, int64_t w, int64_t h);
 /* claude.md #135: saveCanvas() with no path -> a fresh img, a snapshot
  * of the canvas at this instant (see the .c doc comment for why a
  * snapshot rather than a live alias). */

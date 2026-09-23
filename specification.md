@@ -2539,6 +2539,23 @@ border for that call. [#37, #133, #188]
 | `render()` | present the canvas on screen |
 | `getPixelColor(x, y):color` | the painted color of one canvas pixel, or `null` when transparent or out of bounds |
 | `blankImage(w, h):img` | a fresh, fully transparent image |
+| `imageFromPixels(px:arr[int], w, h):img` | an image from RGBA bytes, four per pixel, row-major from the top-left; `px.length` must be exactly `w * h * 4` |
+
+`imageFromPixels(px, w, h)` builds an image from a pixel buffer in
+one call. The buffer is four `int` per pixel — red, green, blue, alpha
+— in row-major order starting at the top-left, and each component is
+clamped to `0`..`255` the way `fillStyle(r, g, b)`'s are. A
+non-positive `w` or `h`, or a `px.length` that is not exactly
+`w * h * 4`, is a runtime failure rather than a silently wrong image,
+the same treatment `clip()` gives a non-positive size.
+
+It adds no capability: the same image can be built with
+`blankImage(w, h)` and a `fillStyle`/`drawPixel` pair per pixel, which
+is what a program had to do before. What it adds is the cost — that
+loop measures about 18 million pixels a second, so a 1920x1080 image
+spends roughly 115ms being handed over one pixel at a time, against
+the single copy this does. It exists for [runtime.md](runtime.md)'s
+decoders, which produce exactly this buffer. [#346]
 
 `drawImage` accepts an `img?` source as well as an `img` (§8.18). A
 source region past the image's edge draws only the overlap. [#185, #241]

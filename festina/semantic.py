@@ -104,6 +104,8 @@ BUILTIN_FUNCTIONS = {
     "fillStyle", "borderColor", "lineWidth", "changeFont",
     "measureTextWidth", "measureTextHeight",
     "regex",
+    # claude.md #346: an img from a pixel buffer, for runtime.md's decoders.
+    "imageFromPixels",
     "setTimeout", "setInterval", "clearTimeout", "clearInterval",
     # claude.md #93: time and canvas export -- backed by libc and by
     # Cairo's own PNG writer, both already linked. claude.md #109 moved
@@ -192,6 +194,8 @@ _BUILTIN_RETURN_TYPES = {
     "regex": types_mod.RegexType(),
     # claude.md #188 (uraikus/festina#76 item 4)
     "blankImage": types_mod.ImageType(),
+    # claude.md #346
+    "imageFromPixels": types_mod.ImageType(),
     # claude.md #189
     "getPixelColor": types_mod.ColorType(),
     # claude.md #162
