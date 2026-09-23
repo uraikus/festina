@@ -235,3 +235,15 @@ resident libraries is a smaller patch surface for any deployment,
 independent of whether a specific library has a known issue today.
 Regression-tested via `ldd` on real compiled binaries for all four
 graphics/audio combinations (`tests/test_codegen.py::TestSlimBinaries`).
+
+The same promise now covers the parts of the runtime written in
+Festina rather than C. [runtime.md](runtime.md) plans to replace
+Cairo's drawing, libjpeg and mpg123 with Festina source, and those are
+not translation units the linker can leave out — so the compiler
+decides instead: `festina/imports.py`'s `RUNTIME_TRIGGERS` maps a
+component to a predicate, and only a program that triggers one gets
+its statements merged in. The IR for an untriggered component is never
+generated at all, which is a stronger claim than a linker dropping
+dead code. The table is empty until the first decoder lands; the
+mechanism is tested in both directions in
+`tests/test_runtime_components.py`.

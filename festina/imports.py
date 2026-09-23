@@ -223,7 +223,66 @@ def _parse_cached(source, path):
     return program
 
 
-def build_program(entry_path):
+#: runtime.md phase 0: Festina-implemented runtime components live here,
+#: one file per component, and are merged into a program exactly the way
+#: a written `import` would be -- see RUNTIME_TRIGGERS below for how one
+#: gets pulled in, and why the table is currently empty.
+RUNTIME_COMPONENT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "runtime", "festina")
+
+#: {component name: predicate over the merged user Program}.
+#:
+#: DELIBERATELY EMPTY. The mechanism ships before its first consumer
+#: because every later phase in runtime.md needs it, but a component
+#: that nothing triggers would be code compiled into every binary for
+#: no reason -- the exact opposite of what this exists to do. Phase 1's
+#: PNG decoder adds the first entry.
+#:
+#: A predicate runs against the PARSED program, not an analysed one:
+#: imports resolve before semantic analysis, so a trigger can ask what
+#: the source says (a declaration's type name) and cannot ask what
+#: codegen concluded (`uses_graphics`). That is a real constraint on
+#: what a trigger may test, and it is why these are predicates over an
+#: AST rather than a read of CodeGen's own flags.
+#:
+#: NOTE for whoever adds the first one: `bootstrap/` is a second
+#: implementation of this compiler, and a component injected here
+#: changes the IR of every program that triggers it. The bootstrap has
+#: to grow the same injection or the differential goes red -- which is
+#: the harness working, not breaking.
+RUNTIME_TRIGGERS = {}
+
+
+def required_components(program, triggers=None):
+    """The runtime components `program` needs, in registry order.
+
+    `triggers` overrides the registry, which is what lets this be
+    tested with a real component before a real consumer exists.
+    """
+    table = RUNTIME_TRIGGERS if triggers is None else triggers
+    return [name for name, wants in table.items() if wants(program)]
+
+
+def _component_statements(name):
+    """Parse one runtime component and tag its statements with its own
+    path, so an error inside it names the component file rather than
+    whatever user program happened to pull it in."""
+    path = os.path.join(RUNTIME_COMPONENT_DIR, f"{name}.f")
+    if not os.path.exists(path):
+        raise CompileError(
+            f"runtime component {name!r} is registered but "
+            f"{os.path.relpath(path, os.path.dirname(RUNTIME_COMPONENT_DIR))} "
+            f"does not exist", file=path)
+    with open(path, encoding="utf-8") as fh:
+        source = fh.read()
+    program = _parse_cached(source, path)
+    for stmt in program.body:
+        stmt.file = path
+    return program.body
+
+
+def build_program(entry_path, triggers=None):
     """Resolve entry_path's full import graph and parse every file into
     one merged ast.Program, in dependency order -- claude.md #5: "An
     import includes the specified file and all of its dependencies in
@@ -258,4 +317,18 @@ def build_program(entry_path):
         body.extend(stmts)
     merged = ast_mod.Program(body)
     merged.database_url = database_url
+
+    # runtime.md phase 0. Components go in FRONT of the user's
+    # statements, for the reason any Festina file's own order matters:
+    # a global has to precede its first use (specification.md 7.2), and
+    # a component that declares one would otherwise be declaring it
+    # after the program that reads it. Prepending also keeps a
+    # component's statements out of `database_url` extraction above,
+    # which is the entry file's business alone.
+    needed = required_components(merged, triggers)
+    if needed:
+        prefix = []
+        for name in needed:
+            prefix.extend(_component_statements(name))
+        merged.body = prefix + merged.body
     return merged

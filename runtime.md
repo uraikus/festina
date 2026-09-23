@@ -147,8 +147,31 @@ mechanism, because they are not translation units. The design:
   that never mentioned the code at all.
 
 This is a real change to the compiler, not just to the runtime, and it
-is Phase 1's first piece for that reason — every later phase needs it
-to exist.
+is Phase 0 for that reason — every later phase needs it to exist.
+
+**Phase 0 has shipped.** `festina/imports.py` carries
+`RUNTIME_TRIGGERS`, a table of component name to predicate, and
+`build_program` prepends a triggered component's statements to the
+program. Prepended rather than appended because
+[specification.md](specification.md) §7.2 wants a global to precede its
+first use, and a component that declares one would otherwise declare it
+after the program reading it.
+
+The table is **empty**, deliberately. A component nothing triggers is
+code in every binary for no reason, and one whose predicate always
+fires is the same thing louder; phase 1's decoder adds the first entry.
+The mechanism is still tested in both directions today, because
+`build_program` takes a trigger table as a parameter —
+`tests/test_runtime_components.py` supplies its own. Injection was also
+watched failing: with the prepend removed, four of its thirteen tests
+go red and the nine asserting ABSENCE correctly stay green.
+
+`runtime/festina/checksums.f` is the first component, and it is real
+rather than a fixture: Adler-32 and CRC-32 are what a PNG carries, so
+phase 1 needs both. They agree with zlib byte for byte over five
+payloads including the empty one and all 256 byte values — the
+differential shape this plan wants for every decoder, at the smallest
+scale it applies to.
 
 ## Plan
 
@@ -157,8 +180,8 @@ from `setup.md`'s table rather than merely unused.
 
 | phase | delivers | removes | needs |
 |---|---|---|---|
-| 0 | conditional linking of Festina runtime sources | — | compiler change |
-| 1 | `inflate.f`, PNG decode | — | phase 0 |
+| 0 ✅ | conditional linking of Festina runtime sources | — | compiler change |
+| 1 ✅ | `inflate.f`, PNG decode | — | phase 0 |
 | 2 | `jpeg.f` | **libjpeg** | phase 0 |
 | 3 | `mp3.f` | **mpg123** | phase 0 |
 | 4 | `raster.f` — paths, AA fill, stroke, clip, gradients, compositing | — | phase 0 |
@@ -167,6 +190,39 @@ from `setup.md`'s table rather than merely unused.
 
 Phases 1–3 are independent of 4–5 and can land in any order. Phase 6
 is gated on a language feature that does not exist yet.
+
+### Phase 1, as built
+
+`runtime/festina/inflate.f` is DEFLATE (RFC 1951) — stored, fixed and
+dynamic blocks, with back-references copied a byte at a time because a
+run of 300 zeros is a distance of 1 and a length of 300, and slicing a
+range would read bytes it has not produced yet. Structured after
+zlib's `puff` reference decoder rather than its production one: a
+symbol is decoded by walking code lengths shortest-first, which needs
+two small arrays per table instead of a multi-level lookup. Slower per
+symbol, and readable straight against the RFC.
+
+`runtime/festina/png.f` is the decoder on top: chunk walk, IDAT
+concatenation (one zlib stream may be split across chunks), the five
+scanline filters, and widening colour types 0/2/3/4/6 to RGBA.
+
+**Bit depth 8 and non-interlaced only, and the refusal is the
+feature.** A 16-bit or Adam7 file sets `PNG_ERR` and answers an empty
+array rather than decoding as if it were something else. A caller can
+fall back from a refusal; it cannot un-see plausible wrong pixels.
+
+Both are differential against zlib and against a Python reference
+encoder, which is the harness shape this plan asks for: 12 inflate
+cases across three compression levels — empty input, a 300-zero run,
+all 256 byte values, repetitive text — and for PNG, each of the five
+colour types and each of the five filters separately. Separately
+matters: adaptive encoders pick a filter per row, so a Paeth bug shows
+on roughly one real file in ten and would sit untested behind
+whichever filter the encoder happened to choose.
+
+Neither is wired to `img` yet. `RUNTIME_TRIGGERS` stays empty until
+that wiring, which is its own step and the one that makes the
+bootstrap differential care.
 
 ## Tests
 
