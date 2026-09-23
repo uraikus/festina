@@ -233,6 +233,24 @@ def target_cpu_and_features(environ=None, binding=None):
     requested = (environ.get(TARGET_CPU_ENV) or "").strip()
     if requested == NATIVE_TARGET_CPU:
         b = binding if binding is not None else _binding()
+        # `native` is the one value that has to ASK the processor, and
+        # the only thing here that can is libLLVM. Without it _Binding
+        # returns from __init__ before _bind() runs, so every entry
+        # point below is simply absent -- and this used to walk into
+        # that and raise AttributeError from a getattr deep inside the
+        # call (decisions.md #345, found by the first macOS and Windows
+        # CI runs in eleven days; neither platform loads libLLVM, and
+        # neither had ever built this). In production it cannot happen:
+        # the only caller is emit_object_file, which by definition
+        # already holds a working binding. Said plainly rather than
+        # left to a missing attribute.
+        if getattr(b, "lib", None) is None:
+            raise LLVMBackendError(
+                f"{TARGET_CPU_ENV}={NATIVE_TARGET_CPU} needs libLLVM to read "
+                f"the host CPU, and it is not loadable here. Builds on this "
+                f"machine go through the clang IR frontend instead, which "
+                f"chooses its own target; unset {TARGET_CPU_ENV} for the "
+                f"portable default.")
         return b.host_cpu_name(), b.host_cpu_features()
     if not requested:
         return DEFAULT_TARGET_CPU, b""

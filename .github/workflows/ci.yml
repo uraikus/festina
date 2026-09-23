@@ -33,7 +33,20 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # decisions.md #345. This was 30, and the two runs either side of
+    # that line tell the whole story: 29:52 (cleared it by eight
+    # seconds) and then 30:16 (cancelled). The work is real -- 161
+    # canaries, each building a whole compiler -- and it is already
+    # parallelised as far as four cores go (#344 took it from 1:49:52
+    # serial to about 30 minutes here). There is no further speedup to
+    # spend instead of minutes.
+    #
+    # #238 raised the windows budget once and recorded that a budget
+    # raised twice is a budget nobody is managing. That rule is about
+    # not papering over slowness nobody has looked at. This one has
+    # been looked at very closely, and 45 matches what windows already
+    # has rather than inventing a number.
+    timeout-minutes: 45
     env:
       FESTINA_STRICT_DEPS: "1"
     steps:

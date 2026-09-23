@@ -8005,6 +8005,49 @@ a Linux container -- CI is the check, and a job that currently times
 out is already red, so a failure there would at least say something a
 timeout does not.
 
+**Both fixes were confirmed by the next run, and it found two more
+things.** macOS went from 14 failures to 2 and 2,476 passed to 2,490 --
+the link fix holds on the platform it was written for, which a Linux
+container could only ever simulate. Windows went from CANCELLED at
+42:56 to finishing in 18:59, a 2.3x improvement that puts it well
+inside its cap; running the suite four-wide there was the right read.
+
+**The same class of bug a second time, in a different feature.**
+`FESTINA_TARGET_CPU=native` (#335, #336) is the one value that has to
+ask the processor, and libLLVM is the only thing here that can.
+`_Binding.__init__` returns before `_bind()` when the library is not
+loadable, so every entry point is simply absent, and
+`target_cpu_and_features` walked into that and raised AttributeError
+from a getattr deep inside the call. Both macOS and Windows hit it;
+both had never built it. Production cannot reach it -- the only caller
+is `emit_object_file`, which by definition already holds a working
+binding -- so what failed was the tests, asserting a property of a
+path those platforms do not have. The function now says so with an
+LLVMBackendError naming the variable, and the two tests skip where
+libLLVM cannot exist. That is not a skip to get green: `native` reads
+the host CPU, libLLVM is what reads it, and without libLLVM there is
+nothing for the claim to be true OF. Every other test in that class is
+string handling and keeps running everywhere.
+
+**Linux ran out of its budget, and this one is minutes rather than a
+bug.** 29:52 in the run before (eight seconds of headroom) and 30:16 in
+the next, cancelled. Raised to 45, matching windows. The work is real
+-- 161 whole-compiler builds -- and #344 already spent the available
+speedup getting it from 1:49:52 to about 30 minutes on four cores;
+there is no second 3x to find. #238's rule is about not papering over
+slowness nobody has looked at, and this has been measured from several
+directions.
+
+**One failure is left unexplained, deliberately.**
+`test_draw_text_writes_onto_the_image` exits 0xC0000409 --
+STATUS_STACK_BUFFER_OVERRUN -- on Windows under `-n`, having passed
+serially. The plausible reading is concurrent processes racing on a
+shared fontconfig cache, the same family as the four races in #344 but
+Windows-shaped. It is a guess. It cannot be reproduced from a Linux
+container, and this entry already contains two confident diagnoses that
+were wrong before the third one was right, so it is recorded as open
+rather than fixed on a theory.
+
 **What the Linux job's clock now says.** 28m20s for the test suite,
 29m52s for the job, against a 30-minute timeout: eight seconds of
 headroom. #344 took it there from a serial run this container measures

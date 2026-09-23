@@ -57,6 +57,18 @@ class TestTheSelection:
         # asserting WHICH cpu -- that is whatever machine this runs on;
         # the claim is that it names a real one and carries its
         # features, which no other value does.
+        #
+        # decisions.md #345: libLLVM is the only thing here that can ask
+        # the processor, so this claim does not merely go unverified
+        # without it -- there is nothing for it to be true OF. macOS and
+        # Windows CI both take the clang IR frontend instead (ci.yml
+        # installs no libLLVM bottle on either), and both raised
+        # AttributeError here the first time they ran this in eleven
+        # days. Every other test in this class is pure string handling
+        # and keeps running everywhere.
+        if not llvm_backend.available():
+            pytest.skip("libLLVM unavailable -- `native` is the one value "
+                        "that reads the host CPU, and libLLVM is what reads it")
         cpu, features = llvm_backend.target_cpu_and_features(
             environ={"FESTINA_TARGET_CPU": "native"})
         assert cpu and cpu != b"generic"
@@ -91,6 +103,12 @@ class TestTheSelection:
         assert blank == unset
 
     def test_the_real_environment_is_the_default_source(self, monkeypatch):
+        # Same libLLVM requirement as test_native_asks_for_the_build_machine
+        # above, and for the same reason: this asks for `native`, which
+        # only libLLVM can answer (decisions.md #345).
+        if not llvm_backend.available():
+            pytest.skip("libLLVM unavailable -- `native` is the one value "
+                        "that reads the host CPU, and libLLVM is what reads it")
         monkeypatch.setenv("FESTINA_TARGET_CPU", "native")
         cpu, _ = llvm_backend.target_cpu_and_features()
         assert cpu != b"generic"
