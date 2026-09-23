@@ -165,23 +165,25 @@ included:
 
 | | |
 |---|---|
-| lexer | 135 match, 0 differ |
-| parser | 135 match, 0 differ, 0 unported |
-| semantic | 135 match, 0 differ, 0 unported |
-| escape analysis | 122 match, 0 differ, 0 unported — 2,370 of 2,370 records |
-| codegen | 122 match, 0 differ, 0 unported — 439,881 of 439,881 IR lines |
+| lexer | 136 match, 0 differ |
+| parser | 136 match, 0 differ, 0 unported |
+| semantic | 136 match, 0 differ, 0 unported |
+| escape analysis | 123 match, 0 differ, 0 unported — 2,384 of 2,384 records |
+| codegen | 123 match, 0 differ, 0 unported — 443,493 of 443,493 IR lines |
 | canaries | 161 registered, 0 missed — 154 caught, 7 via the ratchet |
 
-The corpus is 135 files, of which 122 compile and 13 are rejected by
+The corpus is 136 files, of which 123 compile and 13 are rejected by
 both implementations, so the two column shapes above are the whole of
-it either way. It grew by three without anyone adding a case:
+it either way. It grew by four without anyone adding a case:
 `bootstrap/difftest.py` discovers `.f` files rather than listing them,
 so [runtime.md](runtime.md) phase 1's `inflate.f`, `png.f` and
-`checksums.f` joined the corpus the moment they were written — and the
-bootstrap compiler, itself written in Festina, reproduces their IR byte
-for byte. A decoder written for this project is now held to the same
-standard as the compiler's own source, which was not planned and is
-worth keeping. The 439,881 is file-specific IR: `irdiff`'s shared
+`checksums.f`, and phase 2's `jpeg.f`, joined the corpus the moment
+they were written — and the bootstrap compiler, itself written in
+Festina, reproduces their IR byte for byte, including `jpeg.f`'s
+`arr[float]` and `Math.cos`, which no component had used before. A
+decoder written for this project is held to the same standard as the
+compiler's own source, which was not planned and is worth keeping. The
+443,493 is file-specific IR: `irdiff`'s shared
 preamble is subtracted per file, which is why it is smaller than 119
 whole dumps added together.
 
