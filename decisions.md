@@ -7947,3 +7947,50 @@ before handing it out and retries a dud, and says in a comment that the
 mechanism is unestablished. It cannot mask a compiler bug: it decides
 only whether this fixture's own X server is usable. Running the
 behavioural half serially means it should not arise at all.
+
+345. CI HAD NOT RUN IN ELEVEN DAYS, AND macOS WAS BROKEN THE WHOLE TIME
+
+`festina test` (#341) linked on Linux and failed to link on macOS from
+the day it landed. Fourteen of `tests/test_test_type.py`'s cases died
+at `ld` with `_festina_test_assert`, `_festina_test_group`,
+`_festina_test_report` and `_festina_test_failures` undefined. Nothing
+said so, because nothing had built it.
+
+**The workflow only fires on `push` to `main` and on `pull_request`.**
+This branch's last pull request merged eleven days before this was
+noticed, and every commit since -- ninety-six of them -- accumulated
+without a single CI run. Local runs were green throughout, on the one
+platform that cannot see this class of bug. A branch with no open pull
+request has no CI, and that is worth knowing out loud rather than
+rediscovering.
+
+**The bug is a second implementation that nobody has to remember to
+update.** `_runtime_objects_and_link_libs` drives its feature list from
+`_RUNTIME_FEATURES`, so a new runtime translation unit is picked up by
+the libLLVM path automatically. `_compile_via_clang_ir_frontend`, the
+fallback, repeats every feature by hand as a `needs_*` parameter and an
+`if` block. `tests` was added to the first and not the second. Linux
+takes the first path and macOS takes the second -- ci.yml deliberately
+does not install the libLLVM bottle there -- so the omission is
+invisible on the platform that runs most often.
+
+That function's own docstring already describes this happening once
+before, in claude.md #126 round four, when the darwin graphics swaps
+were missed the same way and every graphics program failed to link.
+Twice is a pattern, so the fix is a test for the CLASS: a signature
+check that every key of `_RUNTIME_FEATURES` has a matching `needs_*`
+parameter on the fallback. It is pure Python, costs nothing, and fails
+the moment the next feature forgets. The behavioural half compiles a
+`festina test` build with libLLVM forced unavailable, which is what
+makes the macOS path testable from Linux at all -- and without the fix
+it raises exactly the link error macOS raised, reproduced here before
+the fix was written.
+
+**What the Linux job's clock now says.** 28m20s for the test suite,
+29m52s for the job, against a 30-minute timeout: eight seconds of
+headroom. #344 took it there from a serial run this container measures
+at 1:49:52, so the split is what made the job fit at all -- but it fits
+by a margin that is not a margin. #238 raised that timeout once and
+recorded that a budget raised twice is a budget nobody is managing, so
+this entry records the number rather than quietly raising it again. The
+next thing added to the suite will need a decision about it.

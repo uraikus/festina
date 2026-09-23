@@ -12142,6 +12142,71 @@ class TestMinimalBuildDependencies:
         cli_mod.compile_file(str(src), str(out), cc=clang)
         assert out.exists()
 
+    def test_every_runtime_feature_has_a_fallback_parameter(self):
+        """The class of bug, rather than the instance of it.
+
+        `_runtime_objects_and_link_libs` (the libLLVM path) drives its
+        feature list from `_RUNTIME_FEATURES`, so a new feature is
+        automatically covered there. `_compile_via_clang_ir_frontend`
+        does not: it repeats every feature as its own `needs_*`
+        parameter and `if` block, and nothing connects the two. A
+        feature added to one and not the other builds perfectly on
+        Linux and fails to link on macOS, which is the only platform
+        that takes the fallback.
+
+        That has now happened twice -- claude.md #126 round four for
+        the darwin graphics swaps, and decisions.md #345 for `tests`,
+        where 14 of test_test_type.py's cases failed real macOS CI on
+        `_festina_test_assert` and friends being undefined. This is a
+        signature check rather than a build, so it costs nothing and
+        fails the moment the next feature forgets.
+        """
+        import inspect
+        from festina import cli as cli_mod
+
+        params = set(inspect.signature(cli_mod._compile_via_clang_ir_frontend).parameters)
+        missing = sorted(name for name in cli_mod._RUNTIME_FEATURES
+                          if f"needs_{name}" not in params)
+        assert not missing, (
+            f"runtime features with no needs_* parameter on the "
+            f"clang-IR fallback: {missing}. The libLLVM path picks "
+            f"these up from _RUNTIME_FEATURES automatically; this one "
+            f"has to be told, and macOS is the platform that finds out.")
+
+    def test_a_test_build_still_links_via_the_fallback(
+            self, parser, semantic, codegen, tmp_path, monkeypatch):
+        """decisions.md #345: `festina test` through the macOS path.
+
+        The behavioural half of the signature check above. `tests` was
+        wired into the libLLVM path only, so every `festina test` build
+        on macOS failed at link with `_festina_test_assert`,
+        `_festina_test_group`, `_festina_test_report` and
+        `_festina_test_failures` undefined. Reproduced on Linux by
+        forcing the fallback, which is what makes it testable here at
+        all: without the fix this raises that exact link error.
+        """
+        clang = shutil.which("clang")
+        if not clang:
+            pytest.skip("clang not on PATH -- nothing to fall back to")
+        from festina import cli as cli_mod, llvm_backend
+
+        class _Unavailable:
+            lib = None
+
+        monkeypatch.setattr(llvm_backend, "_binding_instance", _Unavailable())
+        assert llvm_backend.available() is False
+
+        src = tmp_path / "main.f"
+        src.write_text("test greeting = 'greets'\ngreeting('hi', 'hi')\n")
+        out = tmp_path / "program"
+        cli_mod.compile_file(str(src), str(out), cc=clang, tests_enabled=True)
+        assert out.exists()
+
+        result = subprocess.run([str(out)], cwd=tmp_path, capture_output=True,
+                                 text=True, timeout=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "greets" in result.stdout
+
     def test_a_graphics_program_still_links_via_the_fallback(
             self, parser, semantic, codegen, tmp_path, monkeypatch):
         # claude.md #126 round four: real macOS CI (which always takes

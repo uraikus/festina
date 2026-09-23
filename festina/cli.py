@@ -1251,7 +1251,8 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
     else:
         _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio, link_libs,
                                         needs_http=gen.uses_http, needs_https=gen.uses_https,
-                                        needs_async_io=gen.uses_async_io, needs_threads=gen.uses_threads)
+                                        needs_async_io=gen.uses_async_io, needs_threads=gen.uses_threads,
+                                        needs_tests=gen.tests_enabled)
     _rename_if_linker_appended_exe(output_path)
     return output_path
 
@@ -1328,7 +1329,7 @@ def _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_
 
 def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, needs_audio, link_libs,
                                     needs_http=False, needs_https=False, needs_async_io=False,
-                                    needs_threads=False):
+                                    needs_threads=False, needs_tests=False):
     """Fallback used only when libLLVM couldn't be loaded in this process
     -- the original pipeline, handing the .ll file straight to `cc`
     (which then must actually be clang, or another compiler with an LLVM
@@ -1408,6 +1409,19 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         # pkg-config package, the same shape "async_io" just above has.
         runtime_sources.append(_RUNTIME_THREAD_C)
         pkgs, flags = _feature_pkgs_and_flags("threads")
+        pkg_configs += pkgs
+        extra_link_flags += flags
+    if needs_tests:
+        # claude.md #341: `festina test`'s own assertion runtime. Added
+        # to the libLLVM path above and NOT to this one, which is the
+        # omission this function's docstring already describes happening
+        # once before -- and with the same result, invisible on Linux
+        # and a link failure on macOS: 14 tests in test_test_type.py
+        # failed on `_festina_test_assert` and friends being undefined
+        # (decisions.md #345). Every feature above has to be repeated
+        # here, and nothing makes that automatic.
+        runtime_sources.append(_RUNTIME_TEST_C)
+        pkgs, flags = _feature_pkgs_and_flags("tests")
         pkg_configs += pkgs
         extra_link_flags += flags
     cflags = []
