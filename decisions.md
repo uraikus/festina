@@ -8401,3 +8401,53 @@ its middle, swallowing everything between gdb's banner and its last
 line. The note is printed as well now, because captured stdout is
 shown in full on failure. An instrument whose output is truncated in
 the one place anybody reads it is not an instrument.
+
+**The backtrace, at last, and it names the abort.** CI run 170, with
+the module map asked for before the unwind:
+
+    Thread 1 (Thread 5720.0x1fa8):
+    #0  0x00007ffa6bd74aee in ucrtbase!abort ()
+          from C:\Windows\System32\ucrtbase.dll
+    #1  0x00007ffa47ac5065 in ?? ()
+          from D:\a\_temp\msys64\ucrt64\bin\libcairo-2.dll
+        ... twelve frames inside libcairo-2.dll ...
+    #13 0x00007ff78158355b in festina_image_draw_text ()
+    #14 0x00007ff7815715f5 in main ()
+
+and the map that makes the address mean something:
+
+    0x00007ffa6bcd1000  0x00007ffa6be1aec0  C:\Windows\System32\ucrtbase.dll
+
+0x7ffa6bd74aee is inside it. So the one piece of analysis that
+survived every wrong theory -- 0xC0000409 is `__fastfail`, and UCRT
+raises it for `abort()` -- is confirmed, and the guess made from the
+address alone in the previous round happened to be right for a reason
+that is now a fact rather than a coincidence of address ranges.
+
+**The abort is Cairo's.** Twelve frames of libcairo-2.dll sit between
+our call and `abort()`. Cairo chose to abort rather than put the
+context into the error state it has for exactly this; our frame is the
+call into it. That is worth stating precisely, because "the fix is
+ours" and "the crash is ours" are different claims and only the second
+one is now settled, in the negative.
+
+Whether the FIX is ours turns on why Cairo aborts. The module list
+shows `libfontconfig-1.dll`, `libfreetype-6.dll` and `libharfbuzz-0.dll`
+all loaded, so the font stack is present -- but present is not the
+same as able to resolve a font. `festina_apply_font` asks for
+"sans-serif" through `cairo_select_font_face`, the toy font API, and a
+toy face resolving to nothing is an obvious route into an
+unrecoverable internal error. If that is it, the fix IS ours: check
+the status after selecting a face and decline to draw rather than
+handing Cairo something it will abort on.
+
+So CI now prints `fc-list | wc -l` and `fc-match sans-serif` on that
+runner. Diagnostic only, failing nothing. A count of zero names the
+cause; a healthy count rules it out, and the next instrument after
+that is Cairo debug symbols, since every one of those twelve frames
+is `?? ()` for want of them.
+
+**What the instrument was worth.** Three rounds produced three wrong
+theories from one number. One round with the instrument produced a
+backtrace, a module map, a confirmed mechanism, and a specific next
+question. The instrument cost less than any one of the theories.

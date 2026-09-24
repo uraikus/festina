@@ -259,6 +259,25 @@ jobs:
         # were wrong. This is the alternative to a fourth.
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
+      - name: What fonts can fontconfig see
+        # decisions.md #348. The backtrace says abort() in ucrtbase,
+        # twelve frames deep in libcairo-2.dll, entered from
+        # festina_image_draw_text -- so Cairo aborts inside its text
+        # path rather than returning an error. The remaining question
+        # is WHY, and the cheapest discriminator is whether fontconfig
+        # can resolve a font here at all: festina_apply_font asks for
+        # "sans-serif" through Cairo's toy font API, and a toy face
+        # that resolves to nothing is the obvious way into an
+        # unrecoverable internal error.
+        #
+        # Diagnostic only -- it changes nothing and must never fail the
+        # job. A count of zero would name the cause; a healthy count
+        # rules it out and the next instrument is Cairo debug symbols.
+        run: |
+          echo "fc-list count:"
+          fc-list 2>/dev/null | wc -l || echo "fc-list unavailable"
+          echo "fc-match sans-serif:"
+          fc-match sans-serif 2>/dev/null || echo "fc-match unavailable"
       - name: Run the test suite
         # decisions.md #345: this job was CANCELLED at the 45-minute cap
         # after 42:56, up from 18:31 eleven days earlier -- the suite
