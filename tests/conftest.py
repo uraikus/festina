@@ -207,9 +207,65 @@ def compile_and_run(tmp_path, codegen, cli_mod):
             cwd=tmp_path, capture_output=True, text=True, timeout=15,
             env=run_env, encoding="utf-8",
         )
+        _explain_windows_fatal_status(result, out_path, args, run_env, tmp_path)
         return result
 
     return _run
+
+
+#: Windows exit statuses that are a CRASH rather than a program's own
+#: exit code, mapped to what they mean. A compiled program cannot
+#: return these itself -- they are NTSTATUS values the OS substitutes.
+_WINDOWS_FATAL_STATUS = {
+    0xC0000005: "STATUS_ACCESS_VIOLATION",
+    0xC0000374: "STATUS_HEAP_CORRUPTION",
+    0xC00000FD: "STATUS_STACK_OVERFLOW",
+    0xC0000409: "STATUS_STACK_BUFFER_OVERRUN (__fastfail -- which UCRT "
+                "also raises for abort(), so a library assertion is at "
+                "least as likely as a real stack overrun)",
+}
+
+
+def _explain_windows_fatal_status(result, out_path, args, run_env, cwd):
+    """Turn a bare Windows crash status into something that names what
+    crashed, by re-running the program under gdb for a backtrace.
+
+    decisions.md #345/#348: `test_draw_text_writes_onto_the_image` has
+    been exiting 0xC0000409 on Windows under `-n` for three rounds now,
+    and every round has been spent guessing at the cause from the
+    number alone -- three theories, three wrong. `assert 3221226505 ==
+    0` is the whole of what CI has ever reported about it. A stack is
+    what would settle it, and nothing was collecting one.
+
+    Best-effort and silent when it cannot help: no gdb in the
+    environment, or a crash that does not reproduce on the re-run,
+    leaves the failure exactly as it was. A crash that does NOT
+    reproduce is itself worth knowing, and says so.
+    """
+    if sys.platform != "win32" or not result.returncode:
+        return
+    # A Windows fatal status arrives as a large unsigned value; the
+    # mask is for the sign convention, not for any real 64-bit status.
+    status = result.returncode & 0xFFFFFFFF
+    if status not in _WINDOWS_FATAL_STATUS:
+        return
+    note = [f"\n[crash] exit 0x{status:08X} -- {_WINDOWS_FATAL_STATUS[status]}"]
+    if not shutil.which("gdb"):
+        note.append("[crash] gdb is not in this environment; no backtrace")
+    else:
+        try:
+            dbg = subprocess.run(
+                ["gdb", "--batch", "-ex", "run", "-ex", "bt full",
+                 "--args", str(out_path), *(args or [])],
+                cwd=cwd, capture_output=True, text=True, timeout=120,
+                env=run_env, encoding="utf-8", errors="replace")
+            note.append("[crash] gdb re-run:\n" + (dbg.stdout or "")
+                        + (dbg.stderr or ""))
+        except (OSError, subprocess.SubprocessError) as exc:
+            note.append(f"[crash] gdb re-run failed: {exc}")
+    # Appended to stderr because that is what every caller already puts
+    # in its assertion message.
+    result.stderr = (result.stderr or "") + "\n".join(note)
 
 
 @pytest.fixture

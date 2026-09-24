@@ -247,34 +247,18 @@ jobs:
             mingw-w64-ucrt-x86_64-mpg123
             mingw-w64-ucrt-x86_64-cairo
             mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-gdb
             git
+        # gdb is here for decisions.md #348: a compiled program that
+        # exits with a Windows fatal status gets re-run under it for a
+        # backtrace (tests/conftest.py's _explain_windows_fatal_status).
+        # test_draw_text_writes_onto_the_image has been exiting
+        # 0xC0000409 under -n for three rounds, and `assert 3221226505
+        # == 0` is the whole of what CI has ever said about it -- three
+        # theories have been guessed from that number and all three
+        # were wrong. This is the alternative to a fourth.
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: Warm the fontconfig cache
-        # decisions.md #345/#348: test_draw_text_writes_onto_the_image
-        # exits 0xC0000409 here under -n, having passed serially. That
-        # code is __fastfail, which UCRT also raises for abort() -- so
-        # a library assertion, not a stack overrun in this project's
-        # own code (both drawText paths in
-        # festina_runtime_graphics.c were read for one and are clean).
-        # The one thing that test does which its passing neighbours do
-        # not is rasterise a glyph, and on a cold runner the first
-        # process to do that makes fontconfig build its cache. Four
-        # compiled .exe's racing to build and read the same cache file
-        # is the same shape as the object-cache race fixed in #348,
-        # with fontconfig's assertions in place of a truncated object.
-        #
-        # So the cache is built ONCE, serially, before any of them run.
-        # Cheap, and it removes the only shared mutable file in that
-        # test's path. Non-fatal on purpose: if fc-cache is not in this
-        # MSYS2 environment the suite must still run, and this step
-        # will have proved nothing rather than broken something.
-        #
-        # An experiment, and recorded as one. It is not confirmed to be
-        # the cause -- that cannot be established from a Linux
-        # container, and #345 already holds two confident diagnoses of
-        # this crash that were wrong.
-        run: fc-cache --force --verbose || echo "fc-cache unavailable; cache left cold"
       - name: Run the test suite
         # decisions.md #345: this job was CANCELLED at the 45-minute cap
         # after 42:56, up from 18:31 eleven days earlier -- the suite

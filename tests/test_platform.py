@@ -18,6 +18,7 @@ CRLF-proof on Windows) and the key-name vocabulary artifact
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -1319,3 +1320,92 @@ class TestSharedObjectCacheIsWrittenAtomically:
 
         assert obj.read_bytes() == b"\x7fELF-ish"
         assert [p.name for p in tmp_path.iterdir()] == [obj.name]
+
+
+class TestWindowsFatalStatusExplanation:
+    """decisions.md #348: a Windows crash status is a number and
+    nothing else, and three theories about one particular number have
+    now been guessed from it and been wrong. conftest re-runs such a
+    program under gdb so the next round has a stack instead.
+
+    Tested here because it only ever runs on Windows, where nobody
+    developing this is watching it work.
+    """
+
+    @pytest.fixture
+    def explain(self):
+        from tests.conftest import _explain_windows_fatal_status
+        return _explain_windows_fatal_status
+
+    def _result(self, returncode):
+        return subprocess.CompletedProcess(["program"], returncode,
+                                            stdout="", stderr="")
+
+    def test_nothing_happens_off_windows(self, explain, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "platform", "linux")
+        result = self._result(0xC0000409)
+        explain(result, tmp_path / "program", None, None, tmp_path)
+        assert result.stderr == ""
+
+    def test_an_ordinary_nonzero_exit_is_left_alone(
+            self, explain, monkeypatch, tmp_path):
+        """A program that returns 1 failed; it did not crash, and
+        re-running it under a debugger would say nothing."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        result = self._result(1)
+        explain(result, tmp_path / "program", None, None, tmp_path)
+        assert result.stderr == ""
+
+    def test_a_clean_exit_is_left_alone(self, explain, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "platform", "win32")
+        result = self._result(0)
+        explain(result, tmp_path / "program", None, None, tmp_path)
+        assert result.stderr == ""
+
+    def test_the_crash_is_named_even_with_no_gdb(
+            self, explain, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+        result = self._result(0xC0000409)
+        explain(result, tmp_path / "program", None, None, tmp_path)
+        assert "0xC0000409" in result.stderr
+        assert "__fastfail" in result.stderr, (
+            "the number alone is what three wrong guesses were made from")
+        assert "gdb is not in this environment" in result.stderr
+
+    def test_a_backtrace_is_attached_when_gdb_is_there(
+            self, explain, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gdb")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="#0  cairo_show_text ()\n", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = self._result(0xC0000409)
+        explain(result, tmp_path / "program", ["--flag"], None, tmp_path)
+
+        assert calls and calls[0][0] == "gdb"
+        assert "bt full" in calls[0]
+        assert "--flag" in calls[0], "the program's own arguments must be kept"
+        assert "cairo_show_text" in result.stderr
+
+    def test_a_gdb_that_cannot_run_does_not_replace_the_failure(
+            self, explain, monkeypatch, tmp_path):
+        """The test that crashed is what matters; this is a note on it.
+        A broken debugger must not turn a real assertion failure into an
+        error about the debugger."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gdb")
+
+        def boom(cmd, **kwargs):
+            raise OSError("no exec")
+
+        monkeypatch.setattr(subprocess, "run", boom)
+        result = self._result(0xC0000374)
+        explain(result, tmp_path / "program", None, None, tmp_path)
+        assert "STATUS_HEAP_CORRUPTION" in result.stderr
+        assert "gdb re-run failed" in result.stderr

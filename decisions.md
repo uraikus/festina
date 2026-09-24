@@ -8320,3 +8320,46 @@ and its passing neighbours do not, so CI now builds that cache once,
 serially, before the four-wide run. Recorded as an experiment: #345
 already holds two confident diagnoses of this crash that were wrong,
 and a Linux container cannot settle the third.
+
+**The fontconfig theory is dead, and that is the third one.** CI run
+168 warmed the cache and the crash came back unchanged:
+
+    Run fc-cache --force --verbose || echo "fc-cache unavailable..."
+    C:/Users/runneradmin/AppData/Local/fontconfig/cache: cleaning cache directory
+    D:\a\_temp\msys64\ucrt64\bin\fc-cache.exe: succeeded
+    ...
+    FAILED tests/test_codegen.py::TestImageDrawMethods::
+        test_draw_text_writes_onto_the_image - assert 3221226505 == 0
+
+Checked rather than inferred from the job's colour: the step ran
+`fc-cache` for real, not its `|| echo` fallback. And the failure landed
+at 72% of a sixteen-minute run, six minutes AFTER the cache was built,
+which rules out cold-cache contention on timing alone even if the
+warming had somehow not taken.
+
+So the step is gone. A CI step whose only purpose was a hypothesis
+that has been tested and refuted is not worth three seconds and a
+paragraph of comment explaining a thing that is not true.
+
+**What is actually wrong here is the evidence, not the theories.**
+`assert 3221226505 == 0` is the entire content of every report this
+crash has ever produced, across three rounds. Three diagnoses have
+been guessed from that number -- a stack overrun in this project's
+code, then something about concurrency generally, then fontconfig --
+and all three were wrong. A fourth guess from the same number would
+deserve the same outcome.
+
+`tests/conftest.py` now re-runs a program that exits with a Windows
+fatal status under gdb and attaches the backtrace, with
+`mingw-w64-ucrt-x86_64-gdb` in the job's package list. It names the
+status too, since 0xC0000409 meaning `__fastfail` -- and `__fastfail`
+being what UCRT raises for `abort()` -- is the one genuine piece of
+analysis these rounds produced, and it belongs in the failure rather
+than in a decisions entry nobody reads while staring at CI.
+
+Best-effort by design: no gdb, or a crash that does not reproduce on
+the re-run, leaves the failure exactly as it was. A crash that does
+not reproduce is itself worth knowing, and it says so.
+
+This is not a fix. It is the instrument that should have been built
+before the first theory.
