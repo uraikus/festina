@@ -2175,6 +2175,82 @@ void *festina_image_from_pixels(void *arr, int64_t w, int64_t h) {
     return festina_image_box(out);
 }
 
+/* runtime.md phase 4: img.toPixels() -- the exact inverse of
+ * imageFromPixels above, and the read half of the pixel handoff.
+ *
+ * A rasteriser written in Festina has to see what it is drawing onto,
+ * and getPixelColor() is one pixel per call across the language
+ * boundary. This hands the whole surface over in one call, in the
+ * same format imageFromPixels takes: four `int` per pixel -- R, G, B,
+ * A, straight (NOT premultiplied) alpha -- row-major from the
+ * top-left. So `imageFromPixels(a.toPixels(), a.width, a.height)`
+ * reproduces `a`, and that round trip is the test.
+ *
+ * Un-premultiplying is the whole subtlety, and it is exactly what
+ * festina_pixel_color_from_surface already does for one pixel
+ * (claude.md #189/#192), including the RGB24 case: a JPEG-loaded
+ * surface stores 0 in the top byte because it has no alpha channel,
+ * not because it is transparent, and reading that as alpha would make
+ * every pixel of every JPEG come back fully transparent.
+ *
+ * Alpha 0 answers (0, 0, 0, 0) rather than getPixelColor's -1 'none'
+ * sentinel: this returns four channel values, not a `color`, and a
+ * fully transparent pixel has no colour to recover -- premultiplied
+ * storage has already multiplied it away. Round-tripping it gives
+ * back a transparent pixel, which is what it was. */
+void *festina_image_to_pixels(void *img) {
+    if (!img) return NULL;
+    cairo_surface_t *surface = ((FestinaImageBox *)img)->surface;
+    if (!surface) return NULL;
+    cairo_surface_flush(surface);
+    int w = cairo_image_surface_get_width(surface);
+    int h = cairo_image_surface_get_height(surface);
+    int stride = cairo_image_surface_get_stride(surface);
+    const unsigned char *src = cairo_image_surface_get_data(surface);
+    int opaque = cairo_image_surface_get_format(surface) == CAIRO_FORMAT_RGB24;
+    int64_t n = (int64_t)w * (int64_t)h * 4;
+    if (!src) n = 0;
+
+    /* The array Festina itself emits: one block holding the refcount
+     * and the {length, data} payload, with the elements in a second
+     * allocation -- see festina_release_array, which frees exactly
+     * these two. A refcount of 1 because this is a fresh value the
+     * caller owns, not a literal (those carry the negative immortal
+     * sentinel). */
+    char *raw = calloc(1, sizeof(int64_t) + 2 * sizeof(int64_t));
+    if (!raw) festina_fail("out of memory reading an image's pixels");
+    *(int64_t *)raw = 1;
+    int64_t *payload = (int64_t *)(raw + sizeof(int64_t));
+    int64_t *data = malloc((size_t)(n ? n : 1) * sizeof(int64_t));
+    if (!data) festina_fail("out of memory reading an image's pixels");
+    payload[0] = n;
+    memcpy(&payload[1], &data, sizeof(int64_t *));
+
+    int64_t at = 0;
+    for (int y = 0; y < h && n; y++) {
+        for (int x = 0; x < w; x++) {
+            uint32_t px;
+            memcpy(&px, src + (int64_t)y * stride + (int64_t)x * 4, sizeof(px));
+            uint32_t a = opaque ? 255u : ((px >> 24) & 0xff);
+            uint32_t r = (px >> 16) & 0xff;
+            uint32_t g = (px >> 8) & 0xff;
+            uint32_t b = px & 0xff;
+            if (a == 0) {
+                r = g = b = 0;
+            } else if (a < 255) {
+                r = (r * 255 + a / 2) / a;
+                g = (g * 255 + a / 2) / a;
+                b = (b * 255 + a / 2) / a;
+            }
+            data[at++] = (int64_t)r;
+            data[at++] = (int64_t)g;
+            data[at++] = (int64_t)b;
+            data[at++] = (int64_t)a;
+        }
+    }
+    return payload;
+}
+
 /* claude.md #135: saveCanvas() with no path -> img, a SNAPSHOT of the
  * canvas at this instant rather than a live view of it -- built the
  * exact same way festina_image_clip just above builds any other fresh

@@ -840,6 +840,10 @@ void *festina_blank_image(int64_t w, int64_t h);
 /* claude.md #346: an img from an arr[int] of RGBA bytes, four per
  * pixel, row-major from the top-left. */
 void *festina_image_from_pixels(void *arr, int64_t w, int64_t h);
+/* runtime.md phase 4: the inverse -- the whole surface as an arr[int]
+ * of straight-alpha RGBA, so a Festina rasteriser can read what it is
+ * drawing onto in one call instead of one getPixelColor per pixel. */
+void *festina_image_to_pixels(void *img);
 /* runtime.md: `decoded` when the Festina decoders handled the file,
  * otherwise the C loader's own answer for it. */
 void *festina_load_image_via(void *decoded, const char *path);

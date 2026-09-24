@@ -2815,6 +2815,7 @@ def analyze(program, filename="<string>"):
             if expr.prop in ("width", "height"):
                 return types_mod.PrimitiveType("int")
             if expr.prop in ("clip", "resize", "save", "saveCopy", "getPixelColor",
+                             "toPixels",
                              "drawRect", "drawPixel", "drawCircle", "drawText",
                              "drawImage", "translate", "rotate", "scale",
                              "resetTransform", "saveState", "restoreState",
@@ -4597,6 +4598,22 @@ def analyze(program, filename="<string>"):
                             category="invalid function argument type",
                         )
                 return _COLOR
+            # runtime.md phase 4: img.toPixels() -> arr[int], the read
+            # half of the pixel handoff and the exact inverse of
+            # imageFromPixels(px, w, h). Four ints per pixel -- R, G, B,
+            # A, straight alpha -- row-major, so the two compose into a
+            # round trip. Its own branch for the same reason
+            # getPixelColor has one: it returns a value, and the drawing
+            # methods below all return nothing.
+            if (callee.prop == "toPixels"
+                    and isinstance(infer(callee.obj, scope), types_mod.ImageType)):
+                if expr.args:
+                    raise CompileError(
+                        f"toPixels() expects no arguments, got {len(expr.args)}",
+                        file=filename, line=callee.line, column=callee.column,
+                        category="invalid function argument type",
+                    )
+                return types_mod.ArrayType(_INT)
             # claude.md #134: drawRect/drawPixel/drawCircle/drawText as
             # methods on img -- the same four canvas-level drawing
             # builtins claude.md #37/#39/#133 already give, now also

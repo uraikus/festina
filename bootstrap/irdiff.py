@@ -45,9 +45,17 @@ from bootstrap.difftest import REPO_ROOT, corpus, run_text   # noqa: E402
 CODEGEN_SOURCE = os.path.join(REPO_ROOT, "bootstrap", "irdumpf.f")
 
 # The runtime `declare` block every module emits verbatim. Measured, not
-# assumed: the longest common prefix of all 83 compilable corpus files
-# once each one's own source-path comment is set aside.
-SHARED_PREAMBLE_LINES = 386
+# assumed: the longest common prefix of all 124 compilable corpus files
+# once each one's own source-path comment (line 2, which is the one
+# line that differs between any two of them) is set aside, minus two.
+#
+# Re-measure it rather than incrementing it when a declare is added.
+# decisions.md #346 records getting this wrong by reasoning instead:
+# the naive "longest common prefix of two dumps" is 1, because line 2
+# is each file's own path. The measurement is now 389 against this
+# 387, and runtime.md phase 4's img.toPixels() is the line that moved
+# it from 386.
+SHARED_PREAMBLE_LINES = 387
 
 
 def relative(path):

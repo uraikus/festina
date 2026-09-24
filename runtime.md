@@ -384,6 +384,104 @@ the libLLVM one, the `.ll`-to-clang fallback that macOS CI runs, and
 runtime unit itself. The script asks `cli.component_ir(name)` for the
 IR rather than reimplementing the entry-point rewrite in `sed`.
 
+### Phase 4, specified
+
+Phases 1–3 are decoders: bytes in, pixels out, once per load. A
+rasteriser is a different animal — it draws *onto* a surface the C
+side owns, repeatedly, interleaved with C-side operations, possibly
+every frame. Three things had to be settled before writing any of it,
+and two of them turned out to be already answered in this repository.
+
+**What Cairo is actually used for.** Measured, not guessed —
+`festina_runtime_graphics.c` names 70 distinct Cairo entry points.
+Phase 4's share:
+
+| group | entry points |
+|---|---|
+| paths | `move_to`, `line_to`, `curve_to`, `close_path`, `rectangle`, `arc`, `new_path` |
+| painting | `fill`, `fill_preserve`, `stroke`, `paint`, `paint_with_alpha`, `mask_surface` |
+| source | `set_source_rgba`, `set_source_surface`, `set_source` |
+| patterns | `pattern_create_linear`, `pattern_create_radial`, `add_color_stop_rgb`, `set_filter` |
+| transform | `matrix_init_identity`, `translate`, `scale`, `rotate`, `set_matrix` |
+| state | `save`, `restore`, `clip`, `set_line_width`, `set_operator`, `set_antialias` |
+
+Text (`select_font_face`, `show_text`, `text_extents`) is phase 5.
+PNG I/O is phases 1 and 6. The Xlib surface is the windowing seam and
+is not in scope at all.
+
+**The architecture is already precedented.** claude.md #240 added a
+direct-pixel fast path for opaque flat rectangles, pixels and circles:
+it writes ARGB32 words straight into the Cairo surface, gated on the
+style state being solid and the transform being a whole-pixel offset,
+and falls through to Cairo when the contract does not hold. That is
+exactly the shape phase 4 wants, widened — *Festina computes pixels, C
+owns the surface, Cairo stays as the fallback for whatever the port
+has not reached yet.* It is also the same stance `png.f` and `jpeg.f`
+already take: refuse rather than half-do, and let the caller fall
+through.
+
+**The oracle is already built, too.** `FESTINA_NO_DIRECT_FILL=1`
+renders the same scene through the fast path and through Cairo and
+demands byte-identical PNGs (`TestSolidFillFastPath`, with `_png_diff`
+in `test_codegen.py`). A `FESTINA_*` switch selecting the Festina
+rasteriser reuses that harness whole.
+
+**But the oracle is two-tier, and saying so now is the point.**
+Byte-identity is available for flat, axis-aligned, opaque fills, and
+#240 already demonstrates it. It is NOT available for antialiased
+edges: Cairo and pixman make particular sampling choices, and a
+different rasteriser making different ones is not a bug. Those get
+properties that hold of any correct rasteriser — interior fully
+covered, exterior untouched, edge strictly between, coverage monotonic
+along the normal — plus a measured bound against Cairo, the way
+`jpeg.f` carries "max deviation 1 across 768 samples". A bound that is
+measured and asserted is a test; a bound chosen to make today's output
+pass is not, and the difference will be visible in the diff.
+
+**What it costs, measured.** The worry was that a rasteriser in
+Festina would be too slow to be the real backend, and the figure that
+suggested it — 18M px/s — was wrong for the question: that is
+`blankImage` plus a `drawPixel` builtin call per pixel, not a pixel
+loop. An actual loop over an `arr[int]`, compiled `-O2`:
+
+| inner loop | throughput | a full 800×600 canvas |
+|---|---|---|
+| flat fill | 1.92 G px/s | 0.25 ms |
+| src-over blend, 8-bit coverage, per channel | 96 M px/s | 5.0 ms |
+
+5 ms is the cost of blending *every pixel on the canvas* with
+coverage. Real scenes blend along edges — thousands of pixels — and
+fill flat spans inside, so a frame's rasterising is well under a
+millisecond against a 16.6 ms budget at 60fps. (Benchmarks written so
+the optimiser cannot collapse them: the fill value varies per
+repetition, and the blend reads what the previous pass wrote. The
+first version of the flat measurement reported 2.4 G px/s from twenty
+identical passes, which is what collapsing looks like.)
+
+**What is still missing: the handoff.** `imageFromPixels` (#346)
+builds an image *from* a buffer. A rasteriser also needs to read the
+surface it is drawing onto — a bulk counterpart, not `getPixelColor`
+one pixel at a time. That is phase 4's equivalent of #346 and its
+first piece of compiler work.
+
+**Slices, in dependency order.** Each ends green and is useful alone:
+
+1. the bulk pixel read, and a `raster.f` that can fill one axis-aligned
+   opaque rectangle — the narrowest slice that exercises the whole
+   handoff, and one where byte-identity against Cairo is available
+2. edge list, scanline fill, nonzero and even-odd winding, with
+   analytic coverage — the core; everything below is expressed in it
+3. `curve_to` by flattening, `arc` by the same, `rectangle` and the
+   existing circle cache expressed as paths
+4. stroking: joins, caps, line width, reduced to a fill of the
+   stroke outline
+5. clipping as a coverage mask intersected with the span coverage
+6. linear and radial gradients as a per-span source
+7. `save`/`restore`, the transform stack, and the operators actually
+   reachable from the language
+
+Phase 5 (glyphs) needs 1–5 and nothing after.
+
 ## Tests
 
 **The existing tests largely stand, and that is the point.** They

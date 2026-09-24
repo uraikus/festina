@@ -2243,6 +2243,7 @@ class CodeGen:
             "declare ptr @festina_blank_image(i64, i64)",
             # claude.md #346
             "declare ptr @festina_image_from_pixels(ptr, i64, i64)",
+            "declare ptr @festina_image_to_pixels(ptr)",
             # claude.md #189
             "declare i64 @festina_get_pixel_color(i64, i64)",
             "declare i64 @festina_image_get_pixel_color(ptr, i64, i64)",
@@ -13473,6 +13474,19 @@ class CodeGen:
                         f"i64 {x_val}, i64 {y_val})")
                     self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
                     return out, types_mod.ColorType()
+            # runtime.md phase 4: img.toPixels() -> arr[int]. The
+            # runtime builds the array itself (refcount 1, a fresh
+            # value this expression owns), which is why the result is
+            # marked fresh the way every other allocating call here is.
+            if callee.prop == "toPixels":
+                obj_val, obj_type = self._emit_expr(callee.obj, env, lines)
+                if isinstance(obj_type, types_mod.ImageType):
+                    self.uses_graphics_code = True
+                    out = self.tmp()
+                    lines.append(
+                        f"  {out} = call ptr @festina_image_to_pixels(ptr {obj_val})")
+                    self._release_owned_receiver(callee.obj, obj_val, obj_type, lines)
+                    return out, types_mod.ArrayType(types_mod.PrimitiveType("int"))
             # claude.md #134: drawRect/drawPixel/drawCircle/drawText as
             # methods on img -- the same four canvas-level drawing
             # builtins (claude.md #37/#39/#133), retargeted at the
