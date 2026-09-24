@@ -143,9 +143,37 @@ if pkg-config --exists mbedtls mbedx509 mbedcrypto; then
     build_runtime https festina_runtime_https.c $(pkg-config --cflags mbedtls mbedx509 mbedcrypto) && HTTPS_OK=1
 fi
 
+# runtime.md: the image decoders, which are Festina rather than C --
+# `festina compile` cannot be pointed at them the way build_runtime
+# points $SAN_CC at a .c file, because what gets linked is the
+# component IR with its program entry point rewritten (festina/cli.py's
+# _strip_component_entry, reachable as cli.component_ir). Asking Python
+# for that IR keeps one definition of it; reimplementing the rewrite in
+# sed here would be a second one, drifting.
+#
+# Instrumented like the programs themselves, with the same sanitize_
+# address rewrite: the decoders allocate, so leaving them uninstrumented
+# would quietly exempt the newest allocating code in the runtime from
+# the harness that exists to watch allocations. Tied to $GFX_OK because
+# festinaDecodeImage calls festina_image_from_pixels, which lives in the
+# graphics translation unit.
+IMG_OK=0
+if [ $GFX_OK = 1 ]; then
+    if (cd "$ROOT" && python3 -c 'from festina import cli; print(cli.component_ir("imageload"), end="")') > "$WORK/imageload.ll" 2> "$WORK/imageload.err"; then
+        sed -E 's/^(define [^{]+) \{/\1 sanitize_address {/' "$WORK/imageload.ll" > "$WORK/imageload.asan.ll"
+        "$IR_CC" -fsanitize=address -g -O1 -c "$WORK/imageload.asan.ll" -o "$WORK/rt_imageload.o" 2> "$WORK/imageload.cc.err" && IMG_OK=1
+    fi
+    if [ $IMG_OK = 0 ]; then
+        echo "leak_stress: could not build the Festina image decoders" >&2
+        sed 's/^/    /' "$WORK/imageload.err" "$WORK/imageload.cc.err" 2>/dev/null >&2
+        exit 1
+    fi
+fi
+
 LIBS=(-lsqlite3 -lm -pthread)
 OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o" "$WORK/rt_thread.o" "$WORK/rt_http.o")
 [ $GFX_OK = 1 ] && { OBJS+=("$WORK/rt_graphics.o"); LIBS+=($(pkg-config --libs cairo-xlib x11 libjpeg)); }
+[ $IMG_OK = 1 ] && OBJS+=("$WORK/rt_imageload.o")
 [ $AUD_OK = 1 ] && { OBJS+=("$WORK/rt_audio.o"); LIBS+=($(pkg-config --libs alsa libmpg123)); }
 [ $HTTPS_OK = 1 ] && { OBJS+=("$WORK/rt_https.o"); LIBS+=($(pkg-config --libs mbedtls mbedx509 mbedcrypto)); }
 

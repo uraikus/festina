@@ -369,10 +369,20 @@ compiler linked a decoder into itself and then failed to link at all,
 on the graphics symbols the decoder needs. Generated text cannot tell
 an instruction from a literal.
 
-Both link paths need the object — the libLLVM one and the
-`.ll`-to-clang fallback that macOS CI actually runs. `festina test`'s
-runtime was added to one and not the other once already, and was
-invisible on Linux until macOS failed to link.
+**A decoded image still remembers its file.** `festina_load_image`
+keeps the bytes it read so `save()`/`saveCopy()` reproduce the file
+rather than re-encoding it (claude.md #110). The Festina decoder hands
+back pixels and knows nothing about the file, so
+`festina_load_image_via` attaches the path and bytes on the decoded
+path too — the file is read there, though not decoded. Without that a
+saved JPEG came back a PNG, which four tests in `test_codegen.py` said
+out loud.
+
+**Three link paths need the object**, and nothing makes them agree:
+the libLLVM one, the `.ll`-to-clang fallback that macOS CI runs, and
+`scripts/leak_stress.sh`, which builds and ASan-instruments every
+runtime unit itself. The script asks `cli.component_ir(name)` for the
+IR rather than reimplementing the entry-point rewrite in `sed`.
 
 ## Tests
 

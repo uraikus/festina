@@ -8219,3 +8219,33 @@ not learn what a runtime component is, how imports resolve inside one,
 when to link an object, or that a decoder exists at all -- none of
 which has anything to do with generating IR. Source injection would
 have required all of it.
+
+**A decoded image still has to remember where it came from.** Four
+tests in `test_codegen.py` went red on the first wiring, and they were
+right: claude.md #110 keeps the bytes an image was loaded from so that
+`save()`/`saveCopy()` reproduce the file instead of re-encoding it.
+`festina_load_image` attaches them; the Festina decoder hands back
+pixels and knows nothing about the file, so a JPEG saved as a PNG.
+`festina_load_image_via` now attaches path and bytes on the decoded
+path too -- which means the source file is read on it, though not
+decoded, and that is what makes the swap invisible to everything that
+looks at an image's origin.
+
+Worth naming the shape: the decoder replaced a function, and the
+function did more than its name. Nothing about "decode these bytes to
+pixels" suggests "and remember the bytes", and only the tests knew.
+
+**A third link path, in the sanitizer harness.** `scripts/
+leak_stress.sh` builds every runtime translation unit itself, with
+ASan, and links them all unconditionally -- so it needed the decoder
+too, and `media_churn.f` failed to link without it. It cannot run
+`_strip_component_entry` in shell, so `cli.component_ir(name)` is
+public and the script asks Python for the IR rather than reimplementing
+the rewrite in `sed`. Instrumented like the programs are: the decoders
+allocate, and leaving the newest allocating code in the runtime out of
+the harness that watches allocations would be a strange exemption to
+grant silently.
+
+Three link paths now, and each one found its own missing object at a
+different moment: the clang fallback before it ever ran, the sanitizer
+harness in the gate, the libLLVM path first. Nothing makes them agree.

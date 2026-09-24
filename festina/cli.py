@@ -744,6 +744,28 @@ def _feature_extra_object(cc, name, platform_name=None):
     return None
 
 
+def component_ir(name):
+    """One runtime.md component's IR, ready to be assembled and linked
+    beside a user program.
+
+    Public (no underscore) because a THIRD build path needs it:
+    scripts/leak_stress.sh links every runtime translation unit
+    unconditionally and instruments each one for ASan, and it cannot
+    reproduce _strip_component_entry in shell. It asks for this instead
+    -- `python3 -c 'from festina import cli; print(cli.component_ir(
+    "imageload"))'` -- so there is one implementation of what a
+    component's IR is, not two that drift.
+    """
+    source = os.path.join(_RUNTIME_DIR, "festina", f"{name}.f")
+    program = imports_mod.build_program(source)
+    analyzed = semantic_mod.analyze(program, filename=source)
+    ir = codegen_mod.generate_ir(program, analyzed, filename=source)
+    # No `main` from a component: it is linked into a program that has
+    # one. generate_ir emits the entry wrapper unconditionally, so it
+    # is dropped here rather than made conditional for one caller.
+    return _strip_component_entry(ir, name)
+
+
 def _ensure_festina_component(cc, name):
     """Compile one runtime.md component written in Festina to an object
     file, cached the way _ensure_runtime_object caches the C ones.
@@ -793,13 +815,7 @@ def _ensure_festina_component(cc, name):
     if os.path.exists(obj_path) and os.path.getmtime(obj_path) >= newest:
         return obj_path
 
-    program = imports_mod.build_program(source)
-    analyzed = semantic_mod.analyze(program, filename=source)
-    ir = codegen_mod.generate_ir(program, analyzed, filename=source)
-    # No `main` from a component: it is linked into a program that has
-    # one. generate_ir emits the entry wrapper unconditionally, so it
-    # is dropped here rather than made conditional for one caller.
-    ir = _strip_component_entry(ir, name)
+    ir = component_ir(name)
     with tempfile.NamedTemporaryFile(suffix=".ll", mode="w", delete=False) as tmp:
         tmp.write(ir)
         ir_path = tmp.name

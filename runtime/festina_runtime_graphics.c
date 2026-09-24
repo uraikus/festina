@@ -2072,10 +2072,38 @@ void *festina_blank_image(int64_t w, int64_t h) {
  * they do not implement, or one they refuse rather than half-decode --
  * and the C loader handles it exactly as it always did. The file is
  * read twice on that path, which is the price of a fallback and is
- * paid only by formats the port has not reached. */
+ * paid only by formats the port has not reached.
+ *
+ * A NON-null %d still has to be finished here, and forgetting that was
+ * a real regression: claude.md #110 keeps the bytes an image was
+ * loaded from so that save()/saveCopy() reproduce the file rather than
+ * re-encoding it. festina_load_image attaches them; the Festina
+ * decoder hands back pixels and knows nothing about the file. Without
+ * this block a saved JPEG came back a PNG, which four tests in
+ * test_codegen.py said out loud.
+ *
+ * So the source file IS read on this path too. It is not the decode
+ * -- that is the expensive half and it has already been skipped -- and
+ * it is what makes the decoder swap invisible to everything that
+ * looks at an image's origin. A file that decoded a moment ago and
+ * cannot be read now is not worth failing over: the image is already
+ * correct, and it simply loses the byte-exact save, the same position
+ * an image from a pixel buffer is in. */
 void *festina_load_image_via(void *decoded, const char *path) {
-    if (decoded) return decoded;
-    return festina_load_image(path);
+    if (!decoded) return festina_load_image(path);
+
+    FestinaImageBox *box = (FestinaImageBox *)decoded;
+    int64_t len = 0;
+    unsigned char *bytes = festina_read_image_file_noflail(path, &len);
+    if (bytes) {
+        free(box->bytes);
+        box->bytes = bytes;          /* adopted, not copied */
+        box->byte_count = (size_t)len;
+    }
+    free(box->path);
+    box->path = path ? strdup(path) : NULL;
+    if (path && !box->path) festina_fail("out of memory loading an image");
+    return decoded;
 }
 
 /* claude.md #346: an image from a pixel buffer, in one call.
