@@ -259,25 +259,35 @@ jobs:
         # were wrong. This is the alternative to a fourth.
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: What fonts can fontconfig see
-        # decisions.md #348. The backtrace says abort() in ucrtbase,
-        # twelve frames deep in libcairo-2.dll, entered from
-        # festina_image_draw_text -- so Cairo aborts inside its text
-        # path rather than returning an error. The remaining question
-        # is WHY, and the cheapest discriminator is whether fontconfig
-        # can resolve a font here at all: festina_apply_font asks for
-        # "sans-serif" through Cairo's toy font API, and a toy face
-        # that resolves to nothing is the obvious way into an
-        # unrecoverable internal error.
+      - name: Does the crashing test crash on its own
+        # decisions.md #348. Everything about this crash has been
+        # chased on the premise that it is parallelism-related, because
+        # #345 recorded it passing serially -- four theories, all
+        # wrong, and the font-resolution one died on a runner with 254
+        # fonts where `sans-serif` resolves to Verdana.
         #
-        # Diagnostic only -- it changes nothing and must never fail the
-        # job. A count of zero would name the cause; a healthy count
-        # rules it out and the next instrument is Cairo debug symbols.
+        # That premise has never been re-tested on current code, and it
+        # is one line to test. This runs the crashing test ALONE and
+        # SERIALLY, before the four-wide suite starts, so nothing else
+        # is competing with it:
+        #
+        #   passes here, fails below  -> parallelism is real, and the
+        #                                question is what is shared
+        #   fails here too            -> `-n` was a red herring for
+        #                                four rounds and this is an
+        #                                ordinary deterministic bug on
+        #                                this platform, which is a much
+        #                                easier thing to chase
+        #
+        # continue-on-error because this step's job is to report, not
+        # to judge: the suite below is what decides the job, and a
+        # failure here must not mask which tests it finds.
+        continue-on-error: true
         run: |
-          echo "fc-list count:"
-          fc-list 2>/dev/null | wc -l || echo "fc-list unavailable"
-          echo "fc-match sans-serif:"
-          fc-match sans-serif 2>/dev/null || echo "fc-match unavailable"
+          echo "fc-list count: $(fc-list 2>/dev/null | wc -l)"
+          echo "fc-match sans-serif: $(fc-match sans-serif 2>/dev/null)"
+          python -m pytest -q -p no:randomly \
+            "tests/test_codegen.py::TestImageDrawMethods::test_draw_text_writes_onto_the_image"
       - name: Run the test suite
         # decisions.md #345: this job was CANCELLED at the 45-minute cap
         # after 42:56, up from 18:31 eleven days earlier -- the suite

@@ -8451,3 +8451,44 @@ is `?? ()` for want of them.
 theories from one number. One round with the instrument produced a
 backtrace, a module map, a confirmed mechanism, and a specific next
 question. The instrument cost less than any one of the theories.
+
+**Font resolution is ruled out.** Run 171, on the same runner that
+crashes:
+
+    fc-list count:
+    254
+    fc-match sans-serif:
+    verdana.ttf: "Verdana" "Regular"
+
+254 fonts, and the exact family `festina_apply_font` asks for resolves
+to a real file. The toy-face-resolves-to-nothing route into Cairo's
+abort is closed, and no sixth theory is being offered in its place.
+
+**What is being re-tested instead is the premise.** Every round of
+this has assumed parallelism, because #345 recorded the test passing
+serially. That observation has never been checked again on current
+code, and four theories have been built on top of it. It is one line
+to check: CI now runs the crashing test ALONE and SERIALLY before the
+four-wide suite, `continue-on-error` so it reports without judging.
+
+Passes there and fails below, and parallelism is real and the question
+is what is shared. Fails there too, and `-n` has been a red herring
+for four rounds, and this is an ordinary deterministic bug on this
+platform -- a far easier thing to chase, and one that would explain
+why every shared-resource theory has come up empty.
+
+The alternative next step -- Cairo debug symbols -- was weighed and
+deferred. gdb resolved `ucrtbase!abort` from an export table, so it is
+reading exports; the twelve `?? ()` frames are Cairo's INTERNAL
+statics, which no export table can name and only a debug build would.
+That is a heavier change than re-testing an assumption nobody has
+re-tested.
+
+**And the CI clock, for the record.** The windows suite across four
+runs: 15:55, 17:14, 19:40, 9:54. #287 already settled how to read
+that -- a hosted-runner wall-clock is a sample, not a measurement, and
+a cost claim needs repeats or it is noise. A 2x spread with no
+behavioural difference between the runs is that rule being right. No
+budget decision is warranted, and the earlier worry about linux
+drifting from 28:20 to 35:52 was the same distribution: 22:55 the
+next round.
