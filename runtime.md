@@ -466,9 +466,10 @@ first piece of compiler work.
 
 **Slices, in dependency order.** Each ends green and is useful alone:
 
-1. the bulk pixel read, and a `raster.f` that can fill one axis-aligned
-   opaque rectangle — the narrowest slice that exercises the whole
-   handoff, and one where byte-identity against Cairo is available
+1. ✅ the bulk pixel read, and a `raster.f` that can fill one
+   axis-aligned opaque rectangle — the narrowest slice that exercises
+   the whole handoff, and one where byte-identity against Cairo is
+   available
 2. edge list, scanline fill, nonzero and even-odd winding, with
    analytic coverage — the core; everything below is expressed in it
 3. `curve_to` by flattening, `arc` by the same, `rectangle` and the
@@ -481,6 +482,32 @@ first piece of compiler work.
    reachable from the language
 
 Phase 5 (glyphs) needs 1–5 and nothing after.
+
+**Slice 1, as built.** `img.toPixels()` is the read half of the
+handoff and `runtime/festina/raster.f` holds `rasNewSurface` and
+`rasFillRect`. A scene of four opaque rectangles — including two that
+run off opposite edges — is rendered by Cairo's `drawRect` and by
+`raster.f` through `imageFromPixels`, and the two PNGs are compared
+byte for byte. They match.
+
+The comparison harness is itself checked against two images differing
+in one pixel, because a byte-identity assertion that cannot fail
+proves nothing.
+
+`raster.f` also joined the differential corpus the moment it existed —
+the corpus is auto-discovered, so a new `.f` file under `runtime/
+festina/` is one — and all five harnesses (lexer, parser, semantic,
+escape, codegen) agree on it between the two compiler
+implementations.
+
+One decision recorded where it will start to matter: the buffer format
+is STRAIGHT alpha, because that is what the handoff already speaks.
+Premultiplied is what compositing arithmetic actually wants, and
+converting at the edges will cost two multiplies per pixel touched
+once slice 2 introduces blending. The alternative — a rasteriser whose
+buffers cannot reach `imageFromPixels` without a conversion pass — is
+a second in-memory format for everyone to get wrong. Slice 1 does no
+blending, so the cost today is zero.
 
 ## Tests
 
