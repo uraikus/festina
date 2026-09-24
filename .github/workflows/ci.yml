@@ -288,6 +288,51 @@ jobs:
           echo "fc-match sans-serif: $(fc-match sans-serif 2>/dev/null)"
           python -m pytest -q -p no:randomly \
             "tests/test_codegen.py::TestImageDrawMethods::test_draw_text_writes_onto_the_image"
+      - name: Do concurrent drawText processes crash
+        # decisions.md #348. The step above passes and the suite below
+        # fails, but TWO things differ between them: the suite runs
+        # this test concurrently, AND it runs it after thousands of
+        # others. Concurrency is one candidate and accumulated machine
+        # state is another, and collapsing them is exactly the mistake
+        # the earlier rounds made.
+        #
+        # This separates them. Nothing has run before it, and the only
+        # variable is concurrency: one compiled drawText program,
+        # eight copies at once, five rounds, each in its own directory.
+        # If they crash, the repro shrinks from a twenty-minute suite
+        # to a shell loop and the cause is concurrent Cairo text
+        # processes. If they all pass, concurrency alone is NOT
+        # sufficient and the trigger is something the rest of the suite
+        # leaves behind.
+        #
+        # Reports, never judges: continue-on-error, and every failure
+        # is echoed with its exit code rather than ending the loop.
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/dtx
+          cat > /tmp/dtx/dt.f <<'FESTINA'
+          color black = 'black'
+          fillStyle(black)
+          img sheet = blankImage(128, 64)
+          sheet.drawText('hi', 4, 40)
+          log(sheet.save('out.png'))
+          FESTINA
+          python -m festina.cli compile /tmp/dtx/dt.f -o /tmp/dtx/dt.exe
+          fails=0
+          for round in 1 2 3 4 5; do
+            for i in 1 2 3 4 5 6 7 8; do
+              (
+                d=$(mktemp -d)
+                cd "$d" || exit 0
+                /tmp/dtx/dt.exe >/dev/null 2>&1
+                rc=$?
+                [ $rc -ne 0 ] && echo "round $round worker $i exit $rc (0x$(printf '%X' $rc))"
+                exit 0
+              ) &
+            done
+            wait
+          done
+          echo "concurrent drawText: 40 runs done"
       - name: Run the test suite
         # decisions.md #345: this job was CANCELLED at the 45-minute cap
         # after 42:56, up from 18:31 eleven days earlier -- the suite

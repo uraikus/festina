@@ -8492,3 +8492,34 @@ behavioural difference between the runs is that rule being right. No
 budget decision is warranted, and the earlier worry about linux
 drifting from 28:20 to 35:52 was the same distribution: 22:55 the
 next round.
+
+**The premise survived its re-test.** Run 172:
+
+    Does the crashing test crash on its own ... success  (13s)
+    Run the test suite ......................... failure (0xC0000409)
+
+The test passes alone and serially, and the same test fails inside the
+four-wide suite, with the same twelve Cairo frames under
+`festina_image_draw_text`. #345's original observation holds on
+current code.
+
+**That is not the same as "parallelism is the cause", and the
+difference is the whole lesson of this entry.** TWO things differ
+between those steps. The serial run is alone, first, in a clean
+process. The suite run is concurrent AND follows thousands of other
+tests. Concurrency is one candidate; something the rest of the suite
+leaves behind on the machine is another. Four earlier rounds went
+wrong by collapsing exactly this kind of pair into whichever half was
+more interesting.
+
+So the next step separates them, and nothing runs before it: one
+compiled `drawText` program, eight copies at once, five rounds, each
+in its own directory. Crashes there and the repro shrinks from a
+twenty-minute suite to a shell loop, and concurrent Cairo text
+processes are the cause. All forty pass and concurrency ALONE is
+insufficient -- which would be a genuine finding too, and would point
+at accumulated state rather than at a race.
+
+Either answer is worth more than the question is costing, because
+either one removes half the search space. That is the property none of
+the four theories had.
