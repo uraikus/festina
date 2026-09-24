@@ -1243,3 +1243,79 @@ class TestOnWindowsWindow:
         assert "keyup a" in lines, lines
         assert f"resize {expected_w} {expected_h}" in lines, lines
         assert lines[-1] == "close", lines
+
+
+class TestSharedObjectCacheIsWrittenAtomically:
+    """`/tmp/festina-runtime-cache` is shared by every `festina compile`
+    on the machine, and under `pytest -n` that is four at once all
+    wanting the same object.
+
+    Compiling straight to the shared path leaves a window where the
+    file exists, carries a fresh mtime, and is not finished -- long
+    enough for another process's freshness check to pass and for it to
+    link a truncated object. The property asserted here is the one that
+    closes it: the compiler is never pointed at the shared path.
+    """
+
+    def _fake_cc(self, cli_mod, monkeypatch, written, fail=False):
+        def run_tool(cmd):
+            out = cmd[cmd.index("-o") + 1]
+            written.append(out)
+            if not fail:
+                with open(out, "wb") as fh:
+                    fh.write(b"\x7fELF-ish")
+            return subprocess.CompletedProcess(cmd, 1 if fail else 0,
+                                                stdout="", stderr="boom")
+        monkeypatch.setattr(cli_mod, "_run_tool", run_tool)
+
+    def test_the_compiler_never_writes_the_shared_path(
+            self, cli_mod, monkeypatch, tmp_path):
+        written = []
+        self._fake_cc(cli_mod, monkeypatch, written)
+        obj = tmp_path / "festina_runtime_core.deadbeef.o"
+
+        result = cli_mod._compile_to_cached_object(
+            "clang", ["-O2", "-c", "runtime.c"], str(obj), "nope")
+
+        assert result == str(obj)
+        assert written and written[0] != str(obj), (
+            "cc was pointed straight at the shared cache path")
+        assert obj.read_bytes() == b"\x7fELF-ish"
+
+    def test_nothing_is_left_behind_on_success(
+            self, cli_mod, monkeypatch, tmp_path):
+        self._fake_cc(cli_mod, monkeypatch, [])
+        obj = tmp_path / "festina_runtime_core.deadbeef.o"
+        cli_mod._compile_to_cached_object(
+            "clang", ["-O2", "-c", "runtime.c"], str(obj), "nope")
+        assert [p.name for p in tmp_path.iterdir()] == [obj.name]
+
+    def test_a_failed_compile_leaves_no_object_at_all(
+            self, cli_mod, monkeypatch, tmp_path):
+        """Not a half-written one, and not a stale name for the next
+        process to find: the point of staging is that a failure is
+        invisible to everyone else."""
+        self._fake_cc(cli_mod, monkeypatch, [], fail=True)
+        obj = tmp_path / "festina_runtime_core.deadbeef.o"
+
+        with pytest.raises(Exception) as caught:
+            cli_mod._compile_to_cached_object(
+                "clang", ["-O2", "-c", "runtime.c"], str(obj), "nope")
+
+        assert "nope" in str(caught.value)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_concurrent_loser_may_replace_an_identical_object(
+            self, cli_mod, monkeypatch, tmp_path):
+        """Two processes compiling the same source with the same
+        compiler produce interchangeable objects, so the rename does not
+        need to be guarded -- it just has to be a rename."""
+        self._fake_cc(cli_mod, monkeypatch, [])
+        obj = tmp_path / "festina_runtime_core.deadbeef.o"
+        obj.write_bytes(b"\x7fELF-ish")
+
+        cli_mod._compile_to_cached_object(
+            "clang", ["-O2", "-c", "runtime.c"], str(obj), "nope")
+
+        assert obj.read_bytes() == b"\x7fELF-ish"
+        assert [p.name for p in tmp_path.iterdir()] == [obj.name]

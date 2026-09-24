@@ -8249,3 +8249,74 @@ grant silently.
 Three link paths now, and each one found its own missing object at a
 different moment: the clang fallback before it ever ran, the sanitizer
 harness in the gate, the libLLVM path first. Nothing makes them agree.
+
+348. THE HTTP RACE, AND WHAT COULD ACTUALLY BE FOUND ABOUT THE WINDOWS
+CRASH
+
+Two known-failing things, fixed to very different depths.
+
+**The http race was real, reproducible and is closed.**
+`tests/stress/http_client_pool_kill_live_churn.f` failed with `fail:
+fetch: could not connect to '127.0.0.1:18305'`. §20.2: every thread
+starts before main's first top-level statement, in no defined order,
+so `worker` could be making requests while `upstream` had not reached
+its own `openPort()`. Established as pre-existing before anything was
+changed -- a worktree at the previous commit failed it four times out
+of four -- rather than assumed from the shape of it.
+
+It cannot be retried away. A failed `req.send()` is `festina_fail()`,
+which `exit(1)`s and is not catchable: api.md's "no enclosing try"
+rule is about `throw`, and this is not one. So `worker` gets exactly
+one attempt and it has to come after `upstream` is listening.
+
+The other port-using stress programs in that directory sidestep the
+question rather than answer it -- their client work hangs off `on
+message`, which main only sends after its own top-level
+`openPort()` -- but this one's whole subject is what a thread's `on
+load()` does, so the requests had to stay there. `upstream` writes a
+marker file after `openPort()` and `worker` waits for it, bounded.
+The marker is sound because `openPort()` binds and listens
+SYNCHRONOUSLY (`festina_runtime_http.c`: `bind()` then `listen(fd,
+128)` before returning), so a client that can see the file can
+already connect -- the backlog holds the connection until upstream's
+loop accepts it. A marker written before `listen()` would just move
+the race. Six runs clean, against four failures out of four before.
+
+**The first version of that fix cost coverage, quietly.** It called
+`fail()` on timeout, for a better message than the connect error. But
+`bootstrap/codegen.f` has not ported `fail()`, so the file moved from
+COMPARED to "not ported yet" in the IR differential -- a corpus file
+silently stopped being checked, which is the thing this project's
+whole harness exists to prevent, bought for a nicer string. The wait
+now falls through to the request instead, and the original error is
+the timeout's own report.
+
+**The Windows crash: one real bug found, the actual one not.**
+`test_draw_text_writes_onto_the_image` exits 0xC0000409 under `-n`.
+What can be established from here is what that code means: it is
+`__fastfail`, which UCRT also raises for `abort()`. So it is a library
+assertion, not a stack overrun in this project's code -- and both
+`festina_draw_text` and `festina_image_draw_text` were read for one
+and are clean, with the only fixed-size buffer in the font path
+(`g_font_family[64]`) written through `snprintf`.
+
+Looking for shared mutable state between concurrent processes turned
+up a real one, in this compiler rather than in Cairo:
+`_ensure_runtime_object` compiled straight to the shared cache path.
+Every `festina compile` on the machine uses `/tmp/festina-runtime-
+cache`, and under `-n` four want the same object at once. Writing in
+place leaves a window where the file exists, carries a fresh mtime,
+and is not finished -- long enough for another process's freshness
+check to pass and for it to link a truncated object. Now compiled to a
+private name in the same directory and `os.replace`d, which is atomic
+on both POSIX and Windows. The loser of a race replaces the winner's
+identical object, which costs nothing: same source, same compiler.
+
+That is a genuine parallel-only bug and it is fixed and tested. It is
+NOT established as the cause of the crash -- a truncated object fails
+to link, it does not run and abort. The remaining candidate is
+fontconfig's own cache, the one shared mutable file that test touches
+and its passing neighbours do not, so CI now builds that cache once,
+serially, before the four-wide run. Recorded as an experiment: #345
+already holds two confident diagnoses of this crash that were wrong,
+and a Linux container cannot settle the third.

@@ -820,14 +820,14 @@ def _ensure_festina_component(cc, name):
         tmp.write(ir)
         ir_path = tmp.name
     try:
-        result = _run_tool([cc, "-O2", "-c", ir_path, "-o", obj_path])
-        if result.returncode != 0:
-            raise CompileError(
-                f"failed to compile the Festina runtime component "
-                f"{name}:\n{result.stderr}", category="link error")
+        # Staged and renamed, for the reason _compile_to_cached_object
+        # gives: this cache is shared by every festina compile on the
+        # machine at once.
+        return _compile_to_cached_object(
+            cc, ["-O2", "-c", ir_path], obj_path,
+            f"failed to compile the Festina runtime component {name}")
     finally:
         os.unlink(ir_path)
-    return obj_path
 
 
 #: Globals every module emits because every module is normally a
@@ -973,11 +973,44 @@ def _ensure_runtime_object(cc, name, source, pkg_config_packages):
     cflags = _pkg_config("--cflags", "sqlite3")
     for pkg in pkg_config_packages or ():
         cflags += _pkg_config("--cflags", pkg)
-    cmd = [cc, "-O2", "-c", source, *cflags, "-o", obj_path]
-    result = _run_tool(cmd)
-    if result.returncode != 0:
-        raise CompileError(f"failed to compile the Festina runtime ({name}):\n{result.stderr}",
-                            category="link error")
+    return _compile_to_cached_object(
+        cc, ["-O2", "-c", source, *cflags], obj_path,
+        f"failed to compile the Festina runtime ({name})")
+
+
+def _compile_to_cached_object(cc, args, obj_path, failure_message):
+    """Compile to `obj_path` so that no other process can ever see a
+    half-written one.
+
+    The cache lives in the system temp dir and is shared by every
+    `festina compile` running on the machine, which under `pytest -n`
+    is four of them at once wanting the same object. Writing `cc -o
+    <shared path>` directly leaves a window where the file exists, has
+    a fresh mtime, and is not finished: a second process checks
+    freshness, sees the mtime, and links a truncated object. Compiling
+    to a private name in the same directory and renaming closes it --
+    os.replace is atomic on POSIX and on Windows, and same-directory
+    keeps it a rename rather than a copy.
+
+    The loser of a race replaces the winner's identical object, which
+    is free of consequence: the inputs are the same file and the same
+    compiler, so the two objects are interchangeable.
+    """
+    fd, staged = tempfile.mkstemp(
+        dir=os.path.dirname(obj_path),
+        prefix=os.path.basename(obj_path) + ".",
+        suffix=".tmp")
+    os.close(fd)
+    try:
+        result = _run_tool([cc, *args, "-o", staged])
+        if result.returncode != 0:
+            raise CompileError(f"{failure_message}:\n{result.stderr}",
+                                category="link error")
+        os.replace(staged, obj_path)
+        staged = None
+    finally:
+        if staged is not None and os.path.exists(staged):
+            os.unlink(staged)
     return obj_path
 
 

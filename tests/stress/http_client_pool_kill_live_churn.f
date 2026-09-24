@@ -27,9 +27,37 @@
 // answer, and kill()/live() stay fully deterministic, exactly like
 // thread_db_kill_live_churn.f's own.
 
+// §20.2: every thread starts before main's first top-level statement,
+// in NO defined order -- so `worker` below can be making requests while
+// `upstream` has not reached its own openPort() yet. That is a real
+// race and it fired: `fail: fetch: could not connect to
+// '127.0.0.1:18305'`, four runs out of four under the load of a full
+// leak_stress sweep, and intermittently on its own.
+//
+// It cannot be retried away. A failed req.send() is festina_fail(),
+// which exits(1) and is not catchable by try/catch (api.md's own
+// "no enclosing try" rule is about `throw`, and this is not one), so
+// `worker` gets exactly one attempt and it has to be after `upstream`
+// is listening. The other port-using stress programs in this directory
+// sidestep the question rather than answer it -- their client work
+// hangs off `on message`, which main only sends after its OWN
+// top-level openPort() -- but this one's whole subject is what a
+// thread's `on load()` does, so the requests have to stay there.
+//
+// So `upstream` publishes a marker and `worker` waits for it. The
+// marker is sound because openPort() binds and listens SYNCHRONOUSLY
+// (festina_runtime_http.c: bind() then listen(fd, 128) before it
+// returns), so a client that can see the file can already connect --
+// the backlog holds the connection until upstream's own loop accepts
+// it. A marker written before listen() would just move the race.
+//
+// Only the first of the 301 `on load()` runs ever waits; every later
+// one finds the file already there and spends one stat() on it.
 thread upstream {
     on load() {
         openPort(18305)
+        blob ready = 'upstream.ready'
+        ready.write('1')
     }
     on request(req:http) {
         req.send({'code': 200, 'body': 'ok'})
@@ -38,6 +66,22 @@ thread upstream {
 
 thread worker {
     on load() {
+        // Bounded, and it falls THROUGH to the requests when it runs
+        // out rather than reporting the timeout itself. An upstream
+        // that never came up then fails on the next line with the
+        // same "could not connect to '127.0.0.1:18305'" this wait
+        // exists to prevent -- which is the honest outcome, and says
+        // more than a message about a marker file would.
+        //
+        // A `fail()` here would be louder still, and cost more than it
+        // is worth: bootstrap/codegen.f has not ported fail(), so
+        // writing one moves this file from COMPARED to "not ported
+        // yet" in the IR differential. Buying a better error message
+        // with a silently skipped corpus file is a bad trade.
+        blob ready = 'upstream.ready'
+        int deadline = now() + 10000
+        while !ready.exists() && now() < deadline {
+        }
         int i = 0
         while i < 20 {
             http req = {'url': 'http://127.0.0.1:18305/', 'method': 'GET'}
