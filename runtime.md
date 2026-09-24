@@ -244,6 +244,14 @@ from `setup.md`'s table rather than merely unused.
 Phases 1–3 are independent of 4–5 and can land in any order. Phase 6
 is gated on a language feature that does not exist yet.
 
+**Phase 2's ✅ is for the decoder, not yet for the removal.** libjpeg
+is still in `setup.md` and still on the link line, because the
+fallback needs it: `jpeg.f` refuses progressive, arithmetic and 12-bit
+files, and those load through the C path. Dropping the dependency
+means either covering progressive JPEG or deciding to refuse it
+outright — a user-visible choice, not a port detail — and neither has
+been made. The same will be true of Cairo at phase 5.
+
 ### Phase 1, as built
 
 `runtime/festina/inflate.f` is DEFLATE (RFC 1951) — stored, fixed and
@@ -273,9 +281,9 @@ matters: adaptive encoders pick a filter per row, so a Paeth bug shows
 on roughly one real file in ten and would sit untested behind
 whichever filter the encoder happened to choose.
 
-Neither is wired to `img` yet. `RUNTIME_TRIGGERS` stays empty until
-that wiring, which is its own step and the one that makes the
-bootstrap differential care.
+Neither was wired to `img` when this was written; "Wiring, as built"
+below is that step, and it is the one that made the bootstrap
+differential care.
 
 ### Phase 2, as built
 
@@ -302,6 +310,69 @@ used nearest-neighbour upsampling and scored a max deviation of 5, with
 the first pixel still exact — which is what identified the resampling
 as the only thing wrong. A test asserting `<= 1` fails if the
 resampling regresses and fails far harder if anything before it does.
+
+### Wiring, as built
+
+`img photo = 'x.jpg'` now compiles to two calls:
+
+```llvm
+%d = call ptr @festinaDecodeImage(ptr %path)
+%i = call ptr @festina_load_image_via(ptr %d, ptr %path)
+```
+
+`festinaDecodeImage` is `runtime/festina/imageload.f` — it sniffs the
+signature, hands PNG to `png.f` and JPEG to `jpeg.f`, and returns null
+for anything either decoder refuses. `festina_load_image_via` is three
+lines of C: return what it was given, or fall through to the old C
+loader. Every format the port does not cover loads exactly as it did
+before, which is what makes a partial port safe to ship.
+
+**A linked object, not injected source.** The first version merged
+`imageload.f` into the user's program through `RUNTIME_TRIGGERS`. It
+worked and it was wrong: eighty statements the programmer did not
+write, in their program, changing their IR — so `bootstrap/` would have
+had to replicate the injection or go red on every corpus file
+mentioning `img`. It did, on 18 of 137. Compiled to an object instead,
+the user's IR gains a declare and a call, and the bootstrap needs only
+the matching declare.
+
+**The object is a program minus its entry point, and the minus is
+subtle.** `_strip_component_entry` drops `main`; dropping
+`__festina_main` with it is the obvious next move and it segfaults.
+That function holds the component's top-level statements, and for a
+decoder those are the tables — `JPG_ZIGZAG = [0, 1, 8, ...]` is stores
+inside it. Without them the object links, runs, reads element 0 of an
+empty array and dies in `jpgBlock`. It is renamed
+`__festina_component_init_<name>` and registered in
+`@llvm.global_ctors`, so it runs before `main` without the user's
+program emitting anything to call it.
+
+**Only the path-shaped loads, so far.** `festinaDecodeImage` takes a
+path and reads the file itself, which covers `img x = 'a.png'` and
+`loadImage(...)`. An image arriving as BYTES — a `blob` column out of
+a table, `req.toImg()` — still goes through the C decoder, because
+those reach it via `festina_decode_image_bytes`'s function-pointer
+hook and never touch a path at all. Routing them means a second entry
+point taking an `arr[int]`, and the C side handing bytes to a Festina
+function rather than the other way round. Not done; not pretended.
+
+**Linked only when used**, on `gen.uses_image_load` — set where the
+call is emitted, so it means an image load and not merely graphics. A
+program that fills a rectangle and saves a canvas sets
+`uses_graphics_code` and has no reason to carry a JPEG decoder.
+
+The first version of that trigger searched the finished IR for `call
+ptr @festinaDecodeImage(`, which is wrong in a way worth recording:
+`bootstrap/codegen.f` is a compiler that *emits* that call, so its
+source spells it, so its own IR carries it as a string constant. The
+compiler linked a decoder into itself and then failed to link at all,
+on the graphics symbols the decoder needs. Generated text cannot tell
+an instruction from a literal.
+
+Both link paths need the object — the libLLVM one and the
+`.ll`-to-clang fallback that macOS CI actually runs. `festina test`'s
+runtime was added to one and not the other once already, and was
+invisible on Linux until macOS failed to link.
 
 ## Tests
 

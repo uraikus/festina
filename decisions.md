@@ -8117,3 +8117,105 @@ todo.md says a capability that changes codegen has to land in both
 implementations or the differential goes red. It went red. The
 harness did its job in about four minutes; the reasoning that said it
 would not had already been written down as fact.
+
+347. THE DECODERS ARE A LINKED OBJECT, AND THE ENTRY POINT IS NOT DEAD
+WEIGHT
+
+Wiring [runtime.md](runtime.md)'s decoders to `img` loading. The
+obvious design was the one already built for it: `RUNTIME_TRIGGERS`
+fires on a program mentioning `img` and merges `imageload.f` and its
+imports into that program. It works. `img photo = 'x.jpg'` decoded
+through `jpeg.f` end to end on the first try.
+
+It is still wrong, and the differential said so within minutes.
+Injecting source puts eighty statements the programmer did not write
+into their program, which changes that program's IR -- so
+`bootstrap/`, a second implementation of this compiler, has to
+replicate the entire injection or go red on every corpus file
+mentioning `img`. It went red on 18 of 137. Replicating the injection
+means porting import resolution, trigger predicates and statement
+tagging into `bootstrap/` to keep a decoder linked, which is a large
+amount of compiler to duplicate for a decision that has nothing to do
+with compiling.
+
+The decoders ship as a linked object instead. `imageload.f` compiles
+once to `festina_component_imageload.o`, cached beside the C runtime
+objects, and goes on the link line only when the program loads an
+image. The user's IR gains two lines -- one `declare`, one `call` --
+which the bootstrap already emits identically, because the declare
+block is unconditional (#346 is the same coupling seen from the other
+side: unconditional declares are what made the bootstrap care about
+`imageFromPixels`, and what makes it not care about this).
+
+**What a component object is: a program minus its entry point, and
+`minus` hides a bug.** codegen emits the same module shape for every
+input, so the component arrives with `main` and `__festina_main`.
+Dropping both is the obvious edit and it segfaults. `__festina_main`
+holds the component's top-level statements, and for a decoder those
+are not setup noise -- they are the tables. `JPG_ZIGZAG = [0, 1, 8,
+...]` compiles to stores inside that function. Without it the object
+links cleanly, runs, reads element 0 of an empty array, and dies in
+`jpgBlock`.
+
+The crash was worth more than a working first draft. It is the same
+failure mode as the "externalise globals by shape" attempt in the same
+function an hour earlier -- which would have externalised `@INF_IN`
+and `@JPG_QUANT` along with the program scaffolding, linking cleanly
+and decoding nothing. Both are the same mistake: treating a
+component's own state as part of the program-shaped wrapper around it.
+Only one of them announced itself.
+
+Fixed by renaming rather than dropping: `__festina_main` becomes
+`__festina_component_init_imageload` and gets an `@llvm.global_ctors`
+entry, so it runs before `main` and the user's program still emits
+nothing to call it. Verified under a debugger rather than from correct
+output, because correct output is exactly what the C loader also
+produces: a breakpoint on `festina_load_image` is never reached for a
+plain JPEG, and `festinaDecodeImage` -> `festina_image_from_pixels` is
+the live stack.
+
+**The trigger is a flag, after the IR search compiled a decoder into
+the compiler.** `gen.uses_graphics_code` was the first choice and is
+too wide: a program that fills a rectangle and saves a canvas sets it
+and has no reason to carry a JPEG decoder. The second was searching
+the finished IR for `call ptr @festinaDecodeImage(`, which is exact in
+the sense that mattered and wrong in the sense that did not occur to
+me: `bootstrap/codegen.f` EMITS that call, so its source spells it, so
+its own IR carries it as a string constant. Compiling the bootstrap
+compiler linked a decoder into it and then failed to link at all, on
+the `festina_image_from_pixels` the decoder needs and a program
+without graphics does not have.
+
+Generated text cannot distinguish an instruction from a literal, and
+nothing about a substring search says which one it found. A flag set
+inside `_emit_image_load` can only be right, because it is set exactly
+where the instruction is emitted. The regression test for it is a
+program whose only statement is a `log()` of that call's own text.
+
+That failure is also the self-hosting property doing its job a second
+time in one feature: the compiler compiles itself, so a rule about
+"programs that load images" gets applied to a compiler whose subject
+matter is loading images. The differential caught the first mistake
+in this feature; compiling the differential's own compiler caught the
+second.
+
+**Both link paths, not one.** The libLLVM path and the
+`.ll`-to-clang fallback are separate code with separate feature lists,
+and macOS CI runs the fallback. `festina test`'s runtime was added to
+one and not the other in #345 -- invisible on Linux, fourteen link
+failures on macOS. Same shape here, so both were changed and both were
+run.
+
+**What the bootstrap had to learn, and what it did not.** Porting the
+three `declare` lines was not enough, and the differential said so on
+`tests/stress/media_churn.f`: an img load is now TWO calls where it
+was one, so every temporary after the first one in that file was
+numbered four apart. The fix is four lines in `bootstrap/codegen.f`
+emitting the same two calls.
+
+The size of that fix is the argument for the whole design. The
+bootstrap compiler learned "an img load emits these two lines". It did
+not learn what a runtime component is, how imports resolve inside one,
+when to link an object, or that a decoder exists at all -- none of
+which has anything to do with generating IR. Source injection would
+have required all of it.

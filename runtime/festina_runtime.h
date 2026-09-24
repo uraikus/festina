@@ -840,6 +840,9 @@ void *festina_blank_image(int64_t w, int64_t h);
 /* claude.md #346: an img from an arr[int] of RGBA bytes, four per
  * pixel, row-major from the top-left. */
 void *festina_image_from_pixels(void *arr, int64_t w, int64_t h);
+/* runtime.md: `decoded` when the Festina decoders handled the file,
+ * otherwise the C loader's own answer for it. */
+void *festina_load_image_via(void *decoded, const char *path);
 /* claude.md #135: saveCanvas() with no path -> a fresh img, a snapshot
  * of the canvas at this instant (see the .c doc comment for why a
  * snapshot rather than a live alias). */

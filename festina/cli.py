@@ -744,6 +744,184 @@ def _feature_extra_object(cc, name, platform_name=None):
     return None
 
 
+def _ensure_festina_component(cc, name):
+    """Compile one runtime.md component written in Festina to an object
+    file, cached the way _ensure_runtime_object caches the C ones.
+
+    The component is ordinary Festina -- `imageload.f` imports png.f
+    which imports inflate.f -- so this is the compiler compiling with
+    itself, and it happens once per source change rather than once per
+    user program.
+
+    An OBJECT rather than injected source, which was the first design
+    and the wrong one: merging the component into the user's program
+    changes that program's IR, so `bootstrap/` would have to replicate
+    the injection or the differential goes red on every corpus file
+    mentioning `img` (it did, on 18 of 137). Linking it instead leaves
+    a user program's IR with one declare and one call, which the
+    bootstrap already emits identically.
+
+    Conditional linking is unaffected and is the point: the caller puts
+    this on the link line only when the program actually loads an
+    image, exactly as it does for the graphics and audio translation
+    units.
+    """
+    source = os.path.join(_RUNTIME_DIR, "festina", f"{name}.f")
+    cache_dir = os.path.join(tempfile.gettempdir(), "festina-runtime-cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cc_key = hashlib.sha1(cc.encode()).hexdigest()[:8]
+    obj_path = os.path.join(cache_dir, f"festina_component_{name}.{cc_key}.o")
+
+    # Freshness against the whole component graph, not just the entry:
+    # editing inflate.f has to rebuild imageload.o, and it is imports
+    # away from it.
+    #
+    # And against the COMPILER, which the C objects never have to think
+    # about: their source is C and `cc` compiles it, so `cc` changing is
+    # the whole story. This object's source is Festina and THIS PROGRAM
+    # compiles it, so a change to codegen or to _strip_component_entry
+    # produces a different object from identical source. Leaving that
+    # out served a stale object from a fixed stripper during this
+    # feature's own development, which is the mild version; the sharp
+    # one is a compiler upgrade silently reusing the old compiler's
+    # decoder.
+    graph = list(imports_mod.resolve_imports(source))
+    graph += [m.__file__ for m in (imports_mod, semantic_mod, codegen_mod,
+                                   sys.modules[__name__])
+              if getattr(m, "__file__", None)]
+    newest = max(os.path.getmtime(p) for p in graph)
+    if os.path.exists(obj_path) and os.path.getmtime(obj_path) >= newest:
+        return obj_path
+
+    program = imports_mod.build_program(source)
+    analyzed = semantic_mod.analyze(program, filename=source)
+    ir = codegen_mod.generate_ir(program, analyzed, filename=source)
+    # No `main` from a component: it is linked into a program that has
+    # one. generate_ir emits the entry wrapper unconditionally, so it
+    # is dropped here rather than made conditional for one caller.
+    ir = _strip_component_entry(ir, name)
+    with tempfile.NamedTemporaryFile(suffix=".ll", mode="w", delete=False) as tmp:
+        tmp.write(ir)
+        ir_path = tmp.name
+    try:
+        result = _run_tool([cc, "-O2", "-c", ir_path, "-o", obj_path])
+        if result.returncode != 0:
+            raise CompileError(
+                f"failed to compile the Festina runtime component "
+                f"{name}:\n{result.stderr}", category="link error")
+    finally:
+        os.unlink(ir_path)
+    return obj_path
+
+
+#: Globals every module emits because every module is normally a
+#: program -- see _strip_component_entry.
+_COMPONENT_EXTERNAL_GLOBALS = (
+    "@__festina_db = global ",
+    "@argv = global ",
+    "@argv.header = global ",
+)
+
+
+def _llvm_type_prefix(text):
+    """The type at the start of an LLVM global's initializer.
+
+    Brace-aware, because an array global's type is
+    `{i64, %struct._FestinaArray}` and splitting on the first space
+    yields `{i64,`, which is not a type and which LLVM rejects with
+    "expected type".
+    """
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch in "{[<":
+            depth += 1
+        elif ch in "}]>":
+            depth -= 1
+        elif ch == " " and depth == 0:
+            return text[:i]
+    return text
+
+
+def _strip_component_entry(ir, name):
+    """Make a component's IR linkable beside a real program.
+
+    Three edits, all of which exist because codegen emits the same
+    module shape for every input and a component is not a program:
+
+    `main` is dropped -- the program being linked against brings its
+    own, and a duplicate would be a link error naming a function the
+    programmer never wrote.
+
+    `__festina_main` is RENAMED and registered as a global constructor
+    rather than dropped. It holds the component's top-level statements,
+    and for a decoder those are not decoration: `JPG_ZIGZAG = [0, 1, 8,
+    ...]` compiles to stores in there, so a module without it links,
+    runs, and reads element 0 of an empty array. The first version of
+    this function dropped it and the result segfaulted inside jpgBlock.
+    A constructor (rather than a call the program emits) keeps the user
+    program's IR at one declare and one call, which is the whole reason
+    this is an object and not injected source.
+
+    A `declare` is dropped when the module also `define`s that symbol.
+    codegen declares `festinaDecodeImage` in every module so that a
+    user program can call it; the component is the module that DEFINES
+    it, and LLVM rejects a module carrying both ("invalid redefinition
+    of function"). Fixing it here rather than in codegen keeps the
+    declares unconditional, which is what lets `bootstrap/` emit
+    byte-identical IR for every corpus file -- imageload.f included,
+    since it is one.
+    """
+    defined = set()
+    for line in ir.splitlines():
+        if line.startswith("define "):
+            at = line.find("@")
+            if at != -1:
+                defined.add(line[at:line.find("(", at)])
+
+    init = f"@__festina_component_init_{name}"
+    out = []
+    skipping = False
+    for line in ir.splitlines():
+        if line.startswith("define ") and "@main(" in line:
+            skipping = True
+            continue
+        if line.startswith("define ") and "@__festina_main(" in line:
+            out.append(line.replace("@__festina_main(", f"{init}("))
+            continue
+        if skipping:
+            if line == "}":
+                skipping = False
+            continue
+        if line.startswith("declare "):
+            at = line.find("@")
+            if at != -1 and line[at:line.find("(", at)] in defined:
+                continue
+        # Program scaffolding is emitted by every module, because
+        # every module is normally a whole program. Linked beside a
+        # real one these are duplicate definitions, so the component
+        # refers to the PROGRAM's copies instead of bringing its own.
+        #
+        # A NAMED LIST, not a pattern: the component's own globals look
+        # exactly the same (`@INF_IN`, `@JPG_QUANT` and the rest are
+        # `@name = global ...` too) and must stay definitions. An
+        # earlier version matched on shape and would have externalised
+        # the decoder's entire state, which links cleanly and decodes
+        # nothing.
+        if line.startswith(_COMPONENT_EXTERNAL_GLOBALS):
+            symbol, _, rest = line.partition(" = global ")
+            out.append(f"{symbol} = external global {_llvm_type_prefix(rest)}")
+            continue
+        out.append(line)
+    # 65535 is LLVM's "no particular priority" constructor slot; the
+    # component's globals are its own, so nothing else orders against
+    # it. It runs before main, which is before any call the program
+    # makes into the component.
+    out.append(
+        "@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] "
+        "[{ i32, ptr, ptr } { i32 65535, ptr " + init + ", ptr null }]")
+    return "\n".join(out) + "\n"
+
+
 def _ensure_runtime_object(cc, name, source, pkg_config_packages):
     """Compile one runtime translation unit (core/graphics/audio) to an
     object file once and reuse it (cached in the system temp dir, keyed
@@ -1113,7 +1291,8 @@ def _check_feature_supported(feature, platform_name=None):
 
 def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=False,
                                     uses_http=False, uses_https=False, uses_async_io=False,
-                                    uses_threads=False, uses_tests=False):
+                                    uses_threads=False, uses_tests=False,
+                                    uses_images=False):
     """Every program links core (log/fail/sqlite/regex/timers -- see
     festina_runtime.c's top comment) plus -lm (claude.md #56's
     Math.floor/ceil/round/trunc lower to libm intrinsics -- round() in
@@ -1179,6 +1358,12 @@ def _runtime_objects_and_link_libs(cc, uses_graphics, uses_audio, wants_window=F
             link_libs += _pkg_config("--libs", pkg)
         link_libs += extra_flags
 
+    # runtime.md: the Festina-written decoders, linked only when the
+    # program can load an image -- the same conditional-linking rule
+    # every C feature object above follows.
+    if uses_images:
+        objects.append(_ensure_festina_component(cc, "imageload"))
+
     link_libs += _windows_static_runtime_flags(cc, uses_audio)
     return objects, link_libs
 
@@ -1241,10 +1426,23 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
                            needs_async_io=gen.uses_async_io, needs_threads=gen.uses_threads)
         return output_path
 
+    # runtime.md: the decoder object is needed exactly when the program
+    # loads an image -- see CodeGen.__init__'s own note on why this is a
+    # flag and not a grep of `ir` for the decoder call.
+    #
+    # It rides on needs_graphics rather than standing alone:
+    # festinaDecodeImage calls festina_image_from_pixels, which lives in
+    # the graphics translation unit. Both of _emit_image_load's callers
+    # set uses_graphics_code, so the two are never out of step -- and if
+    # a third caller ever forgets to, the link fails loudly on that
+    # symbol rather than silently.
+    needs_images = gen.uses_image_load
+
     runtime_objects, link_libs = _runtime_objects_and_link_libs(
         cc, needs_graphics, gen.uses_audio, wants_window=gen.uses_graphics,
         uses_http=gen.uses_http, uses_https=gen.uses_https, uses_async_io=gen.uses_async_io,
-        uses_threads=gen.uses_threads, uses_tests=gen.tests_enabled)
+        uses_threads=gen.uses_threads, uses_tests=gen.tests_enabled,
+        uses_images=needs_images)
 
     if llvm_backend.available():
         _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_libs)
@@ -1252,7 +1450,7 @@ def compile_file(entry_path, output_path=None, emit_llvm=False, cc="clang", targ
         _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, gen.uses_audio, link_libs,
                                         needs_http=gen.uses_http, needs_https=gen.uses_https,
                                         needs_async_io=gen.uses_async_io, needs_threads=gen.uses_threads,
-                                        needs_tests=gen.tests_enabled)
+                                        needs_tests=gen.tests_enabled, needs_images=needs_images)
     _rename_if_linker_appended_exe(output_path)
     return output_path
 
@@ -1329,7 +1527,8 @@ def _compile_via_libllvm(ir, entry_path, output_path, cc, runtime_objects, link_
 
 def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphics, needs_audio, link_libs,
                                     needs_http=False, needs_https=False, needs_async_io=False,
-                                    needs_threads=False, needs_tests=False):
+                                    needs_threads=False, needs_tests=False,
+                                    needs_images=False):
     """Fallback used only when libLLVM couldn't be loaded in this process
     -- the original pipeline, handing the .ll file straight to `cc`
     (which then must actually be clang, or another compiler with an LLVM
@@ -1424,6 +1623,15 @@ def _compile_via_clang_ir_frontend(ir, entry_path, output_path, cc, needs_graphi
         pkgs, flags = _feature_pkgs_and_flags("tests")
         pkg_configs += pkgs
         extra_link_flags += flags
+    if needs_images:
+        # runtime.md: an already-compiled object rather than a source
+        # file -- it is Festina, not C, so it cannot go on this command
+        # line as source. Repeated here at all for the reason the
+        # docstring above gives twice over: every feature the libLLVM
+        # path links has to be repeated in this one, nothing makes that
+        # automatic, and the omission is invisible on Linux and a link
+        # failure on macOS (which runs this path).
+        runtime_sources.append(_ensure_festina_component(cc, "imageload"))
     cflags = []
     for pkg in pkg_configs:
         cflags += _pkg_config("--cflags", pkg)

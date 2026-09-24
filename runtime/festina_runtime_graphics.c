@@ -2061,6 +2061,23 @@ void *festina_blank_image(int64_t w, int64_t h) {
     return festina_image_box(out);
 }
 
+/* runtime.md: the decoder-first load path's fallback.
+ *
+ * Codegen emits a call to the Festina decoder and then this, rather
+ * than a branch, so an img load stays two straight calls in the IR:
+ *   %d = call ptr @festinaDecodeImage(ptr %path)
+ *   %i = call ptr @festina_load_image_via(ptr %d, ptr %path)
+ *
+ * A null %d means the Festina decoders declined the file -- a format
+ * they do not implement, or one they refuse rather than half-decode --
+ * and the C loader handles it exactly as it always did. The file is
+ * read twice on that path, which is the price of a fallback and is
+ * paid only by formats the port has not reached. */
+void *festina_load_image_via(void *decoded, const char *path) {
+    if (decoded) return decoded;
+    return festina_load_image(path);
+}
+
 /* claude.md #346: an image from a pixel buffer, in one call.
  *
  * `arr` is a Festina arr[int]: header[0] is the length and header[1]

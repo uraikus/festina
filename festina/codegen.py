@@ -1207,6 +1207,23 @@ class CodeGen:
                                                 # uses_audio below: cli.py links the graphics
                                                 # (Cairo/X11) runtime object file whenever this is
                                                 # true, whether or not a window ever actually opens
+        self.uses_image_load = False           # runtime.md: an img load specifically, not any
+                                                # graphics use -- another pure linking signal, the
+                                                # one that puts the Festina decoder object on the
+                                                # link line. Narrower than uses_graphics_code on
+                                                # purpose: a program that fills a rectangle and
+                                                # saves a canvas sets that flag and has no reason
+                                                # to carry a JPEG decoder. A FLAG rather than
+                                                # grepping the finished IR for the decoder call,
+                                                # which was the first version and was wrong for a
+                                                # reason worth keeping: bootstrap/codegen.f EMITS
+                                                # that call, so its own source spells it, so its
+                                                # own IR contains it as a string constant -- and
+                                                # the compiler linked a decoder into itself and
+                                                # failed on the undefined symbols the decoder
+                                                # needs. Matching on generated text cannot tell an
+                                                # instruction from a literal; a flag set where the
+                                                # instruction is emitted can only be right.
         self.uses_audio = False                # any loadAudio()/.play()/.stop()/.isPlaying()
                                                 # anywhere -- purely a linking signal (unlike
                                                 # uses_graphics/uses_timers, nothing in codegen
@@ -2184,6 +2201,11 @@ class CodeGen:
             "declare i64 @festina_measure_text_width(ptr)",
             "declare i64 @festina_measure_text_height(ptr)",
             "declare ptr @festina_load_image(ptr)",
+            # runtime.md: the decoder-first load path's fallback
+            "declare ptr @festina_load_image_via(ptr, ptr)",
+            # runtime.md: imageload.f, linked as an object when the
+            # program loads an image (cli.py's _ensure_festina_component)
+            "declare ptr @festinaDecodeImage(ptr)",
             # claude.md #171: <text>.callback(fn:func[img]:void) -- the
             # img counterpart of claude.md #165's festina_blob_load_dispatch.
             "declare ptr @festina_image_load_dispatch(ptr, ptr)",
@@ -6221,8 +6243,7 @@ class CodeGen:
         # avoids for the same reason (see _emit_graphics_call).
         if isinstance(to_type, types_mod.ImageType) and from_type == TEXT:
             self.uses_graphics_code = True
-            out = self.tmp()
-            lines.append(f"  {out} = call ptr @festina_load_image(ptr {val})")
+            out = self._emit_image_load(val, lines)
             self._free_text_temp(source_expr, val, TEXT, lines)
             return out
         # claude.md #176: a member type coercing into its enum "pseudo
@@ -14255,6 +14276,38 @@ class CodeGen:
         return name
 
     # ---- graphics: drawRect/drawPixel/drawCircle/drawText/drawImage/loadImage (claude.md #37, #39, #133) ----
+    def _emit_image_load(self, path_val, lines):
+        """An img load, through the Festina decoders first.
+
+        runtime.md: `festinaDecodeImage` is `runtime/festina/imageload.f`
+        compiled to an object, which festina/cli.py puts on the link
+        line exactly when this call is emitted. It answers null for
+        anything those decoders decline -- a format they have not
+        implemented, or one they refuse rather than half-decode -- and
+        festina_load_image_via falls through to the C loader for it.
+
+        Two straight calls rather than a branch, deliberately: this
+        sits inside expression emission, where introducing basic blocks
+        and a phi would complicate every caller for no behavioural
+        gain. The null test is one `if` in C.
+
+        UNCONDITIONAL, and that is what makes it cheap for `bootstrap/`
+        to match: this emits the same two lines for every img load in
+        every program, so the second implementation needs the same two
+        lines and no notion of components at all. Deciding here whether
+        the decoder "is present" would put the linking decision inside
+        codegen, where the bootstrap would have to replicate it.
+        """
+        self.uses_image_load = True
+        decoded = self.tmp()
+        out = self.tmp()
+        lines.append(
+            f"  {decoded} = call ptr @festinaDecodeImage(ptr {path_val})")
+        lines.append(
+            f"  {out} = call ptr @festina_load_image_via("
+            f"ptr {decoded}, ptr {path_val})")
+        return out
+
     def _emit_graphics_call(self, name, expr, env, lines):
         """Draws onto (or loads an image for) the graphics canvas.
         Sets self.uses_graphics so main() knows to open the canvas
@@ -14291,8 +14344,7 @@ class CodeGen:
                 self._free_text_temp(arg_expr, val, vtype, lines)
 
         if name == "loadImage":
-            out = self.tmp()
-            lines.append(f"  {out} = call ptr @festina_load_image(ptr {args[0]})")
+            out = self._emit_image_load(args[0], lines)
             free_text_temps()
             return out, types_mod.ImageType()
 

@@ -425,6 +425,8 @@ arr[text] CG_PRE = [
     'declare i64 @festina_measure_text_width(ptr)',
     'declare i64 @festina_measure_text_height(ptr)',
     'declare ptr @festina_load_image(ptr)',
+    'declare ptr @festina_load_image_via(ptr, ptr)',
+    'declare ptr @festinaDecodeImage(ptr)',
     'declare ptr @festina_image_load_dispatch(ptr, ptr)',
     'declare i8 @festina_save_canvas(ptr)',
     'declare ptr @festina_canvas_to_image()',
@@ -3605,8 +3607,15 @@ Val func cgExprExpecting(e:Node, fty:text, ety:text) {
     // this sets the CODE flag and not the one that opens a canvas.
     if fty == 'img' && v.fty == 'text' {
         CG_USES_GRAPHICS_CODE = true
+        // runtime.md: through the Festina decoders first, falling back
+        // to the C loader on the null they answer for anything they
+        // decline -- see festina/codegen.py's _emit_image_load. Two
+        // straight calls, unconditionally, which is exactly why this
+        // side can match it without knowing what a component is.
+        text idec = cgTmp()
         text iout = cgTmp()
-        cgOut(`  ${iout} = call ptr @festina_load_image(ptr ${v.v})`)
+        cgOut(`  ${idec} = call ptr @festinaDecodeImage(ptr ${v.v})`)
+        cgOut(`  ${iout} = call ptr @festina_load_image_via(ptr ${idec}, ptr ${v.v})`)
         cgFreeTextTemp(e, v)
         Val loaded = cgVal(iout, 'ptr', 'img')
         loaded.fresh = true
@@ -7383,8 +7392,11 @@ Val func cgCall(e:Node, wantValue:bool) {
         CG_USES_GRAPHICS_CODE = true
         Val lp = cgExprExpecting(largs[0], 'text', '')
         if CG_STUCK { return none }
+        // Same two calls as the text-in-an-img-position case above.
+        text ldec = cgTmp()
         text lout = cgTmp()
-        cgOut(`  ${lout} = call ptr @festina_load_image(ptr ${lp.v})`)
+        cgOut(`  ${ldec} = call ptr @festinaDecodeImage(ptr ${lp.v})`)
+        cgOut(`  ${lout} = call ptr @festina_load_image_via(ptr ${ldec}, ptr ${lp.v})`)
         // Cairo reads the PNG inline and keeps no pointer.
         cgFreeTextTemp(largs[0], lp)
         Val lres = cgVal(lout, 'ptr', 'img')

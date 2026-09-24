@@ -47,7 +47,7 @@ CODEGEN_SOURCE = os.path.join(REPO_ROOT, "bootstrap", "irdumpf.f")
 # The runtime `declare` block every module emits verbatim. Measured, not
 # assumed: the longest common prefix of all 83 compilable corpus files
 # once each one's own source-path comment is set aside.
-SHARED_PREAMBLE_LINES = 384
+SHARED_PREAMBLE_LINES = 386
 
 
 def relative(path):

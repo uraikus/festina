@@ -224,33 +224,44 @@ def _parse_cached(source, path):
 
 
 #: runtime.md phase 0: Festina-implemented runtime components live here,
-#: one file per component, and are merged into a program exactly the way
-#: a written `import` would be -- see RUNTIME_TRIGGERS below for how one
-#: gets pulled in, and why the table is currently empty.
+#: one file per component. Two ways in: compiled to an object and put on
+#: the link line (festina/cli.py's _ensure_festina_component -- what the
+#: decoders actually do), or merged into the user's program the way a
+#: written `import` would be, which is what RUNTIME_TRIGGERS below is
+#: for and why that table is empty.
 RUNTIME_COMPONENT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "runtime", "festina")
 
 #: {component name: predicate over the merged user Program}.
 #:
-#: DELIBERATELY EMPTY. The mechanism ships before its first consumer
-#: because every later phase in runtime.md needs it, but a component
-#: that nothing triggers would be code compiled into every binary for
-#: no reason -- the exact opposite of what this exists to do. Phase 1's
-#: PNG decoder adds the first entry.
-#:
 #: A predicate runs against the PARSED program, not an analysed one:
 #: imports resolve before semantic analysis, so a trigger can ask what
 #: the source says (a declaration's type name) and cannot ask what
 #: codegen concluded (`uses_graphics`). That is a real constraint on
 #: what a trigger may test, and it is why these are predicates over an
-#: AST rather than a read of CodeGen's own flags.
+#: AST rather than a read of CodeGen's own flags. It is also half of
+#: why the decoders do not use this table -- the other half follows.
 #:
-#: NOTE for whoever adds the first one: `bootstrap/` is a second
-#: implementation of this compiler, and a component injected here
-#: changes the IR of every program that triggers it. The bootstrap has
-#: to grow the same injection or the differential goes red -- which is
-#: the harness working, not breaking.
+#: DELIBERATELY EMPTY, and the reason is worth more than the mechanism.
+#:
+#: The decoders were wired through here first: `_mentions_image` fired
+#: on any program using `img`, and `imageload.f` and its imports were
+#: merged into it. That works, and it is wrong. Injecting SOURCE puts
+#: eighty statements the programmer did not write into their program,
+#: which changes that program's IR -- so the bootstrap compiler has to
+#: replicate the whole injection or the differential goes red on every
+#: corpus file mentioning `img`. It did: 18 of 137.
+#:
+#: The decoders ship as a linked OBJECT instead (festina/cli.py's
+#: _ensure_festina_component), compiled once from the same source and
+#: put on the link line only when the program loads an image. A user
+#: program's IR then gains two lines -- a declare and a call -- rather
+#: than eighty, and the bootstrap needs only the matching declare.
+#:
+#: The mechanism stays because it is tested and because a component
+#: that genuinely must be part of the program's own compilation would
+#: need it. Nothing does today.
 RUNTIME_TRIGGERS = {}
 
 
@@ -265,21 +276,35 @@ def required_components(program, triggers=None):
 
 
 def _component_statements(name):
-    """Parse one runtime component and tag its statements with its own
-    path, so an error inside it names the component file rather than
-    whatever user program happened to pull it in."""
+    """One runtime component's statements, with its OWN imports
+    resolved, tagged with the file each came from so an error inside a
+    component names the component rather than whatever user program
+    pulled it in.
+
+    The import resolution is the part worth stating: a component is
+    ordinary Festina and imports its dependencies the ordinary way --
+    `imageload.f` says `import png.f`, which says `import inflate.f`.
+    Parsing the entry file alone would leave those statements in the
+    merged program unresolved, so this walks the same
+    `resolve_imports` graph `build_program` does. It deliberately does
+    NOT apply triggers to that graph: a component pulling in another
+    component by trigger would make injection depend on itself.
+    """
     path = os.path.join(RUNTIME_COMPONENT_DIR, f"{name}.f")
     if not os.path.exists(path):
         raise CompileError(
             f"runtime component {name!r} is registered but "
             f"{os.path.relpath(path, os.path.dirname(RUNTIME_COMPONENT_DIR))} "
             f"does not exist", file=path)
-    with open(path, encoding="utf-8") as fh:
-        source = fh.read()
-    program = _parse_cached(source, path)
-    for stmt in program.body:
-        stmt.file = path
-    return program.body
+    body = []
+    for dep in resolve_imports(path):
+        with open(dep, encoding="utf-8") as fh:
+            source = fh.read()
+        program = _parse_cached(source, dep)
+        for stmt in program.body:
+            stmt.file = dep
+        body.extend(program.body)
+    return body
 
 
 def build_program(entry_path, triggers=None):
