@@ -255,7 +255,22 @@ def _explain_windows_fatal_status(result, out_path, args, run_env, cwd):
     else:
         try:
             dbg = subprocess.run(
-                ["gdb", "--batch", "-ex", "run", "-ex", "bt full",
+                ["gdb", "--batch",
+                 "-ex", "set pagination off",
+                 "-ex", "set confirm off",
+                 "-ex", "run",
+                 # `bt` alone came back empty on the first real use of
+                 # this: gdb does not recognise __fastfail as a
+                 # catchable exception, prints "unknown target
+                 # exception 0xc0000409 at <addr>" and has no frame to
+                 # unwind from. The module map is what makes that
+                 # address mean something anyway -- which DLL raised
+                 # it, which is the difference between "UCRT's abort()"
+                 # and "inside Cairo". Asked for FIRST, so it survives
+                 # even when everything after it fails.
+                 "-ex", "info sharedlibrary",
+                 "-ex", "info threads",
+                 "-ex", "thread apply all bt full",
                  "--args", str(out_path), *(args or [])],
                 cwd=cwd, capture_output=True, text=True, timeout=120,
                 env=run_env, encoding="utf-8", errors="replace")
@@ -263,9 +278,14 @@ def _explain_windows_fatal_status(result, out_path, args, run_env, cwd):
                         + (dbg.stderr or ""))
         except (OSError, subprocess.SubprocessError) as exc:
             note.append(f"[crash] gdb re-run failed: {exc}")
-    # Appended to stderr because that is what every caller already puts
-    # in its assertion message.
-    result.stderr = (result.stderr or "") + "\n".join(note)
+    body = "\n".join(note)
+    # BOTH, and the print is the one that matters. Most callers assert
+    # `result.returncode == 0` with no message, so pytest renders the
+    # CompletedProcess repr -- and elides the middle of it, which on the
+    # first real use of this swallowed everything between gdb's banner
+    # and its last line. Captured stdout is shown in full on failure.
+    result.stderr = (result.stderr or "") + body
+    print(body)
 
 
 @pytest.fixture

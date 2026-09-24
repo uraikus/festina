@@ -1389,7 +1389,13 @@ class TestWindowsFatalStatusExplanation:
         explain(result, tmp_path / "program", ["--flag"], None, tmp_path)
 
         assert calls and calls[0][0] == "gdb"
-        assert "bt full" in calls[0]
+        assert "thread apply all bt full" in calls[0]
+        assert "info sharedlibrary" in calls[0], (
+            "the module map is what makes a faulting address mean "
+            "something when gdb has no frame to unwind")
+        assert calls[0].index("info sharedlibrary") < calls[0].index(
+            "thread apply all bt full"), (
+            "asked for first, so it survives when the unwind fails")
         assert "--flag" in calls[0], "the program's own arguments must be kept"
         assert "cairo_show_text" in result.stderr
 

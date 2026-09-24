@@ -8363,3 +8363,41 @@ not reproduce is itself worth knowing, and it says so.
 
 This is not a fix. It is the instrument that should have been built
 before the first theory.
+
+**The instrument's first reading, and it is already worth more than
+the three theories.** CI run 169:
+
+    gdb: unknown target exception 0xc0000409 at 0x7ff9b2994aee
+
+Two facts, where before there were none.
+
+**It reproduces.** The re-run under gdb crashed the same way. Four
+rounds of calling this a race, and the program crashes again when run
+again. (Under load -- the rest of the suite is still going when the
+re-run happens -- so "reproduces under load", not yet "reproduces in
+isolation". That distinction is the next thing to settle and it is
+cheap to settle.)
+
+**The address points away from our own code.** 0x7ff9b2994aee is in
+the range Windows maps system DLLs into, not where an MSYS2-built
+Cairo or a compiled Festina program lands. `ucrtbase.dll` lives there,
+which fits the one piece of analysis that has held up all along:
+0xC0000409 is `__fastfail`, and UCRT raises it for `abort()` and for
+its own invalid-parameter handler.
+
+It is a hypothesis again, so it is not being acted on as more than
+one. The difference from the previous three is that it can be settled
+by a fact already in reach: `info sharedlibrary` prints each module's
+loaded address range, and the address either falls in ucrtbase or it
+does not. That is now asked for FIRST in the gdb invocation, before
+the backtrace, so it survives the unwind failing -- which it did, and
+will again: gdb does not recognise `__fastfail` as a catchable
+exception, so it has no frame to walk and `bt` printed nothing at all.
+
+**And the note nearly did not survive being read.** It went into
+`result.stderr`, and the callers assert `result.returncode == 0` with
+no message -- so pytest rendered the CompletedProcess repr and elided
+its middle, swallowing everything between gdb's banner and its last
+line. The note is printed as well now, because captured stdout is
+shown in full on failure. An instrument whose output is truncated in
+the one place anybody reads it is not an instrument.
