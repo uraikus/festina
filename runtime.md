@@ -470,8 +470,9 @@ first piece of compiler work.
    axis-aligned opaque rectangle — the narrowest slice that exercises
    the whole handoff, and one where byte-identity against Cairo is
    available
-2. edge list, scanline fill, nonzero and even-odd winding, with
-   analytic coverage — the core; everything below is expressed in it
+2. ✅ edge list, scanline fill, nonzero and even-odd winding, with
+   sub-scanline coverage — the core; everything below is expressed
+   in it
 3. `curve_to` by flattening, `arc` by the same, `rectangle` and the
    existing circle cache expressed as paths
 4. stroking: joins, caps, line width, reduced to a fill of the
@@ -508,6 +509,35 @@ once slice 2 introduces blending. The alternative — a rasteriser whose
 buffers cannot reach `imageFromPixels` without a conversion pass — is
 a second in-memory format for everyone to get wrong. Slice 1 does no
 blending, so the cost today is zero.
+
+**Slice 2, as built.** `rasFillPath` takes a path as two flat arrays
+— `pts` of x,y pairs and `ends` holding one index per subpath — fills
+it by the nonzero or even-odd rule, and composites with src-over.
+Coverage is EXACT in x and sampled at `RAS_SUB` positions in y.
+
+**The bound against Cairo is 12, and the obvious explanation for it
+was wrong.** A triangle filled both ways over an opaque background
+differs on 331 of 480,000 pixels, maximum 12, mean 0.0028. The natural
+reading is that `RAS_SUB`'s 1/16 quantisation in y is the residual —
+so that was checked, by varying `RAS_SUB` over 8, 16, 32 and 64. The
+maximum moved by one unit: 13, 12, 12, 12. Sampling density is not
+what separates the two rasterisers, so sixteen is kept because
+thirty-two buys nothing, and the difference lives in how coverage is
+computed rather than how finely it is sampled.
+
+**The measurement itself had to be fixed first.** Comparing the two on
+a TRANSPARENT surface reported a maximum deviation of 255. That was
+the measurement's fault: a pixel with alpha 1/255 un-premultiplies to
+a saturated colour, so comparing RGB while ignoring alpha compares
+noise. Over an opaque background every pixel is opaque and the numbers
+are what a viewer would see. A bound taken from the first version
+would have been meaningless and would have looked alarming.
+
+Pixel-aligned geometry is still asserted exactly, including against
+slice 1's own rectangle fill — two independent code paths that must
+agree on a box — and a left edge at x = 1.5 leaves exactly 128, which
+is the assertion that would catch an off-by-half in the span
+arithmetic.
 
 ## Tests
 

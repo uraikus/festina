@@ -89,3 +89,260 @@ arr[int] func rasNewSurface(sw:int, sh:int) {
     }
     return px
 }
+
+// ---- Slice 2: paths, scanline fill, winding rules, antialiasing ----
+//
+// A path is two arrays. `pts` is x0,y0,x1,y1,... in pixel coordinates,
+// and `ends` holds one index PER SUBPATH: the point index one past
+// that subpath's last point. So a single triangle is ends = [3], and a
+// square with a square hole in it is ends = [4, 8]. Every subpath is
+// implicitly closed; there is no "open" fill.
+//
+// Two arrays rather than a struct because this is the hot data: a
+// glyph is a few hundred points and slice 5 will run this per
+// character. Flat arrays of primitives are what this language makes
+// cheap.
+//
+// **The algorithm: sub-scanlines in y, exact coverage in x.** For each
+// pixel row, RAS_SUB evenly spaced horizontal lines are intersected
+// with every edge; the crossings are sorted, the fill rule turns them
+// into spans, and each span adds its exact horizontal coverage to a
+// per-pixel accumulator. Coverage is therefore EXACT in x and
+// quantised to 1/RAS_SUB in y.
+//
+// That asymmetry is deliberate and is the quality/complexity trade
+// this slice makes. Exact analytic area (what Cairo does) needs a
+// signed-area cell structure and is a substantially harder thing to
+// get right; 16 sub-scanlines is within 1/16 of it on the worst case,
+// a near-horizontal edge, and exact everywhere x dominates. The tests
+// assert properties plus a measured bound rather than byte-identity,
+// which runtime.md's "Phase 4, specified" commits to in advance for
+// exactly this reason.
+
+int RAS_SUB = 16
+int RAS_NONZERO = 0
+int RAS_EVENODD = 1
+
+// Scratch, reused across rows and calls rather than reallocated. A
+// fill touches these and nothing else keeps a reference.
+arr[float] RAS_COV = []
+arr[float] RAS_XS = []
+arr[int] RAS_WS = []
+
+// Grow a float scratch array to at least n entries.
+void func rasEnsureCov(n:int) {
+    while RAS_COV.length < n {
+        RAS_COV.push(0.0)
+    }
+}
+
+float func rasMinF(a:float, b:float) {
+    if a < b { return a }
+    return b
+}
+
+float func rasMaxF(a:float, b:float) {
+    if a > b { return a }
+    return b
+}
+
+// Fill a path.
+//
+// `rule` is RAS_NONZERO or RAS_EVENODD. Colour is straight alpha, and
+// `a` is the fill's own alpha before coverage multiplies it -- so a
+// half-transparent fill over an antialiased edge composites twice, as
+// it should.
+void func rasFillPath(px:arr[int], sw:int, sh:int,
+                      pts:arr[float], ends:arr[int], rule:int,
+                      r:int, g:int, b:int, a:int) {
+    if sw <= 0 || sh <= 0 { return }
+    if ends.length == 0 || pts.length < 6 { return }
+    int ca = rasClamp(a, 0, 255)
+    if ca == 0 { return }
+    int cr = rasClamp(r, 0, 255)
+    int cg = rasClamp(g, 0, 255)
+    int cb = rasClamp(b, 0, 255)
+
+    rasEnsureCov(sw)
+
+    // Vertical extent, so rows the path cannot touch cost nothing.
+    float minY = pts[1]
+    float maxY = pts[1]
+    int i = 1
+    while i < pts.length {
+        minY = rasMinF(minY, pts[i])
+        maxY = rasMaxF(maxY, pts[i])
+        i = i + 2
+    }
+    int y0 = rasClamp(Math.floor(minY), 0, sh)
+    int y1 = rasClamp(Math.floor(maxY) + 1, 0, sh)
+    if y1 <= y0 { return }
+
+    float invSub = 1.0 / RAS_SUB.toFloat()
+
+    int row = y0
+    while row < y1 {
+        int c = 0
+        while c < sw {
+            RAS_COV[c] = 0.0
+            c = c + 1
+        }
+
+        int s = 0
+        while s < RAS_SUB {
+            float sy = row.toFloat() + ((s.toFloat() + 0.5) * invSub)
+
+            // Crossings of this sub-scanline with every edge, kept
+            // sorted by x as they are inserted: a scanline meets a
+            // handful of edges even in a complex path, and an
+            // insertion sort over parallel arrays avoids needing a
+            // comparator over a struct.
+            int nx = 0
+            int sub = 0
+            int from = 0
+            while sub < ends.length {
+                int to = ends[sub]
+                int p = from
+                while p < to {
+                    int q = p + 1
+                    if q == to { q = from }
+                    float ax = pts[p * 2]
+                    float ay = pts[(p * 2) + 1]
+                    float bx = pts[q * 2]
+                    float by = pts[(q * 2) + 1]
+                    bool down = ay <= sy && by > sy
+                    bool up = by <= sy && ay > sy
+                    if down || up {
+                        float t = (sy - ay) / (by - ay)
+                        float xx = ax + (t * (bx - ax))
+                        int w = 1
+                        if up { w = -1 }
+                        // insert, keeping RAS_XS[0..nx) ascending
+                        while RAS_XS.length <= nx { RAS_XS.push(0.0) }
+                        while RAS_WS.length <= nx { RAS_WS.push(0) }
+                        int j = nx
+                        while j > 0 && RAS_XS[j - 1] > xx {
+                            RAS_XS[j] = RAS_XS[j - 1]
+                            RAS_WS[j] = RAS_WS[j - 1]
+                            j = j - 1
+                        }
+                        RAS_XS[j] = xx
+                        RAS_WS[j] = w
+                        nx = nx + 1
+                    }
+                    p = p + 1
+                }
+                from = to
+                sub = sub + 1
+            }
+
+            // Crossings to spans, by the fill rule.
+            int k = 0
+            int wind = 0
+            float spanStart = 0.0
+            bool inside = false
+            while k < nx {
+                if rule == RAS_EVENODD {
+                    wind = wind + 1
+                } else {
+                    wind = wind + RAS_WS[k]
+                }
+                bool wasIn = inside
+                if rule == RAS_EVENODD {
+                    inside = (wind % 2) != 0
+                } else {
+                    inside = wind != 0
+                }
+                if !wasIn && inside {
+                    spanStart = RAS_XS[k]
+                }
+                if wasIn && !inside {
+                    rasAddSpan(sw, spanStart, RAS_XS[k], invSub)
+                }
+                k = k + 1
+            }
+            s = s + 1
+        }
+
+        rasBlendRow(px, sw, row, cr, cg, cb, ca)
+        row = row + 1
+    }
+}
+
+// Add a horizontal span's coverage, exact at both ends.
+void func rasAddSpan(sw:int, xa:float, xb:float, weight:float) {
+    float lo = rasMaxF(xa, 0.0)
+    float hi = rasMinF(xb, sw.toFloat())
+    if hi <= lo { return }
+    int ia = Math.floor(lo)
+    int ib = Math.floor(hi)
+    if ib >= sw { ib = sw - 1 }
+    if ia == ib {
+        RAS_COV[ia] = RAS_COV[ia] + ((hi - lo) * weight)
+        return
+    }
+    RAS_COV[ia] = RAS_COV[ia] + (((ia + 1).toFloat() - lo) * weight)
+    int i = ia + 1
+    while i < ib {
+        RAS_COV[i] = RAS_COV[i] + weight
+        i = i + 1
+    }
+    RAS_COV[ib] = RAS_COV[ib] + ((hi - ib.toFloat()) * weight)
+}
+
+// Composite one row of accumulated coverage onto the surface.
+//
+// src-over in STRAIGHT alpha, which is where that format choice starts
+// costing something: the general case needs a divide per channel to
+// un-premultiply the result. The two cases that actually dominate --
+// an opaque destination and an empty one -- are exact without it and
+// are taken first.
+void func rasBlendRow(px:arr[int], sw:int, row:int,
+                      cr:int, cg:int, cb:int, ca:int) {
+    int base = row * sw * 4
+    int i = 0
+    while i < sw {
+        float cov = RAS_COV[i]
+        if cov > 0.0 {
+            if cov > 1.0 { cov = 1.0 }
+            int sa = Math.round(ca.toFloat() * cov)
+            if sa > 0 {
+                int at = base + (i * 4)
+                int da = px[at + 3]
+                if da == 0 {
+                    px[at] = cr
+                    px[at + 1] = cg
+                    px[at + 2] = cb
+                    px[at + 3] = sa
+                } else {
+                    if sa == 255 {
+                        px[at] = cr
+                        px[at + 1] = cg
+                        px[at + 2] = cb
+                        px[at + 3] = 255
+                    } else {
+                        int inv = 255 - sa
+                        if da == 255 {
+                            px[at] = Math.floorDiv((cr * sa) + (px[at] * inv) + 127, 255)
+                            px[at + 1] = Math.floorDiv((cg * sa) + (px[at + 1] * inv) + 127, 255)
+                            px[at + 2] = Math.floorDiv((cb * sa) + (px[at + 2] * inv) + 127, 255)
+                            px[at + 3] = 255
+                        } else {
+                            // General src-over on straight alpha.
+                            int oa = sa + Math.floorDiv(da * inv + 127, 255)
+                            if oa > 255 { oa = 255 }
+                            if oa > 0 {
+                                int dw = Math.floorDiv(da * inv + 127, 255)
+                                px[at] = Math.floorDiv((cr * sa) + (px[at] * dw) + Math.floorDiv(oa, 2), oa)
+                                px[at + 1] = Math.floorDiv((cg * sa) + (px[at + 1] * dw) + Math.floorDiv(oa, 2), oa)
+                                px[at + 2] = Math.floorDiv((cb * sa) + (px[at + 2] * dw) + Math.floorDiv(oa, 2), oa)
+                                px[at + 3] = oa
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+}
