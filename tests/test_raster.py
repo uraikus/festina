@@ -701,3 +701,179 @@ class TestFilledCirclesAgainstTheTruth:
         # and the mean to what is measured, with a unit's room.
         assert worst <= 18.0, f"max |error| {worst:.1f}"
         assert mean_abs <= 5.5, f"mean |error| {mean_abs:.2f}"
+
+
+class TestStroking:
+    """runtime.md phase 4, slice 4: a stroke is the FILL of its outline.
+
+    Segments become quads, joins become small polygons on the outside of
+    each turn, and the set is filled once with the nonzero rule -- so an
+    overlap is covered once, not blended twice. Styles are the ones the
+    runtime has always had by never changing Cairo's defaults: miter
+    joins, miter limit 10, butt caps."""
+
+    def _alpha_grid(self, tmp_path, cli_mod, w, h, pts, ends, closed, width):
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   "import raster.f\n"
+                   f"arr[int] px = rasNewSurface({w}, {h})\n"
+                   f"arr[float] pts = [{pts}]\n"
+                   f"arr[int] ends = [{ends}]\n"
+                   f"arr[int] closed = [{closed}]\n"
+                   f"rasStrokePath(px, {w}, {h}, pts, ends, closed, {width}, 9, 9, 9, 255)\n"
+                   "int i = 3\ntext out = ''\n"
+                   "while i < px.length { out = `${out} ${px[i]}` i = i + 4 }\n"
+                   "log(out)\n")
+        vals = [int(v) for v in out.split()]
+        return [vals[y * w:(y + 1) * w] for y in range(h)]
+
+    def test_a_line_has_butt_caps_and_exact_width(self, tmp_path, cli_mod):
+        g = self._alpha_grid(tmp_path, cli_mod, 12, 10,
+                             "2.0, 5.0, 10.0, 5.0", "2", "0", "4.0")
+        for y in range(10):
+            for x in range(12):
+                want = 255 if (2 <= x < 10 and 3 <= y < 7) else 0
+                assert g[y][x] == want, f"({x}, {y})"
+
+    def test_a_right_angle_gets_a_square_miter(self, tmp_path, cli_mod):
+        """The outer corner square is filled. A bevel would cut it on
+        the diagonal, and a missing join would leave it empty."""
+        g = self._alpha_grid(tmp_path, cli_mod, 18, 16,
+                             "3.0, 3.0, 13.0, 3.0, 13.0, 13.0", "3", "0", "4.0")
+        for y in (1, 2):
+            for x in (13, 14):
+                assert g[y][x] == 255, f"outer corner ({x}, {y})"
+        assert g[1][15] == 0 and g[0][14] == 0, "and nothing beyond it"
+
+    def test_a_closed_path_is_joined_where_it_closes(self, tmp_path, cli_mod):
+        """The vertex a closed path returns to needs a join too -- the
+        classic off-by-one is to join every vertex but the first. The
+        top-left outer corner exists only if vertex 0 was joined."""
+        g = self._alpha_grid(tmp_path, cli_mod, 16, 16,
+                             "3.0, 3.0, 13.0, 3.0, 13.0, 13.0, 3.0, 13.0",
+                             "4", "1", "4.0")
+        for corner in ((1, 1), (14, 1), (14, 14), (1, 14)):
+            x, y = corner
+            assert g[y][x] == 255, f"corner at {corner}"
+        assert g[8][8] == 0, "a stroke, not a fill: the middle is empty"
+
+    def test_zero_width_draws_nothing(self, tmp_path, cli_mod):
+        g = self._alpha_grid(tmp_path, cli_mod, 8, 8,
+                             "1.0, 1.0, 6.0, 6.0", "2", "0", "0.0")
+        assert all(v == 0 for row in g for v in row)
+
+    def test_a_self_crossing_stroke_is_not_blended_twice(self, tmp_path, cli_mod):
+        """The reason for stroking by filling a union. Half-transparent
+        black over white is 127 everywhere on the stroke -- including
+        where two segments cross. Painting the pieces one by one would
+        leave about 64 there.
+
+        This does NOT test winding consistency, and its first docstring
+        claimed it did. Segment quads are wound consistently by
+        construction -- each is built from its own direction and left
+        normal -- so removing rasEmitPoly's orientation fix still
+        passes here. See the next test for where that fix matters."""
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   "import raster.f\n"
+                   "arr[int] px = rasNewSurface(40, 40)\n"
+                   "rasFillRect(px, 40, 40, 0, 0, 40, 40, 255, 255, 255, 255)\n"
+                   "arr[float] pts = [5.0, 20.0, 35.0, 20.0, 35.0, 5.0, 20.0, 5.0, 20.0, 35.0]\n"
+                   "arr[int] ends = [5]\narr[int] closed = [0]\n"
+                   "rasStrokePath(px, 40, 40, pts, ends, closed, 4.0, 0, 0, 0, 128)\n"
+                   "log(px[((20 * 40) + 20) * 4])\n"
+                   "log(px[((20 * 40) + 10) * 4])\n"
+                   "log(px[((5 * 40) + 27) * 4])\n")
+        crossing, plain, corner = (int(v) for v in out.split())
+        assert crossing == plain == corner, (crossing, plain, corner)
+        assert 126 <= plain <= 129
+
+
+    def test_a_segment_crossing_a_join_is_not_a_hole(self, tmp_path, cli_mod):
+        """Where rasEmitPoly's orientation fix is load-bearing. Join
+        polygons flip winding with the direction of the turn; quads do
+        not. A join fills the wedge OUTSIDE its own two quads, so it
+        never overlaps them -- but another part of the path can cross
+        it. Here a later segment runs straight through a right angle's
+        miter corner. With every piece normalized the crossing is
+        inside once, 127; with the fix removed the opposite-wound join
+        cancels the crossing segment under nonzero and leaves a HOLE,
+        255 -- checked, by putting the bug back."""
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   "import raster.f\n"
+                   "arr[int] px = rasNewSurface(50, 40)\n"
+                   "rasFillRect(px, 50, 40, 0, 0, 50, 40, 255, 255, 255, 255)\n"
+                   "arr[float] pts = [10.0, 10.0, 30.0, 10.0, 30.0, 30.0, 20.0, 0.0, 45.0, 20.0]\n"
+                   "arr[int] ends = [3, 5]\narr[int] closed = [0, 0]\n"
+                   "rasStrokePath(px, 50, 40, pts, ends, closed, 6.0, 0, 0, 0, 128)\n"
+                   "log(px[((8 * 50) + 32) * 4])\n"
+                   "log(px[((10 * 50) + 15) * 4])\n")
+        through_join, plain = (int(v) for v in out.split())
+        assert through_join != 255, "the crossing cancelled to a hole"
+        assert through_join == plain, (through_join, plain)
+
+
+class TestStrokingAgainstCairo:
+    """Cairo's own strokePath over the same geometry. Stroke edges are
+    straight lines, so this bound is tighter than the filled triangle's.
+
+    **No pixel off by more than 60** is asserted separately from the
+    maximum, because it is the join test. A wrong miter-versus-bevel
+    decision does not produce a small error; it leaves a whole wedge
+    wrong by around 225. Measured: max 6 on the polyline, max 14 on the
+    spikes, and zero such pixels on either."""
+
+    def _compare(self, tmp_path, cli_mod, cairo_body, pts, ends, closed, width):
+        _with_raster(tmp_path)
+        assert _run(tmp_path, cli_mod,
+                    "color red = '#c81e1e'\ncolor white = '#ffffff'\n"
+                    "clearCanvas()\nfillStyle(white)\ndrawRect(0, 0, 800, 600)\n"
+                    f"borderColor(red)\nlineWidth({int(width)})\n" + cairo_body +
+                    "log(saveCanvas('cairo.png'))\n") == "true"
+        assert _run(tmp_path, cli_mod,
+                    "import raster.f\n"
+                    "arr[int] px = rasNewSurface(800, 600)\n"
+                    "rasFillRect(px, 800, 600, 0, 0, 800, 600, 255, 255, 255, 255)\n"
+                    f"arr[float] pts = [{pts}]\narr[int] ends = [{ends}]\n"
+                    f"arr[int] closed = [{closed}]\n"
+                    f"rasStrokePath(px, 800, 600, pts, ends, closed, {width}, 200, 30, 30, 255)\n"
+                    "img a = imageFromPixels(px, 800, 600)\n"
+                    "log(a.save('raster.png'))\n") == "true"
+        w, h, ra, na = _decode_png(str(tmp_path / "cairo.png"))
+        _, _, rb, nb = _decode_png(str(tmp_path / "raster.png"))
+        worst = 0
+        wedge = 0
+        for y in range(h):
+            for x in range(w):
+                d = max(abs(ra[y][x * na + i] - rb[y][x * nb + i]) for i in range(3))
+                worst = max(worst, d)
+                if d > 60:
+                    wedge += 1
+        return worst, wedge
+
+    def test_a_polyline_and_a_closed_square(self, tmp_path, cli_mod):
+        worst, wedge = self._compare(
+            tmp_path, cli_mod,
+            "beginPath()\nmoveTo(40, 60)\nlineTo(200, 60)\nlineTo(260, 180)\n"
+            "lineTo(330, 70)\nlineTo(420, 190)\nlineTo(440, 80)\nstrokePath()\n"
+            "beginPath()\nmoveTo(100, 300)\nlineTo(300, 300)\nlineTo(300, 450)\n"
+            "lineTo(100, 450)\nclosePath()\nstrokePath()\n",
+            "40.0, 60.0, 200.0, 60.0, 260.0, 180.0, 330.0, 70.0, 420.0, 190.0, 440.0, 80.0,"
+            " 100.0, 300.0, 300.0, 300.0, 300.0, 450.0, 100.0, 450.0",
+            "6, 10", "0, 1", 6.0)
+        assert wedge == 0, f"{wedge} pixels off by more than 60 -- a join disagrees"
+        assert worst <= 10, f"max deviation {worst}"
+
+    def test_the_miter_limit_bevels_where_cairo_does(self, tmp_path, cli_mod):
+        """Two spikes either side of the limit: 6.54 degrees has a miter
+        ratio of 17.5 and must bevel; 16.26 degrees has 7.07 and must
+        keep a miter seventy pixels long."""
+        worst, wedge = self._compare(
+            tmp_path, cli_mod,
+            "beginPath()\nmoveTo(50, 300)\nlineTo(400, 280)\nlineTo(50, 260)\nstrokePath()\n"
+            "beginPath()\nmoveTo(50, 450)\nlineTo(400, 400)\nlineTo(50, 350)\nstrokePath()\n",
+            "50.0, 300.0, 400.0, 280.0, 50.0, 260.0, 50.0, 450.0, 400.0, 400.0, 50.0, 350.0",
+            "3, 6", "0, 0", 10.0)
+        assert wedge == 0, f"{wedge} pixels off by more than 60 -- a bevel/miter call disagrees"
+        assert worst <= 18, f"max deviation {worst}"

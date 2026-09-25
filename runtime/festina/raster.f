@@ -533,3 +533,217 @@ void func rasCircle(pts:arr[float], ends:arr[int], cx:float, cy:float, r:float) 
     }
     ends.push(Math.floorDiv(pts.length, 2))
 }
+
+// ---- Slice 4: stroking, as a fill of the stroke's outline ----
+//
+// A stroke is not drawn; it is turned into polygons and FILLED by
+// slice 2. Each segment becomes a quad of the line's width, each join
+// becomes a small polygon on the outside of the turn, and the whole set
+// is filled once with the nonzero rule.
+//
+// Once, as a union, rather than piece by piece -- and that is the
+// point of doing it this way. Where a quad and a join overlap, or a
+// path crosses itself, painting the pieces separately would blend the
+// overlap twice and a half-transparent stroke would come out darker at
+// every corner. Filled as one nonzero path, an overlap is simply
+// "inside", once. That only works if every piece winds the same way,
+// so every piece goes through rasEmitPoly, which fixes the orientation.
+//
+// Styles are the ones the runtime already gets from Cairo by never
+// changing them: MITER joins with a miter limit of 10, and BUTT caps.
+// festina_runtime_graphics.c sets a line width and nothing else, so
+// these are what every stroke in the language has always looked like.
+
+float RAS_MITER_LIMIT = 10.0
+
+// Append one polygon -- a triangle when n is 3, a quad when n is 4 --
+// oriented to positive signed area, as its own subpath. Zero-area
+// pieces are dropped: they cover nothing, and a degenerate subpath is
+// one more set of edges to intersect for no pixels.
+void func rasEmitPoly(out:arr[float], outEnds:arr[int], n:int,
+                      x0:float, y0:float, x1:float, y1:float,
+                      x2:float, y2:float, x3:float, y3:float) {
+    float area = ((x0 * y1) - (x1 * y0)) + ((x1 * y2) - (x2 * y1))
+    if n == 4 {
+        area = area + ((x2 * y3) - (x3 * y2)) + ((x3 * y0) - (x0 * y3))
+    } else {
+        area = area + ((x2 * y0) - (x0 * y2))
+    }
+    if Math.abs(area) < 0.000000000001 { return }
+    if area > 0.0 {
+        out.push(x0)
+        out.push(y0)
+        out.push(x1)
+        out.push(y1)
+        out.push(x2)
+        out.push(y2)
+        if n == 4 {
+            out.push(x3)
+            out.push(y3)
+        }
+    } else {
+        if n == 4 {
+            out.push(x3)
+            out.push(y3)
+        }
+        out.push(x2)
+        out.push(y2)
+        out.push(x1)
+        out.push(y1)
+        out.push(x0)
+        out.push(y0)
+    }
+    outEnds.push(Math.floorDiv(out.length, 2))
+}
+
+// Scratch for one subpath's points with consecutive duplicates removed.
+arr[float] RAS_SX = []
+arr[float] RAS_SY = []
+
+// The join at vertex (vx, vy) between an incoming segment of unit
+// direction (ax, ay) and an outgoing one of unit direction (bx, by),
+// for a line of half-width h.
+//
+// With left normals n0 = (-ay, ax) and n1 = (-by, bx), the turn's
+// OUTSIDE is -n when the cross product is positive and +n otherwise --
+// the relationship is algebraic, so it holds whichever way y points.
+// The outer corners of the two quads are V + s*n0*h and V + s*n1*h,
+// and the miter point lies along s*(n0 + n1) at distance h / cos(alpha),
+// alpha being half the angle between the normals: M = V + s*(n0 + n1) *
+// h / (1 + n0.n1).
+//
+// Cairo's rule: the miter length divided by the line width is
+// 1/sin(theta/2) for an interior angle theta, and past the limit the
+// join becomes a bevel. In these terms that ratio is sqrt(2/(1 + c)),
+// c = n0.n1, so a miter stands exactly when 2/(1 + c) <= limit^2. The
+// comparison is done squared, which also keeps it defined at c = -1,
+// the 180-degree reversal where the miter would be infinitely long.
+void func rasJoin(out:arr[float], outEnds:arr[int], vx:float, vy:float,
+                  ax:float, ay:float, bx:float, by:float, h:float) {
+    float cross = (ax * by) - (ay * bx)
+    float dot = (ax * bx) + (ay * by)
+    // Straight on: the quads already meet flush, and there is no
+    // outside to fill.
+    if Math.abs(cross) < 0.000000001 && dot > 0.0 { return }
+    float s = 1.0
+    if cross > 0.0 { s = -1.0 }
+    float n0x = 0.0 - ay
+    float n0y = ax
+    float n1x = 0.0 - by
+    float n1y = bx
+    float pax = vx + (s * n0x * h)
+    float pay = vy + (s * n0y * h)
+    float pbx = vx + (s * n1x * h)
+    float pby = vy + (s * n1y * h)
+    float c = (n0x * n1x) + (n0y * n1y)
+    bool miter = (1.0 + c) > 0.0 && (2.0 / (1.0 + c)) <= (RAS_MITER_LIMIT * RAS_MITER_LIMIT)
+    if miter {
+        float k = h / (1.0 + c)
+        float mx = vx + (s * (n0x + n1x) * k)
+        float my = vy + (s * (n0y + n1y) * k)
+        rasEmitPoly(out, outEnds, 4, vx, vy, pax, pay, mx, my, pbx, pby)
+    } else {
+        rasEmitPoly(out, outEnds, 3, vx, vy, pax, pay, pbx, pby, 0.0, 0.0)
+    }
+}
+
+// Turn a path into the outline of its stroke, ready for rasFillPath
+// with RAS_NONZERO.
+//
+// `closed` holds one flag per subpath, 1 or 0, the way `ends` holds one
+// index per subpath: a closed subpath is joined at every vertex
+// including the one it closes on, an open one is joined only between
+// its segments and gets butt caps -- which are nothing at all, the
+// quads simply end.
+void func rasStrokeOutline(src:arr[float], srcEnds:arr[int], closed:arr[int],
+                           width:float, out:arr[float], outEnds:arr[int]) {
+    if width <= 0.0 { return }
+    float h = width * 0.5
+    int sub = 0
+    int from = 0
+    while sub < srcEnds.length {
+        int to = srcEnds[sub]
+        bool isClosed = sub < closed.length && closed[sub] != 0
+
+        // This subpath's points, consecutive duplicates removed: a
+        // zero-length segment has no direction, and a join needs one
+        // on each side.
+        int m = 0
+        int p = from
+        while p < to {
+            float x = src[p * 2]
+            float y = src[(p * 2) + 1]
+            bool dup = m > 0 && x == RAS_SX[m - 1] && y == RAS_SY[m - 1]
+            if !dup {
+                while RAS_SX.length <= m { RAS_SX.push(0.0) }
+                while RAS_SY.length <= m { RAS_SY.push(0.0) }
+                RAS_SX[m] = x
+                RAS_SY[m] = y
+                m = m + 1
+            }
+            p = p + 1
+        }
+        // A closed path that returns to its start repeats that point;
+        // the closing segment is implied, so the repeat is dropped.
+        if isClosed && m > 1 && RAS_SX[m - 1] == RAS_SX[0] && RAS_SY[m - 1] == RAS_SY[0] {
+            m = m - 1
+        }
+
+        if m >= 2 {
+            int segs = m - 1
+            if isClosed && m >= 3 { segs = m }
+            int i = 0
+            while i < segs {
+                int j = i + 1
+                if j == m { j = 0 }
+                float dx = RAS_SX[j] - RAS_SX[i]
+                float dy = RAS_SY[j] - RAS_SY[i]
+                float len = Math.sqrt((dx * dx) + (dy * dy))
+                float nx = (0.0 - dy) / len
+                float ny = dx / len
+                rasEmitPoly(out, outEnds, 4,
+                            RAS_SX[i] + (nx * h), RAS_SY[i] + (ny * h),
+                            RAS_SX[j] + (nx * h), RAS_SY[j] + (ny * h),
+                            RAS_SX[j] - (nx * h), RAS_SY[j] - (ny * h),
+                            RAS_SX[i] - (nx * h), RAS_SY[i] - (ny * h))
+                i = i + 1
+            }
+
+            // Joins: at every vertex of a closed subpath, at the
+            // interior ones of an open subpath.
+            int v = 1
+            int vEnd = m - 1
+            if isClosed && m >= 3 {
+                v = 0
+                vEnd = m
+            }
+            while v < vEnd {
+                int prev = v - 1
+                if prev < 0 { prev = m - 1 }
+                int next = v + 1
+                if next == m { next = 0 }
+                float ax = RAS_SX[v] - RAS_SX[prev]
+                float ay = RAS_SY[v] - RAS_SY[prev]
+                float la = Math.sqrt((ax * ax) + (ay * ay))
+                float bx = RAS_SX[next] - RAS_SX[v]
+                float by = RAS_SY[next] - RAS_SY[v]
+                float lb = Math.sqrt((bx * bx) + (by * by))
+                rasJoin(out, outEnds, RAS_SX[v], RAS_SY[v],
+                        ax / la, ay / la, bx / lb, by / lb, h)
+                v = v + 1
+            }
+        }
+        from = to
+        sub = sub + 1
+    }
+}
+
+// Stroke a path onto a surface: the outline, filled once.
+void func rasStrokePath(px:arr[int], sw:int, sh:int,
+                        pts:arr[float], ends:arr[int], closed:arr[int],
+                        width:float, r:int, g:int, b:int, a:int) {
+    arr[float] outline = []
+    arr[int] outlineEnds = []
+    rasStrokeOutline(pts, ends, closed, width, outline, outlineEnds)
+    rasFillPath(px, sw, sh, outline, outlineEnds, RAS_NONZERO, r, g, b, a)
+}

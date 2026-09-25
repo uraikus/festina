@@ -475,7 +475,7 @@ first piece of compiler work.
    in it
 3. ✅ `curve_to` by flattening, `arc` by the same, `rectangle` and the
    existing circle cache expressed as paths
-4. stroking: joins, caps, line width, reduced to a fill of the
+4. ✅ stroking: joins, caps, line width, reduced to a fill of the
    stroke outline
 5. clipping as a coverage mask intersected with the span coverage
 6. linear and radial gradients as a per-span source
@@ -593,6 +593,34 @@ the exact fast path (all digits below 2⁵³), a twenty-digit pi is
 outside it, and these sixteen digits round to precisely the doubles
 `Math.PI` and 2·`Math.PI` hold. All five harnesses compare the file
 again.
+
+**Slice 4, as built.** A stroke is the FILL of its outline:
+`rasStrokeOutline` turns each segment into a quad and each join into a
+polygon on the outside of the turn, and `rasStrokePath` fills the set
+once with the nonzero rule. Once, as a union, is the point — an
+overlap is inside once, so a half-transparent stroke that crosses
+itself reads the same at the crossing as anywhere else (127 over
+white, where painting the pieces one by one would give about 64).
+
+Styles are Cairo's defaults, because the runtime has only ever set a
+line width: miter joins, miter limit 10, butt caps. Against Cairo's
+own `strokePath` the maximum deviation is 6 on a polyline with a
+closed square, and 14 on two spikes either side of the miter limit —
+6.5°, which must bevel, and 16.3°, which must keep a seventy-pixel
+miter. Zero pixels differ by more than 60 on either, which is asserted
+separately from the maximum because it is the join test: a wrong
+miter-or-bevel decision leaves a whole wedge wrong by around 225.
+
+**One test claimed more than it checked.** The overlap test's
+docstring said it would catch pieces wound inconsistently. Putting
+that bug back — removing `rasEmitPoly`'s orientation fix — left it
+passing. The reason is geometric: segment quads are consistently
+wound by construction, and a join fills the wedge *outside* its two
+quads, so it never overlaps them. The fix matters only when some other
+part of the path crosses a join, so there is now a test that runs a
+segment straight through a miter corner: 127 with the fix, 255 — a
+hole, the crossing cancelled under nonzero — without it. Both stroke
+bugs were put back and both are caught.
 
 ## Tests
 
