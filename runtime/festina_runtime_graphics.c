@@ -157,6 +157,16 @@ typedef struct {
     cairo_matrix_t transform;
     double fill_r, fill_g, fill_b, alpha;
     int fill_none;
+    /* runtime.md phase 4 slice 7 / decisions.md #350: the gradient is
+     * part of the fill, so it is part of the state. It was not, and
+     * festina_set_fill_source reads the gradient FIRST -- so a gradient
+     * set between saveState() and restoreState() outlived the restore,
+     * and the next fill used it instead of the colour that was saved.
+     * The comment above this struct warns about exactly that half-
+     * measure. A reference is held while saved and handed back on
+     * restore, so the saved pattern survives whatever fillStyle() or a
+     * later gradient does to the live one in between. */
+    cairo_pattern_t *gradient;
     double border_r, border_g, border_b, line_width;
     int border_set;
     double font_size;
@@ -617,6 +627,7 @@ void festina_save_state(void) {
     st->transform = g_transform;
     st->fill_r = g_fill_r; st->fill_g = g_fill_g; st->fill_b = g_fill_b;
     st->alpha = g_fill_alpha; st->fill_none = g_fill_none;
+    st->gradient = g_fill_gradient ? cairo_pattern_reference(g_fill_gradient) : NULL;
     st->border_r = g_border_r; st->border_g = g_border_g; st->border_b = g_border_b;
     st->line_width = g_line_width; st->border_set = g_border_set;
     st->font_size = g_font_size; st->font_slant = g_font_slant;
@@ -633,6 +644,9 @@ void festina_restore_state(void) {
     g_transform = st->transform; g_transform_ready = 1;
     g_fill_r = st->fill_r; g_fill_g = st->fill_g; g_fill_b = st->fill_b;
     g_fill_alpha = st->alpha; g_fill_none = st->fill_none;
+    festina_clear_gradient();
+    g_fill_gradient = st->gradient;     /* the saved reference, handed back */
+    st->gradient = NULL;
     g_border_r = st->border_r; g_border_g = st->border_g; g_border_b = st->border_b;
     g_line_width = st->line_width; g_border_set = st->border_set;
     g_font_size = st->font_size; g_font_slant = st->font_slant;
@@ -2862,11 +2876,12 @@ void *festina_image_clone(void *img) {
  * `cairo_paint`, unconditionally full opacity, completely ignoring
  * `g_fill_alpha` -- every OTHER draw path already carries it (see
  * festina_set_fill_source's own `cairo_set_source_rgba(..., g_fill_
- * alpha)`, and its own `cairo_paint_with_alpha` call for a gradient
- * fill just above, the direct precedent this now follows for the
- * identical reason: cairo_set_source_surface has no alpha channel of
+ * alpha)`; it once also used `cairo_paint_with_alpha` for a gradient,
+ * which was wrong there because paint ignores the path -- decisions.md
+ * #349 -- and is right HERE because drawing an image is a paint of its
+ * rectangle): cairo_set_source_surface has no alpha channel of
  * its own to carry it the way cairo_set_source_rgba does, so applying
- * the alpha has to happen at PAINT time instead of source-setup time).
+ * the alpha has to happen at PAINT time instead of source-setup time.
  * `cairo_paint_with_alpha(cr, 1.0)` is defined to behave identically to
  * plain `cairo_paint`, so this is a strict extension, not a behavior
  * change for the (overwhelmingly common) case where fillAlpha was

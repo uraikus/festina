@@ -1074,3 +1074,220 @@ void func rasFillPathWithClip(px:arr[int], sw:int, sh:int,
                               src:arr[float], mask:arr[float]) {
     rasFillCore(px, sw, sh, pts, ends, rule, src, mask, true)
 }
+
+// ---- Slice 7: transforms, their stack, and the clearing operator ----
+//
+// A transform is Cairo's own affine matrix, as six floats in Cairo's
+// order: [xx, yx, xy, yy, x0, y0], mapping a point (x, y) to
+//
+//     (xx*x + xy*y + x0,  yx*x + yy*y + y0)
+//
+// and the operations compose the way cairo_matrix_translate/rotate/
+// scale do, which is the way the runtime's translate()/rotate()/scale()
+// builtins call them: each one applies FIRST, and then the existing
+// matrix. So M' = M * T, never T * M. Getting that backwards is
+// invisible for a single operation and swaps "rotate about the origin
+// then move" with "move then rotate about the origin" as soon as there
+// are two -- the test for it draws both orders against Cairo.
+//
+// Style state -- colour, source, alpha, line width -- is not held here.
+// Every raster.f call already takes those explicitly, and the runtime
+// keeps its own copy in festina_runtime_graphics.c's state stack. The
+// matrix is the one piece of state these functions need to agree on,
+// so the matrix is what gets a stack.
+
+arr[float] func rasIdentity() {
+    arr[float] m = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    return m
+}
+
+arr[float] func rasCopyMatrix(m:arr[float]) {
+    arr[float] c = [m[0], m[1], m[2], m[3], m[4], m[5]]
+    return c
+}
+
+void func rasTranslate(m:arr[float], tx:float, ty:float) {
+    m[4] = (m[0] * tx) + (m[2] * ty) + m[4]
+    m[5] = (m[1] * tx) + (m[3] * ty) + m[5]
+}
+
+// A zero scale is ignored, as festina_scale ignores it: the matrix would
+// stop being invertible, and every later Cairo call through it fails
+// silently. raster.f does not invert matrices, but it has to draw what
+// the runtime draws, and the runtime draws as if the call never happened.
+void func rasScale(m:arr[float], sx:float, sy:float) {
+    if sx == 0.0 || sy == 0.0 { return }
+    m[0] = m[0] * sx
+    m[1] = m[1] * sx
+    m[2] = m[2] * sy
+    m[3] = m[3] * sy
+}
+
+// Degrees, as the language's rotate() takes them.
+void func rasRotate(m:arr[float], degrees:float) {
+    float a = (degrees * RAS_PI) / 180.0
+    float c = Math.cos(a)
+    float s = Math.sin(a)
+    float xx = (m[0] * c) + (m[2] * s)
+    float yx = (m[1] * c) + (m[3] * s)
+    float xy = (m[2] * c) - (m[0] * s)
+    float yy = (m[3] * c) - (m[1] * s)
+    m[0] = xx
+    m[1] = yx
+    m[2] = xy
+    m[3] = yy
+}
+
+// The points of a path, mapped through a matrix, into a new array.
+arr[float] func rasTransformPoints(m:arr[float], pts:arr[float]) {
+    arr[float] out = []
+    int i = 0
+    while i < pts.length {
+        float x = pts[i]
+        float y = pts[i + 1]
+        out.push((m[0] * x) + (m[2] * y) + m[4])
+        out.push((m[1] * x) + (m[3] * y) + m[5])
+        i = i + 2
+    }
+    return out
+}
+
+// The largest factor by which a matrix can stretch a length: its larger
+// singular value. For [[a, b], [c, d]] that is the root of
+// (S + sqrt(S^2 - 4 det^2)) / 2, with S the sum of squares of the four
+// entries and det = ad - bc.
+float func rasMaxStretch(m:arr[float]) {
+    float a = m[0]
+    float b = m[2]
+    float c = m[1]
+    float d = m[3]
+    float sq = (a * a) + (b * b) + (c * c) + (d * d)
+    float det = (a * d) - (b * c)
+    float disc = (sq * sq) - (4.0 * det * det)
+    if disc < 0.0 { disc = 0.0 }
+    return Math.sqrt((sq + Math.sqrt(disc)) * 0.5)
+}
+
+// A circle under a transform -- in general an ellipse.
+//
+// Transforming slice 3's points is exact for an affine map, which takes
+// lines to lines, but the SEGMENT COUNT has to be decided in device
+// space: a circle flattened at its user-space size and then scaled up
+// tenfold would be visibly faceted. So the count comes from the radius
+// times the matrix's largest stretch, which bounds how far any chord's
+// error can grow. The area-balanced radius survives the map unchanged:
+// an affine transform scales every area by the same |det|, so a polygon
+// balanced to the circle's area is still balanced to the ellipse's.
+void func rasCircleT(pts:arr[float], ends:arr[int], cx:float, cy:float, r:float,
+                     m:arr[float]) {
+    float stretch = rasMaxStretch(m)
+    int n = rasArcSegments(r * stretch, RAS_TAU)
+    float full = RAS_TAU / n.toFloat()
+    float rb = r * Math.sqrt(RAS_TAU / (n.toFloat() * Math.sin(full)))
+    int k = 0
+    while k <= n {
+        float a = (RAS_TAU * k.toFloat()) / n.toFloat()
+        float x = cx + (rb * Math.cos(a))
+        float y = cy + (rb * Math.sin(a))
+        pts.push((m[0] * x) + (m[2] * y) + m[4])
+        pts.push((m[1] * x) + (m[3] * y) + m[5])
+        k = k + 1
+    }
+    ends.push(Math.floorDiv(pts.length, 2))
+}
+
+// Fill a path given in USER space under a transform.
+void func rasFillPathT(px:arr[int], sw:int, sh:int,
+                       pts:arr[float], ends:arr[int], rule:int,
+                       src:arr[float], m:arr[float]) {
+    arr[float] noMask = []
+    rasFillCore(px, sw, sh, rasTransformPoints(m, pts), ends, rule, src, noMask, false)
+}
+
+// Stroke a path given in USER space under a transform.
+//
+// The outline is built in user space, with the user-space width, and
+// only then transformed -- which is how Cairo strokes: the pen lives in
+// user space, so scale(3, 1) makes a width-4 line twelve pixels wide
+// where it runs vertically and four where it runs horizontally. A
+// stroke built in device space with the width scaled by some average
+// factor would be wrong in every direction but one.
+void func rasStrokePathT(px:arr[int], sw:int, sh:int,
+                         pts:arr[float], ends:arr[int], closed:arr[int],
+                         width:float, src:arr[float], m:arr[float]) {
+    arr[float] outline = []
+    arr[int] outlineEnds = []
+    rasStrokeOutline(pts, ends, closed, width, outline, outlineEnds)
+    arr[float] noMask = []
+    rasFillCore(px, sw, sh, rasTransformPoints(m, outline), outlineEnds, RAS_NONZERO,
+                src, noMask, false)
+}
+
+// A stack of matrices, for saveState()/restoreState() -- the part of the
+// state these functions share. Popping an empty stack is an error in the
+// language (festina_restore_state fails with a message), and here it
+// hands back the identity rather than reading past the end.
+arr[float] RAS_MSTACK = []
+
+void func rasPushMatrix(m:arr[float]) {
+    int i = 0
+    while i < 6 {
+        RAS_MSTACK.push(m[i])
+        i = i + 1
+    }
+}
+
+arr[float] func rasPopMatrix() {
+    if RAS_MSTACK.length < 6 { return rasIdentity() }
+    int at = RAS_MSTACK.length - 6
+    arr[float] m = [RAS_MSTACK[at], RAS_MSTACK[at + 1], RAS_MSTACK[at + 2],
+                    RAS_MSTACK[at + 3], RAS_MSTACK[at + 4], RAS_MSTACK[at + 5]]
+    int i = 0
+    while i < 6 {
+        RAS_MSTACK.pop()
+        i = i + 1
+    }
+    return m
+}
+
+// Clear a path to transparent -- the operator clearRect(), clearCircle()
+// and clearPixel() reach, which the runtime implements as Cairo's
+// SOURCE operator with a fully transparent source.
+//
+// SOURCE with coverage c replaces the destination with src*c + dst*(1-c),
+// and with a transparent source that is dst*(1-c). In straight alpha
+// that scales the ALPHA by (1 - c) and leaves the colour alone: the
+// colour of a partly-cleared pixel does not change, it becomes more
+// transparent. A pixel cleared to alpha 0 is written as (0, 0, 0, 0) so
+// that "transparent" has one representation, the one blankImage() makes.
+void func rasClearPath(px:arr[int], sw:int, sh:int,
+                       pts:arr[float], ends:arr[int], rule:int) {
+    if sw <= 0 || sh <= 0 { return }
+    if ends.length == 0 || pts.length < 6 { return }
+    rasEnsureCov(sw)
+    if !rasPathExtent(pts, sh) { return }
+    int row = RAS_Y0
+    while row < RAS_Y1 {
+        rasRowCoverage(row, sw, pts, ends, rule)
+        int base = row * sw * 4
+        int i = 0
+        while i < sw {
+            float cov = RAS_COV[i]
+            if cov > 0.0 {
+                if cov > 1.0 { cov = 1.0 }
+                int at = base + (i * 4)
+                int na = Math.round(px[at + 3].toFloat() * (1.0 - cov))
+                if na <= 0 {
+                    px[at] = 0
+                    px[at + 1] = 0
+                    px[at + 2] = 0
+                    px[at + 3] = 0
+                } else {
+                    px[at + 3] = na
+                }
+            }
+            i = i + 1
+        }
+        row = row + 1
+    }
+}

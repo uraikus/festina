@@ -8697,3 +8697,49 @@ worth anything if a disagreement is allowed to implicate either side.
 A regression test in `test_codegen.py` asserts both halves -- alpha
 applied inside, nothing drawn outside -- and fails against the old
 code, checked by putting it back.
+
+350. restoreState() DID NOT RESTORE A GRADIENT
+
+Found by runtime.md phase 4, slice 7 -- the second C-runtime bug the
+rasteriser port has found, one slice after #349, and in the same
+function's neighbourhood.
+
+`FestinaCanvasState` saved the fill colour, the alpha and `fill_none`,
+but not `g_fill_gradient`. `festina_set_fill_source` checks the
+gradient before the colour, so whatever gradient was live at
+`restoreState()` time won, whatever had been saved. Measured:
+
+    fillStyle(green)
+    saveState()
+    fillLinearGradient(0, 0, red, 100, 0, blue)
+    restoreState()
+    drawRect(0, 0, 100, 20)
+
+drew the gradient -- (241, 0, 14), (126, 0, 129), (11, 0, 244) across
+the rectangle -- where (0, 192, 0) was saved. The reverse failed too:
+a gradient saved and then replaced by `fillStyle(green)` inside the
+pair was gone after the restore, because `fillStyle()` destroys the
+live pattern and nothing else held it. The rectangle came out
+(0, 0, 0) -- the colour from BEFORE the gradient, restored from the
+struct, which is neither what was saved nor what was live.
+
+The struct's own comment already warned against saving part of the
+drawing state. The port found it because slice 7 had to decide which
+state raster.f's stack holds, and that meant reading what the C
+struct holds field by field.
+
+The fix saves a reference (`cairo_pattern_reference`) and hands it
+back on restore, clearing the live one first. A reference rather than
+a copy because patterns here are immutable once built: nothing adds
+stops after `fillLinearGradient`/`fillRadialGradient` return. The
+stack is only ever popped by `festina_restore_state` -- no other code
+resets `g_state_depth` -- so a saved reference cannot be dropped
+without being released, short of the program ending with states still
+saved, which is already a program the runtime does not clean up
+after. `img.saveState()` saves only that image's transform, by
+design; image draws read the same global fill state the canvas does,
+so a gradient drawn into an image is saved and restored by the
+canvas's `saveState()` -- which now includes it.
+
+`test_restore_state_restores_the_gradient_too` checks both directions
+and fails against the old code, checked by putting it back.

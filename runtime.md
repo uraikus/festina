@@ -479,7 +479,7 @@ first piece of compiler work.
    stroke outline
 5. ✅ clipping as a coverage mask intersected with the span coverage
 6. ✅ linear and radial gradients as a per-span source
-7. `save`/`restore`, the transform stack, and the operators actually
+7. ✅ `save`/`restore`, the transform stack, and the operators actually
    reachable from the language
 
 Phase 5 (glyphs) needs 1–5 and nothing after.
@@ -700,6 +700,93 @@ One bound was written before it was measured: the soft-edge gradient
 test asserted 24, copied from slice 3's circle. It measured 27 — the
 same coverage error, since slice 3 drew red over white (a 225-unit
 channel) and this rim is blue over white (255): 24/225 × 255 = 27.2.
+
+**Slice 7, as built.** A transform is Cairo's own six-float matrix,
+and `rasTranslate`, `rasScale` and `rasRotate` compose the way
+`cairo_matrix_translate` and friends do — the new operation applies
+first, M' = M·T. Paths are given in user space and mapped to device
+space just before filling, which is exact for an affine map. Two
+things cannot be mapped afterwards and are decided with the matrix in
+hand:
+
+- a circle's SEGMENT COUNT comes from its radius times the matrix's
+  largest stretch (its larger singular value), so a radius-2 circle
+  scaled by 25 stays within 0.1 px of the true circle instead of
+  being a visible polygon. The area-balanced radius from slice 3
+  survives the map, because an affine map scales every area by the
+  same factor;
+- a stroke's outline is built in user space, with the user-space
+  width, and then mapped — the pen lives in user space, so
+  `scale(3, 1)` makes a width-4 line twelve pixels wide where it runs
+  vertically and four where it runs horizontally.
+
+A zero scale is ignored, as `festina_scale` ignores it. The matrix is
+the only state these functions share — colour, source and width are
+already arguments to every call — so it is the only thing with a
+stack here; the runtime keeps the rest.
+
+Against Cairo, with no pixel off by more than 60 in any of them:
+
+| scene | max deviation |
+|---|---|
+| a rotated rectangle | 13 |
+| translate, then rotate | 12 |
+| rotate, then translate | 13 |
+| a circle under scale(2, 0.5) | 21 |
+| a stroke under scale(3, 1) | 14 |
+
+**The first composition test was blind.** It drew
+translate-then-rotate and rotate-then-translate on one canvas. With
+every operation composed backwards (T·M), it still came in at 12 and
+13, while a single sequence drawn alone had 15,036 pixels off by more
+than 60 (maximum 225). The algebra says why: composed backwards, "A
+then B" yields B·A, so each order's program draws the OTHER order's
+picture, and a canvas holding both is unchanged. Each order is now its
+own test, and each fails alone with its own bug put back: a backwards
+`rasTranslate` fails rotate-then-translate, a backwards `rasRotate`
+fails translate-then-rotate. Neither is caught by the other test,
+which is why there are two. The segment-count bug (the count taken
+from the user-space radius) fails both the faceting test and the
+ellipse.
+
+**Clearing is the one other operator the language reaches.**
+`clearRect`, `clearCircle` and `clearPixel` are Cairo's SOURCE with a
+transparent source; every other SOURCE in the runtime copies a whole
+surface or starts a new one, and no program can aim it at a path.
+With coverage c it leaves dst·(1 − c), which in straight alpha scales
+the ALPHA and leaves the colour alone — a half-cleared (40, 120, 200)
+pixel is (40, 120, 200, 128), not a darker colour. Fully cleared is
+written (0, 0, 0, 0), the one transparent `blankImage` makes. Clearing
+a pixel-aligned rectangle is exact; clearing a shape is the complement
+of filling it to within 1 at every pixel, soft edges included.
+
+Against the true circle, clearing does better than Cairo's clear does:
+
+| clearing a circle, vs the truth | max \|err\| | mean \|err\| | mean signed |
+|---|---|---|---|
+| Cairo, r = 35 | 18.8 | 4.94 | +4.81 |
+| raster.f, r = 35 | 13.1 | 5.04 | +0.14 |
+| Cairo, r = 50 | 29.9 | 7.65 | +7.49 |
+| raster.f, r = 50 | 15.1 | 5.29 | +0.22 |
+
+Cairo's clear is biased, and more so at the larger radius; the cause
+on Cairo's side was not investigated. So the test compares against
+the truth and bounds the bias at 1, not against Cairo: a
+Cairo-bounded test would have to allow its 7.5-unit bias and could
+not catch this implementation acquiring one.
+
+**And the port found a second bug in the C runtime.** The canvas
+state saved by `saveState()` held the fill colour but not the
+gradient, and `festina_set_fill_source` reads the gradient first. So
+a gradient set between `saveState()` and `restoreState()` outlived the
+restore: `fillStyle(green)`, save, a red-to-blue gradient, restore,
+`drawRect` drew red-to-blue — (241, 0, 14) at the left, (11, 0, 244)
+at the right — instead of green. The state now holds a reference to
+the saved gradient and hands it back on restore; the regression test
+checks both directions (a gradient must not survive a restore to a
+colour, and a saved gradient must come back after `fillStyle`
+destroyed the live one) and fails against the old code. decisions.md
+#350.
 
 ## Tests
 

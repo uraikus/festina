@@ -7908,6 +7908,36 @@ class TestCircleMaskFastPath:
             assert pixel(*spot) == (255, 255, 255), (
                 f"the gradient washed outside its shape, at {spot}: {pixel(*spot)}")
 
+    def test_restore_state_restores_the_gradient_too(self, compile_and_run, tmp_path,
+                                                      monkeypatch):
+        """decisions.md #350. The canvas state struct saved the fill
+        colour but not the gradient, and festina_set_fill_source reads
+        the gradient first -- so a gradient set inside a save/restore
+        pair outlived the restore. Both directions are checked: a
+        gradient must NOT survive a restore to a solid colour, and one
+        that was saved MUST come back after a solid colour replaced it
+        (which is the direction that needs the saved reference to
+        outlive fillStyle() destroying the live one)."""
+        self._canvas(compile_and_run, monkeypatch,
+                      "color red = '#ff0000'\ncolor blue = '#0000ff'\n"
+                      "color green = '#00c000'\n"
+                      "fillStyle(green)\n"
+                      "saveState()\n"
+                      "fillLinearGradient(0, 0, red, 100, 0, blue)\n"
+                      "restoreState()\n"
+                      "drawRect(0, 0, 100, 20)\n"
+                      "fillLinearGradient(0, 0, red, 100, 0, blue)\n"
+                      "saveState()\n"
+                      "fillStyle(green)\n"
+                      "restoreState()\n"
+                      "drawRect(0, 40, 100, 20)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        for x in (5, 50, 95):
+            assert pixel(x, 10) == (0, 192, 0), f"gradient outlived restore at {x}"
+        left, right = pixel(5, 50), pixel(95, 50)
+        assert left[0] > 200 and left[2] < 60, f"saved gradient not restored: {left}"
+        assert right[2] > 200 and right[0] < 60, f"saved gradient not restored: {right}"
+
     def test_a_degenerate_radius_draws_nothing_and_does_not_crash(self, compile_and_run,
                                                                     tmp_path, monkeypatch):
         self._canvas(compile_and_run, monkeypatch,

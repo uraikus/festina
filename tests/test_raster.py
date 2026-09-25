@@ -1172,3 +1172,224 @@ class TestGradients:
                    "}\n"
                    "log(`${same} ${cleared}`)\n")
         assert out == "320 320"
+
+
+class TestTransforms:
+    """runtime.md phase 4, slice 7: Cairo's affine matrix, composed the
+    way cairo_matrix_translate/rotate/scale compose -- M' = M * T, each
+    new operation applying FIRST.
+
+    **Each composition order is compared ALONE.** An earlier version of
+    this comparison drew translate-then-rotate and rotate-then-translate
+    on one canvas, and was blind to the bug it was named for: swapping
+    the order exchanges those two results, so with both drawn the image
+    is identical. Put back, the swap passed that version (max 12 and 13)
+    while a single sequence drawn alone had 15,036 pixels off by more
+    than 60 (maximum 225)."""
+
+    WHITE = "rasFillRect(px, 800, 600, 0, 0, 800, 600, 255, 255, 255, 255)\n"
+
+    def _vs_cairo(self, tmp_path, cli_mod, cairo_body, raster_body, box):
+        _with_raster(tmp_path)
+        assert _run(tmp_path, cli_mod,
+                    "color white = '#ffffff'\nclearCanvas()\nfillStyle(white)\n"
+                    "drawRect(0, 0, 800, 600)\n" + cairo_body +
+                    "log(saveCanvas('cairo.png'))\n") == "true"
+        assert _run(tmp_path, cli_mod,
+                    "import raster.f\narr[int] px = rasNewSurface(800, 600)\n" + self.WHITE +
+                    "arr[int] one = [4]\n" + raster_body +
+                    "img a = imageFromPixels(px, 800, 600)\nlog(a.save('raster.png'))\n") == "true"
+        _, _, ra, na = _decode_png(str(tmp_path / "cairo.png"))
+        _, _, rb, nb = _decode_png(str(tmp_path / "raster.png"))
+        x0, y0, x1, y1 = box
+        worst = wedge = ink = 0
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                d = max(abs(ra[y][x * na + i] - rb[y][x * nb + i]) for i in range(3))
+                worst = max(worst, d)
+                wedge += d > 60
+                ink += ra[y][x * na:x * na + 3] != bytes([255, 255, 255])
+        assert ink > 1000, "the region has to contain something to compare"
+        return worst, wedge
+
+    RECT = "arr[float] r2 = [0.0, 0.0, 80.0, 0.0, 80.0, 40.0, 0.0, 40.0]\n"
+
+    def test_translate_then_rotate(self, tmp_path, cli_mod):
+        worst, wedge = self._vs_cairo(
+            tmp_path, cli_mod,
+            "fillStyle(200, 30, 30)\ntranslate(420, 90)\nrotate(30.0)\ndrawRect(0, 0, 80, 40)\n",
+            self.RECT + "arr[float] m = rasIdentity()\nrasTranslate(m, 420.0, 90.0)\n"
+            "rasRotate(m, 30.0)\n"
+            "rasFillPathT(px, 800, 600, r2, one, RAS_NONZERO, rasSolid(200, 30, 30, 255), m)\n",
+            (360, 60, 560, 230))
+        assert wedge == 0, f"{wedge} pixels misplaced -- composition order"
+        assert worst <= 16
+
+    def test_rotate_then_translate(self, tmp_path, cli_mod):
+        worst, wedge = self._vs_cairo(
+            tmp_path, cli_mod,
+            "fillStyle(200, 30, 30)\nrotate(30.0)\ntranslate(420, 90)\ndrawRect(0, 0, 80, 40)\n",
+            self.RECT + "arr[float] m = rasIdentity()\nrasRotate(m, 30.0)\n"
+            "rasTranslate(m, 420.0, 90.0)\n"
+            "rasFillPathT(px, 800, 600, r2, one, RAS_NONZERO, rasSolid(200, 30, 30, 255), m)\n",
+            (230, 230, 460, 420))
+        assert wedge == 0, f"{wedge} pixels misplaced -- composition order"
+        assert worst <= 16
+
+    def test_a_circle_under_a_non_uniform_scale_is_an_ellipse(self, tmp_path, cli_mod):
+        worst, wedge = self._vs_cairo(
+            tmp_path, cli_mod,
+            "fillStyle(200, 30, 30)\nscale(2.0, 0.5)\ndrawCircle(300, 900, 40)\n",
+            "arr[float] m = rasIdentity()\nrasScale(m, 2.0, 0.5)\n"
+            "arr[float] c = []\narr[int] ce = []\nrasCircleT(c, ce, 300.0, 900.0, 40.0, m)\n"
+            "rasFillPath(px, 800, 600, c, ce, RAS_NONZERO, 200, 30, 30, 255)\n",
+            (500, 420, 700, 480))
+        assert wedge == 0
+        assert worst <= 24, f"measured 21, got {worst}"
+
+    def test_a_stroke_under_a_scale_has_an_elliptical_pen(self, tmp_path, cli_mod):
+        """The pen lives in user space, so under scale(3, 1) a width-4
+        line is twelve pixels wide where it runs vertically and four
+        where it runs horizontally. Built in device space with an
+        averaged width, it would be wrong in every direction but one."""
+        worst, wedge = self._vs_cairo(
+            tmp_path, cli_mod,
+            "borderColor(30, 30, 200)\nlineWidth(4)\nscale(3.0, 1.0)\nbeginPath()\n"
+            "moveTo(20, 480)\nlineTo(60, 560)\nlineTo(100, 480)\nstrokePath()\n",
+            "arr[float] m = rasIdentity()\nrasScale(m, 3.0, 1.0)\n"
+            "arr[float] sp = [20.0, 480.0, 60.0, 560.0, 100.0, 480.0]\n"
+            "arr[int] se = [3]\narr[int] sc = [0]\n"
+            "rasStrokePathT(px, 800, 600, sp, se, sc, 4.0, rasSolid(30, 30, 200, 255), m)\n",
+            (40, 460, 320, 580))
+        assert wedge == 0
+        assert worst <= 18, f"measured 14, got {worst}"
+
+    def test_a_small_circle_scaled_up_is_not_faceted(self, tmp_path, cli_mod):
+        """Radius 4 under scale(25) is a radius-100 circle on screen. The
+        segment count has to come from the DEVICE size -- flattened at
+        its user size, it would be a handful of segments stretched into
+        a visibly faceted polygon. Checked against the true circle."""
+        pts = _flatten_output(tmp_path, cli_mod,
+                              "arr[float] m = rasIdentity()\nrasScale(m, 25.0, 25.0)\n"
+                              "arr[float] pts = []\narr[int] e = []\n"
+                              "rasCircleT(pts, e, 8.0, 8.0, 4.0, m)\n")
+        worst = max(_dist_to_polyline((200 + 100 * math.cos(a), 200 + 100 * math.sin(a)), pts)
+                    for a in (2 * math.pi * k / 4000 for k in range(4000)))
+        assert worst <= 0.1, f"{worst:.3f} px from the true circle"
+
+    def test_a_zero_scale_is_ignored(self, tmp_path, cli_mod):
+        """As festina_scale ignores it -- the matrix would stop being
+        invertible, and the runtime draws as if the call never happened."""
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   "import raster.f\narr[float] m = rasIdentity()\n"
+                   "rasTranslate(m, 3.0, 4.0)\nrasScale(m, 0.0, 5.0)\nrasScale(m, 2.0, 0.0)\n"
+                   "log(`${m[0]} ${m[1]} ${m[2]} ${m[3]} ${m[4]} ${m[5]}`)\n")
+        assert out == "1 0 0 1 3 4"
+
+    def test_the_matrix_stack_restores_what_was_saved(self, tmp_path, cli_mod):
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   "import raster.f\narr[float] m = rasIdentity()\n"
+                   "rasTranslate(m, 10.0, 20.0)\n"
+                   "rasPushMatrix(m)\n"
+                   "rasRotate(m, 90.0)\nrasScale(m, 3.0, 3.0)\n"
+                   "arr[float] back = rasPopMatrix()\n"
+                   "log(`${back[0]} ${back[1]} ${back[2]} ${back[3]} ${back[4]} ${back[5]}`)\n"
+                   "arr[float] empty = rasPopMatrix()\n"
+                   "log(`${empty[0]} ${empty[3]} ${empty[4]}`)\n")
+        assert out.splitlines() == ["1 0 0 1 10 20", "1 1 0"]
+
+
+class TestClearing:
+    """clearRect/clearCircle's operator: Cairo's SOURCE with a
+    transparent source, which scales the destination's ALPHA by
+    (1 - coverage) and leaves its colour alone.
+
+    **Against the truth, raster.f clears more accurately than Cairo.**
+    Measured on two circles over opaque colour:
+
+        clearCircle vs TRUE     max|err|  mean|err|  mean signed
+        r=35  Cairo               18.8      4.94       +4.81
+        r=35  raster.f            13.1      5.04       +0.14
+        r=50  Cairo               29.9      7.65       +7.49
+        r=50  raster.f            15.1      5.29       +0.22
+
+    Cairo's SOURCE clear systematically under-clears circle edges,
+    leaving them too opaque. That is Cairo's behaviour, not this
+    project's code, so the tests hold raster.f to the truth and do not
+    try to reproduce it. (Comparing COLOUR at a cleared edge first read
+    as off by 255 -- at alpha 1, where un-premultiplied colour means
+    nothing. The same trap slice 2 hit.)"""
+
+    def _alpha(self, tmp_path, cli_mod, w, h, body):
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   f"import raster.f\narr[int] px = rasNewSurface({w}, {h})\narr[int] one = [4]\n"
+                   + body + "int i = 3\ntext out = ''\n"
+                   "while i < px.length { out = `${out} ${px[i]}` i = i + 4 }\nlog(out)\n")
+        return [int(v) for v in out.split()]
+
+    def test_clearing_a_pixel_aligned_rect_is_exact(self, tmp_path, cli_mod):
+        a = self._alpha(tmp_path, cli_mod, 10, 6,
+                        "rasFillRect(px, 10, 6, 0, 0, 10, 6, 9, 9, 9, 255)\n"
+                        "arr[float] r = [2.0, 1.0, 7.0, 1.0, 7.0, 4.0, 2.0, 4.0]\n"
+                        "rasClearPath(px, 10, 6, r, one, RAS_NONZERO)\n")
+        for i, v in enumerate(a):
+            x, y = i % 10, i // 10
+            assert v == (0 if 2 <= x < 7 and 1 <= y < 4 else 255), f"({x}, {y})"
+
+    def test_clear_is_the_exact_complement_of_fill(self, tmp_path, cli_mod):
+        """Same coverage, opposite ends: filling a circle onto nothing
+        gives alpha 255*c, clearing it out of opaque gives 255*(1-c), so
+        the two sum to 255 at every pixel -- give or take one of
+        rounding. This ties the clear operator to the fill coverage that
+        slice 3 already measured against the true circle."""
+        circle = ("arr[float] c = []\narr[int] ce = []\n"
+                  "rasCircle(c, ce, 20.0, 19.4, 13.3)\n")
+        filled = self._alpha(tmp_path, cli_mod, 40, 40, circle +
+                             "rasFillPath(px, 40, 40, c, ce, RAS_NONZERO, 9, 9, 9, 255)\n")
+        cleared = self._alpha(tmp_path, cli_mod, 40, 40, circle +
+                              "rasFillRect(px, 40, 40, 0, 0, 40, 40, 9, 9, 9, 255)\n"
+                              "rasClearPath(px, 40, 40, c, ce, RAS_NONZERO)\n")
+        assert all(abs((f + c) - 255) <= 1 for f, c in zip(filled, cleared))
+        assert any(0 < f < 255 for f in filled), "soft edges must be in the comparison"
+
+    def test_a_partly_cleared_pixel_keeps_its_colour(self, tmp_path, cli_mod):
+        """Straight alpha: clearing makes a pixel MORE TRANSPARENT, not a
+        different colour. A half-pixel clear edge halves the alpha."""
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   "import raster.f\narr[int] px = rasNewSurface(3, 1)\narr[int] one = [4]\n"
+                   "rasFillRect(px, 3, 1, 0, 0, 3, 1, 40, 120, 200, 255)\n"
+                   "arr[float] r = [1.5, 0.0, 3.0, 0.0, 3.0, 1.0, 1.5, 1.0]\n"
+                   "rasClearPath(px, 3, 1, r, one, RAS_NONZERO)\n"
+                   "log(`${px[4]} ${px[5]} ${px[6]} ${px[7]}`)\n"
+                   "log(`${px[8]} ${px[9]} ${px[10]} ${px[11]}`)\n")
+        half, gone = out.splitlines()
+        assert half == "40 120 200 128"
+        assert gone == "0 0 0 0", "fully cleared is the one transparent: (0, 0, 0, 0)"
+
+    def test_clearing_a_circle_matches_the_truth(self, tmp_path, cli_mod):
+        _with_raster(tmp_path)
+        assert _run(tmp_path, cli_mod,
+                    "import raster.f\narr[int] px = rasNewSurface(120, 120)\n"
+                    "rasFillRect(px, 120, 120, 0, 0, 120, 120, 40, 120, 200, 255)\n"
+                    "arr[float] c = []\narr[int] ce = []\n"
+                    "rasCircle(c, ce, 60.0, 60.0, 50.0)\n"
+                    "rasClearPath(px, 120, 120, c, ce, RAS_NONZERO)\n"
+                    "img a = imageFromPixels(px, 120, 120)\nlog(a.save('c.png'))\n") == "true"
+        _, _, rows, n = _decode_png(str(tmp_path / "c.png"))
+        N = 32
+        errs = []
+        for y in range(8, 113):
+            for x in range(8, 113):
+                if abs(math.hypot(x + .5 - 60, y + .5 - 60) - 50) > 1.5:
+                    continue
+                inside = sum(1 for sy in range(N) for sx in range(N)
+                             if (x + (sx + .5) / N - 60) ** 2 + (y + (sy + .5) / N - 60) ** 2 <= 2500)
+                t = inside / (N * N)
+                if 0 < t < 1:
+                    errs.append(rows[y][x * n + 3] - 255 * (1 - t))
+        assert abs(sum(errs) / len(errs)) <= 1.0, "clearing is biased"
+        assert max(abs(e) for e in errs) <= 18, "measured 15.1; Cairo's own is 29.9"
