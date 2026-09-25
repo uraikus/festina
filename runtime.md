@@ -473,7 +473,7 @@ first piece of compiler work.
 2. ✅ edge list, scanline fill, nonzero and even-odd winding, with
    sub-scanline coverage — the core; everything below is expressed
    in it
-3. `curve_to` by flattening, `arc` by the same, `rectangle` and the
+3. ✅ `curve_to` by flattening, `arc` by the same, `rectangle` and the
    existing circle cache expressed as paths
 4. stroking: joins, caps, line width, reduced to a fill of the
    stroke outline
@@ -538,6 +538,61 @@ slice 1's own rectangle fill — two independent code paths that must
 agree on a box — and a left edge at x = 1.5 leaves exactly 128, which
 is the assertion that would catch an off-by-half in the span
 arithmetic.
+
+**Slice 3, as built.** `rasCubicTo`, `rasArc` and `rasCircle` turn
+curves into polygons for slice 2 to fill. Segment counts are DERIVED
+from error bounds rather than tuned, so 0.1 px — Cairo's own default
+tolerance — is a guarantee, and it is tested as one against the true
+curve sampled densely: 0.057 px worst case for a test cubic, 0.0957
+for an arc, whose bound is tight because the sagitta *is* the error.
+
+**Filled circles had a bias, and fixing it took two tries.** An
+inscribed polygon lies wholly inside its circle, so every filled
+circle came out small. Against Cairo that looked like a max deviation
+of 38 with a large one-sided sum; against the TRUE circle it measured
++12.12 green units light on average.
+
+The first fix balanced the extreme deviations — vertices outside by as
+much as chord midpoints are inside, r' = 2r / (1 + cos(π/n)). It
+helped and was wrong: +3.07 still. Expanding both candidate radii to
+second order in h = π/n shows why — extremes-balanced is r(1 + h²/4),
+area-balanced r(1 + h²/3), and the h²/12 between them predicts a
+3.7-unit deficit. Coverage is an area, so the AREA has to balance:
+r' = r·√(2π / (n·sin(2π/n))). That measures +0.06.
+
+Only a whole circle gets it. A partial arc's end points must lie on the
+true radius because the path's next segment starts there, so `rasArc`
+stays inscribed.
+
+**Against the truth rather than against Cairo:**
+
+| vs the true circle | max \|err\| | mean \|err\| | mean signed |
+|---|---|---|---|
+| Cairo | 22.3 | 3.35 | +1.63 |
+| raster.f | 13.5 | 4.45 | +0.06 |
+
+The earlier "max 24 against Cairo" was two approximations of the same
+circle disagreeing — neither is the reference. raster.f has the
+smaller worst case and less bias; its mean absolute error is higher
+than Cairo's and that is not yet explained. It is recorded, not bounded
+away.
+
+**Two things this slice nearly got wrong in its own tests.** The arc
+end-point check first compared 37.5 against 37.49988 and blamed the
+arc — the harness prints floats to six significant figures, so the
+property is now checked inside the program at full precision. And the
+bias test's failure message claimed an inscribed polygon measured
+"about +6", written before measuring; it is +12.12.
+
+**And one it nearly got wrong in the corpus.** `Math.PI` is a property
+READ, which `bootstrap/codegen.f` has not ported, and using it moved
+`raster.f` from compared to "not ported yet" in three differential
+tests — silently, as a skip. So pi is spelled out, to sixteen
+significant figures: the bootstrap converts float literals only inside
+the exact fast path (all digits below 2⁵³), a twenty-digit pi is
+outside it, and these sixteen digits round to precisely the doubles
+`Math.PI` and 2·`Math.PI` hold. All five harnesses compare the file
+again.
 
 ## Tests
 

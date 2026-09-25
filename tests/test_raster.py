@@ -18,6 +18,7 @@ raster.f fills an `arr[int]`, `imageFromPixels` turns it into an `img`,
 and the PNG that writes is compared against the PNG Cairo's own
 drawRect writes for the same scene.
 """
+import math
 import os
 import struct
 import subprocess
@@ -498,3 +499,205 @@ class TestAgainstCairosOwnRasteriser:
             assert pa == pb, f"{name} at ({x}, {y}): cairo {pa}, raster {pb}"
         assert tuple(rb[inside[1]][inside[0] * nb:inside[0] * nb + 3]) == (200, 30, 30)
         assert tuple(rb[outside[1]][outside[0] * nb:outside[0] * nb + 3]) == (255, 255, 255)
+
+
+def _flatten_output(tmp_path, cli_mod, body):
+    """Run a program that builds `pts` and print it, returning the
+    points as (x, y) pairs."""
+    _with_raster(tmp_path)
+    out = _run(tmp_path, cli_mod,
+               "import raster.f\n" + body +
+               "int i = 0\ntext out = ''\n"
+               "while i < pts.length { out = `${out} ${pts[i]}` i = i + 1 }\n"
+               "log(out)\n")
+    vals = [float(v) for v in out.split()]
+    return [(vals[i], vals[i + 1]) for i in range(0, len(vals), 2)]
+
+
+def _dist_to_polyline(p, poly):
+    best = float("inf")
+    px, py = p
+    for (ax, ay), (bx, by) in zip(poly, poly[1:]):
+        dx, dy = bx - ax, by - ay
+        L = dx * dx + dy * dy
+        t = 0.0 if L == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L))
+        best = min(best, math.hypot(px - (ax + t * dx), py - (ay + t * dy)))
+    return best
+
+
+class TestFlattening:
+    """runtime.md phase 4, slice 3: curves and arcs become polygons.
+
+    The segment counts are derived from error bounds, so the tolerance
+    is a GUARANTEE, and it is checked as one: against the true curve,
+    sampled densely, rather than against a picture of it."""
+
+    TOL = 0.1
+
+    def test_a_cubic_stays_within_tolerance_of_the_true_curve(self, tmp_path, cli_mod):
+        P = [(10.0, 80.0), (40.0, -30.0), (160.0, 190.0), (190.0, 20.0)]
+        poly = _flatten_output(
+            tmp_path, cli_mod,
+            "arr[float] pts = [10.0, 80.0]\n"
+            "rasCubicTo(pts, 10.0, 80.0, 40.0, -30.0, 160.0, 190.0, 190.0, 20.0)\n")
+
+        def B(t):
+            u = 1 - t
+            return tuple(u ** 3 * P[0][i] + 3 * u * u * t * P[1][i]
+                         + 3 * u * t * t * P[2][i] + t ** 3 * P[3][i] for i in (0, 1))
+
+        worst = max(_dist_to_polyline(B(k / 4000), poly) for k in range(4001))
+        assert worst <= self.TOL, f"{worst:.4f} px from the true curve"
+
+    def test_a_cubic_ends_exactly_where_it_was_asked_to(self, tmp_path, cli_mod):
+        """Written, not evaluated at t = 1: the next segment of a path
+        starts from this point, and a rounding error here opens a gap."""
+        poly = _flatten_output(
+            tmp_path, cli_mod,
+            "arr[float] pts = [1.5, 2.5]\n"
+            "rasCubicTo(pts, 1.5, 2.5, 30.0, 90.0, 70.0, -40.0, 123.25, 45.75)\n")
+        assert poly[0] == (1.5, 2.5)
+        assert poly[-1] == (123.25, 45.75)
+
+    def test_a_straight_cubic_is_one_segment(self, tmp_path, cli_mod):
+        """Collinear, evenly spaced controls have zero second
+        difference, so the bound asks for a single chord -- and a
+        flattener that subdivided anyway would be wasting every glyph
+        stem slice 5 feeds it."""
+        poly = _flatten_output(
+            tmp_path, cli_mod,
+            "arr[float] pts = [0.0, 0.0]\n"
+            "rasCubicTo(pts, 0.0, 0.0, 10.0, 10.0, 20.0, 20.0, 30.0, 30.0)\n")
+        assert poly == [(0.0, 0.0), (30.0, 30.0)]
+
+    def test_an_arc_stays_within_tolerance_of_the_true_circle(self, tmp_path, cli_mod):
+        poly = _flatten_output(
+            tmp_path, cli_mod,
+            "arr[float] pts = []\n"
+            "rasArc(pts, 100.0, 100.0, 37.5, 0.3, 4.1)\n")
+        worst = max(
+            _dist_to_polyline((100 + 37.5 * math.cos(a), 100 + 37.5 * math.sin(a)), poly)
+            for a in (0.3 + (4.1 - 0.3) * k / 4000 for k in range(4001)))
+        assert worst <= self.TOL, f"{worst:.4f} px"
+
+    def test_an_arc_begins_and_ends_on_the_true_radius(self, tmp_path, cli_mod):
+        """Paths join at an arc's end points, so those two must be ON
+        the circle -- which is also why only rasCircle, and never
+        rasArc, gets the area-balanced radius.
+
+        Checked inside the program rather than on its printed output:
+        a float in a template literal prints to six significant
+        figures, and the first version of this test compared 37.5
+        against 37.49988 and blamed the arc for the harness's rounding."""
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   "import raster.f\n"
+                   "arr[float] pts = []\n"
+                   "rasArc(pts, 100.0, 100.0, 37.5, 0.3, 4.1)\n"
+                   "int last = pts.length - 2\n"
+                   "float d0 = Math.sqrt(((pts[0] - 100.0) * (pts[0] - 100.0))"
+                   " + ((pts[1] - 100.0) * (pts[1] - 100.0)))\n"
+                   "float d1 = Math.sqrt(((pts[last] - 100.0) * (pts[last] - 100.0))"
+                   " + ((pts[last + 1] - 100.0) * (pts[last + 1] - 100.0)))\n"
+                   "log(Math.abs(d0 - 37.5) < 0.000000001)\n"
+                   "log(Math.abs(d1 - 37.5) < 0.000000001)\n")
+        assert out.splitlines() == ["true", "true"]
+
+    def test_segment_count_follows_size_not_a_constant(self, tmp_path, cli_mod):
+        """A radius-3 circle and a radius-300 one are not the same
+        polygon. Fixed subdivision is either faceted when large or
+        wasteful when small; the bound is neither."""
+        small = _flatten_output(tmp_path, cli_mod,
+                                "arr[float] pts = []\narr[int] e = []\n"
+                                "rasCircle(pts, e, 0.0, 0.0, 3.0)\n")
+        big = _flatten_output(tmp_path, cli_mod,
+                              "arr[float] pts = []\narr[int] e = []\n"
+                              "rasCircle(pts, e, 0.0, 0.0, 300.0)\n")
+        assert len(small) < 15 < 100 < len(big)
+
+    def test_a_sub_tolerance_circle_does_not_vanish(self, tmp_path, cli_mod):
+        """Below half the tolerance the arc bound degenerates -- every
+        point of the circle is within tolerance of its centre. A dot
+        still has to cover the pixel it sits in."""
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   "import raster.f\n"
+                   "arr[int] px = rasNewSurface(3, 3)\n"
+                   "arr[float] pts = []\narr[int] ends = []\n"
+                   "rasCircle(pts, ends, 1.5, 1.5, 0.04)\n"
+                   "rasFillPath(px, 3, 3, pts, ends, RAS_NONZERO, 255, 0, 0, 255)\n"
+                   "log(px[(4 * 4) + 3])\n")
+        assert int(out) > 0
+
+
+class TestFilledCirclesAgainstTheTruth:
+    """A filled circle compared against the TRUE circle's coverage
+    rather than against Cairo -- because comparing against Cairo turned
+    out to measure two approximations disagreeing with each other.
+
+    The reference is computed here: 32x32 point samples per edge pixel,
+    over white, so every expected value is exact to about 1/1000.
+
+    Measured, and recorded because the ordering is the point:
+
+        vs the TRUE circle     max|err|  mean|err|  mean signed
+        Cairo                    22.3      3.35       +1.63
+        raster.f                 13.5      4.45       +0.06
+
+    **The signed column is the regression test.** An inscribed polygon
+    lies wholly inside its circle, so every filled circle came out
+    small: +12.12. Balancing the extreme deviations left +3.07.
+    Balancing the AREA took it to +0.06, as the second-order expansion
+    predicted it would. Both earlier versions were put back and run
+    against the assertion below, and both fail it. (This docstring
+    first said the inscribed figure was "about +6" -- written before it
+    was measured, and wrong by a factor of two.) mean|err| remains above Cairo's and is not
+    explained yet -- it is recorded rather than bounded away.
+    """
+
+    CIRCLES = [(100.0, 100.0, 37.0), (300.0, 120.0, 90.0), (520.0, 80.0, 5.0)]
+
+    def _errors(self, tmp_path, cli_mod):
+        _with_raster(tmp_path)
+        adds = "".join(f"rasCircle(pts, ends, {cx}, {cy}, {r})\n"
+                       for cx, cy, r in self.CIRCLES)
+        assert _run(tmp_path, cli_mod,
+                    "import raster.f\n"
+                    "arr[int] px = rasNewSurface(640, 240)\n"
+                    "rasFillRect(px, 640, 240, 0, 0, 640, 240, 255, 255, 255, 255)\n"
+                    "arr[float] pts = []\narr[int] ends = []\n" + adds +
+                    "rasFillPath(px, 640, 240, pts, ends, RAS_NONZERO, 200, 30, 30, 255)\n"
+                    "img a = imageFromPixels(px, 640, 240)\n"
+                    "log(a.save('c.png'))\n") == "true"
+        w, h, rows, n = _decode_png(str(tmp_path / "c.png"))
+        N = 32
+        errs = []
+        for cx, cy, r in self.CIRCLES:
+            for y in range(int(cy - r - 2), int(cy + r + 3)):
+                for x in range(int(cx - r - 2), int(cx + r + 3)):
+                    if abs(math.hypot(x + 0.5 - cx, y + 0.5 - cy) - r) > 1.5:
+                        continue
+                    inside = sum(
+                        1 for sy in range(N) for sx in range(N)
+                        if (x + (sx + 0.5) / N - cx) ** 2 + (y + (sy + 0.5) / N - cy) ** 2 <= r * r)
+                    t = inside / (N * N)
+                    if 0 < t < 1:
+                        errs.append(rows[y][x * n + 1] - (255 * (1 - t) + 30 * t))
+        return errs
+
+    def test_filled_circles_are_not_biased(self, tmp_path, cli_mod):
+        errs = self._errors(tmp_path, cli_mod)
+        mean_signed = sum(errs) / len(errs)
+        assert abs(mean_signed) <= 1.0, (
+            f"mean signed error {mean_signed:+.2f} -- an inscribed polygon "
+            f"measures +12.12 here and extremes-balanced +3.07")
+
+    def test_filled_circles_stay_within_their_measured_bound(self, tmp_path, cli_mod):
+        errs = self._errors(tmp_path, cli_mod)
+        worst = max(abs(e) for e in errs)
+        mean_abs = sum(abs(e) for e in errs) / len(errs)
+        # Measured 13.5 and 4.45. Cairo's own figures against the same
+        # truth are 22.3 and 3.35, so the max is held to below Cairo's
+        # and the mean to what is measured, with a unit's room.
+        assert worst <= 18.0, f"max |error| {worst:.1f}"
+        assert mean_abs <= 5.5, f"mean |error| {mean_abs:.2f}"

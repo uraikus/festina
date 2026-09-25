@@ -346,3 +346,190 @@ void func rasBlendRow(px:arr[int], sw:int, row:int,
         i = i + 1
     }
 }
+
+// ---- Slice 3: curves and arcs, by flattening ----
+//
+// Slice 2 fills polygons. Everything curved becomes a polygon first:
+// a cubic Bezier or a circular arc is replaced by enough straight
+// segments that no point of the true curve is further than
+// RAS_TOLERANCE from them. Filling is then slice 2's job, unchanged.
+//
+// The segment counts below are DERIVED, not tuned. Each comes from an
+// error bound that holds for every input, so the tolerance is a
+// guarantee rather than a typical case, and the tests check the
+// guarantee directly against the true curve rather than against a
+// picture of it.
+//
+// 0.1 px is Cairo's own default tolerance, so a shape flattened here is
+// flattened as finely as Cairo would have flattened it.
+
+float RAS_TOLERANCE = 0.1
+
+// Pi and a full turn, spelled out rather than read from Math.PI. A
+// runtime component is a corpus file, and bootstrap/codegen.f has not
+// ported a READ of a Math constant (it has every Math CALL this file
+// makes). Using Math.PI moved raster.f from compared to "not ported
+// yet" in the IR differential -- a corpus file silently stopping being
+// checked, which is the thing that harness exists to prevent, and the
+// same trade decisions.md #348 refused once already for fail().
+//
+// Sixteen significant figures, not more: the bootstrap converts a float
+// literal only inside the exact fast path -- every digit together
+// forming an integer below 2^53, so the conversion is one correctly
+// rounded division -- and a twenty-digit pi is outside it. These two
+// are inside it AND round to precisely the doubles Math.PI and
+// 2 * Math.PI hold, checked, so nothing is lost by spelling them out.
+float RAS_PI = 3.141592653589793
+float RAS_TAU = 6.283185307179586
+
+// A curve so large that it would need more segments than this is far
+// larger than any surface the runtime can create, and would be clipped
+// to that surface by the fill anyway. The cap exists so that a
+// coordinate of 1e12 costs a bounded amount of work rather than an
+// unbounded one; it can make a flattening coarser than RAS_TOLERANCE
+// only for curves thousands of times bigger than anything drawable.
+int RAS_MAX_SEGMENTS = 4096
+
+int func rasCapSegments(n:int) {
+    if n < 1 { return 1 }
+    if n > RAS_MAX_SEGMENTS { return RAS_MAX_SEGMENTS }
+    return n
+}
+
+// How many uniform-t segments keep a cubic within RAS_TOLERANCE.
+//
+// B''(t) = 6[(1-t)(P0 - 2P1 + P2) + t(P1 - 2P2 + P3)], so |B''| is at
+// most 6m, where m is the larger of those two second differences. The
+// chord through B(a) and B(b) strays from the curve by at most
+// (b-a)^2 / 8 * max|B''| -- the standard linear-interpolation remainder,
+// which holds for vector-valued curves too. With n equal steps that is
+// 3m / (4 n^2), and requiring it to be at most the tolerance gives
+// n >= sqrt(3m / (4 * tol)).
+int func rasCubicSegments(x0:float, y0:float, x1:float, y1:float,
+                          x2:float, y2:float, x3:float, y3:float) {
+    float ax = x0 - (2.0 * x1) + x2
+    float ay = y0 - (2.0 * y1) + y2
+    float bx = x1 - (2.0 * x2) + x3
+    float by = y1 - (2.0 * y2) + y3
+    float m = Math.max(Math.sqrt((ax * ax) + (ay * ay)),
+                       Math.sqrt((bx * bx) + (by * by)))
+    if m <= 0.0 { return 1 }
+    return rasCapSegments(Math.ceil(Math.sqrt((3.0 * m) / (4.0 * RAS_TOLERANCE))))
+}
+
+// Append a cubic Bezier from the path's current point (x0, y0) -- which
+// the caller has already emitted -- through controls (x1, y1) and
+// (x2, y2) to (x3, y3).
+//
+// The final point is written as (x3, y3) exactly rather than evaluated
+// at t = 1: the evaluation would land a rounding error away from it,
+// and the next segment of the path starts from that point.
+void func rasCubicTo(pts:arr[float], x0:float, y0:float,
+                     x1:float, y1:float, x2:float, y2:float,
+                     x3:float, y3:float) {
+    int n = rasCubicSegments(x0, y0, x1, y1, x2, y2, x3, y3)
+    int k = 1
+    while k < n {
+        float t = k.toFloat() / n.toFloat()
+        float u = 1.0 - t
+        float w0 = u * u * u
+        float w1 = 3.0 * u * u * t
+        float w2 = 3.0 * u * t * t
+        float w3 = t * t * t
+        pts.push((w0 * x0) + (w1 * x1) + (w2 * x2) + (w3 * x3))
+        pts.push((w0 * y0) + (w1 * y1) + (w2 * y2) + (w3 * y3))
+        k = k + 1
+    }
+    pts.push(x3)
+    pts.push(y3)
+}
+
+// How many segments keep a circular arc of radius r, sweeping `sweep`
+// radians, within RAS_TOLERANCE.
+//
+// A chord subtending angle a strays from its arc by the sagitta,
+// r(1 - cos(a/2)), and that is the whole error. Holding it to the
+// tolerance gives a <= 2 acos(1 - tol/r).
+//
+// Below a radius of half the tolerance, every point of the circle is
+// within tolerance of its centre, so the bound degenerates; a small
+// fixed polygon is used there instead. It is not zero segments, because
+// a circle that vanishes entirely would stop covering the pixel it sits
+// in -- and a sub-pixel dot is still a dot.
+int func rasArcSegments(r:float, sweep:float) {
+    float s = Math.abs(sweep)
+    if s <= 0.0 { return 1 }
+    if r <= (RAS_TOLERANCE * 0.5) { return rasCapSegments(Math.ceil((s / RAS_TAU) * 8.0)) }
+    float step = 2.0 * Math.acos(1.0 - (RAS_TOLERANCE / r))
+    return rasCapSegments(Math.ceil(s / step))
+}
+
+// Append the points of a circular arc centred on (cx, cy), from angle
+// a0 to angle a1 in radians, INCLUDING its first point -- so an arc can
+// begin a subpath on its own, which is what a circle is.
+//
+// Angles run the way Cairo's do: 0 along +x, increasing towards +y,
+// which on a surface whose y grows downwards is clockwise on screen.
+// a1 < a0 sweeps the other way; the segment count is taken from the
+// size of the sweep and its sign is kept.
+void func rasArc(pts:arr[float], cx:float, cy:float, r:float,
+                 a0:float, a1:float) {
+    int n = rasArcSegments(r, a1 - a0)
+    int k = 0
+    while k <= n {
+        float a = a0 + (((a1 - a0) * k.toFloat()) / n.toFloat())
+        pts.push(cx + (r * Math.cos(a)))
+        pts.push(cy + (r * Math.sin(a)))
+        k = k + 1
+    }
+}
+
+// A whole circle as one closed subpath. The arc's last point repeats
+// its first; the repeated edge has zero length, and slice 2's
+// crossing test skips a zero-height edge rather than counting it.
+//
+// **Not inscribed.** A polygon with its vertices ON the circle lies
+// entirely inside it, so every flattened circle comes out slightly
+// small -- a systematic bias, not noise. Measured against Cairo's own
+// arc path, three filled circles were uniformly lighter at the edge:
+// the signed error summed to +10645 over 1001 differing pixels, and
+// the chord geometry predicts exactly that size of deficit (a chord's
+// mean distance inside its arc is two thirds of the sagitta).
+//
+// So the vertices go out to the radius at which the polygon's AREA
+// equals the circle's: an n-gon of circumradius r' has area
+// (n/2) r'^2 sin(2pi/n), so r' = r * sqrt(2pi / (n sin(2pi/n))).
+//
+// Area, not the extremes. The first version of this balanced the
+// worst-case deviations instead -- r' = 2r / (1 + cos(pi/n)), vertices
+// outside by exactly as much as chord midpoints are inside -- and that
+// halved the error and cut the bias sevenfold, but left a residual:
+// still +3.05 green units light on average, against the TRUE circle.
+// Expanding both radii to second order in h = pi/n explains it
+// exactly: extremes-balanced is r(1 + h^2/4), area-balanced is
+// r(1 + h^2/3), and the h^2/12 between them is about 0.017 px at this
+// tolerance, which predicts a 3.7-unit deficit. A fill's coverage is an
+// area, so the area is what has to balance.
+//
+// It stays within tolerance: vertices end up about r*h^2/3 outside the
+// true circle, two thirds of the inscribed sagitta, and chord midpoints
+// about half that inside.
+//
+// Only a whole circle can do this. A partial arc's end points have to
+// lie on the true radius, because the path's next segment starts
+// there; pushing them outward would open a gap at every join. rasArc
+// therefore stays inscribed, and its callers get the tighter bound
+// that inscription gives on the joins it cannot move.
+void func rasCircle(pts:arr[float], ends:arr[int], cx:float, cy:float, r:float) {
+    int n = rasArcSegments(r, RAS_TAU)
+    float full = RAS_TAU / n.toFloat()
+    float rb = r * Math.sqrt(RAS_TAU / (n.toFloat() * Math.sin(full)))
+    int k = 0
+    while k <= n {
+        float a = (RAS_TAU * k.toFloat()) / n.toFloat()
+        pts.push(cx + (rb * Math.cos(a)))
+        pts.push(cy + (rb * Math.sin(a)))
+        k = k + 1
+    }
+    ends.push(Math.floorDiv(pts.length, 2))
+}
