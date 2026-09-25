@@ -267,22 +267,17 @@ void func rasFillPath(px:arr[int], sw:int, sh:int,
                       pts:arr[float], ends:arr[int], rule:int,
                       r:int, g:int, b:int, a:int) {
     arr[float] noMask = []
-    rasFillCore(px, sw, sh, pts, ends, rule, r, g, b, a, noMask, false)
+    rasFillCore(px, sw, sh, pts, ends, rule, rasSolid(r, g, b, a), noMask, false)
 }
 
-// The fill itself, optionally through a clip mask. See slice 5 below
-// for what the mask means.
+// The fill itself, from any source (slice 6), optionally through a clip
+// mask (slice 5).
 void func rasFillCore(px:arr[int], sw:int, sh:int,
                       pts:arr[float], ends:arr[int], rule:int,
-                      r:int, g:int, b:int, a:int,
-                      mask:arr[float], useMask:bool) {
+                      src:arr[float], mask:arr[float], useMask:bool) {
     if sw <= 0 || sh <= 0 { return }
     if ends.length == 0 || pts.length < 6 { return }
-    int ca = rasClamp(a, 0, 255)
-    if ca == 0 { return }
-    int cr = rasClamp(r, 0, 255)
-    int cg = rasClamp(g, 0, 255)
-    int cb = rasClamp(b, 0, 255)
+    if rasSourceIsEmpty(src) { return }
 
     rasEnsureCov(sw)
     if !rasPathExtent(pts, sh) { return }
@@ -298,7 +293,7 @@ void func rasFillCore(px:arr[int], sw:int, sh:int,
                 c = c + 1
             }
         }
-        rasBlendRow(px, sw, row, cr, cg, cb, ca)
+        rasBlendRowSource(px, sw, row, src)
         row = row + 1
     }
 }
@@ -341,43 +336,50 @@ void func rasBlendRow(px:arr[int], sw:int, row:int,
             if cov > 1.0 { cov = 1.0 }
             int sa = Math.round(ca.toFloat() * cov)
             if sa > 0 {
-                int at = base + (i * 4)
-                int da = px[at + 3]
-                if da == 0 {
-                    px[at] = cr
-                    px[at + 1] = cg
-                    px[at + 2] = cb
-                    px[at + 3] = sa
-                } else {
-                    if sa == 255 {
-                        px[at] = cr
-                        px[at + 1] = cg
-                        px[at + 2] = cb
-                        px[at + 3] = 255
-                    } else {
-                        int inv = 255 - sa
-                        if da == 255 {
-                            px[at] = Math.floorDiv((cr * sa) + (px[at] * inv) + 127, 255)
-                            px[at + 1] = Math.floorDiv((cg * sa) + (px[at + 1] * inv) + 127, 255)
-                            px[at + 2] = Math.floorDiv((cb * sa) + (px[at + 2] * inv) + 127, 255)
-                            px[at + 3] = 255
-                        } else {
-                            // General src-over on straight alpha.
-                            int oa = sa + Math.floorDiv(da * inv + 127, 255)
-                            if oa > 255 { oa = 255 }
-                            if oa > 0 {
-                                int dw = Math.floorDiv(da * inv + 127, 255)
-                                px[at] = Math.floorDiv((cr * sa) + (px[at] * dw) + Math.floorDiv(oa, 2), oa)
-                                px[at + 1] = Math.floorDiv((cg * sa) + (px[at + 1] * dw) + Math.floorDiv(oa, 2), oa)
-                                px[at + 2] = Math.floorDiv((cb * sa) + (px[at + 2] * dw) + Math.floorDiv(oa, 2), oa)
-                                px[at + 3] = oa
-                            }
-                        }
-                    }
-                }
+                rasBlendPixel(px, base + (i * 4), cr, cg, cb, sa)
             }
         }
         i = i + 1
+    }
+}
+
+// src-over of one straight-alpha pixel, `sa` being the source's alpha
+// after coverage has multiplied it. The single definition of the blend:
+// solid rows and gradient rows both come here, so the arithmetic cannot
+// drift between them.
+void func rasBlendPixel(px:arr[int], at:int, cr:int, cg:int, cb:int, sa:int) {
+    int da = px[at + 3]
+    if da == 0 {
+        px[at] = cr
+        px[at + 1] = cg
+        px[at + 2] = cb
+        px[at + 3] = sa
+        return
+    }
+    if sa == 255 {
+        px[at] = cr
+        px[at + 1] = cg
+        px[at + 2] = cb
+        px[at + 3] = 255
+        return
+    }
+    int inv = 255 - sa
+    if da == 255 {
+        px[at] = Math.floorDiv((cr * sa) + (px[at] * inv) + 127, 255)
+        px[at + 1] = Math.floorDiv((cg * sa) + (px[at + 1] * inv) + 127, 255)
+        px[at + 2] = Math.floorDiv((cb * sa) + (px[at + 2] * inv) + 127, 255)
+        px[at + 3] = 255
+        return
+    }
+    // General src-over on straight alpha.
+    int oa = sa + Math.floorDiv(da * inv + 127, 255)
+    if oa > 255 { oa = 255 }
+    if oa > 0 {
+        int dw = Math.floorDiv(da * inv + 127, 255)
+        px[at] = Math.floorDiv((cr * sa) + (px[at] * dw) + Math.floorDiv(oa, 2), oa)
+        px[at + 1] = Math.floorDiv((cg * sa) + (px[at + 1] * dw) + Math.floorDiv(oa, 2), oa)
+        px[at + 2] = Math.floorDiv((cb * sa) + (px[at + 2] * dw) + Math.floorDiv(oa, 2), oa)
+        px[at + 3] = oa
     }
 }
 
@@ -890,7 +892,7 @@ void func rasClipIntersect(mask:arr[float], sw:int, sh:int,
 void func rasFillPathClip(px:arr[int], sw:int, sh:int,
                           pts:arr[float], ends:arr[int], rule:int,
                           r:int, g:int, b:int, a:int, mask:arr[float]) {
-    rasFillCore(px, sw, sh, pts, ends, rule, r, g, b, a, mask, true)
+    rasFillCore(px, sw, sh, pts, ends, rule, rasSolid(r, g, b, a), mask, true)
 }
 
 void func rasStrokePathClip(px:arr[int], sw:int, sh:int,
@@ -900,5 +902,175 @@ void func rasStrokePathClip(px:arr[int], sw:int, sh:int,
     arr[float] outline = []
     arr[int] outlineEnds = []
     rasStrokeOutline(pts, ends, closed, width, outline, outlineEnds)
-    rasFillCore(px, sw, sh, outline, outlineEnds, RAS_NONZERO, r, g, b, a, mask, true)
+    rasFillCore(px, sw, sh, outline, outlineEnds, RAS_NONZERO, rasSolid(r, g, b, a), mask, true)
+}
+
+// ---- Slice 6: gradients, as a per-pixel source ----
+//
+// A fill so far has had one colour. A SOURCE generalises that to a
+// colour per pixel, described by a small float array so that it can be
+// passed around like any other value:
+//
+//   solid   [0, r, g, b, a]
+//   linear  [1, x0, y0, x1, y1, r0, g0, b0, r1, g1, b1, a]
+//   radial  [2, cx, cy, radius, r0, g0, b0, r1, g1, b1, a]
+//
+// These are exactly the gradients the language can ask for:
+// fillLinearGradient between two points and fillRadialGradient from a
+// centre out to a radius, each with two opaque stops at 0 and 1, and
+// fillAlpha applying on top. festina_runtime_graphics.c builds them as
+// cairo_pattern_create_linear and cairo_pattern_create_radial with the
+// inner circle of radius 0, and never sets an extend mode -- so
+// Cairo's default for gradients applies, which is PAD: beyond either
+// end the end colour simply continues.
+//
+// Each pixel is sampled at its CENTRE, (x + 0.5, y + 0.5), which is
+// where pixman samples too.
+
+int RAS_SRC_SOLID = 0
+int RAS_SRC_LINEAR = 1
+int RAS_SRC_RADIAL = 2
+
+arr[float] func rasSolid(r:int, g:int, b:int, a:int) {
+    arr[float] src = [0.0, rasClamp(r, 0, 255).toFloat(), rasClamp(g, 0, 255).toFloat(),
+                      rasClamp(b, 0, 255).toFloat(), rasClamp(a, 0, 255).toFloat()]
+    return src
+}
+
+arr[float] func rasLinear(x0:float, y0:float, x1:float, y1:float,
+                          r0:int, g0:int, b0:int, r1:int, g1:int, b1:int, a:int) {
+    arr[float] src = [1.0, x0, y0, x1, y1,
+                      rasClamp(r0, 0, 255).toFloat(), rasClamp(g0, 0, 255).toFloat(),
+                      rasClamp(b0, 0, 255).toFloat(), rasClamp(r1, 0, 255).toFloat(),
+                      rasClamp(g1, 0, 255).toFloat(), rasClamp(b1, 0, 255).toFloat(),
+                      rasClamp(a, 0, 255).toFloat()]
+    return src
+}
+
+arr[float] func rasRadial(cx:float, cy:float, radius:float,
+                          r0:int, g0:int, b0:int, r1:int, g1:int, b1:int, a:int) {
+    float rad = radius
+    if rad < 0.0 { rad = 0.0 }
+    arr[float] src = [2.0, cx, cy, rad,
+                      rasClamp(r0, 0, 255).toFloat(), rasClamp(g0, 0, 255).toFloat(),
+                      rasClamp(b0, 0, 255).toFloat(), rasClamp(r1, 0, 255).toFloat(),
+                      rasClamp(g1, 0, 255).toFloat(), rasClamp(b1, 0, 255).toFloat(),
+                      rasClamp(a, 0, 255).toFloat()]
+    return src
+}
+
+// The source's own alpha, before coverage.
+int func rasSourceAlpha(src:arr[float]) {
+    return Math.round(src[src.length - 1])
+}
+
+// Where a pixel centre falls along a gradient, 0 at the first stop and
+// 1 at the second, PAD-extended: clamped rather than repeated.
+//
+// A linear gradient projects the point onto the line between its two
+// ends. A radial one measures distance from the centre over the radius.
+//
+// **Degenerate gradients, as Cairo draws them -- measured, not
+// guessed.** A linear gradient whose two end points coincide, or a
+// radial one of radius zero, has no direction to measure along, and the
+// two are NOT treated alike:
+//
+//   degenerate linear  every pixel is the AVERAGE of the stops -- with
+//                      the only stops this language makes, 0 and 1,
+//                      exactly the t = 0.5 colour. Red to blue drew
+//                      (128, 0, 128) everywhere.
+//   degenerate radial  NOTHING is drawn. Green to magenta at radius 0
+//                      left (0, 0, 0, 0) under the whole rectangle.
+//
+// The first version used the end colour for both, on the reasoning
+// that PAD "continues the end colour". Cairo disagreed with that guess
+// on every pixel of both cases, differently each time -- which is the
+// reason these are stated as measurements rather than as a rule that
+// sounds right.
+float RAS_DEGENERATE_LINEAR_T = 0.5
+
+// Whether a source draws nothing at all, whatever it covers.
+bool func rasSourceIsEmpty(src:arr[float]) {
+    if rasSourceAlpha(src) == 0 { return true }
+    return src[0] == 2.0 && src[3] <= 0.0
+}
+
+float func rasGradientT(src:arr[float], fx:float, fy:float) {
+    float t = 0.0
+    if src[0] == 1.0 {
+        float dx = src[3] - src[1]
+        float dy = src[4] - src[2]
+        float len2 = (dx * dx) + (dy * dy)
+        if len2 <= 0.0 { return RAS_DEGENERATE_LINEAR_T }
+        t = (((fx - src[1]) * dx) + ((fy - src[2]) * dy)) / len2
+    } else {
+        float rad = src[3]
+        // Unreachable for a fill -- rasFillCore turns a zero-radius
+        // radial away before any pixel is visited -- and kept defined
+        // anyway so the function has an answer for every input.
+        if rad <= 0.0 { return 1.0 }
+        float ex = fx - src[1]
+        float ey = fy - src[2]
+        t = Math.sqrt((ex * ex) + (ey * ey)) / rad
+    }
+    if t < 0.0 { return 0.0 }
+    if t > 1.0 { return 1.0 }
+    return t
+}
+
+// One pixel row of accumulated coverage, composited from a source.
+//
+// A solid source goes straight to rasBlendRow, unchanged, so a solid
+// fill through this path is the byte-identical fill it always was. A
+// gradient computes its colour at each covered pixel's centre and hands
+// it to the same rasBlendPixel.
+void func rasBlendRowSource(px:arr[int], sw:int, row:int, src:arr[float]) {
+    if src[0] == 0.0 {
+        rasBlendRow(px, sw, row, Math.round(src[1]), Math.round(src[2]),
+                    Math.round(src[3]), Math.round(src[4]))
+        return
+    }
+    int ca = rasSourceAlpha(src)
+    // Stop colours sit after the geometry: 5 floats of geometry for
+    // linear (kind plus two points), 4 for radial (kind, centre, radius).
+    int k = 5
+    if src[0] == 2.0 { k = 4 }
+    float r0 = src[k]
+    float g0 = src[k + 1]
+    float b0 = src[k + 2]
+    float r1 = src[k + 3]
+    float g1 = src[k + 4]
+    float b1 = src[k + 5]
+    float fy = row.toFloat() + 0.5
+    int base = row * sw * 4
+    int i = 0
+    while i < sw {
+        float cov = RAS_COV[i]
+        if cov > 0.0 {
+            if cov > 1.0 { cov = 1.0 }
+            int sa = Math.round(ca.toFloat() * cov)
+            if sa > 0 {
+                float t = rasGradientT(src, i.toFloat() + 0.5, fy)
+                int cr = Math.round(r0 + ((r1 - r0) * t))
+                int cg = Math.round(g0 + ((g1 - g0) * t))
+                int cb = Math.round(b0 + ((b1 - b0) * t))
+                rasBlendPixel(px, base + (i * 4), cr, cg, cb, sa)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Fill with any source, optionally through a clip.
+void func rasFillPathWith(px:arr[int], sw:int, sh:int,
+                          pts:arr[float], ends:arr[int], rule:int,
+                          src:arr[float]) {
+    arr[float] noMask = []
+    rasFillCore(px, sw, sh, pts, ends, rule, src, noMask, false)
+}
+
+void func rasFillPathWithClip(px:arr[int], sw:int, sh:int,
+                              pts:arr[float], ends:arr[int], rule:int,
+                              src:arr[float], mask:arr[float]) {
+    rasFillCore(px, sw, sh, pts, ends, rule, src, mask, true)
 }

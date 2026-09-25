@@ -471,12 +471,58 @@ static cairo_t *festina_canvas_context(void) {
 
 /* Sets the fill source: a gradient when one is active, otherwise the
  * flat colour, in both cases carrying the current alpha. */
+/* runtime.md phase 4 slice 6: the gradient, with fillAlpha carried in
+ * its own stops.
+ *
+ * This replaces a cairo_paint_with_alpha() call that was a real bug,
+ * found by comparing raster.f's gradients against Cairo's. paint()
+ * ignores the current path and covers the whole clip region -- which
+ * for the canvas is the whole canvas -- so a gradient drawn with
+ * fillAlpha(0.5) did two wrong things at once: it washed a
+ * half-transparent gradient over EVERYTHING outside the shape, and
+ * then the caller's cairo_fill() drew the shape itself at full
+ * opacity, so fillAlpha was ignored exactly where it was asked for.
+ * api.md documents fillAlpha as applying to every fill; measured, a
+ * pixel inside a 50%-alpha gradient rect was opaque red and one 400px
+ * away was blue-tinted.
+ *
+ * Scaling the stops' alpha instead makes the SOURCE translucent, which
+ * is right for every caller -- fill, fill_preserve and show_text alike
+ * -- because none of them paints outside what it draws. Cairo
+ * interpolates gradients premultiplied, so two stops sharing an alpha
+ * give exactly the opaque gradient times that alpha. */
+static cairo_pattern_t *festina_gradient_with_alpha(cairo_pattern_t *src, double alpha) {
+    cairo_pattern_t *out;
+    double x0, y0, x1, y1, r0, r1;
+    if (cairo_pattern_get_type(src) == CAIRO_PATTERN_TYPE_LINEAR) {
+        cairo_pattern_get_linear_points(src, &x0, &y0, &x1, &y1);
+        out = cairo_pattern_create_linear(x0, y0, x1, y1);
+    } else {
+        cairo_pattern_get_radial_circles(src, &x0, &y0, &r0, &x1, &y1, &r1);
+        out = cairo_pattern_create_radial(x0, y0, r0, x1, y1, r1);
+    }
+    int n = 0;
+    cairo_pattern_get_color_stop_count(src, &n);
+    for (int i = 0; i < n; i++) {
+        double off, r, g, b, a;
+        cairo_pattern_get_color_stop_rgba(src, i, &off, &r, &g, &b, &a);
+        cairo_pattern_add_color_stop_rgba(out, off, r, g, b, a * alpha);
+    }
+    return out;
+}
+
 static void festina_set_fill_source(cairo_t *cr) {
     if (g_fill_gradient) {
-        cairo_set_source(cr, g_fill_gradient);
-        if (g_fill_alpha < 1.0) {
-            cairo_paint_with_alpha(cr, g_fill_alpha);
+        if (g_fill_alpha >= 1.0) {
+            cairo_set_source(cr, g_fill_gradient);
+            return;
         }
+        /* cairo_set_source takes its own reference, so this one can be
+         * dropped at once and the pattern lives exactly as long as it is
+         * the source. */
+        cairo_pattern_t *p = festina_gradient_with_alpha(g_fill_gradient, g_fill_alpha);
+        cairo_set_source(cr, p);
+        cairo_pattern_destroy(p);
         return;
     }
     cairo_set_source_rgba(cr, g_fill_r, g_fill_g, g_fill_b, g_fill_alpha);

@@ -478,7 +478,7 @@ first piece of compiler work.
 4. ✅ stroking: joins, caps, line width, reduced to a fill of the
    stroke outline
 5. ✅ clipping as a coverage mask intersected with the span coverage
-6. linear and radial gradients as a per-span source
+6. ✅ linear and radial gradients as a per-span source
 7. `save`/`restore`, the transform stack, and the operators actually
    reachable from the language
 
@@ -661,6 +661,45 @@ and so could not tell the two apart whatever its name claimed.
 the new path cannot reach is outside it and must close. The obvious
 optimisation leaves those rows as open as before; put back, it fails
 the test that names it.
+
+**Slice 6, as built.** A fill's colour is now a SOURCE — a small
+float array describing a solid colour, a linear gradient or a radial
+one — and each covered pixel's colour is computed at its centre. These
+are exactly the gradients the language can ask for: two opaque stops
+at 0 and 1, PAD-extended because the runtime never sets an extend
+mode. The per-pixel blend moved into one `rasBlendPixel` that solid
+and gradient rows both call, so the arithmetic cannot drift between
+them; solid fills through the new path were checked byte-identical,
+and the extra call costs nothing measurable.
+
+Against Cairo, each gradient fills a pixel-aligned rectangle, so
+coverage is 1 everywhere and only COLOUR is compared: a horizontal
+linear gradient is byte-identical including both pad regions, a
+diagonal one and a radial one are within 1.
+
+**The degenerate cases were measured, and my guess was wrong for both
+— differently.** Coincident end points, or a radius of zero, give a
+gradient no direction. I assumed PAD would continue the end colour.
+Cairo draws the AVERAGE of the stops for a degenerate linear gradient
+— (128, 0, 128) from red and blue — and draws NOTHING AT ALL for a
+zero-radius radial one. They are two rules now, stated as
+measurements, and both are byte-identical to Cairo.
+
+**And the comparison found a real bug in the C runtime.** Under
+`fillAlpha`, `festina_set_fill_source` called `cairo_paint_with_alpha`
+for a gradient — and `paint()` ignores the path. So a gradient drawn
+with `fillAlpha(0.5)` washed a translucent gradient over the ENTIRE
+canvas, and the shape itself was then filled at full opacity: opaque
+red inside a 50% rectangle, a blue tint four hundred pixels away.
+api.md documents `fillAlpha` as applying to every fill. The fix scales
+the gradient's own stops by the alpha, which makes the source
+translucent for every caller — fill, preserved fill and text — and a
+regression test in `test_codegen.py` fails against the old code.
+
+One bound was written before it was measured: the soft-edge gradient
+test asserted 24, copied from slice 3's circle. It measured 27 — the
+same coverage error, since slice 3 drew red over white (a 225-unit
+channel) and this rim is blue over white (255): 24/225 × 255 = 27.2.
 
 ## Tests
 

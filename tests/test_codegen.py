@@ -7883,6 +7883,31 @@ class TestCircleMaskFastPath:
         assert left[0] > left[2], left      # red end
         assert right[2] > right[0], right   # blue end
 
+    def test_fill_alpha_on_a_gradient_stays_inside_the_shape(self, compile_and_run,
+                                                               tmp_path, monkeypatch):
+        """runtime.md phase 4 slice 6 found this, comparing raster.f's
+        gradients against Cairo's. festina_set_fill_source used to call
+        cairo_paint_with_alpha for a gradient under fillAlpha -- and
+        paint() ignores the path, so it washed a translucent gradient
+        over the ENTIRE canvas, then the caller filled the shape itself
+        at full opacity. Measured before the fix: opaque red inside a
+        50%-alpha rect, and a blue tint 400 pixels away from it."""
+        self._canvas(compile_and_run, monkeypatch,
+                      "color a = 'red'\n"
+                      "color b = 'blue'\n"
+                      "fillStyle(255, 255, 255)\ndrawRect(0, 0, 800, 600)\n"
+                      "fillAlpha(0.5)\n"
+                      "fillLinearGradient(10, 0, a, 50, 0, b)\n"
+                      "drawRect(0, 20, 60, 20)\n"
+                      "fillAlpha(1.0)")
+        _, _, pixel = _decode_png(str(tmp_path / "out.png"))
+        inside = pixel(3, 30)            # the red pad end, half over white
+        assert 120 <= inside[1] <= 135, f"fillAlpha ignored inside: {inside}"
+        assert inside[0] == 255
+        for spot in ((3, 5), (30, 60), (100, 100)):
+            assert pixel(*spot) == (255, 255, 255), (
+                f"the gradient washed outside its shape, at {spot}: {pixel(*spot)}")
+
     def test_a_degenerate_radius_draws_nothing_and_does_not_crash(self, compile_and_run,
                                                                     tmp_path, monkeypatch):
         self._canvas(compile_and_run, monkeypatch,

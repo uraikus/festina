@@ -1018,3 +1018,157 @@ class TestClipping:
         for y in range(8):
             for x in range(12):
                 assert g[y][x] == (255 if 1 <= x < 6 and 2 <= y < 6 else 0), f"({x}, {y})"
+
+
+class TestGradients:
+    """runtime.md phase 4, slice 6: gradients as a per-pixel source.
+
+    The language's gradients are exactly two opaque stops at 0 and 1,
+    linear between two points or radial from a centre out to a radius,
+    PAD-extended because the runtime never sets an extend mode. Against
+    Cairo each is drawn into a pixel-aligned rectangle, so coverage is
+    exactly 1 everywhere and the comparison is of COLOUR alone:
+    drawRect with a gradient bypasses the solid fast path and goes to
+    Cairo's own fill.
+
+    Measured: horizontal linear byte-identical, diagonal linear and
+    radial within 1, both degenerate cases byte-identical."""
+
+    CAIRO_HEAD = ("color red = '#ff0000'\ncolor blue = '#0000ff'\n"
+                  "color green = '#00c000'\ncolor magenta = '#e000e0'\n"
+                  "color yellow = '#ffff00'\ncolor white = '#ffffff'\n")
+
+    def _both(self, tmp_path, cli_mod, cairo_body, raster_body):
+        _with_raster(tmp_path)
+        assert _run(tmp_path, cli_mod, self.CAIRO_HEAD + "clearCanvas()\n" + cairo_body +
+                    "log(saveCanvas('cairo.png'))\n") == "true"
+        assert _run(tmp_path, cli_mod,
+                    "import raster.f\n"
+                    "arr[int] px = rasNewSurface(800, 600)\narr[int] one = [4]\n"
+                    + raster_body +
+                    "img a = imageFromPixels(px, 800, 600)\n"
+                    "log(a.save('raster.png'))\n") == "true"
+        return (_decode_png(str(tmp_path / "cairo.png")),
+                _decode_png(str(tmp_path / "raster.png")))
+
+    @staticmethod
+    def _max_diff(pair, x0, y0, x1, y1):
+        (_, _, ra, na), (_, _, rb, nb) = pair
+        return max(max(abs(ra[y][x * na + i] - rb[y][x * nb + i]) for i in range(4))
+                   for y in range(y0, y1) for x in range(x0, x1))
+
+    RECT_A = "arr[float] ra = [0.0, 0.0, 300.0, 0.0, 300.0, 150.0, 0.0, 150.0]\n"
+
+    def test_a_horizontal_linear_gradient_is_byte_identical(self, tmp_path, cli_mod):
+        """Including the PAD regions either side of the two stops, which
+        this rectangle deliberately reaches into."""
+        pair = self._both(tmp_path, cli_mod,
+                          "fillLinearGradient(40, 0, red, 260, 0, blue)\ndrawRect(0, 0, 300, 150)\n",
+                          self.RECT_A +
+                          "rasFillPathWith(px, 800, 600, ra, one, RAS_NONZERO,"
+                          " rasLinear(40.0, 0.0, 260.0, 0.0, 255, 0, 0, 0, 0, 255, 255))\n")
+        assert self._max_diff(pair, 0, 0, 300, 150) == 0
+
+    def test_a_diagonal_linear_gradient_is_within_one(self, tmp_path, cli_mod):
+        pair = self._both(tmp_path, cli_mod,
+                          "fillLinearGradient(20, 10, green, 260, 140, magenta)\ndrawRect(0, 0, 300, 150)\n",
+                          self.RECT_A +
+                          "rasFillPathWith(px, 800, 600, ra, one, RAS_NONZERO,"
+                          " rasLinear(20.0, 10.0, 260.0, 140.0, 0, 192, 0, 224, 0, 224, 255))\n")
+        assert self._max_diff(pair, 0, 0, 300, 150) <= 1
+
+    def test_a_radial_gradient_is_within_one(self, tmp_path, cli_mod):
+        """The rectangle reaches past the radius, so PAD is covered too."""
+        pair = self._both(tmp_path, cli_mod,
+                          "fillRadialGradient(150, 150, 100, yellow, blue)\ndrawRect(0, 0, 300, 300)\n",
+                          "arr[float] rc = [0.0, 0.0, 300.0, 0.0, 300.0, 300.0, 0.0, 300.0]\n"
+                          "rasFillPathWith(px, 800, 600, rc, one, RAS_NONZERO,"
+                          " rasRadial(150.0, 150.0, 100.0, 255, 255, 0, 0, 0, 255, 255))\n")
+        assert self._max_diff(pair, 0, 0, 300, 300) <= 1
+
+    def test_a_degenerate_linear_gradient_is_the_midpoint_colour(self, tmp_path, cli_mod):
+        """Coincident end points. Cairo draws the average of the stops
+        everywhere -- (128, 0, 128) from red and blue. The first version
+        used the end colour, on the reasoning that PAD continues it, and
+        was wrong on every pixel."""
+        pair = self._both(tmp_path, cli_mod,
+                          "fillLinearGradient(150, 70, red, 150, 70, blue)\ndrawRect(0, 0, 300, 150)\n",
+                          self.RECT_A +
+                          "rasFillPathWith(px, 800, 600, ra, one, RAS_NONZERO,"
+                          " rasLinear(150.0, 70.0, 150.0, 70.0, 255, 0, 0, 0, 0, 255, 255))\n")
+        assert self._max_diff(pair, 0, 0, 300, 150) == 0
+        (_, _, rb, nb) = pair[1]
+        assert tuple(rb[70][150 * nb:150 * nb + 4]) == (128, 0, 128, 255)
+
+    def test_a_zero_radius_radial_gradient_draws_nothing(self, tmp_path, cli_mod):
+        """Not the outer colour, not the inner one: Cairo leaves the
+        rectangle fully transparent. Measured, and different from the
+        degenerate linear case -- which is why they are two rules."""
+        pair = self._both(tmp_path, cli_mod,
+                          "fillRadialGradient(150, 75, 0, green, magenta)\ndrawRect(0, 0, 300, 150)\n",
+                          self.RECT_A +
+                          "rasFillPathWith(px, 800, 600, ra, one, RAS_NONZERO,"
+                          " rasRadial(150.0, 75.0, 0.0, 0, 192, 0, 224, 0, 224, 255))\n")
+        assert self._max_diff(pair, 0, 0, 300, 150) == 0
+        (_, _, rb, nb) = pair[1]
+        assert tuple(rb[75][150 * nb:150 * nb + 4]) == (0, 0, 0, 0)
+
+    def test_fill_alpha_applies_on_top_of_a_gradient(self, tmp_path, cli_mod):
+        """fillAlpha multiplies the gradient's opaque stops, over an
+        opaque background -- the path where the source's own alpha is
+        not 255 and the blend is src-over rather than a copy."""
+        pair = self._both(tmp_path, cli_mod,
+                          "fillStyle(white)\ndrawRect(0, 0, 300, 150)\n"
+                          "fillAlpha(0.5)\nfillLinearGradient(40, 0, red, 260, 0, blue)\n"
+                          "drawRect(0, 0, 300, 150)\nfillAlpha(1.0)\n",
+                          self.RECT_A +
+                          "rasFillRect(px, 800, 600, 0, 0, 300, 150, 255, 255, 255, 255)\n"
+                          "rasFillPathWith(px, 800, 600, ra, one, RAS_NONZERO,"
+                          " rasLinear(40.0, 0.0, 260.0, 0.0, 255, 0, 0, 0, 0, 255, 128))\n")
+        assert self._max_diff(pair, 0, 0, 300, 150) <= 1
+
+    def test_a_gradient_over_a_soft_edge(self, tmp_path, cli_mod):
+        """A radial gradient filling a circle, so colour AND coverage
+        vary together at the rim. Against Cairo's drawCircle -- whose
+        rim is its own flattening -- so this is a bound, not identity.
+
+        Measured 27. The first version of this test asserted 24, copied
+        from slice 3's solid circle without measuring this case. The two
+        are the same coverage error: slice 3 drew red over white, whose
+        worst channel spans 225, and this rim is blue over white, which
+        spans 255 -- 24 / 225 * 255 = 27.2. The bound is that same
+        coverage error, about 0.107, in this colour range."""
+        pair = self._both(tmp_path, cli_mod,
+                          "fillStyle(white)\ndrawRect(0, 0, 300, 300)\n"
+                          "fillRadialGradient(150, 150, 90, yellow, blue)\n"
+                          "drawCircle(150, 150, 90)\n",
+                          "rasFillRect(px, 800, 600, 0, 0, 300, 300, 255, 255, 255, 255)\n"
+                          "arr[float] c = []\narr[int] ce = []\n"
+                          "rasCircle(c, ce, 150.0, 150.0, 90.0)\n"
+                          "rasFillPathWith(px, 800, 600, c, ce, RAS_NONZERO,"
+                          " rasRadial(150.0, 150.0, 90.0, 255, 255, 0, 0, 0, 255, 255))\n")
+        assert self._max_diff(pair, 0, 0, 300, 300) <= 28
+
+    def test_a_gradient_goes_through_a_clip(self, tmp_path, cli_mod):
+        """Slices 5 and 6 compose: the left half of a gradient, clipped,
+        is exactly the left half of the unclipped gradient."""
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   "import raster.f\n"
+                   "arr[float] r = [0.0, 0.0, 40.0, 0.0, 40.0, 4.0, 0.0, 4.0]\narr[int] one = [4]\n"
+                   "arr[float] src = rasLinear(0.0, 0.0, 40.0, 0.0, 255, 0, 0, 0, 0, 255, 255)\n"
+                   "arr[int] a = rasNewSurface(40, 4)\n"
+                   "rasFillPathWith(a, 40, 4, r, one, RAS_NONZERO, src)\n"
+                   "arr[int] b = rasNewSurface(40, 4)\n"
+                   "arr[float] half = [0.0, 0.0, 20.0, 0.0, 20.0, 4.0, 0.0, 4.0]\n"
+                   "arr[float] mask = rasClipMask(40, 4, half, one, RAS_NONZERO)\n"
+                   "rasFillPathWithClip(b, 40, 4, r, one, RAS_NONZERO, src, mask)\n"
+                   "int i = 0\nint same = 0\nint cleared = 0\n"
+                   "while i < a.length {\n"
+                   "  int x = Math.floorDiv(i, 4) % 40\n"
+                   "  if x < 20 && a[i] == b[i] { same = same + 1 }\n"
+                   "  if x >= 20 && b[i] == 0 { cleared = cleared + 1 }\n"
+                   "  i = i + 1\n"
+                   "}\n"
+                   "log(`${same} ${cleared}`)\n")
+        assert out == "320 320"

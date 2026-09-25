@@ -8644,3 +8644,56 @@ before any evidence existed; one inverted reading of a field that
 cannot say no; one "intermittent" that was a step change. What finally
 worked was the least interesting instrument available: diffing two
 install logs.
+
+349. A GRADIENT UNDER fillAlpha PAINTED THE WHOLE CANVAS
+
+Found by runtime.md phase 4, slice 6 -- the first bug the rasteriser
+port has found in the C runtime it is replacing, rather than in
+itself.
+
+`festina_set_fill_source` handled a gradient under `fillAlpha` like
+this:
+
+    cairo_set_source(cr, g_fill_gradient);
+    if (g_fill_alpha < 1.0) {
+        cairo_paint_with_alpha(cr, g_fill_alpha);
+    }
+    return;
+
+`cairo_paint_with_alpha` paints the whole clip region and ignores the
+current path entirely. On the canvas the clip region is the whole
+canvas. So every gradient fill under `fillAlpha` did two wrong things:
+it washed a translucent copy of the gradient over everything outside
+the shape, and then each of the six callers went on to `cairo_fill()`
+the shape itself at FULL opacity -- so `fillAlpha` was ignored in the
+one place it was asked for. Measured, with a 50% red-to-blue gradient
+drawn into a 300x150 rectangle over white:
+
+| pixel | drew | should be |
+|---|---|---|
+| inside the rectangle | (255, 0, 0, 255) | about (255, 128, 128) |
+| 400 px away | (127, 127, 255, 127) | (255, 255, 255) |
+| just below it | (255, 127, 127, 255) | (255, 255, 255) |
+
+api.md says `fillAlpha` "applies uniformly to whatever's drawn next".
+Nothing tested a gradient under `fillAlpha`, so nothing noticed.
+
+The fix scales the gradient's stops by the alpha and makes that the
+source. A translucent source is right for every caller -- `cairo_fill`,
+`cairo_fill_preserve` before a border, `cairo_show_text` -- because none
+of them paints outside what it draws, and Cairo interpolates gradients
+premultiplied, so two stops sharing an alpha give exactly the opaque
+gradient times that alpha. After: (255, 127, 127) inside, untouched
+white outside.
+
+**How it was found is the part worth keeping.** raster.f's gradient
+test compared a 50%-alpha gradient against Cairo and failed by 127.
+The first reading of a failure like that is that the new code is
+wrong. It was the old code: raster.f did what api.md says, and Cairo's
+output could not be explained by any correct implementation, because
+it was opaque where it should be translucent. The comparison is only
+worth anything if a disagreement is allowed to implicate either side.
+
+A regression test in `test_codegen.py` asserts both halves -- alpha
+applied inside, nothing drawn outside -- and fails against the old
+code, checked by putting it back.
