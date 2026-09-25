@@ -354,13 +354,30 @@ jobs:
             || echo "DOWNGRADE FAILED -- the old package may no longer be in the archive"
           echo "installed: $(pacman -Q mingw-w64-ucrt-x86_64-cairo)"
           set +e
+          # Run 176 read 20/20 failed here -- with every run's output
+          # thrown away, so it showed the test exiting non-zero and not
+          # WHY. A lone downgrade can fail for reasons of its own. So
+          # each exit code is kept, and the first failure's output
+          # printed: the [crash] line and 0xC0000409 are what make it
+          # the same abort rather than a new breakage.
           fails=0
+          codes=""
           for i in $(seq 1 20); do
             python -m pytest -q -p no:randomly \
               "tests/test_codegen.py::TestImageDrawMethods::test_draw_text_writes_onto_the_image" \
-              >/dev/null 2>&1
-            [ $? -ne 0 ] && fails=$((fails + 1))
+              > run.log 2>&1
+            rc=$?
+            codes="$codes $rc"
+            if [ $rc -ne 0 ]; then
+              fails=$((fails + 1))
+              if [ $fails -eq 1 ]; then
+                echo "---- first failure, run $i ----"
+                tail -n 60 run.log
+                echo "---- end ----"
+              fi
+            fi
           done
+          echo "EXIT CODES:$codes"
           echo "RATE with $(pacman -Q mingw-w64-ucrt-x86_64-cairo): $fails/20 failed"
           # Back to current before the steps below compile the examples
           # and the graphics runtime -- they must test what users get.

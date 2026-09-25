@@ -8639,6 +8639,33 @@ after the suite and measures the same twenty-run rate. The crash
 returning makes cairo-1 the fault and cairo-2 the fix; staying away
 moves suspicion to libwinpthread, the only other thing that changed.
 
+**Run 176 answered, most of the way.** On one runner, in one job:
+
+    RATE pytest-single: 0/20 failed                      (cairo 1.18.6-2)
+    RATE with mingw-w64-ucrt-x86_64-cairo 1.18.6-1: 20/20 failed
+
+Only cairo was swapped; libwinpthread stayed at r426. That puts
+the fault in cairo-1.18.6-1, upstream in MSYS2's package, and the fix
+in the -2 rebuild that CI already installs. Nothing in this repository
+caused it, and no change here was needed to fix it.
+
+One gap, recorded rather than rounded off: the step threw away each
+run's output, so "20/20 failed" shows the test exited non-zero and not
+that it was the same 0xC0000409 abort. A single package downgrade can
+break in ways of its own. The runs took about six seconds each, which
+fits a real draw rather than a failed load, but that is suggestive,
+not proof. The step now keeps every exit code and prints the first
+failure's output, so one more run closes it. Until then the Windows
+diagnostic steps stay in place.
+
+(The same run's linux job hit its 45-minute cap: the bootstrap
+differential took 42:11 against 24:42 one run earlier, over the same
+1,217 tests. raster.f is the only corpus file that grew between them,
+and a bootstrap dump of it measures 0.13 s -- all 161 canaries
+scanning it would add about 21 s serially. The serial half ran at its
+usual pace. That is the runner, which #287 already says is a sample,
+but it leaves the 45-minute budget with little margin.)
+
 **The cost of this entry, stated plainly.** Six theories; five wrong
 before any evidence existed; one inverted reading of a field that
 cannot say no; one "intermittent" that was a step change. What finally
