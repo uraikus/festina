@@ -259,80 +259,66 @@ jobs:
         # were wrong. This is the alternative to a fourth.
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: Does the crashing test crash on its own
-        # decisions.md #348. Everything about this crash has been
-        # chased on the premise that it is parallelism-related, because
-        # #345 recorded it passing serially -- four theories, all
-        # wrong, and the font-resolution one died on a runner with 254
-        # fonts where `sans-serif` resolves to Verdana.
+      - name: Windows crash diagnostics
+        # decisions.md #348. EXPLICIT VERDICTS, because the previous
+        # version of this step was read wrong: with
+        # continue-on-error, a step's `conclusion` is "success" no
+        # matter what the command returned, and that field was taken
+        # as evidence the test passed when it had in fact failed. A
+        # diagnostic must print its own answer, not leave it to a
+        # field that cannot say no.
         #
-        # That premise has never been re-tested on current code, and it
-        # is one line to test. This runs the crashing test ALONE and
-        # SERIALLY, before the four-wide suite starts, so nothing else
-        # is competing with it:
-        #
-        #   passes here, fails below  -> parallelism is real, and the
-        #                                question is what is shared
-        #   fails here too            -> `-n` was a red herring for
-        #                                four rounds and this is an
-        #                                ordinary deterministic bug on
-        #                                this platform, which is a much
-        #                                easier thing to chase
-        #
-        # continue-on-error because this step's job is to report, not
-        # to judge: the suite below is what decides the job, and a
-        # failure here must not mask which tests it finds.
+        # Three probes, narrowing. The suite below still decides the
+        # job; this only reports.
         continue-on-error: true
         run: |
           echo "fc-list count: $(fc-list 2>/dev/null | wc -l)"
           echo "fc-match sans-serif: $(fc-match sans-serif 2>/dev/null)"
+
+          set +e
           python -m pytest -q -p no:randomly \
-            "tests/test_codegen.py::TestImageDrawMethods::test_draw_text_writes_onto_the_image"
-      - name: Do concurrent drawText processes crash
-        # decisions.md #348. The step above passes and the suite below
-        # fails, but TWO things differ between them: the suite runs
-        # this test concurrently, AND it runs it after thousands of
-        # others. Concurrency is one candidate and accumulated machine
-        # state is another, and collapsing them is exactly the mistake
-        # the earlier rounds made.
-        #
-        # This separates them. Nothing has run before it, and the only
-        # variable is concurrency: one compiled drawText program,
-        # eight copies at once, five rounds, each in its own directory.
-        # If they crash, the repro shrinks from a twenty-minute suite
-        # to a shell loop and the cause is concurrent Cairo text
-        # processes. If they all pass, concurrency alone is NOT
-        # sufficient and the trigger is something the rest of the suite
-        # leaves behind.
-        #
-        # Reports, never judges: continue-on-error, and every failure
-        # is echoed with its exit code rather than ending the loop.
-        continue-on-error: true
-        run: |
+            "tests/test_codegen.py::TestImageDrawMethods::test_draw_text_writes_onto_the_image" \
+            >/dev/null 2>&1
+          echo "VERDICT alone-and-serial: rc=$?"
+
           mkdir -p /tmp/dtx
-          cat > /tmp/dtx/dt.f <<'FESTINA'
+          # A: drawText onto a BLANK image -- what the previous probe
+          # did, and it passed 40/40 concurrently.
+          cat > /tmp/dtx/blank.f <<'FESTINA'
           color black = 'black'
           fillStyle(black)
           img sheet = blankImage(128, 64)
           sheet.drawText('hi', 4, 40)
           log(sheet.save('out.png'))
           FESTINA
-          python -m festina.cli compile /tmp/dtx/dt.f -o /tmp/dtx/dt.exe
+          # B: drawText onto an image LOADED FROM A FILE -- what the
+          # failing test actually does, and the one difference between
+          # it and probe A.
+          cat > /tmp/dtx/loaded.f <<'FESTINA'
+          color black = 'black'
+          img src = blankImage(128, 64)
+          log(src.save('sheet.png'))
+          img sheet = 'sheet.png'
+          fillStyle(black)
+          sheet.drawText('hi', 4, 40)
+          log(sheet.save('out.png'))
+          FESTINA
+          for name in blank loaded; do
+            python -m festina.cli compile /tmp/dtx/$name.f -o /tmp/dtx/$name.exe >/dev/null 2>&1
+            d=$(mktemp -d); ( cd "$d" && /tmp/dtx/$name.exe >/dev/null 2>&1 )
+            echo "VERDICT single $name: rc=$?"
+          done
+
           fails=0
           for round in 1 2 3 4 5; do
             for i in 1 2 3 4 5 6 7 8; do
-              (
-                d=$(mktemp -d)
-                cd "$d" || exit 0
-                /tmp/dtx/dt.exe >/dev/null 2>&1
-                rc=$?
-                [ $rc -ne 0 ] && echo "round $round worker $i exit $rc (0x$(printf '%X' $rc))"
-                exit 0
-              ) &
+              ( d=$(mktemp -d); cd "$d" || exit 0; /tmp/dtx/loaded.exe >/dev/null 2>&1; rc=$?
+                [ $rc -ne 0 ] && echo "  loaded concurrent round $round worker $i rc=$rc"
+                exit 0 ) &
             done
             wait
           done
-          echo "concurrent drawText: 40 runs done"
+          echo "VERDICT concurrent-loaded: 40 runs done (any failures listed above)"
       - name: Run the test suite
         # decisions.md #345: this job was CANCELLED at the 45-minute cap
         # after 42:56, up from 18:31 eleven days earlier -- the suite

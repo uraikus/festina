@@ -8523,3 +8523,43 @@ at accumulated state rather than at a race.
 Either answer is worth more than the question is costing, because
 either one removes half the search space. That is the property none of
 the four theories had.
+
+**A correction, and it inverts four rounds of premise.** The step that
+ran the crashing test alone and serially was reported here as passing.
+It did not pass:
+
+    1 failed in 12.90s
+    ##[error]Process completed with exit code 1.
+
+The mistake was reading the step's `conclusion` field. With
+`continue-on-error: true`, GitHub reports a step's conclusion as
+"success" whatever the command returned -- so that field is
+structurally incapable of saying no, and it was taken as evidence of
+a pass. The `[crash]` line sitting at the tail of that same step,
+which should have been impossible for a passing test, is what
+eventually gave it away.
+
+So the picture inverts:
+
+| probe | result |
+|---|---|
+| the test, alone and serial | FAILS |
+| 40 concurrent `drawText` processes | all pass |
+
+**Parallelism was never the cause.** Four rounds of shared-resource
+theories -- fontconfig's cache, font resolution, the object cache --
+were chasing a property the crash does not have. Every one of them
+came up empty, and this is why. #345's "passed serially" is either no
+longer true or was never checked the way it was recorded.
+
+**And the two rows disagree about something concrete.** The passing
+probe draws text onto `blankImage(128, 64)`. The failing test draws it
+onto an image LOADED FROM A PNG FILE. That is the only difference
+between them, and it is now the next probe: the same program, once
+with a blank image and once with a loaded one, single and concurrent,
+each printing its own exit code.
+
+**The instrument's own lesson.** A diagnostic that reports through a
+field which cannot express failure is worse than no diagnostic,
+because it produces confident wrong readings. Every probe now prints
+an explicit `VERDICT ...: rc=$?` line of its own.
