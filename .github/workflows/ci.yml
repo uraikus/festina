@@ -260,40 +260,38 @@ jobs:
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Windows crash diagnostics
-        # decisions.md #348. EXPLICIT VERDICTS, because the previous
-        # version of this step was read wrong: with
-        # continue-on-error, a step's `conclusion` is "success" no
-        # matter what the command returned, and that field was taken
-        # as evidence the test passed when it had in fact failed. A
-        # diagnostic must print its own answer, not leave it to a
-        # field that cannot say no.
+        # decisions.md #348. The crash is INTERMITTENT -- run 174 was
+        # fully green, including the alone-and-serial probe that had
+        # failed the two runs before it. So the thing worth collecting
+        # is a RATE, not another yes/no: without one, no change can be
+        # shown to help, and four theories were argued from single
+        # draws.
         #
-        # Three probes, narrowing. The suite below still decides the
-        # job; this only reports.
+        # Twenty runs of the failing test, counted. Twenty standalone
+        # runs of the same drawing done as a compiled program, counted
+        # separately -- across two earlier runs those have never once
+        # crashed (0 of 80) while the pytest-driven test fails roughly
+        # two thirds of the time, and that gap is the sharpest clue
+        # available.
+        #
+        # continue-on-error, and every line is an explicit count: a
+        # step conclusion cannot report a rate, and reading one as if
+        # it could is the mistake this whole entry is now about.
         continue-on-error: true
         run: |
           echo "fc-list count: $(fc-list 2>/dev/null | wc -l)"
-          echo "fc-match sans-serif: $(fc-match sans-serif 2>/dev/null)"
-
           set +e
-          python -m pytest -q -p no:randomly \
-            "tests/test_codegen.py::TestImageDrawMethods::test_draw_text_writes_onto_the_image" \
-            >/dev/null 2>&1
-          echo "VERDICT alone-and-serial: rc=$?"
+
+          fails=0
+          for i in $(seq 1 20); do
+            python -m pytest -q -p no:randomly \
+              "tests/test_codegen.py::TestImageDrawMethods::test_draw_text_writes_onto_the_image" \
+              >/dev/null 2>&1
+            [ $? -ne 0 ] && fails=$((fails + 1))
+          done
+          echo "RATE pytest-single: $fails/20 failed"
 
           mkdir -p /tmp/dtx
-          # A: drawText onto a BLANK image -- what the previous probe
-          # did, and it passed 40/40 concurrently.
-          cat > /tmp/dtx/blank.f <<'FESTINA'
-          color black = 'black'
-          fillStyle(black)
-          img sheet = blankImage(128, 64)
-          sheet.drawText('hi', 4, 40)
-          log(sheet.save('out.png'))
-          FESTINA
-          # B: drawText onto an image LOADED FROM A FILE -- what the
-          # failing test actually does, and the one difference between
-          # it and probe A.
           cat > /tmp/dtx/loaded.f <<'FESTINA'
           color black = 'black'
           img src = blankImage(128, 64)
@@ -303,22 +301,13 @@ jobs:
           sheet.drawText('hi', 4, 40)
           log(sheet.save('out.png'))
           FESTINA
-          for name in blank loaded; do
-            python -m festina.cli compile /tmp/dtx/$name.f -o /tmp/dtx/$name.exe >/dev/null 2>&1
-            d=$(mktemp -d); ( cd "$d" && /tmp/dtx/$name.exe >/dev/null 2>&1 )
-            echo "VERDICT single $name: rc=$?"
+          python -m festina.cli compile /tmp/dtx/loaded.f -o /tmp/dtx/loaded.exe >/dev/null 2>&1
+          pfails=0
+          for i in $(seq 1 20); do
+            d=$(mktemp -d); ( cd "$d" && /tmp/dtx/loaded.exe >/dev/null 2>&1 )
+            [ $? -ne 0 ] && pfails=$((pfails + 1))
           done
-
-          fails=0
-          for round in 1 2 3 4 5; do
-            for i in 1 2 3 4 5 6 7 8; do
-              ( d=$(mktemp -d); cd "$d" || exit 0; /tmp/dtx/loaded.exe >/dev/null 2>&1; rc=$?
-                [ $rc -ne 0 ] && echo "  loaded concurrent round $round worker $i rc=$rc"
-                exit 0 ) &
-            done
-            wait
-          done
-          echo "VERDICT concurrent-loaded: 40 runs done (any failures listed above)"
+          echo "RATE standalone-binary: $pfails/20 failed"
       - name: Run the test suite
         # decisions.md #345: this job was CANCELLED at the 45-minute cap
         # after 42:56, up from 18:31 eleven days earlier -- the suite

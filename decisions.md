@@ -8563,3 +8563,43 @@ each printing its own exit code.
 field which cannot express failure is worse than no diagnostic,
 because it produces confident wrong readings. Every probe now prints
 an explicit `VERDICT ...: rc=$?` line of its own.
+
+**It is intermittent, and that is the finding the last five rounds
+were missing.** Run 174 was fully green on Windows -- the whole suite,
+2634 passed, 1391 skipped, 0 failed -- including the alone-and-serial
+probe that had failed in each of the two runs before it:
+
+    VERDICT alone-and-serial: rc=0
+    VERDICT single blank: rc=0
+    VERDICT single loaded: rc=0
+    VERDICT concurrent-loaded: 40 runs done (any failures listed above)
+
+Every observation to date:
+
+| probe | outcome |
+|---|---|
+| full suite, runs 170-173 | failed 4/4 |
+| full suite, run 174 | PASSED |
+| the test alone and serial, runs 172-173 | failed 2/2 |
+| the test alone and serial, run 174 | passed |
+| standalone compiled probes | 0 failures in 80 runs |
+
+An intermittent fault explains the entire history of this entry.
+#345's "passed serially" was most likely one lucky draw. So was every
+"the experiment refutes the theory" -- with a two-thirds failure rate,
+a single green run proves nothing, and several of these rounds
+accepted exactly that as proof.
+
+**So the next instrument collects a RATE.** Twenty runs of the failing
+test, counted, and twenty runs of the same drawing as a standalone
+compiled program, counted separately. Without a rate no change can be
+shown to help, and this entry now contains five arguments made from
+single draws.
+
+**The sharpest clue is the gap between those two counts.** The
+standalone binaries have never crashed -- 0 of 80 across two runs --
+while the pytest-driven test fails about two thirds of the time. Same
+drawing, same library, same machine. Whatever the difference is, it is
+in how the test runs the program rather than in what the program
+draws, and that is a much smaller place to look than "Cairo on
+Windows".
