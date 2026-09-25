@@ -8603,3 +8603,44 @@ drawing, same library, same machine. Whatever the difference is, it is
 in how the test runs the program rather than in what the program
 draws, and that is a much smaller place to look than "Cairo on
 Windows".
+
+**It was a step change, and the environment moved under it.** Runs
+174 and 175 were both fully green on Windows, and 175's rate probe
+read 0/20 for the test and 0/20 for the standalone binary. Tallied
+across every attempt:
+
+| period | attempts | outcome |
+|---|---|---|
+| runs 170-173, Sep 24 | suite x4, serial x2 | failed 6/6 |
+| runs 174-175, Sep 25 | suite x2, serial x21 | passed 23/23 |
+
+The previous paragraph of this entry called that "intermittent, about
+two thirds". It was not. A fault with a two-thirds failure rate
+passing twenty-one straight has a probability around 1e-10; this is a
+step change, and it sits on a day boundary. Our code across it touched
+only `raster.f`, which is linked into nothing, and CI yaml. But the
+Windows job installs MSYS2 with `update: true`, so every run takes the
+newest packages -- and comparing the two runs' install logs, exactly
+two changed:
+
+| package | run 173 (crashed) | run 175 (clean) |
+|---|---|---|
+| cairo | 1.18.6-1 | 1.18.6-2 |
+| libwinpthread | r420 | r426 |
+
+Everything else in Cairo's dependency set -- fontconfig, freetype,
+harfbuzz, pixman, libpng, glib2, expat, brotli, graphite2, gcc-libs --
+is identical. A `-1 -> -2` release is MSYS2 rebuilding the same
+upstream version, which is what a backported patch looks like, and the
+backtrace put twelve frames inside libcairo-2.dll above `abort()`.
+
+That is still a correlation, so the next run puts cairo-1.18.6-1 back
+after the suite and measures the same twenty-run rate. The crash
+returning makes cairo-1 the fault and cairo-2 the fix; staying away
+moves suspicion to libwinpthread, the only other thing that changed.
+
+**The cost of this entry, stated plainly.** Six theories; five wrong
+before any evidence existed; one inverted reading of a field that
+cannot say no; one "intermittent" that was a step change. What finally
+worked was the least interesting instrument available: diffing two
+install logs.

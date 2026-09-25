@@ -331,6 +331,41 @@ jobs:
         # budget raised twice is a budget nobody is managing. This is
         # the alternative to raising it a second time.
         run: python -m pytest tests/ -q -n auto --dist worksteal
+      - name: Put the old Cairo back
+        # decisions.md #348. Runs 170-173 (Sep 24) failed 6 of 6; runs
+        # 174-175 (Sep 25) passed 23 of 23 -- a step change, not
+        # intermittency, since a ~2/3 fault passing 21 straight is
+        # around 1e-10. Across that boundary exactly two MSYS2 packages
+        # changed: cairo 1.18.6-1 -> 1.18.6-2 and libwinpthread
+        # r420 -> r426. Cairo is the prime suspect -- the backtrace was
+        # twelve frames inside libcairo-2.dll ending in abort().
+        #
+        # A correlation is not a cause, so this puts the OLD cairo back
+        # and measures the same 20-run rate. The crash returning names
+        # cairo-1 as the fault and cairo-2 as the fix; it staying away
+        # moves suspicion to libwinpthread, which is the next thing to
+        # pin. Last in the job and `if: always()`, so the suite above
+        # ran on current packages and this cannot disturb it.
+        if: always()
+        continue-on-error: true
+        run: |
+          pacman -U --noconfirm \
+            https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-cairo-1.18.6-1-any.pkg.tar.zst \
+            || echo "DOWNGRADE FAILED -- the old package may no longer be in the archive"
+          echo "installed: $(pacman -Q mingw-w64-ucrt-x86_64-cairo)"
+          set +e
+          fails=0
+          for i in $(seq 1 20); do
+            python -m pytest -q -p no:randomly \
+              "tests/test_codegen.py::TestImageDrawMethods::test_draw_text_writes_onto_the_image" \
+              >/dev/null 2>&1
+            [ $? -ne 0 ] && fails=$((fails + 1))
+          done
+          echo "RATE with $(pacman -Q mingw-w64-ucrt-x86_64-cairo): $fails/20 failed"
+          # Back to current before the steps below compile the examples
+          # and the graphics runtime -- they must test what users get.
+          pacman -S --noconfirm mingw-w64-ucrt-x86_64-cairo
+          echo "restored: $(pacman -Q mingw-w64-ucrt-x86_64-cairo)"
       - name: Compile and run the core examples
         # windows.md Phase 0's exit criteria, verbatim: the four
         # windowless examples build and run natively as .exe.
