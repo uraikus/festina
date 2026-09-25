@@ -477,7 +477,7 @@ first piece of compiler work.
    existing circle cache expressed as paths
 4. ✅ stroking: joins, caps, line width, reduced to a fill of the
    stroke outline
-5. clipping as a coverage mask intersected with the span coverage
+5. ✅ clipping as a coverage mask intersected with the span coverage
 6. linear and radial gradients as a per-span source
 7. `save`/`restore`, the transform stack, and the operators actually
    reachable from the language
@@ -621,6 +621,46 @@ part of the path crosses a join, so there is now a test that runs a
 segment straight through a miter corner: 127 with the fix, 255 — a
 hole, the crossing cancelled under nonzero — without it. Both stroke
 bugs were put back and both are caught.
+
+**Slice 5, as built.** A clip is a mask — one float per pixel, the
+fraction the clip lets through — built by the same `rasRowCoverage`
+every fill uses, and a clipped draw multiplies its coverage by it.
+Masks compose: two clips intersect by multiplying, a soft clip edge
+needs nothing special, and strokes are clipped for free because they
+are fills.
+
+The row loop moved out of `rasFillPath` into `rasRowCoverage` so the
+same coverage can be blended, stored or multiplied without three
+copies of the scanline code. The refactor was checked byte-for-byte,
+not just by the tests still passing — several of those use bounds,
+and "within the bound" is not "unchanged". A scene with a translucent
+triangle, an even-odd circle and a translucent stroke renders to an
+identical PNG before and after.
+
+**There is no Cairo to compare against here.** The language exposes
+no path clip; the runtime's only `cairo_clip` is internal to
+`drawImageRegion`. So the oracles are exact: a rectangular clip, two
+clips intersecting, and a cross-check — a full-surface fill through a
+soft circular clip must be byte-identical to a plain fill of that
+circle, because a shape with coverage 1 everywhere makes the product
+equal to the clip. That comparison includes the soft edges, and the
+test asserts that it does.
+
+**A product is not an intersection, and that is the definition.**
+Where shape and clip both have soft edges in one pixel, multiplying
+coverages does not give the area of their geometric overlap. The test
+that pins this now puts them on OPPOSITE halves of a pixel: they do
+not overlap at all, and the product still draws a quarter. Cairo's
+clip does the same — it is the conflation every mask compositor has —
+so it is asserted, to stop a later "fix" diverging from what it
+replaces. The first version of that test put the edges on
+perpendicular sides, where the halves genuinely overlap in a quarter,
+and so could not tell the two apart whatever its name claimed.
+
+`rasClipIntersect` visits every row, not just the new path's: a row
+the new path cannot reach is outside it and must close. The obvious
+optimisation leaves those rows as open as before; put back, it fails
+the test that names it.
 
 ## Tests
 

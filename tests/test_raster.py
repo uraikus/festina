@@ -877,3 +877,144 @@ class TestStrokingAgainstCairo:
             "3, 6", "0, 0", 10.0)
         assert wedge == 0, f"{wedge} pixels off by more than 60 -- a bevel/miter call disagrees"
         assert worst <= 18, f"max deviation {worst}"
+
+
+class TestClipping:
+    """runtime.md phase 4, slice 5: a clip is a coverage mask, and a
+    clipped draw multiplies its coverage by it.
+
+    The language exposes no path clip -- the runtime's one cairo_clip is
+    internal to drawImageRegion -- so there is no Cairo program to
+    compare against. The oracles are exact instead: cases where the
+    right answer is fixed by the definition, and cross-checks against
+    unclipped fills that must come out byte-identical."""
+
+    def _alpha(self, tmp_path, cli_mod, w, h, setup):
+        _with_raster(tmp_path)
+        out = _run(tmp_path, cli_mod,
+                   "import raster.f\n"
+                   f"arr[int] px = rasNewSurface({w}, {h})\n" + setup +
+                   "int i = 3\ntext out = ''\n"
+                   "while i < px.length { out = `${out} ${px[i]}` i = i + 4 }\n"
+                   "log(out)\n")
+        vals = [int(v) for v in out.split()]
+        return [vals[y * w:(y + 1) * w] for y in range(h)]
+
+    FULL = ("arr[float] all = [0.0, 0.0, 40.0, 0.0, 40.0, 40.0, 0.0, 40.0]\n"
+            "arr[int] allEnds = [4]\n")
+
+    def test_a_rectangular_clip_is_exact(self, tmp_path, cli_mod):
+        g = self._alpha(tmp_path, cli_mod, 10, 6,
+                        "arr[float] cp = [3.0, 1.0, 7.0, 1.0, 7.0, 4.0, 3.0, 4.0]\n"
+                        "arr[int] ce = [4]\n"
+                        "arr[float] mask = rasClipMask(10, 6, cp, ce, RAS_NONZERO)\n"
+                        + self.FULL +
+                        "rasFillPathClip(px, 10, 6, all, allEnds, RAS_NONZERO, 9, 9, 9, 255, mask)\n")
+        for y in range(6):
+            for x in range(10):
+                assert g[y][x] == (255 if 3 <= x < 7 and 1 <= y < 4 else 0), f"({x}, {y})"
+
+    def test_a_full_shape_through_a_soft_clip_is_the_clip(self, tmp_path, cli_mod):
+        """Where the shape covers every pixel completely, its coverage
+        is exactly 1 and the product IS the clip's coverage. So a
+        full-surface fill through a circular clip must be byte-for-byte
+        a plain fill of that circle -- soft edges and all. This is the
+        cross-check that the mask path and the fill path compute the
+        same coverage."""
+        clipped = self._alpha(tmp_path, cli_mod, 40, 40,
+                              "arr[float] cp = []\narr[int] ce = []\n"
+                              "rasCircle(cp, ce, 20.0, 19.3, 13.7)\n"
+                              "arr[float] mask = rasClipMask(40, 40, cp, ce, RAS_NONZERO)\n"
+                              + self.FULL +
+                              "rasFillPathClip(px, 40, 40, all, allEnds, RAS_NONZERO, 9, 9, 9, 255, mask)\n")
+        plain = self._alpha(tmp_path, cli_mod, 40, 40,
+                            "arr[float] cp = []\narr[int] ce = []\n"
+                            "rasCircle(cp, ce, 20.0, 19.3, 13.7)\n"
+                            "rasFillPath(px, 40, 40, cp, ce, RAS_NONZERO, 9, 9, 9, 255)\n")
+        assert clipped == plain
+        assert any(0 < v < 255 for row in plain for v in row), (
+            "the comparison has to include soft edges to mean anything")
+
+    def test_an_open_clip_changes_nothing(self, tmp_path, cli_mod):
+        clipped = self._alpha(tmp_path, cli_mod, 30, 30,
+                              "arr[float] mask = rasClipAll(30, 30)\n"
+                              "arr[float] t = [3.0, 2.5, 27.2, 9.0, 11.0, 28.4]\narr[int] te = [3]\n"
+                              "rasFillPathClip(px, 30, 30, t, te, RAS_NONZERO, 9, 9, 9, 180, mask)\n")
+        plain = self._alpha(tmp_path, cli_mod, 30, 30,
+                            "arr[float] t = [3.0, 2.5, 27.2, 9.0, 11.0, 28.4]\narr[int] te = [3]\n"
+                            "rasFillPath(px, 30, 30, t, te, RAS_NONZERO, 9, 9, 9, 180)\n")
+        assert clipped == plain
+
+    def test_clips_intersect(self, tmp_path, cli_mod):
+        g = self._alpha(tmp_path, cli_mod, 12, 12,
+                        "arr[float] a = [1.0, 1.0, 8.0, 1.0, 8.0, 8.0, 1.0, 8.0]\narr[int] ae = [4]\n"
+                        "arr[float] b = [4.0, 4.0, 11.0, 4.0, 11.0, 11.0, 4.0, 11.0]\narr[int] be = [4]\n"
+                        "arr[float] mask = rasClipMask(12, 12, a, ae, RAS_NONZERO)\n"
+                        "rasClipIntersect(mask, 12, 12, b, be, RAS_NONZERO)\n"
+                        "arr[float] all = [0.0, 0.0, 12.0, 0.0, 12.0, 12.0, 0.0, 12.0]\n"
+                        "arr[int] allEnds = [4]\n"
+                        "rasFillPathClip(px, 12, 12, all, allEnds, RAS_NONZERO, 9, 9, 9, 255, mask)\n")
+        for y in range(12):
+            for x in range(12):
+                assert g[y][x] == (255 if 4 <= x < 8 and 4 <= y < 8 else 0), f"({x}, {y})"
+
+    def test_intersecting_closes_rows_the_new_path_cannot_reach(self, tmp_path, cli_mod):
+        """rasClipIntersect visits EVERY row. The obvious optimisation --
+        only the new path's own rows -- would leave the others as open
+        as before: an open clip narrowed to the top half would still let
+        the bottom half through. Put back, that bug fails this test."""
+        g = self._alpha(tmp_path, cli_mod, 8, 8,
+                        "arr[float] mask = rasClipAll(8, 8)\n"
+                        "arr[float] top = [0.0, 0.0, 8.0, 0.0, 8.0, 3.0, 0.0, 3.0]\narr[int] te = [4]\n"
+                        "rasClipIntersect(mask, 8, 8, top, te, RAS_NONZERO)\n"
+                        "arr[float] all = [0.0, 0.0, 8.0, 0.0, 8.0, 8.0, 0.0, 8.0]\n"
+                        "arr[int] allEnds = [4]\n"
+                        "rasFillPathClip(px, 8, 8, all, allEnds, RAS_NONZERO, 9, 9, 9, 255, mask)\n")
+        for y in range(8):
+            assert all(v == (255 if y < 3 else 0) for v in g[y]), f"row {y}: {g[y]}"
+
+    def test_soft_edges_multiply_they_do_not_intersect(self, tmp_path, cli_mod):
+        """The shape covers the LEFT half of column 0; the clip covers
+        the RIGHT half. Geometrically they do not overlap at all, so a
+        true intersection would draw nothing there. The mask product
+        draws 0.5 x 0.5 = 0.25, alpha 64.
+
+        That is asserted deliberately. It is the conflation that every
+        mask-based compositor has, Cairo's clip included, and slice 5's
+        docstring in raster.f says why it is the definition rather than
+        an approximation of one. Pinning it stops a later change from
+        "fixing" it into disagreement with the Cairo it replaces.
+
+        The first version of this test put the two soft edges on
+        PERPENDICULAR sides of the pixel, where the halves really do
+        overlap in a quarter -- so it could not tell a product from an
+        intersection, whatever its name said."""
+        g = self._alpha(tmp_path, cli_mod, 3, 2,
+                        "arr[float] cp = [0.5, 0.0, 3.0, 0.0, 3.0, 2.0, 0.5, 2.0]\narr[int] ce = [4]\n"
+                        "arr[float] mask = rasClipMask(3, 2, cp, ce, RAS_NONZERO)\n"
+                        "arr[float] s = [0.0, 0.0, 0.5, 0.0, 0.5, 2.0, 0.0, 2.0]\narr[int] se = [4]\n"
+                        "rasFillPathClip(px, 3, 2, s, se, RAS_NONZERO, 9, 9, 9, 255, mask)\n")
+        assert g[0][0] == 64, "0.5 x 0.5, though the halves do not overlap"
+        assert g[0][1] == 0, "the clip is open here but the shape is absent"
+
+    def test_a_clip_outside_the_surface_lets_nothing_through(self, tmp_path, cli_mod):
+        g = self._alpha(tmp_path, cli_mod, 6, 6,
+                        "arr[float] cp = [50.0, 50.0, 60.0, 50.0, 60.0, 60.0]\narr[int] ce = [3]\n"
+                        "arr[float] mask = rasClipMask(6, 6, cp, ce, RAS_NONZERO)\n"
+                        "arr[float] all = [0.0, 0.0, 6.0, 0.0, 6.0, 6.0, 0.0, 6.0]\n"
+                        "arr[int] allEnds = [4]\n"
+                        "rasFillPathClip(px, 6, 6, all, allEnds, RAS_NONZERO, 9, 9, 9, 255, mask)\n")
+        assert all(v == 0 for row in g for v in row)
+
+    def test_a_stroke_is_clipped_like_a_fill(self, tmp_path, cli_mod):
+        """A stroke is a fill of its outline, so clipping it needs
+        nothing new -- but that is a claim, and this checks it: a
+        horizontal line clipped to its own left half."""
+        g = self._alpha(tmp_path, cli_mod, 12, 8,
+                        "arr[float] cp = [0.0, 0.0, 6.0, 0.0, 6.0, 8.0, 0.0, 8.0]\narr[int] ce = [4]\n"
+                        "arr[float] mask = rasClipMask(12, 8, cp, ce, RAS_NONZERO)\n"
+                        "arr[float] s = [1.0, 4.0, 11.0, 4.0]\narr[int] se = [2]\narr[int] sc = [0]\n"
+                        "rasStrokePathClip(px, 12, 8, s, se, sc, 4.0, 9, 9, 9, 255, mask)\n")
+        for y in range(8):
+            for x in range(12):
+                assert g[y][x] == (255 if 1 <= x < 6 and 2 <= y < 6 else 0), f"({x}, {y})"

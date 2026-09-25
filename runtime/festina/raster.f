@@ -146,6 +146,117 @@ float func rasMaxF(a:float, b:float) {
     return b
 }
 
+// The vertical span of rows a path can touch, clipped to the surface,
+// left in RAS_Y0 .. RAS_Y1 (half-open). False when it touches none.
+int RAS_Y0 = 0
+int RAS_Y1 = 0
+
+bool func rasPathExtent(pts:arr[float], sh:int) {
+    float minY = pts[1]
+    float maxY = pts[1]
+    int i = 1
+    while i < pts.length {
+        minY = rasMinF(minY, pts[i])
+        maxY = rasMaxF(maxY, pts[i])
+        i = i + 2
+    }
+    RAS_Y0 = rasClamp(Math.floor(minY), 0, sh)
+    RAS_Y1 = rasClamp(Math.floor(maxY) + 1, 0, sh)
+    return RAS_Y1 > RAS_Y0
+}
+
+// One pixel row's coverage of a path, into RAS_COV[0 .. sw), as a
+// fraction of the pixel: exact in x, RAS_SUB samples in y.
+//
+// Pulled out of rasFillPath so that the same coverage can go to three
+// places -- blended onto pixels, stored as a clip mask, or multiplied
+// by one -- without three copies of the scanline loop to drift apart.
+void func rasRowCoverage(row:int, sw:int, pts:arr[float], ends:arr[int], rule:int) {
+    int c = 0
+    while c < sw {
+        RAS_COV[c] = 0.0
+        c = c + 1
+    }
+    float invSub = 1.0 / RAS_SUB.toFloat()
+
+    int s = 0
+    while s < RAS_SUB {
+        float sy = row.toFloat() + ((s.toFloat() + 0.5) * invSub)
+
+        // Crossings of this sub-scanline with every edge, kept
+        // sorted by x as they are inserted: a scanline meets a
+        // handful of edges even in a complex path, and an
+        // insertion sort over parallel arrays avoids needing a
+        // comparator over a struct.
+        int nx = 0
+        int sub = 0
+        int from = 0
+        while sub < ends.length {
+            int to = ends[sub]
+            int p = from
+            while p < to {
+                int q = p + 1
+                if q == to { q = from }
+                float ax = pts[p * 2]
+                float ay = pts[(p * 2) + 1]
+                float bx = pts[q * 2]
+                float by = pts[(q * 2) + 1]
+                bool down = ay <= sy && by > sy
+                bool up = by <= sy && ay > sy
+                if down || up {
+                    float t = (sy - ay) / (by - ay)
+                    float xx = ax + (t * (bx - ax))
+                    int w = 1
+                    if up { w = -1 }
+                    // insert, keeping RAS_XS[0..nx) ascending
+                    while RAS_XS.length <= nx { RAS_XS.push(0.0) }
+                    while RAS_WS.length <= nx { RAS_WS.push(0) }
+                    int j = nx
+                    while j > 0 && RAS_XS[j - 1] > xx {
+                        RAS_XS[j] = RAS_XS[j - 1]
+                        RAS_WS[j] = RAS_WS[j - 1]
+                        j = j - 1
+                    }
+                    RAS_XS[j] = xx
+                    RAS_WS[j] = w
+                    nx = nx + 1
+                }
+                p = p + 1
+            }
+            from = to
+            sub = sub + 1
+        }
+
+        // Crossings to spans, by the fill rule.
+        int k = 0
+        int wind = 0
+        float spanStart = 0.0
+        bool inside = false
+        while k < nx {
+            if rule == RAS_EVENODD {
+                wind = wind + 1
+            } else {
+                wind = wind + RAS_WS[k]
+            }
+            bool wasIn = inside
+            if rule == RAS_EVENODD {
+                inside = (wind % 2) != 0
+            } else {
+                inside = wind != 0
+            }
+            if !wasIn && inside {
+                spanStart = RAS_XS[k]
+            }
+            if wasIn && !inside {
+                rasAddSpan(sw, spanStart, RAS_XS[k], invSub)
+            }
+            k = k + 1
+        }
+        s = s + 1
+    }
+
+}
+
 // Fill a path.
 //
 // `rule` is RAS_NONZERO or RAS_EVENODD. Colour is straight alpha, and
@@ -155,6 +266,16 @@ float func rasMaxF(a:float, b:float) {
 void func rasFillPath(px:arr[int], sw:int, sh:int,
                       pts:arr[float], ends:arr[int], rule:int,
                       r:int, g:int, b:int, a:int) {
+    arr[float] noMask = []
+    rasFillCore(px, sw, sh, pts, ends, rule, r, g, b, a, noMask, false)
+}
+
+// The fill itself, optionally through a clip mask. See slice 5 below
+// for what the mask means.
+void func rasFillCore(px:arr[int], sw:int, sh:int,
+                      pts:arr[float], ends:arr[int], rule:int,
+                      r:int, g:int, b:int, a:int,
+                      mask:arr[float], useMask:bool) {
     if sw <= 0 || sh <= 0 { return }
     if ends.length == 0 || pts.length < 6 { return }
     int ca = rasClamp(a, 0, 255)
@@ -164,106 +285,19 @@ void func rasFillPath(px:arr[int], sw:int, sh:int,
     int cb = rasClamp(b, 0, 255)
 
     rasEnsureCov(sw)
+    if !rasPathExtent(pts, sh) { return }
 
-    // Vertical extent, so rows the path cannot touch cost nothing.
-    float minY = pts[1]
-    float maxY = pts[1]
-    int i = 1
-    while i < pts.length {
-        minY = rasMinF(minY, pts[i])
-        maxY = rasMaxF(maxY, pts[i])
-        i = i + 2
-    }
-    int y0 = rasClamp(Math.floor(minY), 0, sh)
-    int y1 = rasClamp(Math.floor(maxY) + 1, 0, sh)
-    if y1 <= y0 { return }
-
-    float invSub = 1.0 / RAS_SUB.toFloat()
-
-    int row = y0
-    while row < y1 {
-        int c = 0
-        while c < sw {
-            RAS_COV[c] = 0.0
-            c = c + 1
-        }
-
-        int s = 0
-        while s < RAS_SUB {
-            float sy = row.toFloat() + ((s.toFloat() + 0.5) * invSub)
-
-            // Crossings of this sub-scanline with every edge, kept
-            // sorted by x as they are inserted: a scanline meets a
-            // handful of edges even in a complex path, and an
-            // insertion sort over parallel arrays avoids needing a
-            // comparator over a struct.
-            int nx = 0
-            int sub = 0
-            int from = 0
-            while sub < ends.length {
-                int to = ends[sub]
-                int p = from
-                while p < to {
-                    int q = p + 1
-                    if q == to { q = from }
-                    float ax = pts[p * 2]
-                    float ay = pts[(p * 2) + 1]
-                    float bx = pts[q * 2]
-                    float by = pts[(q * 2) + 1]
-                    bool down = ay <= sy && by > sy
-                    bool up = by <= sy && ay > sy
-                    if down || up {
-                        float t = (sy - ay) / (by - ay)
-                        float xx = ax + (t * (bx - ax))
-                        int w = 1
-                        if up { w = -1 }
-                        // insert, keeping RAS_XS[0..nx) ascending
-                        while RAS_XS.length <= nx { RAS_XS.push(0.0) }
-                        while RAS_WS.length <= nx { RAS_WS.push(0) }
-                        int j = nx
-                        while j > 0 && RAS_XS[j - 1] > xx {
-                            RAS_XS[j] = RAS_XS[j - 1]
-                            RAS_WS[j] = RAS_WS[j - 1]
-                            j = j - 1
-                        }
-                        RAS_XS[j] = xx
-                        RAS_WS[j] = w
-                        nx = nx + 1
-                    }
-                    p = p + 1
-                }
-                from = to
-                sub = sub + 1
+    int row = RAS_Y0
+    while row < RAS_Y1 {
+        rasRowCoverage(row, sw, pts, ends, rule)
+        if useMask {
+            int base = row * sw
+            int c = 0
+            while c < sw {
+                RAS_COV[c] = RAS_COV[c] * mask[base + c]
+                c = c + 1
             }
-
-            // Crossings to spans, by the fill rule.
-            int k = 0
-            int wind = 0
-            float spanStart = 0.0
-            bool inside = false
-            while k < nx {
-                if rule == RAS_EVENODD {
-                    wind = wind + 1
-                } else {
-                    wind = wind + RAS_WS[k]
-                }
-                bool wasIn = inside
-                if rule == RAS_EVENODD {
-                    inside = (wind % 2) != 0
-                } else {
-                    inside = wind != 0
-                }
-                if !wasIn && inside {
-                    spanStart = RAS_XS[k]
-                }
-                if wasIn && !inside {
-                    rasAddSpan(sw, spanStart, RAS_XS[k], invSub)
-                }
-                k = k + 1
-            }
-            s = s + 1
         }
-
         rasBlendRow(px, sw, row, cr, cg, cb, ca)
         row = row + 1
     }
@@ -746,4 +780,125 @@ void func rasStrokePath(px:arr[int], sw:int, sh:int,
     arr[int] outlineEnds = []
     rasStrokeOutline(pts, ends, closed, width, outline, outlineEnds)
     rasFillPath(px, sw, sh, outline, outlineEnds, RAS_NONZERO, r, g, b, a)
+}
+
+// ---- Slice 5: clipping, as a coverage mask ----
+//
+// A clip is a mask: one float per pixel, the fraction of that pixel
+// the clip lets through. A mask built from a path is simply that path's
+// coverage, computed by the same rasRowCoverage every fill uses, and a
+// clipped draw multiplies its own coverage by the mask pixel for pixel
+// before blending.
+//
+// **Multiplying coverages is not intersecting shapes, and it is still
+// the right definition.** Where both the shape and the clip have a
+// soft edge in the same pixel, the product is not the area of their
+// geometric intersection: a pixel half-covered by each can truly
+// contain anything from none of their overlap to half of it, and the
+// product says a quarter regardless. That is how Cairo's clip works,
+// and every mask-based compositor's -- it is the definition, not an
+// approximation of some better one, and the tests hold it to the
+// product rather than to the intersection. Wherever EITHER edge is
+// pixel-aligned the two agree exactly, and that is tested too.
+//
+// Why a mask rather than clipping the geometry: a mask composes. Two
+// clips intersect by multiplying, an antialiased clip needs nothing
+// special, and it works identically for fills and for strokes, which
+// are fills. Clipping polygons against polygons exactly is a much
+// larger piece of code that would still have to decide what a soft
+// clip edge means.
+
+// A clip that lets everything through: the state before any clip.
+arr[float] func rasClipAll(sw:int, sh:int) {
+    arr[float] mask = []
+    int n = sw * sh
+    int i = 0
+    while i < n {
+        mask.push(1.0)
+        i = i + 1
+    }
+    return mask
+}
+
+// A clip from a path: that path's coverage, capped at one.
+arr[float] func rasClipMask(sw:int, sh:int, pts:arr[float], ends:arr[int], rule:int) {
+    arr[float] mask = []
+    int n = sw * sh
+    int i = 0
+    while i < n {
+        mask.push(0.0)
+        i = i + 1
+    }
+    if sw <= 0 || sh <= 0 { return mask }
+    if ends.length == 0 || pts.length < 6 { return mask }
+    rasEnsureCov(sw)
+    if !rasPathExtent(pts, sh) { return mask }
+    int row = RAS_Y0
+    while row < RAS_Y1 {
+        rasRowCoverage(row, sw, pts, ends, rule)
+        int base = row * sw
+        int c = 0
+        while c < sw {
+            float v = RAS_COV[c]
+            if v > 1.0 { v = 1.0 }
+            mask[base + c] = v
+            c = c + 1
+        }
+        row = row + 1
+    }
+    return mask
+}
+
+// Narrow a clip to its intersection with a path, in place.
+//
+// Every row is visited, not just the path's: a row the new path cannot
+// reach is outside it, so everything the old clip let through there is
+// now clipped away. Skipping those rows -- the obvious optimisation --
+// would leave them as open as before, and a clip that silently fails to
+// narrow is a clip that silently draws where it should not.
+void func rasClipIntersect(mask:arr[float], sw:int, sh:int,
+                           pts:arr[float], ends:arr[int], rule:int) {
+    if sw <= 0 || sh <= 0 { return }
+    bool any = ends.length > 0 && pts.length >= 6
+    if any {
+        rasEnsureCov(sw)
+        any = rasPathExtent(pts, sh)
+    }
+    int row = 0
+    while row < sh {
+        int base = row * sw
+        int c = 0
+        if any && row >= RAS_Y0 && row < RAS_Y1 {
+            rasRowCoverage(row, sw, pts, ends, rule)
+            while c < sw {
+                float v = RAS_COV[c]
+                if v > 1.0 { v = 1.0 }
+                mask[base + c] = mask[base + c] * v
+                c = c + 1
+            }
+        } else {
+            while c < sw {
+                mask[base + c] = 0.0
+                c = c + 1
+            }
+        }
+        row = row + 1
+    }
+}
+
+// Fill and stroke through a clip.
+void func rasFillPathClip(px:arr[int], sw:int, sh:int,
+                          pts:arr[float], ends:arr[int], rule:int,
+                          r:int, g:int, b:int, a:int, mask:arr[float]) {
+    rasFillCore(px, sw, sh, pts, ends, rule, r, g, b, a, mask, true)
+}
+
+void func rasStrokePathClip(px:arr[int], sw:int, sh:int,
+                            pts:arr[float], ends:arr[int], closed:arr[int],
+                            width:float, r:int, g:int, b:int, a:int,
+                            mask:arr[float]) {
+    arr[float] outline = []
+    arr[int] outlineEnds = []
+    rasStrokeOutline(pts, ends, closed, width, outline, outlineEnds)
+    rasFillCore(px, sw, sh, outline, outlineEnds, RAS_NONZERO, r, g, b, a, mask, true)
 }
