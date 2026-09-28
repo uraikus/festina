@@ -207,6 +207,14 @@ class TestEverythingElseStaysWithCairo:
         plain = _compile(tmp_path, cli_mod, _pixels_program(
             "fillStyle(0, 0, 0)\nchangeFont(20, null, null)\n", "a.drawText('Hello', 5, 40)\n"),
             name="plain")
+        # A throwaway Cairo run first. On CI's Windows job the FIRST
+        # process to draw italic differed from every later one -- Cairo
+        # against Cairo, 6 channels -- while the four runs after it all
+        # agreed, ours included (run 180). Why is not established; a
+        # font cache warming on a fresh runner would explain it and has
+        # not been checked. The claim tested is that the fallback draws
+        # what Cairo draws, and that needs Cairo in a steady state.
+        _run(tmp_path, prog, cairo_only=True)
         cairo1 = _run(tmp_path, prog, cairo_only=True)
         ours1 = _run(tmp_path, prog)
         cairo2 = _run(tmp_path, prog, cairo_only=True)

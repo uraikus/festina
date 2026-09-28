@@ -1134,6 +1134,17 @@ def _compile_to_cached_object(cc, args, obj_path, failure_message):
     return obj_path
 
 
+#: How far before a compile's start an object's mtime may fall and still
+#: count as "written since". Windows stamps files from a clock that ticks
+#: every ~15 ms, not the one time.time() reads, so an object written a
+#: moment AFTER `started` can carry an mtime before it -- which is what
+#: made the first version of this check refuse an object that had, in
+#: fact, just been built (CI run 180). A stale object cannot hide in the
+#: window: a compile only starts because the freshness check found the
+#: object missing or older than its sources, microseconds earlier.
+_MTIME_SLACK_SECONDS = 2.0
+
+
 def _publish_cached_object(staged, obj_path, started, attempts=20):
     """Rename `staged` over `obj_path`, or settle for an equivalent.
 
@@ -1151,7 +1162,7 @@ def _publish_cached_object(staged, obj_path, started, attempts=20):
             return
         except PermissionError:
             try:
-                if os.path.getmtime(obj_path) >= started:
+                if os.path.getmtime(obj_path) >= started - _MTIME_SLACK_SECONDS:
                     os.unlink(staged)
                     return
             except OSError:

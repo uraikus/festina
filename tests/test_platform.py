@@ -1350,6 +1350,11 @@ class TestSharedObjectCacheIsWrittenAtomically:
             with open(out, "wb") as fh:
                 fh.write(b"ours")
             obj.write_bytes(b"theirs")          # the winner lands mid-compile
+            # ...stamped as Windows stamps it: from a clock that ticks
+            # every ~15 ms, so a moment BEFORE the compile began as time.time()
+            # sees it. CI run 180 failed this very test by comparing the two
+            # clocks exactly.
+            os.utime(obj, (time.time() - 0.02, time.time() - 0.02))
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         monkeypatch.setattr(cli_mod, "_run_tool", run_tool)
         calls = self._refuse_replace(cli_mod, monkeypatch, times=99)
