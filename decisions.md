@@ -8948,3 +8948,14 @@ of 5, too weak to keep); with the fix it passes in about two seconds.
 The original test ran 0 hangs in 300 under load after the fix, and the
 HTTP churn programs are clean under the leak harness. Windows has no
 worker pool (callbacks block there), so this never applied to it.
+
+**The class, not just the instance.** Every other hand-off from a
+worker thread was checked for the same shape. The `thread` runtime's
+waits all re-test their condition under in_lock, and every producer
+changes the queue under that lock before signalling, so no wakeup can
+fall between; messages to the main thread are not signalled at all --
+the main loop polls every 20 ms while a thread is alive. The blob/img/
+aud async pool reaches the main loop the same way, by a 20 ms poll, not
+a pipe. Audio's buffer callbacks signal with the lock held. The HTTP
+pool was the only wake pipe in the runtime, and the only place a byte
+could be thrown away after the fact.
