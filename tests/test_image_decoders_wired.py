@@ -22,6 +22,7 @@ the formats the port does cover stop needing libjpeg and Cairo's PNG
 reader.
 """
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -106,7 +107,11 @@ class TestTheTrigger:
             "fillStyle(red)\n"
             "drawPixel(0, 0)\n"
             "saveCanvas('out.png')\n", "drawing")
-        assert "jpgDecode" not in syms
+        # The entry point, not a helper: helpers are internal to the
+        # component now (_COMPONENT_EXPORTS) and -O2 may inline them
+        # away, so their absence would pass whether or not the decoder
+        # was linked. The one exported name cannot vanish that way.
+        assert "festinaDecodeImage" not in syms
 
     def test_a_program_that_merely_mentions_the_call_gets_no_decoder(
             self, tmp_path, cli_mod):
@@ -120,8 +125,7 @@ class TestTheTrigger:
         syms = self._symbols(
             tmp_path, cli_mod,
             "log('  %t1 = call ptr @festinaDecodeImage(ptr %t0)')\n", "quoting")
-        assert "jpgDecode" not in syms
-        assert "inflateZlib" not in syms
+        assert "festinaDecodeImage" not in syms
 
     @pytest.mark.parametrize("source,name", [
         ("img a = 'x.png'\nlog(a.width)\n", "decl"),
@@ -131,12 +135,18 @@ class TestTheTrigger:
     def test_a_program_that_loads_an_image_gets_the_whole_decode_path(
             self, source, name, tmp_path, cli_mod):
         # imageload.f imports png.f and jpeg.f, which import inflate.f:
-        # linking one object brings the whole decode path with it.
+        # linking one object brings the whole decode path with it. The
+        # object is linked when its one exported name is; that it holds
+        # the whole path is a property of the object, read from its IR.
+        # The helpers are INTERNAL there, so they cannot collide with a
+        # program's own names -- and so the binary must not export them.
         syms = self._symbols(tmp_path, cli_mod, source, name)
         assert "festinaDecodeImage" in syms
-        assert "pngDecode" in syms
-        assert "jpgDecode" in syms
-        assert "inflateZlib" in syms
+        ir = cli_mod.component_ir("imageload")
+        for helper in ("pngDecode", "jpgDecode", "inflateZlib"):
+            assert f"define internal ptr @{helper}(" in ir, helper
+            # " T " is a global text symbol; macOS's nm adds a leading _.
+            assert not re.search(rf" T _?{helper}$", syms, re.M), f"{helper} is exported"
 
 
 class TestTheComponentObject:
@@ -171,7 +181,7 @@ class TestTheComponentObject:
         registered as a global constructor instead, so it still runs --
         before main, without the user's program emitting a call."""
         ir = self._stripped()
-        assert "define void @__festina_component_init_imageload(" in ir
+        assert "define internal void @__festina_component_init_imageload(" in ir
         assert "@llvm.global_ctors" in ir
         assert "@__festina_component_init_imageload, ptr null" in ir
 
@@ -203,8 +213,11 @@ class TestTheComponentObject:
         ir = self._stripped()
         assert "@__festina_db = external global" in ir
         assert "@argv = external global" in ir
-        assert "@JPG_ZIGZAG.header = global" in ir
-        assert "@INF_IN = global" in ir
+        # Definitions, INTERNAL ones: a component's state is its own
+        # and must not collide with a program's globals of the same
+        # name. `external` would be the bug this test was written for.
+        assert "@JPG_ZIGZAG.header = internal global" in ir
+        assert "@INF_IN = internal global" in ir
 
 
 class TestItActuallyDecodes:

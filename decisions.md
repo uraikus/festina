@@ -8837,3 +8837,77 @@ run once per size disagreed 47% of the time. The two instruments were
 measuring different programs. That test is gone: it asserted a
 property of the machine's font configuration and of call order, not
 of anything font.f does.
+
+352. THE DEFAULT FACE IS BUNDLED, UNHINTED, AND DRAWN BY font.f
+
+Decided by the user, after runtime.md's phase 5 spec put three
+questions: bundle DejaVu Sans (yes), draw it unhinted in greyscale
+(yes). The third -- whether italic should slant and text should take a
+gradient, both api.md promises the runtime does not keep -- was not
+answered, so both keep today's behaviour.
+
+**What changed for programs.** Regular `sans-serif` text at a whole-
+pixel size, under no scale or rotation, is now drawn and measured by
+`runtime/festina/text.f` (on font.f and raster.f) from
+`runtime/fonts/DejaVuSans.ttf`, and looks the same on every machine.
+`measureTextWidth` is unchanged -- exact before and after, per phase 5
+slice 4. `measureTextHeight` now reports unhinted heights ('Hello' at
+16 px: 14, where hinted Linux said 12) and no longer depends on the
+first size a program used (#351). Bold, italic, other families, and a
+scaled or rotated transform go to Cairo exactly as before, and a test
+checks each draws the same bytes either way. FESTINA_CAIRO_TEXT=1 sends
+everything to Cairo, for comparison.
+
+**The seam.** text.f answers COVERAGE -- a mask -- and the C side
+composites it with the source it always set, so colour, fillAlpha and
+text ignoring gradients are unchanged by construction. The drawn alpha
+of black text on a transparent image is byte for byte text.f's mask,
+at three sizes. The font's bytes, and a table of text.f's three entry
+points, are an object festina/cli.py generates (`text_font_source`)
+and links only into programs that draw or measure text: 781,008 bytes
+more than the same program without. It registers itself from a
+constructor, so a program without text needs no stub.
+
+**Five things the wiring found.**
+
+1. `measureTextWidth('')` returned 19. `''.split('')` in Festina is ONE
+   empty element, not none, so the empty text laid out as a .notdef
+   box. An existing test (test_text_metrics_follow_the_declared_font)
+   caught it; slice 4's word list had no empty string, and has now.
+
+2. A component's insides were public. font.f's tests import font.f and
+   measure text, and the link failed on duplicate `fntHas` and `FNT_IN`
+   -- as it would have for any program with a function named like any
+   component helper, the image decoders' included. Components now
+   export only their entry points (`_COMPONENT_EXPORTS`) and everything
+   else is internal. Two image-decoder tests had checked "the decoder is
+   linked" by looking for helper names like `pngDecode` in the binary;
+   internal and inlined, those can vanish whether or not the decoder is
+   there, so the tests would have passed blind. They check the exported
+   entry now, and that no helper is exported.
+
+3. Text needed a lock. text.f, font.f and raster.f keep state in
+   globals, and worker threads may draw text into their own images
+   (#234). Two workers drawing at once, without the lock, crashed 5 runs
+   out of 5 -- segfaults and malloc's heap-corruption aborts. With an
+   atomic_flag spinlock around the component calls, their images are
+   byte-identical to the main thread's.
+
+4. The packaged compiler (scripts/package_compiler.sh) listed eight
+   runtime files by name and had missed everything since: the http,
+   https, async, thread and test runtimes, the Festina components, and
+   now the font and its header -- which every runtime object's freshness
+   check reads, so without it even hello.f would not build. And the
+   component cache's freshness read the compiler's .py files, which a
+   packaged compiler does not have. The whole runtime/ directory is
+   packaged now, a frozen compiler's identity is its executable, and
+   test_packaging.py builds a program that loads an image and draws and
+   measures text, where it used to build only hello.f.
+
+5. No stress program drew text, deliberately -- Cairo's text path
+   reaches fontconfig, whose process-lifetime caches LeakSanitizer
+   reports. The default face no longer goes there, so
+   tests/stress/draw_text_churn.f now churns drawing and measuring
+   under scripts/leak_stress.sh, which builds the text component and
+   the font instrumented. Clean; with the C side's release of the mask
+   put back, it reports 800 leaked arrays.

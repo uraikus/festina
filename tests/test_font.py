@@ -1082,7 +1082,7 @@ int main(int argc, char **argv) {
 LAYOUT_WORDS = ([chr(c) for c in range(33, 127) if chr(c) not in "'`$\\{}"] +
                 ["Hello", "xg", " ", "Handgloves", "The quick brown fox", "iiiiiiii", "WAVE",
                  "fi fl", "0123456789", "\u00e9", "\u00c5ngstr\u00f6m", "\u00c9\u00c7\u00d1",
-                 "\u4e2d", "a\U0001F600b", "a\U00020000b", "\ue000", "  two  spaces  "])
+                 "\u4e2d", "a\U0001F600b", "a\U00020000b", "\ue000", "  two  spaces  ", ""])
 LAYOUT_SIZES = list(range(6, 73, 3))
 
 
@@ -1133,7 +1133,10 @@ class TestLayout:
         lines = _run_in(tmp_path, prog, open(_font("DejaVuSans.ttf"), "rb").read())
         out = {}
         for line in lines:
-            parts = line.split(" | ")
+            # "px k width height | gid:x gid:x ... | runtimeWidth runtimeHeight",
+            # split on the bar alone: the empty text has no glyphs, so its
+            # middle field is empty and " | " would not find both bars.
+            parts = line.split("|")
             px, k, w, h = map(int, parts[0].split()[:4])
             out[(px, k)] = (w, h, parts[1].split() if len(parts) > 1 else [],
                             tuple(map(int, parts[2].split())) if len(parts) > 2 else None)
@@ -1199,7 +1202,7 @@ class TestLayout:
         lines = _run_in(tmp_path / "run", built.build_program(_layout_program(words, sizes)), font)
         ours = {}
         for line in lines:
-            head, glyphs = line.split(" |")
+            head, glyphs = line.split("|")[:2]
             px, k, w, h = map(int, head.split())
             ours[(px, k)] = (w, h, glyphs.split())
         oracle = _build_c(built, "cairo_text", CAIRO_TEXT_C, ["cairo", "freetype2"])

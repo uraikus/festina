@@ -861,6 +861,7 @@ identical to *a stated configuration*, and the spec has to choose one.
   FreeType's light hinting mode, and native TrueType hinting is a
   bytecode interpreter for the fonts' own instruction programs;
   neither is in scope. **This is a visible change and it is the user's call.**
+  (Decided: unhinted — decisions.md #352.)
 - **No kerning, no ligatures**, to match. A later phase can add
   kerning from `kern`/GPOS as a deliberate change; it would change
   `measureTextWidth`, so it is not a port detail either.
@@ -941,7 +942,9 @@ My recommendation is to bundle one face as the default and scan for
 any family a program names explicitly: the default is what almost
 every program uses, and it is the part that most needs to be the same
 everywhere. That is a recommendation, not a decision; the choice is
-the user's, and the bundle needs permission.
+the user's, and the bundle needs permission. (Decided: DejaVu Sans is
+bundled — decisions.md #352. The directory scan for named families was
+not asked for and is not built: other families stay with Cairo.)
 
 **Slices, in dependency order.** Each ends green and is useful alone:
 
@@ -960,8 +963,9 @@ the user's, and the bundle needs permission.
    `measureTextWidth` reproduced exactly, and `measureTextHeight`
    exactly against the unhinted reference — not against today's runtime,
    whose heights depend on hinting (see slice 4, as built)
-5. the font decision implemented, whichever it is
-6. wiring: `drawText`, `img.drawText` and both measures reach font.f
+5. ✅ the font decision implemented, whichever it is — DejaVu Sans,
+   bundled
+6. ✅ wiring: `drawText`, `img.drawText` and both measures reach font.f
    behind a switch, the way phase 4's wiring will, with refused fonts
    falling through to Cairo
 
@@ -1150,6 +1154,33 @@ width `FT_DivFix`'s rounding changes at a tested size. Cairo on that
 file settles both: the height is the control box's (60 px, not 30, at
 40 px), and the rounding is there. Six bugs were put back; both of
 those survived until the built font existed, and all six fail now.
+
+**Slices 5 and 6, as built** (decisions.md #352 has the decisions and
+what the wiring found). `runtime/fonts/DejaVuSans.ttf` is the default
+face, unmodified, with its licence beside it. `runtime/festina/text.f`
+answers three questions for the C side — how wide, how tall, and which
+pixels a line covers — and regular `sans-serif` text at a whole-pixel
+size under no scale or rotation goes through it; bold, italic, other
+families and scaled or rotated text go to Cairo as before, byte for
+byte, which a test checks for each.
+
+text.f's answer is a coverage mask: each glyph rasterised in a box its
+own size and added into the line's mask, saturating, which is how
+Cairo accumulates a glyph run. C composites the mask with the source it
+always set — so colour, fillAlpha, and text's indifference to
+gradients are the C side's and unchanged — and the result is exact:
+black text on a transparent image leaves alpha equal to the mask, byte
+for byte, at 9, 16 and 31 px. The canvas and an `img` draw identical
+text.
+
+The font reaches a program as generated C — the bytes and a table of
+text.f's entry points, registered from a constructor — linked only
+where text is drawn or measured (781,008 bytes). Components export
+only their entry points now; text.f is serialised behind a spinlock,
+without which two workers drawing text crashed every time;
+FESTINA_CAIRO_TEXT=1 is the switch back to Cairo; the packaged compiler
+carries the whole runtime directory; and text is under the leak
+harness for the first time.
 
 ## Tests
 

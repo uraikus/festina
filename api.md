@@ -2504,6 +2504,21 @@ and `same` above are literally the same record. An empty literal
 (`font f = ''`) is rejected — it says nothing, and is far likelier to be
 a mistake than an intent.
 
+#### The default face
+
+The default family, `sans-serif`, is **DejaVu Sans, bundled with the
+compiler** and linked into every program that draws or measures text.
+Regular text in it — no `bold`, no `italic` — at any whole-pixel size
+looks the same on every machine: the same font, anti-aliased in
+greyscale, not hinted, whatever fonts or font settings the machine has.
+A program that draws no text carries none of it.
+
+Everything else — `bold`, `italic`, and any other family — is found
+among the machine's installed fonts and drawn as before, so it can
+differ between machines. So can text drawn under a `scale` or `rotate`,
+in any face. (DejaVu Sans's licence travels with the font:
+`runtime/fonts/LICENSE-DejaVu`.)
+
 ### Computing a color or font at runtime
 
 There is deliberately **no way to turn a runtime `text` value into a
@@ -2642,6 +2657,13 @@ the inked height of *that string*, which is why it takes the text:
 `'x'` is shorter than `'Xg'`. For a stable line height independent of
 which letters appear, measure a string with both an ascender and a
 descender.
+
+In the default face both are exact and the same everywhere: advances
+are rounded to whole pixels per character, and the height is taken
+from the unhinted outlines, so `'Hello'` at 16px is 40 wide and 14
+tall on every machine. (Before the default face was bundled, the
+height depended on the machine's font settings, and on Linux even on
+the first text size a program happened to use.)
 
 ## Files
 

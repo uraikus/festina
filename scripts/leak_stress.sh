@@ -170,10 +170,35 @@ if [ $GFX_OK = 1 ]; then
     fi
 fi
 
+# runtime.md phase 5: text.f and the bundled font, the same way and for
+# the same reasons as the decoders above -- the component's IR from
+# cli.component_ir, the font object's C from cli.text_font_source.
+# Linked into every program here, as the graphics object is; a program
+# that draws no text never calls it. Default-face text through this
+# path is the first text the harness can churn at all: Cairo's reaches
+# fontconfig, whose process-lifetime caches LeakSanitizer reports (see
+# tests/stress/media_churn.f and draw_text_churn.f).
+TEXT_OK=0
+if [ $GFX_OK = 1 ]; then
+    if (cd "$ROOT" && python3 -c 'from festina import cli; print(cli.component_ir("text"), end="")') > "$WORK/text.ll" 2> "$WORK/text.err" \
+        && (cd "$ROOT" && python3 -c 'from festina import cli; print(cli.text_font_source(), end="")') > "$WORK/text_font.c" 2>> "$WORK/text.err"; then
+        sed -E 's/^(define [^{]+) \{/\1 sanitize_address {/' "$WORK/text.ll" > "$WORK/text.asan.ll"
+        "$IR_CC" -fsanitize=address -g -O1 -c "$WORK/text.asan.ll" -o "$WORK/rt_text.o" 2> "$WORK/text.cc.err" \
+            && "$SAN_CC" -fsanitize=address -g -O0 -c "$WORK/text_font.c" -I "$ROOT/runtime" -o "$WORK/rt_text_font.o" 2>> "$WORK/text.cc.err" \
+            && TEXT_OK=1
+    fi
+    if [ $TEXT_OK = 0 ]; then
+        echo "leak_stress: could not build the Festina text component" >&2
+        sed 's/^/    /' "$WORK/text.err" "$WORK/text.cc.err" 2>/dev/null >&2
+        exit 1
+    fi
+fi
+
 LIBS=(-lsqlite3 -lm -pthread)
 OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o" "$WORK/rt_thread.o" "$WORK/rt_http.o")
 [ $GFX_OK = 1 ] && { OBJS+=("$WORK/rt_graphics.o"); LIBS+=($(pkg-config --libs cairo-xlib x11 libjpeg)); }
 [ $IMG_OK = 1 ] && OBJS+=("$WORK/rt_imageload.o")
+[ $TEXT_OK = 1 ] && OBJS+=("$WORK/rt_text.o" "$WORK/rt_text_font.o")
 [ $AUD_OK = 1 ] && { OBJS+=("$WORK/rt_audio.o"); LIBS+=($(pkg-config --libs alsa libmpg123)); }
 [ $HTTPS_OK = 1 ] && { OBJS+=("$WORK/rt_https.o"); LIBS+=($(pkg-config --libs mbedtls mbedx509 mbedcrypto)); }
 

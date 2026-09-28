@@ -137,20 +137,21 @@ if [[ -n "${MSYSTEM:-}" ]]; then
 fi
 
 cd "$REPO_ROOT"
+# The whole runtime/ directory, not a list of files in it. The list
+# this replaced named eight C files and headers and missed everything
+# added since: the http, https, async, thread and test runtimes, the
+# Festina components (runtime/festina/), the bundled font
+# (runtime/fonts/) and its header -- so a packaged compiler built
+# hello.f, the only thing its test tried, and could not build a program
+# that loaded an image. tests/test_packaging.py now builds one that
+# does, and draws and measures text. A directory cannot fall behind.
 pyinstaller \
     --onefile \
     --name festina \
     --distpath "$DISTPATH" \
     --workpath "$WORKPATH" \
     --specpath "$SPECPATH" \
-    --add-data "$RUNTIME_DIR/festina_runtime.c${ADD_DATA_SEP}runtime" \
-    --add-data "$RUNTIME_DIR/festina_runtime_graphics.c${ADD_DATA_SEP}runtime" \
-    --add-data "$RUNTIME_DIR/festina_runtime_audio.c${ADD_DATA_SEP}runtime" \
-    --add-data "$RUNTIME_DIR/festina_runtime_window_mac.m${ADD_DATA_SEP}runtime" \
-    --add-data "$RUNTIME_DIR/festina_runtime_window_win32.c${ADD_DATA_SEP}runtime" \
-    --add-data "$RUNTIME_DIR/festina_runtime.h${ADD_DATA_SEP}runtime" \
-    --add-data "$RUNTIME_DIR/festina_runtime_internal.h${ADD_DATA_SEP}runtime" \
-    --add-data "$RUNTIME_DIR/festina_runtime_window.h${ADD_DATA_SEP}runtime" \
+    --add-data "$RUNTIME_DIR${ADD_DATA_SEP}runtime" \
     --paths . \
     packaging/festina_entry.py
 

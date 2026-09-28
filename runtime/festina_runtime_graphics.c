@@ -418,6 +418,139 @@ static void festina_apply_font(cairo_t *cr) {
     cairo_set_font_size(cr, g_font_size);
 }
 
+/* ---- runtime.md phase 5, slice 6: text through font.f ----
+ *
+ * The default face -- sans-serif, regular, at a whole-pixel size -- is
+ * drawn and measured by runtime/festina/text.f from the bundled DejaVu
+ * Sans, unhinted and in greyscale (decisions.md #352), instead of by
+ * Cairo and whatever font this machine's fontconfig picks. Everything
+ * else stays with Cairo, unchanged: bold (the bold face is not
+ * bundled), italic (which today draws upright on a default Linux
+ * install -- runtime.md phase 5 -- and changing that is a separate
+ * decision), any other family, and a transform that scales or rotates.
+ *
+ * text.f answers coverage; this side composites it with the same
+ * source it always set, so colour, fillAlpha, and text's standing
+ * indifference to gradients are unchanged. FESTINA_CAIRO_TEXT=1 sends
+ * everything back to Cairo -- the comparison the tests draw against. */
+#include "festina_text_hooks.h"
+
+static const FestinaTextHooks *g_text_hooks = NULL;
+
+void festina_text_register(const FestinaTextHooks *hooks) {
+    g_text_hooks = hooks;
+}
+
+/* text.f, font.f and raster.f keep their working state in globals --
+ * the open font, raster.f's scanline scratch -- and a worker thread
+ * may draw text into its own `img` (claude.md #234) while another
+ * does the same. Cairo's text path was safe for that, so this one is
+ * serialised: one call into the component at a time. A spinlock
+ * rather than a mutex, the same plain-C11 stance #240's lock-free
+ * circle cache takes; a call holds it for the time one line of text
+ * takes to rasterise. */
+static atomic_flag g_text_lock = ATOMIC_FLAG_INIT;
+
+static void festina_text_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_text_lock, memory_order_acquire)) {
+        /* spin */
+    }
+}
+
+static void festina_text_unlock(void) {
+    atomic_flag_clear_explicit(&g_text_lock, memory_order_release);
+}
+
+static int festina_text_ci_equal(const char *a, const char *b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+/* Is the current font text.f's to draw? */
+static int festina_text_ours(void) {
+    static atomic_int cairo_only = -1;       /* -1: environment not read yet */
+    if (!g_text_hooks) return 0;
+    int only = atomic_load_explicit(&cairo_only, memory_order_relaxed);
+    if (only < 0) {
+        const char *e = getenv("FESTINA_CAIRO_TEXT");
+        only = e && *e && strcmp(e, "0") != 0;
+        atomic_store_explicit(&cairo_only, only, memory_order_relaxed);
+    }
+    if (only) return 0;
+    if (g_font_slant != CAIRO_FONT_SLANT_NORMAL) return 0;
+    if (g_font_weight != CAIRO_FONT_WEIGHT_NORMAL) return 0;
+    if (!festina_text_ci_equal(g_font_family, "sans-serif")) return 0;
+    if (g_font_size < 1.0 || g_font_size > 4096.0 || g_font_size != floor(g_font_size)) return 0;
+    return 1;
+}
+
+/* The font's bytes as the arr[int] text.f reads, built once and never
+ * freed: its refcount is the negative immortal sentinel, so no
+ * Festina code that holds it -- font.f keeps it in a global -- ever
+ * releases it. Called only with the text lock held. */
+static void *festina_text_font(void) {
+    static void *payload = NULL;
+    if (payload) return payload;
+    int64_t n = g_text_hooks->font_len;
+    char *raw = calloc(1, sizeof(int64_t) + 2 * sizeof(int64_t));
+    int64_t *data = malloc((size_t)(n ? n : 1) * sizeof(int64_t));
+    if (!raw || !data) festina_fail("out of memory loading the bundled font");
+    *(int64_t *)raw = -1;
+    int64_t *header = (int64_t *)(raw + sizeof(int64_t));
+    for (int64_t i = 0; i < n; i++) data[i] = g_text_hooks->font[i];
+    header[0] = n;
+    memcpy(&header[1], &data, sizeof(int64_t *));
+    payload = header;
+    return payload;
+}
+
+/* Draw `text` with its pen at (x, y) on `cr`, whose source is already
+ * set, if text.f can: returns 1 when it did (including a line with no
+ * ink), 0 to fall back to Cairo. Only under an identity transform or a
+ * whole-pixel translation, where the mask lands on device pixels as it
+ * was computed; a scale or rotation would resample it. */
+static int festina_text_draw(cairo_t *cr, const cairo_matrix_t *m, const char *text,
+                             int64_t x, int64_t y) {
+    if (!festina_text_ours()) return 0;
+    if (m && (m->xx != 1.0 || m->yy != 1.0 || m->xy != 0.0 || m->yx != 0.0 ||
+              m->x0 != floor(m->x0) || m->y0 != floor(m->y0))) return 0;
+    festina_text_lock();
+    int64_t *arr = g_text_hooks->mask(text, (int64_t)g_font_size, festina_text_font());
+    festina_text_unlock();
+    if (!arr) return 0;
+    int64_t len = arr[0];
+    int64_t *d;
+    memcpy(&d, &arr[1], sizeof(d));
+    int handled = 0;
+    if (len >= 4) {
+        int64_t x0 = d[0], y0 = d[1], w = d[2], h = d[3];
+        if (w <= 0 || h <= 0) {
+            handled = 1;                    /* nothing inked: nothing to draw */
+        } else if (len == 4 + w * h && w < 65536 && h < 65536) {
+            cairo_surface_t *mask = cairo_image_surface_create(CAIRO_FORMAT_A8, (int)w, (int)h);
+            if (cairo_surface_status(mask) == CAIRO_STATUS_SUCCESS) {
+                unsigned char *px = cairo_image_surface_get_data(mask);
+                int stride = cairo_image_surface_get_stride(mask);
+                for (int64_t row = 0; row < h; row++) {
+                    for (int64_t col = 0; col < w; col++) {
+                        px[row * stride + col] = (unsigned char)d[4 + row * w + col];
+                    }
+                }
+                cairo_surface_mark_dirty(mask);
+                cairo_mask_surface(cr, mask, (double)(x + x0), (double)(y + y0));
+                handled = 1;
+            }
+            cairo_surface_destroy(mask);
+        }
+    }
+    festina_release_array(arr);
+    return handled;
+}
+
 /* claude.md #89: measuring deliberately does NOT require the canvas
  * window. Text metrics depend only on the font, so these run against a
  * tiny scratch image surface and work in a program that never draws
@@ -435,6 +568,12 @@ static cairo_t *festina_measure_context(void) {
 
 int64_t festina_measure_text_width(const char *text) {
     if (!text) text = "";
+    if (festina_text_ours()) {
+        festina_text_lock();
+        int64_t w = g_text_hooks->width(text, (int64_t)g_font_size, festina_text_font());
+        festina_text_unlock();
+        if (w >= 0) return w;
+    }
     cairo_t *cr = festina_measure_context();
     cairo_text_extents_t ext;
     cairo_text_extents(cr, text, &ext);
@@ -447,6 +586,12 @@ int64_t festina_measure_text_width(const char *text) {
 
 int64_t festina_measure_text_height(const char *text) {
     if (!text) text = "";
+    if (festina_text_ours()) {
+        festina_text_lock();
+        int64_t h = g_text_hooks->height(text, (int64_t)g_font_size, festina_text_font());
+        festina_text_unlock();
+        if (h >= 0) return h;
+    }
     cairo_t *cr = festina_measure_context();
     cairo_text_extents_t ext;
     cairo_text_extents(cr, text, &ext);
@@ -1642,6 +1787,10 @@ void festina_draw_text(const char *text, int64_t x, int64_t y) {
      * filled only -- borderColor outlines shapes, not glyphs. */
     if (g_fill_none) { cairo_destroy(cr); return; }
     cairo_set_source_rgba(cr, g_fill_r, g_fill_g, g_fill_b, g_fill_alpha);
+    if (festina_text_draw(cr, g_transform_ready ? &g_transform : NULL, text, x, y)) {
+        cairo_destroy(cr);
+        return;
+    }
     festina_apply_font(cr);
     cairo_move_to(cr, (double)x, (double)y);
     cairo_show_text(cr, text);
@@ -2600,12 +2749,15 @@ void festina_image_draw_circle_colors(void *img, int64_t x, int64_t y, int64_t r
 
 void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y) {
     if (!img || !text) return;
-    cairo_t *cr = festina_image_context((FestinaImageBox *)img);
+    FestinaImageBox *box = (FestinaImageBox *)img;
+    cairo_t *cr = festina_image_context(box);
     if (g_fill_none) { cairo_destroy(cr); return; }
     cairo_set_source_rgba(cr, g_fill_r, g_fill_g, g_fill_b, g_fill_alpha);
-    festina_apply_font(cr);
-    cairo_move_to(cr, (double)x, (double)y);
-    cairo_show_text(cr, text);
+    if (!festina_text_draw(cr, box->transform_ready ? &box->transform : NULL, text, x, y)) {
+        festina_apply_font(cr);
+        cairo_move_to(cr, (double)x, (double)y);
+        cairo_show_text(cr, text);
+    }
     cairo_destroy(cr);
     festina_image_bytes_now_stale(img);
 }

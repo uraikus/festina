@@ -102,3 +102,40 @@ class TestPackagedCompilerBinary:
         )
         assert result.returncode == 0, result.stderr
         assert "define" in result.stdout  # real LLVM IR, not an error message
+
+    def test_the_runtime_travels_whole(self, packaged_binary, tmp_path):
+        """The packaged compiler needs every file the unpackaged one reads
+        from runtime/, not only the C files someone remembered to list.
+        The list it used to have named eight files; it missed the
+        Festina components (runtime/festina/), the bundled font
+        (runtime/fonts/), and the http, https, async, thread and test
+        runtimes -- so a packaged compiler could build hello.f, which is
+        all this file used to try, and not a program that loads an
+        image or draws text. This one does both."""
+        if not _c_compiler_available():
+            pytest.skip("no C compiler to link what the packaged binary produces")
+        if subprocess.run(["pkg-config", "--exists", "cairo"]).returncode != 0:
+            if os.environ.get("FESTINA_STRICT_DEPS"):
+                pytest.fail("cairo's development files are required here")
+            pytest.skip("cairo's development files are not installed")
+        src = tmp_path / "text.f"
+        src.write_text(
+            "img a = blankImage(64, 24)\n"
+            "fillStyle(0, 0, 0)\n"
+            "a.drawText('ok', 2, 18)\n"
+            "log(a.save('a.png'))\n"
+            "img b = 'a.png'\n"
+            "log(b.width)\n"
+            "log(measureTextWidth('ok'))\n")
+        out = tmp_path / "text"
+        result = subprocess.run(
+            [packaged_binary, "compile", str(src), "-o", str(out)],
+            cwd=tmp_path, capture_output=True, text=True, timeout=300)
+        assert result.returncode == 0, f"compile failed:\n{result.stderr}"
+        run = subprocess.run([str(out)], cwd=tmp_path, capture_output=True, text=True,
+                             timeout=60, env=dict(os.environ, DISPLAY=""))
+        assert run.returncode == 0, run.stderr
+        # 19: DejaVu Sans at the default 16 px, o 1253 and k 1186 units
+        # of 2048, rounded per glyph to 10 + 9 -- the same number the
+        # unpackaged compiler gives.
+        assert run.stdout.split() == ["true", "64", "19"]

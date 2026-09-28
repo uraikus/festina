@@ -440,6 +440,13 @@ class TestLeakStress:
         assert set(_stress_programs()) == {
             "collections_churn.f",      # arr[T]/map[T], nested and aliased
             "media_churn.f",            # img/aud/blob handles, incl. BLOB round trips
+            # runtime.md phase 5 / decisions.md #352: text drawn and
+            # measured through text.f -- a mask array handed from
+            # Festina to C and released there every call, and the font
+            # array C builds once as immortal. The first text any stress
+            # program draws: Cairo's text path was untestable here, its
+            # fontconfig caches being process-lifetime.
+            "draw_text_churn.f",
             "regex_and_files_churn.f",  # regex compilation, file and time text
             "structs_and_rows_churn.f", # structs, query rows, scope exits
             "text_churn.f",             # text, the copy-managed one

@@ -1224,6 +1224,11 @@ class CodeGen:
                                                 # needs. Matching on generated text cannot tell an
                                                 # instruction from a literal; a flag set where the
                                                 # instruction is emitted can only be right.
+        self.uses_text = False                 # runtime.md phase 5: drawText, img.drawText or
+                                                # a measureText* call -- another pure linking
+                                                # signal, the one that puts text.f and the
+                                                # bundled font on the link line. Never changes
+                                                # the IR, so bootstrap/ has nothing to follow.
         self.uses_audio = False                # any loadAudio()/.play()/.stop()/.isPlaying()
                                                 # anywhere -- purely a linking signal (unlike
                                                 # uses_graphics/uses_timers, nothing in codegen
@@ -13548,6 +13553,7 @@ class CodeGen:
                                 f"  call void @festina_image_draw_circle(ptr {obj_val}, "
                                 f"i64 {x}, i64 {y}, i64 {r})")
                     else:  # drawText
+                        self.uses_text = True
                         text, x, y = arg_vals
                         lines.append(
                             f"  call void @festina_image_draw_text(ptr {obj_val}, "
@@ -14432,6 +14438,7 @@ class CodeGen:
             free_text_temps()
             return "0", None
         if name in ("measureTextWidth", "measureTextHeight"):
+            self.uses_text = True
             fn = ("festina_measure_text_width" if name == "measureTextWidth"
                   else "festina_measure_text_height")
             out = self.tmp()
@@ -14490,6 +14497,7 @@ class CodeGen:
                 x, y, r = args
                 lines.append(f"  call void @festina_draw_circle(i64 {x}, i64 {y}, i64 {r})")
         elif name == "drawText":
+            self.uses_text = True
             text, x, y = args
             lines.append(f"  call void @festina_draw_text(ptr {text}, i64 {x}, i64 {y})")
         elif name == "drawImage":

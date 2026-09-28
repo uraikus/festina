@@ -731,9 +731,12 @@ int func fntAdvancePx(g:int, px:int) {
 
 // The code points of a text. Festina's text is UTF-8 and the language
 // already decodes it -- split('') is one code point per element -- so
-// there is nothing to reimplement here.
+// there is nothing to reimplement here. Except the empty text: split('')
+// gives it ONE empty element rather than none, which laid '' out as a
+// .notdef box nineteen pixels wide until measureTextWidth('') said so.
 arr[int] func fntCodePoints(s:text) {
     arr[int] out = []
+    if s.length == 0 { return out }
     arr[text] cs = s.split('')
     int i = 0
     while i < cs.length {
