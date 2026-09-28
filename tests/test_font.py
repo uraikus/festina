@@ -35,7 +35,7 @@ CORE_FONTS = ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
 SANS = os.path.join(DEJAVU_DIR, "DejaVuSans.ttf")
 
 # FNT_E_* in font.f.
-E_SHORT, E_NOT_SFNT, E_CFF, E_COLLECTION, E_TABLE, E_NO_CMAP, E_GLYPH, E_COMPOSITE = range(1, 9)
+E_SHORT, E_NOT_SFNT, E_CFF, E_COLLECTION, E_TABLE, E_NO_CMAP, E_GLYPH, E_COMPONENT = range(1, 9)
 
 
 def _missing(reason):
@@ -52,13 +52,12 @@ ORACLE_C = r"""
 #include FT_FREETYPE_H
 #include <stdio.h>
 #include <stdlib.h>
-/* argv: font, cmap format to force (0 = FreeType's own choice),
- * 'r' to compose composites instead of reporting them. */
+/* argv: font, cmap format to force (0 = FreeType's own choice).
+ * Composites are composed, as a renderer sees them. */
 int main(int argc, char **argv) {
     FT_Library lib; FT_Face f;
     if (FT_Init_FreeType(&lib) || FT_New_Face(lib, argv[1], 0, &f)) { puts("OPENFAIL"); return 0; }
     int want = atoi(argv[2]);
-    int recurse = argc > 3 && argv[3][0] == 'r';
     if (want) {
         for (int i = 0; i < f->num_charmaps; i++) {
             FT_CharMap m = f->charmaps[i];
@@ -69,14 +68,9 @@ int main(int argc, char **argv) {
     }
     printf("upem %d glyphs %ld\n", f->units_per_EM, f->num_glyphs);
     for (long g = 0; g < f->num_glyphs; g++) {
-        int fl = FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP |
-                 (recurse ? 0 : FT_LOAD_NO_RECURSE);
+        int fl = FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP;
         if (FT_Load_Glyph(f, g, fl)) { printf("g %ld LOADFAIL\n", g); continue; }
         FT_GlyphSlot s = f->glyph;
-        if (s->format == FT_GLYPH_FORMAT_COMPOSITE) {
-            printf("g %ld adv %ld composite\n", g, s->metrics.horiAdvance);
-            continue;
-        }
         FT_Outline *o = &s->outline;
         printf("g %ld adv %ld c %d:", g, s->metrics.horiAdvance, o->n_contours);
         for (int i = 0; i < o->n_contours; i++) printf(" %d", o->contours[i]);
@@ -99,7 +93,6 @@ def _dump_program(cmap_format=0, composites=False):
     select = ""
     if cmap_format:
         select = (f"if !fntSelectCmap({cmap_format}) {{ log('no cmap {cmap_format}') }}\n")
-    composite_line = "log(`g ${g} adv ${fntAdvance(g)} composite`)"
     return (
         "import font.f\n"
         "blob raw = 'font.ttf'\n"
@@ -121,9 +114,7 @@ def _dump_program(cmap_format=0, composites=False):
         "    arr[int] ends = []\n"
         "    int n = fntGlyph(g, xs, ys, oc, ends)\n"
         "    if n < 0 {\n"
-        f"        if FNT_ERR == {E_COMPOSITE} {{ {composite_line} }} else {{\n"
-        "            log(`g ${g} err ${FNT_ERR}`)\n"
-        "        }\n"
+        "        log(`g ${g} err ${FNT_ERR}`)\n"
         "    } else {\n"
         "        text line = `g ${g} adv ${fntAdvance(g)} c ${n}:`\n"
         "        int k = 0\n"
@@ -207,8 +198,9 @@ def _run_in(tmp_path, program, font_bytes):
     return r.stdout.splitlines()
 
 
-def _oracle(built, font_path, cmap_format=0, recurse=False):
-    args = [built.build_oracle(), font_path, str(cmap_format)] + (["r"] if recurse else [])
+def _oracle(built, font_path, cmap_format=0):
+    """FreeType's view: composites composed, as a renderer sees them."""
+    args = [built.build_oracle(), font_path, str(cmap_format)]
     r = subprocess.run(args, capture_output=True, text=True, timeout=300, check=True)
     return r.stdout.splitlines()
 
@@ -229,18 +221,29 @@ def _mappings(lines):
 
 
 def _compare(ours, theirs):
-    """(simple glyphs identical, composites seen, disagreements)."""
+    """(glyphs identical, disagreements)."""
     mine, ref = _by_glyph(ours), _by_glyph(theirs)
     assert mine.keys() == ref.keys()
-    same, composites, bad = 0, 0, []
+    same, bad = 0, []
     for g, line in ref.items():
         if line == mine[g]:
             same += 1
-            if line.endswith(" composite"):
-                composites += 1
         else:
             bad.append((line[:120], mine[g][:120]))
-    return same, composites, bad
+    return same, bad
+
+
+def _composite_ids(data):
+    """Which glyphs of a font are composites, from its own bytes."""
+    t = _tables(data)
+    maxp = t[b"maxp"][0]
+    n = struct.unpack(">H", data[maxp + 4:maxp + 6])[0]
+    out = set()
+    for g in range(n):
+        body = _glyph_bytes(data, t, g)
+        if len(body) >= 2 and struct.unpack(">h", body[:2])[0] < 0:
+            out.add(g)
+    return out
 
 
 # ---- the tables, and the file they come from ----
@@ -365,8 +368,14 @@ def _build_small_font(source_path, text):
     sub = sub[:2] + struct.pack(">H", len(sub)) + sub[4:]
     cmap = struct.pack(">HHHHI", 0, 1, 3, 1, 12) + sub
     loca_bytes = struct.pack(f">{len(loca)}H", *loca)
-    tables = {b"cmap": cmap, b"glyf": glyf, b"head": bytes(head), b"hhea": bytes(hhea),
-              b"hmtx": hmtx, b"loca": loca_bytes, b"maxp": bytes(maxp)}
+    return _pack_sfnt({b"cmap": cmap, b"glyf": glyf, b"head": bytes(head), b"hhea": bytes(hhea),
+                       b"hmtx": hmtx, b"loca": loca_bytes, b"maxp": bytes(maxp)})
+
+
+def _pack_sfnt(tables):
+    """Tables into a TrueType file: the directory, sorted by tag, then
+    each table padded to four bytes. Checksums are left zero; neither
+    reader checks them."""
     tags = sorted(tables)
     out = struct.pack(">IHHHH", 0x00010000, len(tags), 0, 0, 0)
     offset = 12 + 16 * len(tags)
@@ -383,15 +392,19 @@ def _build_small_font(source_path, text):
 class TestOutlinesMatchFreeType:
 
     @pytest.mark.parametrize("name", CORE_FONTS)
-    def test_every_simple_glyph_matches_freetype(self, built, tmp_path, name):
-        """Every simple glyph, point for point, and every advance. A
-        composite prints as one on both sides until slice 2 reads them."""
+    def test_every_glyph_matches_freetype(self, built, tmp_path, name):
+        """Every glyph, point for point, and every advance -- simple
+        glyphs (slice 1) and composites composed (slice 2), which in
+        these fonts nest up to four deep."""
         path = _font(name)
-        ours = _run_in(tmp_path, built.build_program(_dump_program()), open(path, "rb").read())
+        data = open(path, "rb").read()
+        ours = _run_in(tmp_path, built.build_program(_dump_program()), data)
         theirs = _oracle(built, path)
-        same, composites, bad = _compare(ours, theirs)
+        same, bad = _compare(ours, theirs)
         assert not bad, f"{len(bad)} glyphs differ, first: {bad[0]}"
-        assert same - composites > 1000, "the comparison has to include real outlines"
+        composites = _composite_ids(data)
+        assert len(composites) > 1000 and same > len(composites) + 1000, \
+            "the comparison has to include real outlines of both kinds"
 
     def test_the_format_12_cmap_matches_freetype_everywhere(self, built, tmp_path):
         """Every code point from 0 to U+10FFFF, both ways: nothing
@@ -423,7 +436,7 @@ class TestOutlinesMatchFreeType:
         ours = _run_in(tmp_path / "run", built.build_program(_dump_program()), small)
         theirs = _oracle(built, str(path))
         assert theirs[0] != "OPENFAIL", "FreeType must accept the built font"
-        same, _, bad = _compare(ours, theirs)
+        same, bad = _compare(ours, theirs)
         assert not bad, bad[:2]
         assert _mappings(ours) == _mappings(theirs)
         assert len(_mappings(theirs)) >= 10
@@ -496,3 +509,169 @@ class TestRefusals:
         by = _by_glyph(lines)
         assert by[str(g)] == f"g {g} err {E_GLYPH}"
         assert " c " in by["38"], "the glyphs around it still read"
+
+
+# ---- slice 2: composites the CI fonts never build ----
+
+def _dejavu_simple(data, t, ch):
+    """DejaVu's glyph for `ch`, which must be a simple one."""
+    co = t[b"cmap"][0]
+    for i in range(struct.unpack(">H", data[co + 2:co + 4])[0]):
+        p, e, off = struct.unpack(">HHI", data[co + 4 + 8 * i:co + 12 + 8 * i])
+        sub = co + off
+        if (p, e) == (3, 10):
+            for k in range(struct.unpack(">I", data[sub + 12:sub + 16])[0]):
+                s0, s1, g0 = struct.unpack(">III", data[sub + 16 + 12 * k:sub + 28 + 12 * k])
+                if s0 <= ord(ch) <= s1:
+                    body = _glyph_bytes(data, t, g0 + ord(ch) - s0)
+                    assert struct.unpack(">h", body[:2])[0] >= 0, ch
+                    return body
+    raise KeyError(ch)
+
+
+# Component flags (glyf spec).
+WORDS, XY, SCALE, MORE, XYSCALE, TWO_BY_TWO = 1, 2, 8, 32, 64, 128
+SCALED_OFFSET, UNSCALED_OFFSET = 2048, 4096
+
+
+def _component(flags, glyph, a1, a2, transform=()):
+    """One component record. Byte arguments are packed signed when they
+    are x/y offsets and unsigned when they are point numbers, as the
+    spec says they are read."""
+    out = struct.pack(">HH", flags, glyph)
+    if flags & WORDS:
+        out += struct.pack(">hh" if flags & XY else ">HH", a1, a2)
+    else:
+        out += struct.pack(">bb" if flags & XY else ">BB", a1, a2)
+    for v in transform:
+        out += struct.pack(">h", round(v * 16384))
+    return out
+
+
+def _composite(components, xmin=0):
+    """A composite glyph: numberOfContours -1, a bounding box (only xMin
+    is read, by the lsb adjustment), then the components, each but the
+    last flagged MORE."""
+    body = struct.pack(">hhhhh", -1, xmin, -500, 2000, 2000)
+    for i, (flags, glyph, a1, a2, transform) in enumerate(components):
+        if i < len(components) - 1:
+            flags |= MORE
+        body += _component(flags, glyph, a1, a2, transform)
+    return body
+
+
+def _build_composite_font(source_path):
+    """Composites using everything DejaVu does not: one scale, separate
+    x and y scales, a 2x2 matrix, scaled composites nested inside
+    composites, and a composite whose lsb disagrees with its xMin. Then
+    three that font.f must refuse -- point matching, a scaled offset,
+    and a composite that contains itself -- which FreeType handles
+    (or rejects) in its own way.
+
+    Returns (font bytes, {glyph: what font.f must say about it}),
+    where the value is None for "the same as FreeType"."""
+    data = open(source_path, "rb").read()
+    t = _tables(data)
+    o, l, H = (_dejavu_simple(data, t, c) for c in "olH")
+    notdef = _glyph_bytes(data, t, 0)
+    s = 0.7071
+    glyphs = [
+        (notdef, None),
+        (o, None),                                                      # 1
+        (l, None),                                                      # 2
+        (H, None),                                                      # 3
+        (_composite([(XY | SCALE, 1, -20, 30, (0.5,))]), None),         # 4: one scale, byte offsets
+        (_composite([(XY | WORDS | XYSCALE, 2, 300, -200, (1.5, -0.75)),
+                     (XY, 1, -5, 7, ())]), None),                       # 5: x/y scale, then plain
+        (_composite([(XY | WORDS | TWO_BY_TWO, 3, 1000, 50,
+                      (s, 0.25, -0.3, 0.9))]), None),                   # 6: a 2x2
+        (_composite([(XY | SCALE | UNSCALED_OFFSET, 5, 10, 10, (0.75,)),
+                     (XY | WORDS, 6, -100, 0, ())]), None),             # 7: nested, scaled
+        (_composite([(XY, 1, 0, 0, ())], xmin=40), None),               # 8: lsb 45, xMin 40
+        (_composite([(XY, 1, 0, 0, ()), (0, 2, 0, 2, ())]), E_COMPONENT),  # 9: point matching
+        (_composite([(XY | SCALE | SCALED_OFFSET, 1, 30, 30, (0.5,))]), E_COMPONENT),  # 10
+        (_composite([(XY, 11, 0, 0, ())]), E_GLYPH),                    # 11: contains itself
+    ]
+    advances = [1000 + 10 * i for i in range(len(glyphs))]
+    # Simple glyphs get their own xMin as lsb, as a well-formed font
+    # would -- except 'l', three units off, so that a component whose
+    # own lsb and xMin disagree sits inside composites 5 and 7, and
+    # FreeType says whether that disagreement travels with it.
+    lsbs = [0] * len(glyphs)
+    for g in (1, 2, 3):
+        lsbs[g] = struct.unpack(">h", glyphs[g][0][2:4])[0]
+    lsbs[2] += 3
+    lsbs[8] = 45
+    glyf, loca = b"", []
+    for body, _ in glyphs:
+        body += b"\0" * (len(body) % 2)
+        loca.append(len(glyf))
+        glyf += body
+    loca.append(len(glyf))
+    head = bytearray(data[t[b"head"][0]:t[b"head"][0] + t[b"head"][1]])
+    head[50:52] = struct.pack(">h", 1)
+    maxp = bytearray(data[t[b"maxp"][0]:t[b"maxp"][0] + t[b"maxp"][1]])
+    maxp[4:6] = struct.pack(">H", len(glyphs))
+    hhea = bytearray(data[t[b"hhea"][0]:t[b"hhea"][0] + t[b"hhea"][1]])
+    hhea[34:36] = struct.pack(">H", len(glyphs))
+    hmtx = b"".join(struct.pack(">Hh", a, b) for a, b in zip(advances, lsbs))
+    # 'A' onward maps to glyph 1 onward; one segment, by idDelta.
+    n = len(glyphs) - 1
+    segs = [(0x41, 0x41 + n - 1, (1 - 0x41) & 0xFFFF), (0xFFFF, 0xFFFF, 1)]
+    sub = struct.pack(">HHHHHHH", 4, 0, 0, 4, 0, 0, 0)
+    sub += struct.pack(">HH", segs[0][1], 0xFFFF) + b"\0\0"
+    sub += struct.pack(">HH", segs[0][0], 0xFFFF)
+    sub += struct.pack(">HH", segs[0][2], 1) + struct.pack(">HH", 0, 0)
+    sub = sub[:2] + struct.pack(">H", len(sub)) + sub[4:]
+    cmap = struct.pack(">HHHHI", 0, 1, 3, 1, 12) + sub
+    font = _pack_sfnt({b"cmap": cmap, b"glyf": glyf, b"head": bytes(head),
+                       b"hhea": bytes(hhea), b"hmtx": hmtx,
+                       b"loca": struct.pack(f">{len(loca)}I", *loca), b"maxp": bytes(maxp)})
+    return font, {g: want for g, (_, want) in enumerate(glyphs)}
+
+
+class TestComposites:
+    """Slice 2. The DejaVu comparison above already covers composites
+    as CI's fonts build them -- nested four deep, byte and word offsets,
+    USE_MY_METRICS. This covers what they never do."""
+
+    def test_transformed_and_nested_components_match_freetype(self, built, tmp_path):
+        """Scales and matrices go through FreeType's own 16.16 rounding
+        (FT_MulFix), so they land on the same integers, and are
+        compared exactly. The composites font.f refuses are checked for
+        the right code instead."""
+        font, expect = _build_composite_font(_font("DejaVuSans.ttf"))
+        path = tmp_path / "comp.ttf"
+        path.write_bytes(font)
+        theirs = _by_glyph(_oracle(built, str(path)))
+        ours = _by_glyph(_run_in(tmp_path / "run", built.build_program(_dump_program()), font))
+        compared = 0
+        for g, want in expect.items():
+            if want is None:
+                assert ours[str(g)] == theirs[str(g)], (g, theirs[str(g)][:160], ours[str(g)][:160])
+                compared += 1
+            else:
+                assert ours[str(g)] == f"g {g} err {want}", (g, ours[str(g)])
+        assert compared == 9
+
+    def test_the_shift_applies_to_the_glyph_asked_for_only(self, built, tmp_path):
+        """Glyph 8 is glyph 1 unmoved, but its own lsb is five units
+        right of its xMin, so it comes out five units right of glyph 1.
+        And glyph 2 is three units right of where its points say when
+        drawn alone -- but as a component of glyph 5 it is placed by
+        its offset, not by its own lsb. (That second half is FreeType's
+        behaviour; the comparison above is what establishes it.)"""
+        font, _ = _build_composite_font(_font("DejaVuSans.ttf"))
+        ours = _by_glyph(_run_in(tmp_path, built.build_program(_dump_program()), font))
+        pts = lambda g: [tuple(map(int, p.split(",")[:2])) for p in ours[str(g)].split(" p ")[1].split()]
+        assert pts(8) == [(x + 5, y) for x, y in pts(1)]
+        raw_l = pts(2)
+        in_5 = pts(5)[:len(raw_l)]
+        # Component 1 of glyph 5 is 'l' scaled (1.5, -0.75) and moved
+        # by (300, -200): its x is 1.5 * (raw - 3) + 300 only if the
+        # standalone shift stayed behind.
+        def mulfix_1_5(v):          # FT_MulFix by exactly 1.5: halves away from zero
+            m = (abs(v) * 3 + 1) // 2
+            return m if v >= 0 else -m
+        assert [x for x, _ in in_5] == [mulfix_1_5(x - 3) + 300 for x, _ in raw_l]
+        assert any((x - 3) % 2 for x, _ in raw_l), "a half has to be in it for the rounding to count"

@@ -951,7 +951,7 @@ the user's, and the bundle needs permission.
 1. ✅ `runtime/festina/font.f`: the table directory and the tables above,
    simple glyphs to outlines in font units, compared exactly against
    FreeType for every glyph of DejaVu Sans; the refusals, each tested
-2. composite glyphs — offsets, scaled components; point-matched
+2. ✅ composite glyphs — offsets, scaled components; point-matched
    components refused until a font needs them
 3. glyph outlines through raster.f: quadratic flattening, scale and
    y-flip, fractional origins, compared against the explicit-option
@@ -1014,6 +1014,39 @@ refused rather than read past, and a single glyph whose `loca` entry
 points outside `glyf` fails alone while the glyphs around it still
 read. `font.f` is in the differential corpus and all five harnesses
 compare it.
+
+**Slice 2, as built.** Composites are decoded in place: each component
+is another glyph, itself possibly composite, transformed by its matrix
+and moved by its offset. The four CI fonts hold 8,120 composites,
+nested up to four deep with up to eight components, and every one
+matches FreeType's composed outline point for point — so all 19,483
+glyphs of those fonts now do. They matched on the first run, which is
+exactly when the checking matters, because those fonts use none of
+the harder paths: no scale, no 2×2 matrix, no point matching.
+
+So the test builds a font that does, the way slice 1 built one for
+short loca. A single scale, separate x and y scales, a 2×2 matrix, a
+scaled composite nested inside another, and a composite whose own lsb
+is five units right of its xMin, all compared exactly with FreeType.
+Exactly, because transforms here go through FreeType's own 16.16
+arithmetic (`FT_MulFix`, rounding halves away from zero), so a scaled
+point lands on the same integer in both. A naive multiply that shifts
+without handling the sign disagrees only on negative exact halves;
+put back, it fails.
+
+**The lsb adjustment belongs to the glyph asked for, not to its
+components.** The built font's `l` is three units off its xMin, and
+placed inside a composite it is placed by the component offset alone —
+FreeType's behaviour, established by the comparison, and pinned by a
+test that also checks the rounding. Applying the adjustment at every
+level instead fails five tests, including DejaVu's own.
+
+Point-matched components, and offsets the flags say to scale (which
+FreeType scales by a vector length computed its own way), are refused
+with `FNT_E_COMPONENT` rather than written untested: no font here uses
+either. A composite that contains itself stops at a depth of 16 with
+`FNT_E_GLYPH`; without the guard it crashes the program. Ten bugs were
+put back across the decoder and every one fails a test.
 
 ## Tests
 

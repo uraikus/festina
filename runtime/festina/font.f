@@ -26,7 +26,9 @@ int FNT_E_COLLECTION = 4     // a .ttc -- refused until a slice needs one
 int FNT_E_TABLE = 5          // a required table is missing
 int FNT_E_NO_CMAP = 6        // no Unicode cmap in a format read here
 int FNT_E_GLYPH = 7          // a glyph index out of range, or a bad glyph
-int FNT_E_COMPOSITE = 8      // a composite glyph -- slice 2 reads these
+int FNT_E_COMPONENT = 8      // a component placed by point matching, or
+                             // with a scaled offset -- refused until a
+                             // font needs one
 
 int FNT_UPEM = 0
 int FNT_NGLYPHS = 0
@@ -321,18 +323,15 @@ int func fntGlyphData(g:int) {
 // thing, and where the two disagree the outline moves by lsb - xMin.
 // In DejaVu Sans they disagree for exactly six glyphs, by one unit
 // each, and those were the only simple glyphs that differed from
-// FreeType before this.
+// FreeType before this. Only the glyph asked for is moved: a
+// component inside a composite is placed by its offset alone.
 int func fntGlyph(g:int, xs:arr[int], ys:arr[int], onCurve:arr[int], ends:arr[int]) {
     FNT_ERR = 0
     if g < 0 || g >= FNT_NGLYPHS { FNT_ERR = FNT_E_GLYPH return -1 }
-    int at = fntGlyphData(g)
-    if FNT_ERR != 0 { return -1 }
-    if FNT_GLYPH_LEN == 0 { return 0 }
-    int contours = fntS16(at)
-    if contours < 0 { FNT_ERR = FNT_E_COMPOSITE return -1 }
     int base = xs.length
-    int n = fntSimpleGlyph(at, contours, xs, ys, onCurve, ends)
-    if n < 0 { return n }
+    int n = fntGlyphAt(g, xs, ys, onCurve, ends, 0)
+    if n <= 0 { return n }
+    int at = fntGlyphData(g)
     int shift = fntLsb(g) - fntS16(at + 2)
     if shift != 0 {
         int i = base
@@ -342,6 +341,121 @@ int func fntGlyph(g:int, xs:arr[int], ys:arr[int], onCurve:arr[int], ends:arr[in
         }
     }
     return n
+}
+
+// Composites nest -- DejaVu goes four deep -- and a corrupt font can
+// make one contain itself. Past this depth the glyph is refused rather
+// than recursed into forever.
+int FNT_MAX_DEPTH = 16
+
+int func fntGlyphAt(g:int, xs:arr[int], ys:arr[int], onCurve:arr[int], ends:arr[int],
+                    depth:int) {
+    if depth > FNT_MAX_DEPTH || g < 0 || g >= FNT_NGLYPHS { FNT_ERR = FNT_E_GLYPH return -1 }
+    int at = fntGlyphData(g)
+    if FNT_ERR != 0 { return -1 }
+    if FNT_GLYPH_LEN == 0 { return 0 }
+    int contours = fntS16(at)
+    if contours >= 0 { return fntSimpleGlyph(at, contours, xs, ys, onCurve, ends) }
+    return fntCompositeGlyph(at, xs, ys, onCurve, ends, depth)
+}
+
+// FreeType's FT_MulFix: a 16.16 multiply rounded half away from zero.
+// Component transforms go through exactly this, so a scaled component
+// lands on the same integer here as there.
+int func fntMulFix(a:int, b:int) {
+    int sign = 1
+    if a < 0 { a = 0 - a sign = 0 - sign }
+    if b < 0 { b = 0 - b sign = 0 - sign }
+    int c = ((a * b) + 32768) >> 16
+    if sign < 0 { return 0 - c }
+    return c
+}
+
+// A composite is a list of components, each another glyph -- itself
+// possibly composite -- decoded in place, transformed by its 2x2
+// matrix and moved by its offset. Flags, per the glyf spec:
+//   1 args are words     2 args are x/y offsets (else point indices)
+//   8 one scale         64 separate x and y scales    128 a 2x2
+//  32 more components follow
+//  2048 / 4096 scaled / unscaled component offset
+// Scales are F2Dot14; times four makes them 16.16, which is what
+// FreeType multiplies with.
+int func fntCompositeGlyph(at:int, xs:arr[int], ys:arr[int], onCurve:arr[int],
+                           ends:arr[int], depth:int) {
+    int p = at + 10
+    int total = 0
+    bool more = true
+    while more {
+        int flags = fntU16(p)
+        int comp = fntU16(p + 2)
+        p = p + 4
+        bool xy = (flags & 2) != 0
+        int dx = 0
+        int dy = 0
+        if (flags & 1) != 0 {
+            if xy { dx = fntS16(p) dy = fntS16(p + 2) } else { dx = fntU16(p) dy = fntU16(p + 2) }
+            p = p + 4
+        } else {
+            dx = fntU8(p)
+            dy = fntU8(p + 1)
+            if xy {
+                if dx >= 128 { dx = dx - 256 }
+                if dy >= 128 { dy = dy - 256 }
+            }
+            p = p + 2
+        }
+        int mxx = 65536
+        int myx = 0
+        int mxy = 0
+        int myy = 65536
+        bool scaled = true
+        if (flags & 8) != 0 {
+            mxx = fntS16(p) * 4
+            myy = mxx
+            p = p + 2
+        } else if (flags & 64) != 0 {
+            mxx = fntS16(p) * 4
+            myy = fntS16(p + 2) * 4
+            p = p + 4
+        } else if (flags & 128) != 0 {
+            mxx = fntS16(p) * 4
+            myx = fntS16(p + 2) * 4
+            mxy = fntS16(p + 4) * 4
+            myy = fntS16(p + 6) * 4
+            p = p + 8
+        } else {
+            scaled = false
+        }
+        if FNT_ERR != 0 { return -1 }
+        // Point matching places a component by lining up a point of it
+        // with a point already placed. No font here uses it, so it is
+        // refused rather than written untested; so is an offset that
+        // the flags say to scale, which FreeType scales by a vector
+        // length computed its own way.
+        if !xy || (scaled && (flags & 2048) != 0 && (flags & 4096) == 0) {
+            FNT_ERR = FNT_E_COMPONENT
+            return -1
+        }
+
+        int first = xs.length
+        int n = fntGlyphAt(comp, xs, ys, onCurve, ends, depth + 1)
+        if n < 0 { return -1 }
+        int i = first
+        while i < xs.length {
+            int x = xs[i]
+            int y = ys[i]
+            if scaled {
+                x = fntMulFix(xs[i], mxx) + fntMulFix(ys[i], mxy)
+                y = fntMulFix(xs[i], myx) + fntMulFix(ys[i], myy)
+            }
+            xs[i] = x + dx
+            ys[i] = y + dy
+            i = i + 1
+        }
+        total = total + n
+        more = (flags & 32) != 0
+    }
+    return total
 }
 
 int func fntSimpleGlyph(at:int, contours:int, xs:arr[int], ys:arr[int], onCurve:arr[int],
