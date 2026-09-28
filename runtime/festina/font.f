@@ -698,3 +698,120 @@ int func fntGlyphPath(g:int, size:float, ox:float, oy:float,
     }
     return n
 }
+
+// ---- slice 4: laying out a line of text ----
+//
+// What Cairo's toy API does with a string, measured (runtime.md phase
+// 5): each code point maps to a glyph through the cmap, one to one --
+// no kerning, no ligatures -- and the pen moves by each glyph's
+// advance ROUNDED TO A WHOLE PIXEL, because hint metrics are on. The
+// rounding is FreeType's and Cairo's integer arithmetic, reproduced
+// here exactly: the size becomes a 16.16 scale with FT_DivFix, an
+// advance is scaled into 26.6 with FT_MulFix, and Cairo rounds that
+// half up to whole pixels. Against the runtime's measureTextWidth that
+// is exact -- 7,437 of 7,437 strings and sizes -- because hinting
+// never moves an advance in these fonts.
+//
+// Sizes are whole pixels, as the language's fonts are.
+
+// FreeType's FT_DivFix for positive operands: (a << 16) / b, rounded.
+int func fntDivFix(a:int, b:int) {
+    return Math.floorDiv((a << 16) + (b >> 1), b)
+}
+
+// The 16.16 factor from font units to 26.6 at `px` pixels per em.
+int func fntScale(px:int) {
+    return fntDivFix(px * 64, FNT_UPEM)
+}
+
+// A glyph's advance at `px`, in whole pixels, as Cairo rounds it.
+int func fntAdvancePx(g:int, px:int) {
+    return (fntMulFix(fntAdvance(g), fntScale(px)) + 32) >> 6
+}
+
+// The code points of a text. Festina's text is UTF-8 and the language
+// already decodes it -- split('') is one code point per element -- so
+// there is nothing to reimplement here.
+arr[int] func fntCodePoints(s:text) {
+    arr[int] out = []
+    arr[text] cs = s.split('')
+    int i = 0
+    while i < cs.length {
+        out.push(cs[i].charCodeAt(0))
+        i = i + 1
+    }
+    return out
+}
+
+// Lay a line out: for each code point, its glyph and the pen x it is
+// drawn at, starting from x. Returns the total advance in pixels.
+int func fntLayout(s:text, px:int, x:float, gids:arr[int], pens:arr[float]) {
+    arr[int] cps = fntCodePoints(s)
+    int pen = 0
+    int i = 0
+    while i < cps.length {
+        int g = fntGlyphIndex(cps[i])
+        gids.push(g)
+        pens.push(x + pen.toFloat())
+        pen = pen + fntAdvancePx(g, px)
+        i = i + 1
+    }
+    return pen
+}
+
+// measureTextWidth: how far the pen moves.
+int func fntTextWidth(s:text, px:int) {
+    arr[int] gids = []
+    arr[float] pens = []
+    return fntLayout(s, px, 0.0, gids, pens)
+}
+
+// measureTextHeight: the inked height of this string. Each glyph's box
+// is its outline's control box at this size -- every point, on the
+// curve or not, which is what FreeType's metrics measure -- scaled
+// into 26.6 and then widened to whole pixels, top down and bottom up,
+// as Cairo widens it. The height is the union of those boxes. A glyph
+// with no ink (a space) has no box and does not count.
+//
+// This matches Cairo exactly when Cairo is unhinted -- 7,437 of 7,437
+// -- and differs from the runtime today, which hints (runtime.md phase
+// 5): hinting moves outlines, snapping a baseline overshoot or an
+// ascender onto the pixel grid.
+int func fntTextHeight(s:text, px:int) {
+    arr[int] cps = fntCodePoints(s)
+    int scale = fntScale(px)
+    bool any = false
+    int top = 0
+    int bottom = 0
+    int i = 0
+    while i < cps.length {
+        arr[int] xs = []
+        arr[int] ys = []
+        arr[int] oc = []
+        arr[int] ce = []
+        int n = fntGlyph(fntGlyphIndex(cps[i]), xs, ys, oc, ce)
+        if n > 0 {
+            int hi = fntMulFix(ys[0], scale)
+            int lo = hi
+            int k = 1
+            while k < ys.length {
+                int v = fntMulFix(ys[k], scale)
+                if v > hi { hi = v }
+                if v < lo { lo = v }
+                k = k + 1
+            }
+            if hi != lo {
+                // Device y grows downwards: the top is -hi, floored to
+                // the pixel grid; the bottom is -lo, ceiled.
+                int t = Math.floorDiv(0 - hi, 64)
+                int b = Math.floorDiv((0 - lo) + 63, 64)
+                if !any || t < top { top = t }
+                if !any || b > bottom { bottom = b }
+                any = true
+            }
+        }
+        i = i + 1
+    }
+    if !any { return 0 }
+    return bottom - top
+}

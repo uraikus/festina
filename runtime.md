@@ -956,8 +956,10 @@ the user's, and the bundle needs permission.
 3. ✅ glyph outlines through raster.f: quadratic flattening, scale and
    y-flip, fractional origins, compared against the explicit-option
    Cairo oracle with a measured bound
-4. layout: UTF-8 decoding, rounded advances, glyph 0 for the missing;
-   `measureTextWidth`/`measureTextHeight` reproduced exactly
+4. ✅ layout: UTF-8 decoding, rounded advances, glyph 0 for the missing;
+   `measureTextWidth` reproduced exactly, and `measureTextHeight`
+   exactly against the unhinted reference — not against today's runtime,
+   whose heights depend on hinting (see slice 4, as built)
 5. the font decision implemented, whichever it is
 6. wiring: `drawText`, `img.drawText` and both measures reach font.f
    behind a switch, the way phase 4's wiring will, with refused fonts
@@ -1105,6 +1107,49 @@ Seven bugs were put back; six fail. The seventh — starting on the last
 point without consuming it — only adds a zero-length closing edge,
 the same curves and one duplicate point, so no picture can see it and
 it is not a bug. The consuming form is kept because it is FreeType's.
+
+**Slice 4, as built.** `fntLayout` maps a text's code points to glyphs
+— one to one, no kerning, no ligatures — and places each at a whole-
+pixel pen position; `fntTextWidth` and `fntTextHeight` are the two
+measures. Code points come from the language (`split('')`), which
+already decodes UTF-8, so a four-byte character is one glyph; a
+character the font lacks is glyph 0 with glyph 0's advance.
+
+The arithmetic is FreeType's and Cairo's integers, reproduced: the
+size becomes a 16.16 scale through `FT_DivFix`, each advance is scaled
+into 26.6 with `FT_MulFix` and rounded half up to a pixel, and the
+inked height is the union of each glyph's control box widened
+outwards to the pixel grid. Checked first in Python across 111 strings
+× 67 sizes, then in font.f:
+
+| | width | height |
+|---|---|---|
+| vs the runtime's `measureTextWidth`, today | exact | — |
+| vs Cairo, unhinted, same file | exact | exact |
+| vs the runtime's `measureTextHeight`, today (hinted) | exact | differs in 3,484 of 7,437, from −2 to +3 px — mostly +1, unhinted being taller |
+
+Glyph ids and pen positions match Cairo's own `text_to_glyphs` too.
+
+**Today's heights are not one thing** (decisions.md #351). The
+runtime's text is hinted or not depending on the first size the
+process uses — below 7.5 px Ubuntu's fontconfig turns hinting off for
+DejaVu Sans, and Cairo's toy API keeps that decision for every later
+size. So "matches measureTextHeight" has no fixed meaning to aim at,
+and the test that tried to record the difference was itself fooled by
+it: its first size was 6. Width is unaffected — hinting never moves an
+advance in these fonts, exact both ways.
+
+**Two things DejaVu cannot show, so the built font does.** DejaVu's em
+is 2048 units, a power of two, so `FT_DivFix` never rounds and dropping
+its rounding term changed nothing. And real glyphs put an on-curve
+point at every extreme, so "control box" and "on-curve points only"
+give the same heights. The built font gets a 1000-unit em, and a glyph
+whose top is an off-curve point at twice the curve's height, with an
+advance of 2291 — found by searching every advance for one whose pixel
+width `FT_DivFix`'s rounding changes at a tested size. Cairo on that
+file settles both: the height is the control box's (60 px, not 30, at
+40 px), and the rounding is there. Six bugs were put back; both of
+those survived until the built font existed, and all six fail now.
 
 ## Tests
 

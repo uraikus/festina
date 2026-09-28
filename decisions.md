@@ -8778,3 +8778,42 @@ canvas's `saveState()` -- which now includes it.
 
 `test_restore_state_restores_the_gradient_too` checks both directions
 and fails against the old code, checked by putting it back.
+
+351. TEXT IS HINTED OR NOT DEPENDING ON THE FIRST SIZE A PROGRAM USES
+
+Found by runtime.md phase 5, slice 4, while checking that font.f's
+`measureTextHeight` differs from the runtime's in the way the spec
+said it would. It did not differ at all, in one test program -- and
+did in another, for the same string at the same size.
+
+The cause is two things that are each reasonable. fontconfig-config
+on Ubuntu ships `20-unhint-small-dejavu-sans.conf`: DejaVu Sans below
+7.5 px is not hinted. And Cairo's toy font API resolves a family name
+through fontconfig ONCE, at the first size it is used at, and reuses
+that resolution -- hinting decision included -- at every size after.
+So the first text size a process uses decides whether all of its text
+is hinted:
+
+    first 7 px, then 15:  "Hello" 13 px tall at 15 (unhinted)
+    first 8 px, then 15:  "Hello" 12 px tall at 15 (hinted)
+    15 first, then 6:     6 px measures 4 (hinted); 6 first measures 6
+
+The flip is between 7 and 8, exactly the rule's 7.5. It is not only
+metrics: "Hello" drawn at 15 px differs in 167 channels, by up to 236,
+depending on whether anything was drawn at 6 px earlier in the same
+process. Reproduced in plain C against Cairo, so it is Cairo's
+behaviour with this configuration, not the runtime's code.
+
+Nothing is changed here. Which is RIGHT -- hinted or not -- is the
+hinting question runtime.md's phase 5 spec already puts to the user;
+font.f's path has neither problem, since it reads a named file with
+fixed options, so slice 6 removes this for the fonts it reaches.
+
+**What it did to a test first.** The slice-4 test meant to record
+"today's heights differ from unhinted ones" measured sizes 6 up to 72
+in one program. Its first size was 6, below the rule, so the runtime
+was unhinted for the whole run and agreed everywhere -- and a C probe
+run once per size disagreed 47% of the time. The two instruments were
+measuring different programs. That test is gone: it asserted a
+property of the machine's font configuration and of call order, not
+of anything font.f does.

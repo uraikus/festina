@@ -23,6 +23,8 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -175,8 +177,7 @@ class _Built:
             return self.programs[source]
         from festina import cli
         from tests.conftest import compile_file_or_skip, _require_c_compiler
-        d = self.root / f"prog{len(self.programs)}"
-        d.mkdir()
+        d = Path(tempfile.mkdtemp(prefix="prog", dir=self.root))
         src = os.path.join(imports_mod.RUNTIME_COMPONENT_DIR, "font.f")
         (d / "font.f").write_text(open(src, encoding="utf-8").read(), encoding="utf-8")
         (d / "main.f").write_text(source, encoding="utf-8")
@@ -280,12 +281,26 @@ def _metric(data, tables, g):
     return adv, struct.unpack(">h", data[at:at + 2])[0]
 
 
-def _build_small_font(source_path, text):
+# A glyph whose top is an OFF-curve point: one quadratic from (0, 0)
+# through (500, 1500) to (1000, 0). The curve peaks at 750, its control
+# box at 1500 -- the two measures of "how tall" this glyph is disagree
+# by a factor of two, where in any real font's glyphs, which put an
+# on-curve point at every extreme, they agree.
+HUMP_BODY = (struct.pack(">hhhhh", 1, 0, 0, 1000, 750) + struct.pack(">H", 2) +
+             struct.pack(">H", 0) + bytes([1, 0, 1]) +
+             struct.pack(">hhh", 0, 500, 500) + struct.pack(">hhh", 0, 1500, -1500))
+
+
+def _build_small_font(source_path, text, upem=None, hump=None):
     """A real TrueType font holding .notdef and the SIMPLE glyphs for
     `text`, with a short loca, a format-4 cmap only, and fewer hmtx
     entries than glyphs -- the three paths DejaVu itself never takes.
     The last few glyphs share one advance, which is what makes the
-    shorter hmtx legal: it stores that advance once."""
+    shorter hmtx legal: it stores that advance once.
+
+    `upem` replaces DejaVu's 2048 units per em -- a power of two, which
+    makes every size's scale an exact division and hides the rounding
+    in FT_DivFix -- and `hump`, a code point, maps to HUMP_BODY."""
     data = open(source_path, "rb").read()
     t = _tables(data)
     cmap_src = {}
@@ -309,16 +324,26 @@ def _build_small_font(source_path, text):
         if ord(ch) not in [c for c, _ in chars]:
             chars.append((ord(ch), len(glyphs)))
             glyphs.append(g)
+    if hump is not None:
+        glyphs.insert(1, "hump")
+        chars = [(c, g + 1) for c, g in chars] + [(hump, 1)]
+    # The hump's advance is 2291 on purpose: with a 1000-unit em, at
+    # 12 px, it is one of the few advances whose pixel width changes if
+    # FT_DivFix's rounding is dropped -- a one-in-65536 effect on the
+    # scale that only shows where an advance sits on a rounding edge.
+    # Found by searching every advance, not by guessing.
+    metric = lambda g: (2291, 0) if g == "hump" else _metric(data, t, g)
+    body_of = lambda g: HUMP_BODY if g == "hump" else _glyph_bytes(data, t, g)
     # Monospace the tail so hmtx can stop early: the last three glyphs
     # take the advance of the one before them.
-    advances = [_metric(data, t, g)[0] for g in glyphs]
-    lsbs = [_metric(data, t, g)[1] for g in glyphs]
+    advances = [metric(g)[0] for g in glyphs]
+    lsbs = [metric(g)[1] for g in glyphs]
     nh = len(glyphs) - 3
     for k in range(nh, len(glyphs)):
         advances[k] = advances[nh - 1]
     glyf, loca = b"", []
     for g in glyphs:
-        body = _glyph_bytes(data, t, g)
+        body = body_of(g)
         if len(body) % 2:
             body += b"\0"
         loca.append(len(glyf) // 2)
@@ -327,6 +352,8 @@ def _build_small_font(source_path, text):
     assert loca[-1] < 65536, "too big for a short loca"
     head = bytearray(data[t[b"head"][0]:t[b"head"][0] + t[b"head"][1]])
     head[50:52] = struct.pack(">h", 0)
+    if upem is not None:
+        head[18:20] = struct.pack(">H", upem)
     maxp = bytearray(data[t[b"maxp"][0]:t[b"maxp"][0] + t[b"maxp"][1]])
     maxp[4:6] = struct.pack(">H", len(glyphs))
     hhea = bytearray(data[t[b"hhea"][0]:t[b"hhea"][0] + t[b"hhea"][1]])
@@ -714,7 +741,7 @@ int main(int argc, char **argv) {
 }
 """
 
-GLYPH_TEXT = "HamburgefonstivQRS&@%gÉÅ"     # composites last: É, Å
+GLYPH_TEXT = "HamburgefonstivQRS&@%g\u00c9\u00c5"     # composites last: E-acute, A-ring
 
 
 def _build_c(built, name, source, packages):
@@ -760,8 +787,7 @@ def _build_render_program(built, source):
         return built.programs[key]
     from festina import cli
     from tests.conftest import compile_file_or_skip, _require_c_compiler
-    d = built.root / f"render{len(built.programs)}"
-    d.mkdir()
+    d = Path(tempfile.mkdtemp(prefix="render", dir=built.root))
     for comp in ("font.f", "raster.f"):
         src = os.path.join(imports_mod.RUNTIME_COMPONENT_DIR, comp)
         (d / comp).write_text(open(src, encoding="utf-8").read(), encoding="utf-8")
@@ -1007,3 +1033,185 @@ def _seg_dist(px, py, a, b):
     L = dx * dx + dy * dy
     t = 0.0 if L == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L))
     return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+# ---- slice 4: laying out a line ----
+
+CAIRO_TEXT_C = r"""
+/* argv: font px, then strings. Per string, under the spec's reference
+ * options and the font FILE: the advance, the inked height, and each
+ * glyph Cairo's own text_to_glyphs lays out, as gid:x. */
+#include <cairo.h>
+#include <cairo-ft.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    FT_Library lib; FT_Face face;
+    FT_Init_FreeType(&lib);
+    if (FT_New_Face(lib, argv[1], 0, &face)) { puts("OPENFAIL"); return 1; }
+    cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    cairo_t *cr = cairo_create(s);
+    cairo_set_font_face(cr, cairo_ft_font_face_create_for_ft_face(face, 0));
+    cairo_set_font_size(cr, atof(argv[2]));
+    cairo_font_options_t *fo = cairo_font_options_create();
+    cairo_font_options_set_antialias(fo, CAIRO_ANTIALIAS_GRAY);
+    cairo_font_options_set_hint_style(fo, CAIRO_HINT_STYLE_NONE);
+    cairo_font_options_set_hint_metrics(fo, CAIRO_HINT_METRICS_ON);
+    cairo_set_font_options(cr, fo);
+    cairo_scaled_font_t *sf = cairo_get_scaled_font(cr);
+    for (int i = 3; i < argc; i++) {
+        cairo_text_extents_t e;
+        cairo_text_extents(cr, argv[i], &e);
+        printf("%d %d |", (int)(e.x_advance + 0.5), (int)(e.height + 0.5));
+        cairo_glyph_t *glyphs = NULL; int n = 0;
+        cairo_scaled_font_text_to_glyphs(sf, 0, 0, argv[i], -1, &glyphs, &n, NULL, NULL, NULL);
+        for (int k = 0; k < n; k++) printf(" %lu:%g", glyphs[k].index, glyphs[k].x);
+        printf("\n");
+        cairo_glyph_free(glyphs);
+    }
+    return 0;
+}
+"""
+
+# Everything printable in ASCII that a Festina literal can hold as it
+# is, words, composites, a character past U+FFFF that DejaVu does have
+# (U+1F600, four bytes of UTF-8), and three it does not -- CJK, one
+# from the supplementary CJK plane (also four bytes) and a private-use
+# code point -- which must come out as glyph 0 with glyph 0's advance.
+LAYOUT_WORDS = ([chr(c) for c in range(33, 127) if chr(c) not in "'`$\\{}"] +
+                ["Hello", "xg", " ", "Handgloves", "The quick brown fox", "iiiiiiii", "WAVE",
+                 "fi fl", "0123456789", "\u00e9", "\u00c5ngstr\u00f6m", "\u00c9\u00c7\u00d1",
+                 "\u4e2d", "a\U0001F600b", "a\U00020000b", "\ue000", "  two  spaces  "])
+LAYOUT_SIZES = list(range(6, 73, 3))
+
+
+def _layout_program(words, sizes, runtime_too=False):
+    lit = ", ".join(f"'{w}'" for w in words)
+    body = [
+        "import font.f", "blob raw = 'font.ttf'", "arr[int] bytes = []", "int i = 0",
+        "while i < raw.length {", "    bytes.push(raw.byteAt(i))", "    i = i + 1", "}",
+        "int e = fntOpen(bytes)", f"arr[text] words = [{lit}]",
+        f"arr[int] sizes = [{', '.join(map(str, sizes))}]", "int s = 0",
+        "while s < sizes.length {", "    int px = sizes[s]",
+    ]
+    if runtime_too:
+        body.append("    changeFont(px, null, null)")
+    body += [
+        "    int k = 0", "    while k < words.length {",
+        "        arr[int] gids = []", "        arr[float] pens = []",
+        "        int w = fntLayout(words[k], px, 0.0, gids, pens)",
+        "        text line = `${px} ${k} ${w} ${fntTextHeight(words[k], px)} |`",
+        "        int j = 0",
+        "        while j < gids.length {",
+        "            line = `${line} ${gids[j]}:${Math.round(pens[j])}`",
+        "            j = j + 1",
+        "        }",
+    ]
+    if runtime_too:
+        body.append("        line = `${line} | ${measureTextWidth(words[k])} ${measureTextHeight(words[k])}`")
+    body += ["        log(line)", "        k = k + 1", "    }", "    s = s + 1", "}"]
+    return "\n".join(body) + "\n"
+
+
+def _sans_is_dejavu():
+    try:
+        out = subprocess.run(["fc-match", "-f", "%{file}", "sans-serif"],
+                             capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        _missing("fc-match is not available to say which file sans-serif is")
+    if os.path.realpath(out) != os.path.realpath(SANS):
+        _missing(f"sans-serif resolves to {out}, not {SANS}: the runtime would be "
+                 f"measuring a different font")
+
+
+class TestLayout:
+    """Slice 4."""
+
+    def _ours(self, built, tmp_path, runtime_too=False):
+        prog = built.build_program(_layout_program(LAYOUT_WORDS, LAYOUT_SIZES, runtime_too))
+        lines = _run_in(tmp_path, prog, open(_font("DejaVuSans.ttf"), "rb").read())
+        out = {}
+        for line in lines:
+            parts = line.split(" | ")
+            px, k, w, h = map(int, parts[0].split()[:4])
+            out[(px, k)] = (w, h, parts[1].split() if len(parts) > 1 else [],
+                            tuple(map(int, parts[2].split())) if len(parts) > 2 else None)
+        assert len(out) == len(LAYOUT_WORDS) * len(LAYOUT_SIZES)
+        return out
+
+    def test_width_matches_measure_text_width_exactly(self, built, tmp_path):
+        """The runtime's own measureTextWidth, called in the same
+        program -- the thing slice 6 will replace -- against font.f,
+        over every string and size. Exact, because hinting never moves
+        an advance here: measured 7,437 of 7,437 in a wider sweep."""
+        _sans_is_dejavu()
+        ours = self._ours(built, tmp_path, runtime_too=True)
+        wrong = [(LAYOUT_WORDS[k], px, w, rt[0]) for (px, k), (w, _, _, rt) in ours.items() if w != rt[0]]
+        assert not wrong, wrong[:5]
+
+    def test_layout_and_height_match_unhinted_cairo_exactly(self, built, tmp_path):
+        """Against Cairo under the spec's reference options: the
+        advance, the inked height, and every glyph's id and pen position
+        from Cairo's own text_to_glyphs."""
+        ours = self._ours(built, tmp_path)
+        oracle = _build_c(built, "cairo_text", CAIRO_TEXT_C, ["cairo", "freetype2"])
+        wrong = []
+        for px in LAYOUT_SIZES:
+            out = subprocess.run([oracle, _font("DejaVuSans.ttf"), str(px)] + LAYOUT_WORDS,
+                                 capture_output=True, text=True, check=True).stdout.splitlines()
+            for k, line in enumerate(out):
+                head, glyphs = line.split(" |")
+                w, h = map(int, head.split())
+                mine = ours[(px, k)]
+                if (w, h, glyphs.split()) != mine[:3]:
+                    wrong.append((LAYOUT_WORDS[k], px, (w, h, glyphs.split()[:4]), mine[:2], mine[2][:4]))
+        assert not wrong, wrong[:3]
+
+    def test_characters_are_code_points_and_missing_ones_are_glyph_zero(self, built, tmp_path):
+        """A four-byte character is ONE glyph -- decoding it as bytes
+        would put four here -- whether the font has it (U+1F600 is in
+        DejaVu Sans) or not (U+20000 is not, and is glyph 0). CJK and a
+        private-use character are glyph 0 too."""
+        ours = self._ours(built, tmp_path)
+        gids = lambda word: [g.split(":")[0] for g in ours[(12, LAYOUT_WORDS.index(word))][2]]
+        assert gids("\u4e2d") == ["0"]
+        assert gids("\ue000") == ["0"]
+        have = gids("a\U0001F600b")
+        assert len(have) == 3 and "0" not in have, have
+        lack = gids("a\U00020000b")
+        assert len(lack) == 3 and lack[1] == "0" and "0" not in (lack[0], lack[2]), lack
+
+    def test_layout_matches_cairo_where_dejavu_cannot_tell(self, built, tmp_path):
+        """Two things DejaVu Sans cannot show, in the built font. Its em
+        is 1000 units, not a power of two, so FT_DivFix's rounding
+        decides the scale at some sizes. And '^' is the hump: its top is
+        an off-curve point twice as high as the curve reaches, so the
+        height tells whether the box is the control box (every point) or
+        only the on-curve points -- Cairo's answer, not an assumption,
+        decides which."""
+        text = "Handgloves 0123 xyz"
+        font = _build_small_font(_font("DejaVuSans.ttf"), text, upem=1000, hump=0x5E)
+        path = tmp_path / "built.ttf"
+        path.write_bytes(font)
+        words = ["^", "x^x", "Handgloves", "0123", "xyz", "gloves 0"]
+        sizes = list(range(6, 73))
+        lines = _run_in(tmp_path / "run", built.build_program(_layout_program(words, sizes)), font)
+        ours = {}
+        for line in lines:
+            head, glyphs = line.split(" |")
+            px, k, w, h = map(int, head.split())
+            ours[(px, k)] = (w, h, glyphs.split())
+        oracle = _build_c(built, "cairo_text", CAIRO_TEXT_C, ["cairo", "freetype2"])
+        wrong = []
+        for px in sizes:
+            out = subprocess.run([oracle, str(path), str(px)] + words,
+                                 capture_output=True, text=True, check=True).stdout.splitlines()
+            for k, line in enumerate(out):
+                head, glyphs = line.split(" |")
+                w, h = map(int, head.split())
+                if (w, h, glyphs.split()) != ours[(px, k)]:
+                    wrong.append((words[k], px, (w, h), ours[(px, k)][:2]))
+        assert not wrong, wrong[:4]
+        # The hump's height is the control box's: 1500 units, not 750.
+        assert ours[(40, 0)][1] >= 58, ours[(40, 0)]
