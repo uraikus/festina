@@ -1173,6 +1173,13 @@ black text on a transparent image leaves alpha equal to the mask, byte
 for byte, at 9, 16 and 31 px. The canvas and an `img` draw identical
 text.
 
+**It is 12 times slower than Cairo per line, and that was not noticed
+until after CI was dispatched.** 74 us per 25-character line against
+5.9 us (693 us before a glyph cache and `amor` arrays — decisions.md
+#352 has the numbers and the profile). 224 lines fit a 60 fps frame;
+Cairo's 2,814. Every glyph of a size is rasterised once and blitted at
+whole-pixel pens after that, checked against an uncached rasterisation.
+
 The font reaches a program as generated C — the bytes and a table of
 text.f's entry points, registered from a constructor — linked only
 where text is drawn or measured (781,008 bytes). Components export

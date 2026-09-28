@@ -282,6 +282,122 @@ class TestTheFillIsTheCSides:
         assert all(p[:3] == (0, 160, 0) for p in solid)
 
 
+class TestTheGlyphCache:
+    """text.f rasterises each (glyph, size) once and blits it after that
+    -- 693 us per line became 71 us. Everything else here compares text.f
+    with text.f, which a cache bug would slip through, so these compare
+    the CACHED mask with an uncached rasterisation of the same line, done
+    the slow way: each glyph's path through raster.f onto a surface, at
+    its own pen position."""
+
+    def _both(self, tmp_path, cli_mod, lines):
+        """For each (text, px): text.f's mask and the uncached surface's
+        alpha, as {(text, px): (x0, y0, w, h, mask rows, {(x, y): alpha})}."""
+        d = tmp_path / "cache"
+        d.mkdir(exist_ok=True)
+        shutil.copy(FONT, d / "font.ttf")
+        body = ["import text.f", "blob raw = 'font.ttf'", "arr[int] bytes = []", "int i = 0",
+                "while i < raw.length {", "    bytes.push(raw.byteAt(i))", "    i = i + 1", "}",
+                "int e = fntOpen(bytes)"]
+        for n, (text, px) in enumerate(lines):
+            body += [
+                f"arr[int] m{n} = festinaTextMask('{text}', {px}, bytes)",
+                f"text o{n} = ''", f"int k{n} = 0",
+                f"while k{n} < m{n}.length {{ o{n} = `${{o{n}}} ${{m{n}[k{n}]}}` k{n} = k{n} + 1 }}",
+                f"log(o{n})",
+                # The reference: the same line, glyph by glyph, uncached.
+                f"arr[int] g{n} = []", f"arr[float] p{n} = []",
+                f"int wd{n} = fntLayout('{text}', {px}, 0.0, g{n}, p{n})",
+                f"arr[int] s{n} = rasNewSurface(320, 200)",
+                f"int j{n} = 0",
+                f"while j{n} < g{n}.length {{",
+                f"    arr[float] pts = []", f"    arr[int] ends = []",
+                f"    int r = fntGlyphPath(g{n}[j{n}], {float(px)!r}, 20.0 + p{n}[j{n}], 150.0, pts, ends)",
+                f"    rasFillPath(s{n}, 320, 200, pts, ends, RAS_NONZERO, 0, 0, 0, 255)",
+                f"    j{n} = j{n} + 1", "}",
+                # Only the rows the text can occupy (baseline 150, size <= 31:
+                # rows 110..170), so the string stays short.
+                f"text a{n} = ''", f"int q{n} = (110 * 320 * 4) + 3",
+                f"while q{n} < (170 * 320 * 4) {{ a{n} = `${{a{n}}} ${{s{n}[q{n}]}}` q{n} = q{n} + 4 }}",
+                f"log(a{n})"]
+        prog = _compile(d, cli_mod, "\n".join(body) + "\n",
+                        with_components=("text.f", "font.f", "raster.f"))
+        out = _run(d, prog)
+        result = {}
+        for n, key in enumerate(lines):
+            v = [int(t) for t in out[2 * n].split()]
+            x0, y0, w, h = v[:4]
+            ref = [int(t) for t in out[2 * n + 1].split()]
+            result[key] = (x0, y0, w, h, v[4:], ref)
+        return result
+
+    def test_cached_glyphs_equal_uncached_rasterisation(self, tmp_path, cli_mod):
+        """Repeated letters ('llll', 'Handgloves') put the same cached
+        glyph at many pens; three sizes put different entries under one
+        glyph; accents and a four-byte character add composites and a
+        missing glyph. Each pixel within one grey level of the uncached
+        rasterisation: the mask sums float coverages and rounds once, the
+        surface blends 8-bit alphas glyph by glyph, and where two glyphs
+        touch the two differ by a rounding at most."""
+        lines = [("Handgloves llll", 16), ("Handgloves llll", 9), ("Handgloves llll", 31),
+                 ("\u00c9t\u00e9 \u00c5ngstr\u00f6m", 24), ("a\U00020000b To", 16)]
+        results = self._both(tmp_path, cli_mod, lines)
+        for (text, px), (x0, y0, w, h, mask, ref) in results.items():
+            assert w > 0 and h > 0
+            assert 110 <= 150 + y0 and 150 + y0 + h <= 170 and 20 + x0 + w <= 320, \
+                "the mask has to sit inside the rows and columns compared"
+            worst, inked = 0, 0
+            for y in range(110, 170):
+                for x in range(320):
+                    want = ref[(y - 110) * 320 + x]
+                    mx, my = x - 20 - x0, y - 150 - y0
+                    got = mask[my * w + mx] if 0 <= mx < w and 0 <= my < h else 0
+                    worst = max(worst, abs(got - want))
+                    inked += want > 0
+            assert inked > 100, (text, px)
+            assert worst <= 1, f"{text!r} at {px}: worst {worst}"
+
+    def test_the_cache_survives_being_emptied(self, tmp_path, cli_mod):
+        """The pool is cleared at the start of a call once it is over
+        TXT_POOL_LIMIT floats (four million; lowered here). A line drawn before that and again after must be
+        identical: a clear that left the index behind would send the
+        second one to offsets in a pool that is gone."""
+        d = tmp_path / "clear"
+        d.mkdir()
+        shutil.copy(FONT, d / "font.ttf")
+        body = ["import text.f", "blob raw = 'font.ttf'", "arr[int] bytes = []", "int i = 0",
+                "while i < raw.length {", "    bytes.push(raw.byteAt(i))", "    i = i + 1", "}",
+                # The limit is an ordinary global: lowered here so that ordinary
+                # glyphs empty the pool, instead of four million floats of 100 px
+                # ones (which took fifteen seconds to draw).
+                "TXT_POOL_LIMIT = 30000",
+                "arr[int] first = festinaTextMask('Handgloves 42', 20, bytes)",
+                "int cleared = 0",
+                "int size = 20",
+                "while size < 60 {",
+                "    int before = TXT_POOL.length",
+                "    arr[int] big = festinaTextMask('ABCDEFGHIJKLMNOPQRSTUVWXYZ', size, bytes)",
+                "    if TXT_POOL.length < before { cleared = cleared + 1 }",
+                "    size = size + 1",
+                "}",
+                "arr[int] second = festinaTextMask('Handgloves 42', 20, bytes)",
+                "log(cleared)",
+                "log(first.length == second.length)",
+                "int diff = 0",
+                "int k = 0",
+                "while k < first.length && k < second.length {",
+                "    if first[k] != second[k] { diff = diff + 1 }",
+                "    k = k + 1",
+                "}",
+                "log(diff)",
+                "log(first.length > 100)"]
+        prog = _compile(d, cli_mod, "\n".join(body) + "\n",
+                        with_components=("text.f", "font.f", "raster.f"))
+        cleared, same_len, diff, real = _run(d, prog)
+        assert int(cleared) >= 1, "the churn has to be enough to empty the pool"
+        assert (same_len, diff, real) == ("true", "0", "true")
+
+
 class TestLinking:
 
     def _symbols(self, tmp_path, cli_mod, source, name):

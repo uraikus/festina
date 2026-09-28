@@ -8959,3 +8959,51 @@ aud async pool reaches the main loop the same way, by a 20 ms poll, not
 a pipe. Audio's buffer callbacks signal with the lock held. The HTTP
 pool was the only wake pipe in the runtime, and the only place a byte
 could be thrown away after the fact.
+
+**Speed, measured after the fact -- and it was not fine.** Slices 5 and
+6 shipped without a timing, and the first one, taken while CI ran,
+found drawText 77 times slower than Cairo: 693 us per 25-character
+line against 9 us. A frame at 60 fps would have held about 24 lines.
+Cairo caches each glyph's bitmap; text.f rasterised every glyph of
+every line from its outline, and pushed one array element per pixel of
+the result, each push a realloc.
+
+Profiled with callgrind, in two steps. First a glyph cache: every pen
+position is a whole pixel, so a glyph's coverage at a given size is
+the same wherever it lands, and each (glyph, size) is now rasterised
+once and blitted after that -- 693 us to 119. Then the per-pixel
+pushes, two thirds of what was left, moved to `amor` (geometric
+growth) arrays: 119 to 74. Marginal cost, startup excluded (7 ms, the
+same as Cairo's 9):
+
+| per 25-character line | font.f | Cairo |
+|---|---|---|
+| before | 693 us | 9 us |
+| glyph cache | 119 us | |
+| + amor arrays | **74 us** | **5.9 us** |
+| lines in a 16.6 ms frame | 224 | 2,814 |
+
+So text.f is still about twelve times slower than Cairo per line. 224
+lines a frame covers nearly any program; a text-heavy one (a scrolling
+log, a terminal) could still feel it, and `FESTINA_CAIRO_TEXT=1` is
+the way back. Left on the table: the remaining cost is still one
+`push` call per pixel of the line's mask, twice.
+
+**Nothing about the output changed.** The mask is byte-identical to the
+uncached version on 78 line/size cases (13 strings, six sizes, empty
+and blank lines included), checked before the cache was trusted. It
+cannot be checked against the old code by the test suite -- the tests
+compare text.f with text.f -- so it is now checked against an uncached
+rasterisation done the slow way, glyph by glyph through raster.f, within
+one grey level. Seven bugs put back in the cache (a key ignoring size
+or glyph, a dropped x or y offset, the pen ignored when blitting, a
+pool cleared without its index, a pool never cleared) all fail a test.
+
+**And the differential harness found a gap.** The first version made
+the pool a global `amor arr`, and the bootstrap compiler disagreed with
+the Python one on text.f: `bootstrap/codegen.f` compiles a global
+`amor arr` as a plain array (a local one it gets right). Not fixed
+here; it is why text.f's pool is a plain array, with a comment saying
+so. A corpus file cannot use a global amor array until that port
+learns it.
+
