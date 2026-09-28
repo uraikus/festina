@@ -1050,9 +1050,13 @@ def _seg_dist(px, py, a, b):
 # ---- slice 4: laying out a line ----
 
 CAIRO_TEXT_C = r"""
-/* argv: font px, then strings. Per string, under the spec's reference
- * options and the font FILE: the advance, the inked height, and each
- * glyph Cairo's own text_to_glyphs lays out, as gid:x. */
+/* argv: font px wordsfile. The strings come from a UTF-8 file, one per
+ * line, NOT from argv: Windows hands a program its arguments re-encoded
+ * in the ANSI code page, so on CI's Windows job 'e-acute' arrived as an
+ * invalid byte (Cairo drew nothing) and a four-byte character as '??'.
+ * Per string, under the spec's reference options and the font FILE:
+ * the advance, the inked height, and each glyph Cairo's own
+ * text_to_glyphs lays out, as gid:x. */
 #include <cairo.h>
 #include <cairo-ft.h>
 #include <stdio.h>
@@ -1072,19 +1076,35 @@ int main(int argc, char **argv) {
     cairo_font_options_set_hint_metrics(fo, CAIRO_HINT_METRICS_ON);
     cairo_set_font_options(cr, fo);
     cairo_scaled_font_t *sf = cairo_get_scaled_font(cr);
-    for (int i = 3; i < argc; i++) {
+    FILE *words = fopen(argv[3], "rb");
+    if (!words) { puts("NOWORDS"); return 1; }
+    static char line[4096];
+    while (fgets(line, sizeof line, words)) {
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
         cairo_text_extents_t e;
-        cairo_text_extents(cr, argv[i], &e);
+        cairo_text_extents(cr, line, &e);
         printf("%d %d |", (int)(e.x_advance + 0.5), (int)(e.height + 0.5));
         cairo_glyph_t *glyphs = NULL; int n = 0;
-        cairo_scaled_font_text_to_glyphs(sf, 0, 0, argv[i], -1, &glyphs, &n, NULL, NULL, NULL);
+        cairo_scaled_font_text_to_glyphs(sf, 0, 0, line, -1, &glyphs, &n, NULL, NULL, NULL);
         for (int k = 0; k < n; k++) printf(" %lu:%g", glyphs[k].index, glyphs[k].x);
         printf("\n");
         cairo_glyph_free(glyphs);
     }
+    fclose(words);
     return 0;
 }
 """
+
+
+def _words_file(directory, words):
+    """The oracle's input: UTF-8, one string per line (see CAIRO_TEXT_C
+    for why not argv). None of the strings holds a newline."""
+    assert not any("\n" in w or "\r" in w for w in words)
+    path = os.path.join(str(directory), "words.txt")
+    with open(path, "wb") as fh:
+        fh.write(("\n".join(words) + "\n").encode("utf-8"))
+    return path
 
 # Everything printable in ASCII that a Festina literal can hold as it
 # is, words, composites, a character past U+FFFF that DejaVu does have
@@ -1181,8 +1201,10 @@ class TestLayout:
         oracle = _build_c(built, "cairo_text", CAIRO_TEXT_C, ["cairo", "freetype2"])
         wrong = []
         for px in LAYOUT_SIZES:
-            out = subprocess.run([oracle, _font("DejaVuSans.ttf"), str(px)] + LAYOUT_WORDS,
-                                 capture_output=True, text=True, check=True).stdout.splitlines()
+            out = subprocess.run([oracle, _font("DejaVuSans.ttf"), str(px),
+                                  _words_file(tmp_path, LAYOUT_WORDS)],
+                                 capture_output=True, text=True, check=True,
+                                 encoding="utf-8").stdout.splitlines()
             for k, line in enumerate(out):
                 head, glyphs = line.split(" |")
                 w, h = map(int, head.split())
@@ -1228,8 +1250,9 @@ class TestLayout:
         oracle = _build_c(built, "cairo_text", CAIRO_TEXT_C, ["cairo", "freetype2"])
         wrong = []
         for px in sizes:
-            out = subprocess.run([oracle, str(path), str(px)] + words,
-                                 capture_output=True, text=True, check=True).stdout.splitlines()
+            out = subprocess.run([oracle, str(path), str(px), _words_file(tmp_path, words)],
+                                 capture_output=True, text=True, check=True,
+                                 encoding="utf-8").stdout.splitlines()
             for k, line in enumerate(out):
                 head, glyphs = line.split(" |")
                 w, h = map(int, head.split())

@@ -1322,6 +1322,73 @@ class TestSharedObjectCacheIsWrittenAtomically:
         assert [p.name for p in tmp_path.iterdir()] == [obj.name]
 
 
+    def _refuse_replace(self, cli_mod, monkeypatch, times):
+        """Make os.replace fail as Windows fails it when the destination
+        is open in another process (a concurrent link reading it)."""
+        real = os.replace
+        calls = []
+
+        def replace(src, dst):
+            calls.append(dst)
+            if len(calls) <= times:
+                raise PermissionError(13, "Access is denied")
+            return real(src, dst)
+        monkeypatch.setattr(cli_mod.os, "replace", replace)
+        monkeypatch.setattr(cli_mod.time, "sleep", lambda s: None)
+        return calls
+
+    def test_windows_refusal_with_a_fresh_object_there_uses_it(
+            self, cli_mod, monkeypatch, tmp_path):
+        """CI's Windows job: another process built the same object while
+        this one compiled, and is linking against it, so the rename is
+        refused. The object there is newer than this compile's start --
+        same inputs, same compiler -- so it is used and ours dropped."""
+        obj = tmp_path / "festina_runtime_core.deadbeef.o"
+
+        def run_tool(cmd):
+            out = cmd[cmd.index("-o") + 1]
+            with open(out, "wb") as fh:
+                fh.write(b"ours")
+            obj.write_bytes(b"theirs")          # the winner lands mid-compile
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        monkeypatch.setattr(cli_mod, "_run_tool", run_tool)
+        calls = self._refuse_replace(cli_mod, monkeypatch, times=99)
+
+        assert cli_mod._compile_to_cached_object(
+            "clang", ["-c", "x.c"], str(obj), "nope") == str(obj)
+        assert obj.read_bytes() == b"theirs"
+        assert [p.name for p in tmp_path.iterdir()] == [obj.name], "ours is cleaned up"
+        assert len(calls) == 1, "no waiting needed"
+
+    def test_windows_refusal_over_an_old_object_waits_and_replaces(
+            self, cli_mod, monkeypatch, tmp_path):
+        """An object older than this compile could be stale, so it is not
+        taken as a substitute: the rename is retried until the other
+        process lets go, and then ours goes in."""
+        self._fake_cc(cli_mod, monkeypatch, [])
+        obj = tmp_path / "festina_runtime_core.deadbeef.o"
+        obj.write_bytes(b"old")
+        os.utime(obj, (1, 1))
+        calls = self._refuse_replace(cli_mod, monkeypatch, times=3)
+
+        cli_mod._compile_to_cached_object("clang", ["-c", "x.c"], str(obj), "nope")
+        assert obj.read_bytes() == b"\x7fELF-ish"
+        assert len(calls) == 4
+        assert [p.name for p in tmp_path.iterdir()] == [obj.name]
+
+    def test_windows_refusal_that_never_ends_is_reported(
+            self, cli_mod, monkeypatch, tmp_path):
+        self._fake_cc(cli_mod, monkeypatch, [])
+        obj = tmp_path / "festina_runtime_core.deadbeef.o"
+        obj.write_bytes(b"old")
+        os.utime(obj, (1, 1))
+        self._refuse_replace(cli_mod, monkeypatch, times=10_000)
+        with pytest.raises(PermissionError):
+            cli_mod._compile_to_cached_object("clang", ["-c", "x.c"], str(obj), "nope")
+        assert obj.read_bytes() == b"old"
+        assert [p.name for p in tmp_path.iterdir()] == [obj.name], "no staged file left behind"
+
+
 class TestWindowsFatalStatusExplanation:
     """decisions.md #348: a Windows crash status is a number and
     nothing else, and three theories about one particular number have

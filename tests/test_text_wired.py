@@ -190,20 +190,39 @@ class TestEverythingElseStaysWithCairo:
         ("scaled", "changeFont(20, null, null)\na.scale(2.0, 2.0)\n"),
     ])
     def test_it_draws_exactly_what_cairo_draws(self, tmp_path, cli_mod, name, setup):
+        """Two claims, checked separately because CI's Windows job
+        separated them. First the PATH: text.f cannot draw bold, italic,
+        another family, a scale or a rotation, so had it drawn one of
+        these it would have drawn the plain line -- regular, unscaled,
+        unrotated -- and that is exactly what this must not equal. That
+        needs nothing from Cairo. Then the PIXELS: byte for byte what
+        Cairo alone draws. On Windows the italic case matched the path
+        claim (only 6 channels from Cairo -- text.f's plain line differs
+        in hundreds) and failed the pixel one, with Cairo agreeing with
+        itself; the runs now alternate, Cairo first, so a difference
+        that follows whichever process ran first shows as that and not
+        as "ours"."""
         prog = _compile(tmp_path, cli_mod, _pixels_program(
-            "fillStyle(0, 0, 0)\n" + setup, "a.drawText('Hello', 5, 40)\n"))
-        ours, cairo = _run(tmp_path, prog), _run(tmp_path, prog, cairo_only=True)
-        assert any(t != "0" for t in ours[0].split()), "something has to be drawn"
-        if ours != cairo:
-            # Say which of two things this is. CI's Windows job failed
-            # the italic case once with nothing more than "they differ";
-            # a second Cairo-only run tells a path-selection bug (Cairo
-            # agrees with itself, so text.f drew one of them) from Cairo
-            # not drawing it the same way twice on that platform.
-            again = _run(tmp_path, prog, cairo_only=True)
-            differ = lambda a, b: sum(x != y for x, y in zip(a[0].split(), b[0].split()))
-            pytest.fail(f"{name}: {differ(ours, cairo)} channels differ from Cairo; "
-                        f"Cairo against itself: {differ(cairo, again)}")
+            "fillStyle(0, 0, 0)\n" + setup, "a.drawText('Hello', 5, 40)\n"), name="fallback")
+        plain = _compile(tmp_path, cli_mod, _pixels_program(
+            "fillStyle(0, 0, 0)\nchangeFont(20, null, null)\n", "a.drawText('Hello', 5, 40)\n"),
+            name="plain")
+        cairo1 = _run(tmp_path, prog, cairo_only=True)
+        ours1 = _run(tmp_path, prog)
+        cairo2 = _run(tmp_path, prog, cairo_only=True)
+        ours2 = _run(tmp_path, prog)
+        text_f_plain = _run(tmp_path, plain)
+        assert any(t != "0" for t in ours1[0].split()), "something has to be drawn"
+
+        differ = lambda a, b: sum(x != y for x, y in zip(a[0].split(), b[0].split()))
+        assert differ(ours1, text_f_plain) > 100, (
+            f"{name}: drew text.f's plain line ({differ(ours1, text_f_plain)} channels "
+            f"from it) -- the path took what it cannot draw")
+        if not (ours1 == cairo1 == cairo2 == ours2):
+            pytest.fail(f"{name}: in run order cairo1, ours1, cairo2, ours2 -- "
+                        f"ours1/cairo1 {differ(ours1, cairo1)}, ours2/cairo2 {differ(ours2, cairo2)}, "
+                        f"cairo1/cairo2 {differ(cairo1, cairo2)}, ours1/ours2 {differ(ours1, ours2)}, "
+                        f"cairo1/ours2 {differ(cairo1, ours2)} channels differ")
 
     def test_a_whole_pixel_translation_is_ours_and_moves_it_exactly(self, tmp_path, cli_mod):
         prog = _compile(tmp_path, cli_mod, _pixels_program(

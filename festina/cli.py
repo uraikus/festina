@@ -65,6 +65,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from . import __version__
 from . import imports as imports_mod
@@ -1106,7 +1107,15 @@ def _compile_to_cached_object(cc, args, obj_path, failure_message):
     The loser of a race replaces the winner's identical object, which
     is free of consequence: the inputs are the same file and the same
     compiler, so the two objects are interchangeable.
+
+    Except on Windows, where a file another process has open cannot be
+    replaced at all: os.replace raises PermissionError ("Access is
+    denied") while a concurrent link is reading the winner's object --
+    CI's Windows job hit exactly that. _publish_cached_object handles
+    it: an object written after this compile began came from the same
+    inputs and is used as it is; an older one is waited for.
     """
+    started = time.time()
     fd, staged = tempfile.mkstemp(
         dir=os.path.dirname(obj_path),
         prefix=os.path.basename(obj_path) + ".",
@@ -1117,12 +1126,39 @@ def _compile_to_cached_object(cc, args, obj_path, failure_message):
         if result.returncode != 0:
             raise CompileError(f"{failure_message}:\n{result.stderr}",
                                 category="link error")
-        os.replace(staged, obj_path)
+        _publish_cached_object(staged, obj_path, started)
         staged = None
     finally:
         if staged is not None and os.path.exists(staged):
             os.unlink(staged)
     return obj_path
+
+
+def _publish_cached_object(staged, obj_path, started, attempts=20):
+    """Rename `staged` over `obj_path`, or settle for an equivalent.
+
+    A refused rename (Windows, the destination open in another process)
+    whose destination was written AFTER this compile started means
+    another process compiled the same inputs meanwhile -- its object is
+    as good as this one, and is left where it is. A destination older
+    than that could be stale, so it is waited for instead: a link holds
+    the file for as long as it takes to link, and the backoff here
+    comes to about ten seconds before the refusal is reported.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(staged, obj_path)
+            return
+        except PermissionError:
+            try:
+                if os.path.getmtime(obj_path) >= started:
+                    os.unlink(staged)
+                    return
+            except OSError:
+                pass
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 # ---- WASM export (claude.md #148) ----
