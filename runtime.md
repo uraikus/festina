@@ -948,7 +948,7 @@ the user's, and the bundle needs permission.
 0. measure macOS and Windows: what Cairo's toy `sans-serif` resolves
    to, its anti-aliasing, hint metrics and kerning there — a CI probe
    step, the way the Windows crash was measured, removed once read
-1. `runtime/festina/font.f`: the table directory and the tables above,
+1. ✅ `runtime/festina/font.f`: the table directory and the tables above,
    simple glyphs to outlines in font units, compared exactly against
    FreeType for every glyph of DejaVu Sans; the refusals, each tested
 2. composite glyphs — offsets, scaled components; point-matched
@@ -966,6 +966,54 @@ the user's, and the bundle needs permission.
 Slices 1–4 need no decision and can start now. Slice 5 needs the font
 decision, and slice 6 needs the greyscale/unhinted change agreed,
 since that is when users would see it.
+
+**Slice 1, as built.** `font.f` reads a font in place, from the file's
+own bytes: `fntOpen` finds and range-checks the tables, `fntGlyphIndex`
+maps a code point through the cmap, `fntAdvance`/`fntLsb` read hmtx,
+and `fntGlyph` decodes a simple glyph into points, on-curve flags and
+contour ends in font units. Every glyph of the four fonts
+fonts-dejavu-core installs matches FreeType's unscaled, unhinted
+outline point for point — 11,363 simple glyphs, with every advance —
+and the format-12 cmap matches over all of U+0000–U+10FFFF, 5,918
+mappings in DejaVu Sans, supplementary planes included. The format-4
+table matches too. The whole of DejaVu Sans — every glyph and 1.1
+million cmap lookups — parses in 0.15 s.
+
+**Three glyphs disagreed, by one unit, and FreeType was right.**
+FreeType places a glyph so its left edge sits `lsb` (from hmtx) right
+of the origin, which is what the glyph header's `xMin` normally says
+as well. In DejaVu Sans the two disagree for six glyphs, by one unit
+each; three are simple, and those were exactly the three that
+differed. `fntGlyph` now moves the outline by `lsb − xMin`, as
+FreeType does. Checked across the whole font before it was believed:
+every other glyph has `lsb = xMin`.
+
+**The fonts CI has do not reach every path, so the test builds one
+that does.** All four are long-loca and all four have a format-12
+cmap. (DejaVu Sans does exercise hmtx's shared-advance tail — 6,238
+entries for 6,253 glyphs — and putting that bug back fails its test.)
+So the test assembles a real TrueType file
+from DejaVu's own glyphs — short loca, format 4 only, a monospaced tail
+past `numberOfHMetrics` — and FreeType reads it too, so it is compared
+exactly like the rest. Its digits share one format-4 segment mapped
+through the glyph array, with holes and a nonzero `idDelta`, because
+one of the eleven bugs put back to check these tests survived: a 0
+read from the glyph array must mean "missing" without the delta being
+added, and neither DejaVu's format-4 table nor the first version of
+the built font ever took that path. It fails now.
+
+**Refusals are codes, and damage is not absence.** CFF (`OTTO`),
+collections, a file that is not a font, a missing table and a font
+with no Unicode cmap each return their own `FNT_ERR`. A table that is
+listed but runs past the end of the file says `E_SHORT`, not
+`E_TABLE`: the first version reported a file cut off in the middle of
+`glyf` as missing its `glyf`, which is the wrong thing to tell the
+caller. Every multi-byte read is range-checked, so a truncated file —
+tested at seven lengths from 0 bytes to the middle of `glyf` — is
+refused rather than read past, and a single glyph whose `loca` entry
+points outside `glyf` fails alone while the glyphs around it still
+read. `font.f` is in the differential corpus and all five harnesses
+compare it.
 
 ## Tests
 
