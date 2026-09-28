@@ -194,7 +194,16 @@ class TestEverythingElseStaysWithCairo:
             "fillStyle(0, 0, 0)\n" + setup, "a.drawText('Hello', 5, 40)\n"))
         ours, cairo = _run(tmp_path, prog), _run(tmp_path, prog, cairo_only=True)
         assert any(t != "0" for t in ours[0].split()), "something has to be drawn"
-        assert ours == cairo, name
+        if ours != cairo:
+            # Say which of two things this is. CI's Windows job failed
+            # the italic case once with nothing more than "they differ";
+            # a second Cairo-only run tells a path-selection bug (Cairo
+            # agrees with itself, so text.f drew one of them) from Cairo
+            # not drawing it the same way twice on that platform.
+            again = _run(tmp_path, prog, cairo_only=True)
+            differ = lambda a, b: sum(x != y for x, y in zip(a[0].split(), b[0].split()))
+            pytest.fail(f"{name}: {differ(ours, cairo)} channels differ from Cairo; "
+                        f"Cairo against itself: {differ(cairo, again)}")
 
     def test_a_whole_pixel_translation_is_ours_and_moves_it_exactly(self, tmp_path, cli_mod):
         prog = _compile(tmp_path, cli_mod, _pixels_program(
