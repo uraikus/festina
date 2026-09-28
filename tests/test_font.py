@@ -33,9 +33,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from festina import imports as imports_mod   # noqa: E402
 
 DEJAVU_DIR = "/usr/share/fonts/truetype/dejavu"
+# DejaVu Sans is BUNDLED (runtime/fonts/, decisions.md #352) and byte-
+# identical to the file fonts-dejavu-core installs, so every test of
+# DejaVu Sans reads the bundled copy and runs on every platform with
+# FreeType -- not only where the system happens to have DejaVu. The
+# other three faces are the system's, and skip where it lacks them.
+BUNDLED_SANS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "runtime", "fonts", "DejaVuSans.ttf")
 CORE_FONTS = ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf",
               "DejaVuSerif.ttf", "DejaVuSerif-Bold.ttf"]
-SANS = os.path.join(DEJAVU_DIR, "DejaVuSans.ttf")
+SANS = BUNDLED_SANS
+SYSTEM_SANS = os.path.join(DEJAVU_DIR, "DejaVuSans.ttf")
 
 # FNT_E_* in font.f.
 E_SHORT, E_NOT_SFNT, E_CFF, E_COLLECTION, E_TABLE, E_NO_CMAP, E_GLYPH, E_COMPONENT = range(1, 9)
@@ -53,6 +61,7 @@ def _missing(reason):
 ORACLE_C = r"""
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_TRUETYPE_TABLES_H   /* FT_Get_CMap_Format: macOS's clang refuses it undeclared */
 #include <stdio.h>
 #include <stdlib.h>
 /* argv: font, cmap format to force (0 = FreeType's own choice).
@@ -192,10 +201,11 @@ def built(tmp_path_factory):
     return _Built(tmp_path_factory.mktemp("font"))
 
 
-def _run_in(tmp_path, program, font_bytes):
+def _run_in(tmp_path, program, font_bytes, env=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "font.ttf").write_bytes(font_bytes)
-    r = subprocess.run([program], cwd=tmp_path, capture_output=True, text=True, timeout=300)
+    r = subprocess.run([program], cwd=tmp_path, capture_output=True, text=True, timeout=300,
+                       env=dict(os.environ, **(env or {})))
     assert r.returncode == 0, r.stdout + r.stderr
     return r.stdout.splitlines()
 
@@ -208,6 +218,8 @@ def _oracle(built, font_path, cmap_format=0):
 
 
 def _font(name):
+    if name == "DejaVuSans.ttf":
+        return BUNDLED_SANS
     path = os.path.join(DEJAVU_DIR, name)
     if not os.path.exists(path):
         _missing(f"{path} is not installed (fonts-dejavu-core)")
@@ -1120,8 +1132,8 @@ def _sans_is_dejavu():
                              capture_output=True, text=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         _missing("fc-match is not available to say which file sans-serif is")
-    if os.path.realpath(out) != os.path.realpath(SANS):
-        _missing(f"sans-serif resolves to {out}, not {SANS}: the runtime would be "
+    if os.path.realpath(out) != os.path.realpath(SYSTEM_SANS):
+        _missing(f"sans-serif resolves to {out}, not {SYSTEM_SANS}: Cairo would be "
                  f"measuring a different font")
 
 
@@ -1130,7 +1142,11 @@ class TestLayout:
 
     def _ours(self, built, tmp_path, runtime_too=False):
         prog = built.build_program(_layout_program(LAYOUT_WORDS, LAYOUT_SIZES, runtime_too))
-        lines = _run_in(tmp_path, prog, open(_font("DejaVuSans.ttf"), "rb").read())
+        # With runtime_too, the runtime's measures are CAIRO's: since
+        # slice 6 the default face is measured by font.f itself, and
+        # comparing font.f with font.f would pass whatever it did.
+        lines = _run_in(tmp_path, prog, open(_font("DejaVuSans.ttf"), "rb").read(),
+                        env={"FESTINA_CAIRO_TEXT": "1"})
         out = {}
         for line in lines:
             # "px k width height | gid:x gid:x ... | runtimeWidth runtimeHeight",
@@ -1144,10 +1160,14 @@ class TestLayout:
         return out
 
     def test_width_matches_measure_text_width_exactly(self, built, tmp_path):
-        """The runtime's own measureTextWidth, called in the same
-        program -- the thing slice 6 will replace -- against font.f,
-        over every string and size. Exact, because hinting never moves
-        an advance here: measured 7,437 of 7,437 in a wider sweep."""
+        """Cairo's measureTextWidth -- what the runtime answered before
+        slice 6, reached now through FESTINA_CAIRO_TEXT=1 -- against
+        font.f, over every string and size. Exact, because hinting never
+        moves an advance here: measured 7,437 of 7,437 in a wider sweep.
+        (Its first version, written before slice 6, compared against
+        the runtime's own answer; once that answer WAS font.f's, the
+        test compared font.f with itself. CI's first run on macOS is
+        what led to noticing.)"""
         _sans_is_dejavu()
         ours = self._ours(built, tmp_path, runtime_too=True)
         wrong = [(LAYOUT_WORDS[k], px, w, rt[0]) for (px, k), (w, _, _, rt) in ours.items() if w != rt[0]]
