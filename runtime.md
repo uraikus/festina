@@ -953,7 +953,7 @@ the user's, and the bundle needs permission.
    FreeType for every glyph of DejaVu Sans; the refusals, each tested
 2. ✅ composite glyphs — offsets, scaled components; point-matched
    components refused until a font needs them
-3. glyph outlines through raster.f: quadratic flattening, scale and
+3. ✅ glyph outlines through raster.f: quadratic flattening, scale and
    y-flip, fractional origins, compared against the explicit-option
    Cairo oracle with a measured bound
 4. layout: UTF-8 decoding, rounded advances, glyph 0 for the missing;
@@ -1047,6 +1047,64 @@ with `FNT_E_COMPONENT` rather than written untested: no font here uses
 either. A composite that contains itself stops at a depth of 16 with
 `FNT_E_GLYPH`; without the guard it crashes the program. Ten bugs were
 put back across the decoder and every one fails a test.
+
+**Slice 3, as built.** `fntGlyphPath` turns a glyph into a raster.f
+path at a size and an origin: TrueType's quadratic B-splines walked the
+way FreeType's `FT_Outline_Decompose` walks them — implied on-curve
+midpoints between off-curve runs, and a contour that starts on an
+off-curve point started on its last point or halfway — then flattened
+by a derived segment count and filled with the nonzero rule. font.f
+produces paths and does not import raster.f; whoever draws decides how.
+
+Against Cairo with the spec's options and the same font file, drawing
+24 glyphs (composites included) one at a time:
+
+| size | 12 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|
+| worst pixel | 12 | 16 | 20 | 18 | 20 |
+| mean over ink | 2.58 | 2.39 | 1.03 | 0.86 | 0.30 |
+
+with no pixel off by more than 60 at any size, which is what a
+misplaced edge or a missing contour would produce.
+
+**The tolerance is not raster.f's, and it was measured, not copied.**
+At raster.f's 0.1 px a chord can sit a tenth of a pixel inside a curve
+— up to 25 grey levels on an edge pixel, always light. Against the
+true outline:
+
+| tolerance | worst (16 / 32 px) | mean over ink | bias | per glyph |
+|---|---|---|---|---|
+| 0.1 | 22.9 / 27.9 | 4.58 / 3.18 | +0.81 | 44 µs |
+| 0.03 | 8.0 / 8.5 | 1.87 / 1.29 | +0.19 | 54 µs |
+| 0.01 | 8.0 / 8.5 | 0.95 / 0.61 | +0.09 | 70 µs |
+
+The worst case stops improving at 0.03, and that was checked rather
+than assumed: 8 is raster.f's own sampling floor — with 64 sub-rows
+instead of 16 it falls to 2.3 at 0.01 — and 0.03 px is at most 7.7
+levels, just under it. Tighter lowers only the mean, for 30% more
+time, so glyphs flatten at 0.03.
+
+**Against the truth, raster.f is closer than Cairo.** Cairo's own
+greyscale glyphs measure 19.7 / 23.2 worst and 3.39 / 1.87 mean from
+the true outline at 16 / 32 px; raster.f's 8.0 / 8.5 and 1.87 / 1.29.
+That is why raster.f's distance from Cairo *grew* slightly as its
+tolerance tightened: what is left between them is mostly Cairo's
+error. The reference itself was checked first — its first reading
+disagreed with both renderers more than they disagreed with each
+other, which looked like a bug in the reference; 16, 64 and 256
+sub-rows agree to 0.3, so it was not. At fractional origins the
+numbers hold: worst 8.4, mean 1.84 / 1.25, bias +0.17.
+
+The segment count is a guarantee, tested as one: six quadratics from
+nearly flat to a 400 px sweep, each chord within 0.03 px of the curve
+sampled densely, and some chord at least half that, so the count is
+not just generously high. A contour rotated to start in each of the
+three cases draws the same pixels.
+
+Seven bugs were put back; six fail. The seventh — starting on the last
+point without consuming it — only adds a zero-length closing edge,
+the same curves and one duplicate point, so no picture can see it and
+it is not a bug. The consuming form is kept because it is FreeType's.
 
 ## Tests
 

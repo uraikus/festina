@@ -535,3 +535,166 @@ int func fntSimpleGlyph(at:int, contours:int, xs:arr[int], ys:arr[int], onCurve:
     if FNT_ERR != 0 { return -1 }
     return contours
 }
+
+// ---- slice 3: a glyph as a path raster.f can fill ----
+//
+// The path format is raster.f's: `pts` holds x, y pairs in device
+// space and `ends` the point count at the end of each subpath. font.f
+// does not import raster.f -- it produces paths, and whoever draws
+// decides how -- so the tolerance is repeated here rather than shared.
+//
+// TrueType contours are quadratic B-splines: a run of off-curve points
+// has an implied on-curve point halfway between each pair, and a
+// contour may start on an off-curve point. Device space is y-down with
+// the baseline at oy, so a font unit y goes to oy - y * scale. Glyphs
+// are drawn with the nonzero rule, which is what TrueType outlines are
+// designed for: overlapping contours in one glyph are both "inside".
+
+// Glyphs are flattened finer than raster.f's paths (0.1 px, Cairo's
+// default for shapes), and the number was measured, not assumed.
+// Against the true outline, at 16 and 32 px:
+//
+//   tolerance   worst pixel   mean over ink   bias     time per glyph
+//   0.1         22.9 / 27.9   4.58 / 3.18     +0.81    44 us
+//   0.03         8.0 / 8.5    1.87 / 1.29     +0.19    54 us
+//   0.01         8.0 / 8.5    0.95 / 0.61     +0.09    70 us
+//
+// At 0.1 a chord can sit a tenth of a pixel inside a curve -- up to 25
+// grey levels on an edge pixel, always on the light side. At 0.03 the
+// worst case stops improving: 8 is raster.f's own sampling floor, and
+// 0.03 px is at most 7.7 levels, just under it. Tighter only lowers
+// the mean, for 30% more time. (The floor was checked, not assumed:
+// with RAS_SUB at 64 instead of 16 the worst case falls to 2.3 at 0.01
+// and 6.8 at 0.03 -- where the tolerance is then what limits it.)
+float FNT_TOLERANCE = 0.03
+int FNT_MAX_SEGMENTS = 1024
+
+// How many uniform-t segments keep a quadratic within FNT_TOLERANCE.
+// B''(t) = 2(P0 - 2P1 + P2) is constant, so over n equal steps the
+// chord strays from the curve by at most |P0 - 2P1 + P2| / (4 n^2) --
+// the same interpolation remainder raster.f's cubic count comes from.
+int func fntQuadSegments(x0:float, y0:float, x1:float, y1:float, x2:float, y2:float) {
+    float dx = x0 - (2.0 * x1) + x2
+    float dy = y0 - (2.0 * y1) + y2
+    float d = Math.sqrt((dx * dx) + (dy * dy))
+    if d <= 0.0 { return 1 }
+    int n = Math.ceil(Math.sqrt(d / (4.0 * FNT_TOLERANCE)))
+    if n < 1 { return 1 }
+    if n > FNT_MAX_SEGMENTS { return FNT_MAX_SEGMENTS }
+    return n
+}
+
+// A quadratic from the current point (x0, y0), already emitted, through
+// (x1, y1) to (x2, y2), which is written exactly.
+void func fntQuadTo(pts:arr[float], x0:float, y0:float, x1:float, y1:float,
+                    x2:float, y2:float) {
+    int n = fntQuadSegments(x0, y0, x1, y1, x2, y2)
+    int k = 1
+    while k < n {
+        float t = k.toFloat() / n.toFloat()
+        float u = 1.0 - t
+        pts.push((u * u * x0) + (2.0 * u * t * x1) + (t * t * x2))
+        pts.push((u * u * y0) + (2.0 * u * t * y1) + (t * t * y2))
+        k = k + 1
+    }
+    pts.push(x2)
+    pts.push(y2)
+}
+
+// One contour, points first..last, in device space. The walk is
+// FreeType's (FT_Outline_Decompose): start on the first point if it is
+// on the curve; otherwise on the last if that one is (consuming it);
+// otherwise halfway between the two. Then every on-curve point ends a
+// line or a quadratic, and two off-curve points in a row have their
+// implied on-curve midpoint between them.
+void func fntContourPath(xs:arr[int], ys:arr[int], oc:arr[int], first:int, last:int,
+                         s:float, ox:float, oy:float, pts:arr[float]) {
+    if last < first { return }
+    float fx = ox + (xs[first].toFloat() * s)
+    float fy = oy - (ys[first].toFloat() * s)
+    float lx = ox + (xs[last].toFloat() * s)
+    float ly = oy - (ys[last].toFloat() * s)
+    float sx = fx
+    float sy = fy
+    int i = first + 1
+    int stop = last
+    bool pending = false
+    float cx = 0.0
+    float cy = 0.0
+    if oc[first] == 0 {
+        // The first point is a control point: it is pending from the
+        // start, and the contour begins somewhere else.
+        pending = true
+        cx = fx
+        cy = fy
+        if oc[last] != 0 {
+            sx = lx
+            sy = ly
+            stop = last - 1
+        } else {
+            sx = (fx + lx) * 0.5
+            sy = (fy + ly) * 0.5
+        }
+    }
+    pts.push(sx)
+    pts.push(sy)
+    float px = sx
+    float py = sy
+    while i <= stop {
+        float x = ox + (xs[i].toFloat() * s)
+        float y = oy - (ys[i].toFloat() * s)
+        if oc[i] != 0 {
+            if pending {
+                fntQuadTo(pts, px, py, cx, cy, x, y)
+                pending = false
+            } else {
+                pts.push(x)
+                pts.push(y)
+            }
+            px = x
+            py = y
+        } else {
+            if pending {
+                float mx = (cx + x) * 0.5
+                float my = (cy + y) * 0.5
+                fntQuadTo(pts, px, py, cx, cy, mx, my)
+                px = mx
+                py = my
+            }
+            pending = true
+            cx = x
+            cy = y
+        }
+        i = i + 1
+    }
+    // Back to the start, closing the contour.
+    if pending {
+        fntQuadTo(pts, px, py, cx, cy, sx, sy)
+    } else {
+        pts.push(sx)
+        pts.push(sy)
+    }
+}
+
+// Glyph g as a path at `size` px per em, its origin -- the pen position
+// on the baseline -- at (ox, oy). Appends to pts/ends; returns the
+// number of contours, or -1 with FNT_ERR set.
+int func fntGlyphPath(g:int, size:float, ox:float, oy:float,
+                      pts:arr[float], ends:arr[int]) {
+    arr[int] xs = []
+    arr[int] ys = []
+    arr[int] oc = []
+    arr[int] ce = []
+    int n = fntGlyph(g, xs, ys, oc, ce)
+    if n <= 0 { return n }
+    float s = size / FNT_UPEM.toFloat()
+    int first = 0
+    int c = 0
+    while c < ce.length {
+        fntContourPath(xs, ys, oc, first, ce[c], s, ox, oy, pts)
+        ends.push(Math.floorDiv(pts.length, 2))
+        first = ce[c] + 1
+        c = c + 1
+    }
+    return n
+}

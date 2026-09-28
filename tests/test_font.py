@@ -17,6 +17,7 @@ Linux job installs and the one `sans-serif` resolves to there. None of
 them has a short loca table or only a format-4 cmap, so one more font
 is BUILT here, from DejaVu's own glyphs, to reach those paths.
 """
+import math
 import os
 import shutil
 import struct
@@ -675,3 +676,334 @@ class TestComposites:
             return m if v >= 0 else -m
         assert [x for x, _ in in_5] == [mulfix_1_5(x - 3) + 300 for x, _ in raw_l]
         assert any((x - 3) % 2 for x, _ in raw_l), "a half has to be in it for the rounding to count"
+
+
+# ---- slice 3: glyphs drawn through raster.f ----
+
+CAIRO_GLYPHS_C = r"""
+/* argv: font size W H out.png, then gid x y triples. The options are
+ * runtime.md's phase 5 reference -- greyscale, unhinted, hint metrics
+ * on -- and the face is the FILE, not whatever fontconfig picks, so
+ * this compares rasterisation and nothing else. Each glyph is shown on
+ * its own, the way drawText composites them. */
+#include <cairo.h>
+#include <cairo-ft.h>
+#include <stdlib.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+    FT_Library lib; FT_Face face;
+    FT_Init_FreeType(&lib);
+    if (FT_New_Face(lib, argv[1], 0, &face)) { puts("OPENFAIL"); return 1; }
+    int W = atoi(argv[3]), H = atoi(argv[4]);
+    cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+    cairo_t *cr = cairo_create(s);
+    cairo_set_source_rgb(cr, 1, 1, 1); cairo_paint(cr); cairo_set_source_rgb(cr, 0, 0, 0);
+    cairo_set_font_face(cr, cairo_ft_font_face_create_for_ft_face(face, 0));
+    cairo_set_font_size(cr, atof(argv[2]));
+    cairo_font_options_t *fo = cairo_font_options_create();
+    cairo_font_options_set_antialias(fo, CAIRO_ANTIALIAS_GRAY);
+    cairo_font_options_set_hint_style(fo, CAIRO_HINT_STYLE_NONE);
+    cairo_font_options_set_hint_metrics(fo, CAIRO_HINT_METRICS_ON);
+    cairo_set_font_options(cr, fo);
+    for (int i = 6; i + 2 < argc; i += 3) {
+        cairo_glyph_t g = { (unsigned long)atoi(argv[i]), atof(argv[i + 1]), atof(argv[i + 2]) };
+        cairo_show_glyphs(cr, &g, 1);
+    }
+    cairo_surface_write_to_png(s, argv[5]);
+    return 0;
+}
+"""
+
+GLYPH_TEXT = "HamburgefonstivQRS&@%gÉÅ"     # composites last: É, Å
+
+
+def _build_c(built, name, source, packages):
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if not cc:
+        _missing("no C compiler to build the oracle")
+    try:
+        flags = subprocess.run(["pkg-config", "--cflags", "--libs"] + packages,
+                               capture_output=True, text=True, check=True).stdout.split()
+    except (OSError, subprocess.CalledProcessError):
+        _missing(f"{' '.join(packages)} not found by pkg-config")
+    src = built.root / f"{name}.c"
+    src.write_text(source)
+    out = built.root / name
+    if not out.exists():
+        subprocess.run([cc, str(src), "-o", str(out)] + flags, check=True)
+    return str(out)
+
+
+def _render_program(jobs):
+    """A Festina program drawing each job's glyphs onto its own white
+    surface through raster.f, one glyph at a time, and saving it."""
+    lines = ["import font.f", "import raster.f", "blob raw = 'font.ttf'", "arr[int] bytes = []",
+             "int i = 0", "while i < raw.length {", "    bytes.push(raw.byteAt(i))", "    i = i + 1",
+             "}", "int e = fntOpen(bytes)"]
+    for name, size, W, H, placed in jobs:
+        lines.append(f"arr[int] px_{name} = rasNewSurface({W}, {H})")
+        lines.append(f"rasFillRect(px_{name}, {W}, {H}, 0, 0, {W}, {H}, 255, 255, 255, 255)")
+        for g, x, y in placed:
+            lines += ["if true {", "    arr[float] pts = []", "    arr[int] ends = []",
+                      f"    int n = fntGlyphPath({g}, {float(size)!r}, {float(x)!r}, {float(y)!r}, pts, ends)",
+                      f"    rasFillPath(px_{name}, {W}, {H}, pts, ends, RAS_NONZERO, 0, 0, 0, 255)",
+                      "}"]
+        lines.append(f"img a_{name} = imageFromPixels(px_{name}, {W}, {H})")
+        lines.append(f"log(a_{name}.save('{name}.png'))")
+    return "\n".join(lines) + "\n"
+
+
+def _build_render_program(built, source):
+    """Like build_program, with raster.f beside font.f."""
+    key = ("render", source)
+    if key in built.programs:
+        return built.programs[key]
+    from festina import cli
+    from tests.conftest import compile_file_or_skip, _require_c_compiler
+    d = built.root / f"render{len(built.programs)}"
+    d.mkdir()
+    for comp in ("font.f", "raster.f"):
+        src = os.path.join(imports_mod.RUNTIME_COMPONENT_DIR, comp)
+        (d / comp).write_text(open(src, encoding="utf-8").read(), encoding="utf-8")
+    (d / "main.f").write_text(source, encoding="utf-8")
+    compile_file_or_skip(cli, str(d / "main.f"), str(d / "program"), cc=_require_c_compiler())
+    built.programs[key] = str(d / "program")
+    return built.programs[key]
+
+
+def _grey(path):
+    """The green channel of a saved PNG, as rows -- black on white, so
+    every channel is the same."""
+    from tests.test_raster import _decode_png
+    w, h, rows, n = _decode_png(str(path))
+    return [[row[x * n + 1] for x in range(w)] for row in rows]
+
+
+def _layout(gids, size, frac=False):
+    """Glyphs in a row with room between them, so none overlaps the
+    next. With `frac`, every origin gets a different fraction of a
+    pixel in x and a quarter in y."""
+    step = math.ceil(size * 1.4)
+    base = math.ceil(size * 1.4)
+    placed = []
+    for k, g in enumerate(gids):
+        x, y = 10 + k * step, base
+        if frac:
+            x, y = x + (k * 0.37) % 1.0, y + 0.25
+        placed.append((g, x, y))
+    return step * len(gids) + 20, math.ceil(size * 2) + 10, placed
+
+
+def _gids(built, text):
+    """Code points to glyphs through FreeType, which slice 1 showed
+    agrees with font.f's cmap everywhere."""
+    cmap = {}
+    for m in _mappings(_oracle(built, SANS)):
+        _, cp, g = m.split()
+        cmap[int(cp)] = int(g)
+    return [cmap[ord(c)] for c in text]
+
+
+def _stats(a, b):
+    """(max |a-b|, mean |a-b|, mean a-b, pixels off by > 60), over the
+    pixels either image inked."""
+    diffs = [pa - pb for ra, rb in zip(a, b) for pa, pb in zip(ra, rb) if pa < 255 or pb < 255]
+    assert len(diffs) > 500, "the comparison has to include real glyphs"
+    return (max(abs(d) for d in diffs), sum(abs(d) for d in diffs) / len(diffs),
+            sum(diffs) / len(diffs), sum(1 for d in diffs if abs(d) > 60))
+
+
+def _true_grey(outlines, placed, size, W, H, sub=32, steps=64):
+    """The exact picture: each glyph's quadratics flattened finely
+    enough not to matter (64 steps each), filled by nonzero winding with
+    coverage exact in x and `sub` rows per pixel -- which converges:
+    16, 64 and 256 rows agree to 0.3 grey levels on these glyphs."""
+    s = size / 2048
+    edges = []
+    for g, ox, oy in placed:
+        ends, pts = outlines[g]
+        first = 0
+        for e in ends:
+            c = [(ox + x * s, oy - y * s, on) for x, y, on in pts[first:e + 1]]
+            first = e + 1
+            seq = []
+            for i in range(len(c)):
+                a, b = c[i], c[(i + 1) % len(c)]
+                seq.append(a)
+                if not a[2] and not b[2]:
+                    seq.append(((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, 1))
+            k = next(i for i, p in enumerate(seq) if p[2])
+            seq = seq[k:] + seq[:k]
+            poly, i = [], 0
+            while i < len(seq):
+                a, b = seq[i], seq[(i + 1) % len(seq)]
+                if b[2]:
+                    poly.append(a[:2])
+                    i += 1
+                else:
+                    c2 = seq[(i + 2) % len(seq)]
+                    for t in range(steps):
+                        u = t / steps
+                        poly.append(((1 - u) ** 2 * a[0] + 2 * (1 - u) * u * b[0] + u * u * c2[0],
+                                     (1 - u) ** 2 * a[1] + 2 * (1 - u) * u * b[1] + u * u * c2[1]))
+                    i += 2
+            for i in range(len(poly)):
+                (x0, y0), (x1, y1) = poly[i], poly[(i + 1) % len(poly)]
+                if y0 != y1:
+                    edges.append((x0, y0, x1, y1))
+    cov = [[0.0] * W for _ in range(H)]
+    for row in range(H):
+        for k in range(sub):
+            y = row + (k + 0.5) / sub
+            xs = sorted((x0 + (y - y0) * (x1 - x0) / (y1 - y0), 1 if y1 > y0 else -1)
+                        for x0, y0, x1, y1 in edges if (y0 <= y < y1) or (y1 <= y < y0))
+            w = 0
+            for j in range(len(xs) - 1):
+                w += xs[j][1]
+                if w:
+                    xa, b = max(xs[j][0], 0), min(xs[j + 1][0], W)
+                    while xa < b:
+                        px = int(xa)
+                        nxt = min(b, px + 1)
+                        cov[row][px] += (nxt - xa) / sub
+                        xa = nxt
+    return [[255 - 255 * min(v, 1.0) for v in r] for r in cov]
+
+
+def _outlines(built):
+    """FreeType's composed outlines of DejaVu Sans, as integers --
+    identical to font.f's, per slice 1 and 2."""
+    out = {}
+    for line in _oracle(built, SANS):
+        if line.startswith("g ") and " c " in line:
+            head, pts = line.split(" p")
+            ends = [int(v) for v in head.split(":")[1].split()]
+            out[int(head.split()[1])] = (ends, [tuple(map(int, p.split(","))) for p in pts.split()])
+    return out
+
+
+class TestGlyphsDrawn:
+    """Slice 3. Two references, because neither alone is enough: Cairo
+    is what text looks like today, and the true outline is what it
+    should look like -- and they are not the same. Measured on these
+    glyphs, Cairo's own greyscale rendering is up to 19.7 / 23.2 grey
+    levels from the truth at 16 / 32 px, raster.f's 8.0 / 8.5."""
+
+    # Measured maxima against Cairo, per size: 12, 16, 20, 18, 20.
+    CAIRO_BOUND = {12: 16, 16: 20, 32: 24, 64: 24, 128: 24}
+
+    @pytest.mark.parametrize("size", sorted(CAIRO_BOUND))
+    def test_glyphs_match_cairo_within_a_measured_bound(self, built, tmp_path, size):
+        font_path = _font("DejaVuSans.ttf")
+        W, H, placed = _layout(_gids(built, GLYPH_TEXT), size)
+        prog = _build_render_program(built, _render_program([("r", size, W, H, placed)]))
+        tmp_path.mkdir(exist_ok=True)
+        (tmp_path / "font.ttf").write_bytes(open(font_path, "rb").read())
+        subprocess.run([prog], cwd=tmp_path, check=True, capture_output=True, timeout=300)
+        oracle = _build_c(built, "cairo_glyphs", CAIRO_GLYPHS_C, ["cairo", "freetype2"])
+        args = [oracle, font_path, str(size), str(W), str(H), str(tmp_path / "c.png")]
+        for g, x, y in placed:
+            args += [str(g), str(x), str(y)]
+        subprocess.run(args, check=True, timeout=300)
+        worst, mean, bias, wrong = _stats(_grey(tmp_path / "r.png"), _grey(tmp_path / "c.png"))
+        assert wrong == 0, f"{wrong} pixels off by more than 60 -- a misplaced or missing edge"
+        assert worst <= self.CAIRO_BOUND[size], f"worst {worst}"
+        assert mean <= 3.0 and abs(bias) <= 1.0, (mean, bias)
+
+    @pytest.mark.parametrize("size", [16, 32])
+    def test_glyphs_match_the_true_outline(self, built, tmp_path, size):
+        """At fractional origins, which Cairo positions its own way and
+        the truth does not care about. Measured here at 16 / 32 px:
+        worst 8.4 / 8.4, mean 1.84 / 1.25, bias +0.16 / +0.17 (and
+        8.0 / 8.5, 1.87 / 1.29 at whole-pixel origins)."""
+        font_path = _font("DejaVuSans.ttf")
+        W, H, placed = _layout(_gids(built, GLYPH_TEXT), size, frac=True)
+        prog = _build_render_program(built, _render_program([("r", size, W, H, placed)]))
+        (tmp_path / "font.ttf").write_bytes(open(font_path, "rb").read())
+        subprocess.run([prog], cwd=tmp_path, check=True, capture_output=True, timeout=300)
+        truth = _true_grey(_outlines(built), placed, size, W, H)
+        worst, mean, bias, wrong = _stats(_grey(tmp_path / "r.png"), truth)
+        assert wrong == 0
+        assert worst <= 10, f"worst {worst:.1f}"
+        assert mean <= 2.5, f"mean {mean:.2f}"
+        assert abs(bias) <= 0.5, f"bias {bias:+.2f}"
+
+    def test_flattening_meets_its_tolerance(self, built, tmp_path):
+        """The segment count is derived, so the tolerance is a
+        guarantee: every chord within 0.03 px of its true quadratic,
+        checked against the curve sampled densely -- and some chord
+        close to it, so the count is not just generously high."""
+        curves = [(0, 0, 50, 80, 100, 0), (0, 0, 1, 30, 2, 0), (5, 5, 400, 5, 400, 300),
+                  (0, 0, 3, 3, 6, 0), (10, 10, 10.5, 200, 11, 10), (0, 0, 0.1, 0.1, 0.2, 0)]
+        prog = ["import font.f"]
+        for k, (x0, y0, x1, y1, x2, y2) in enumerate(curves):
+            prog += [f"arr[float] p{k} = [{float(x0)!r}, {float(y0)!r}]",
+                     f"fntQuadTo(p{k}, {float(x0)!r}, {float(y0)!r}, {float(x1)!r}, {float(y1)!r}, "
+                     f"{float(x2)!r}, {float(y2)!r})",
+                     f"text t{k} = ''", f"int i{k} = 0",
+                     f"while i{k} < p{k}.length {{ t{k} = `${{t{k}}} ${{p{k}[i{k}]}}` i{k} = i{k} + 1 }}",
+                     f"log(t{k})"]
+        out = _run_in(tmp_path, built.build_program("\n".join(prog) + "\n"), b"")
+        worst_seen = 0.0
+        for (x0, y0, x1, y1, x2, y2), line in zip(curves, out):
+            v = [float(t) for t in line.split()]
+            poly = list(zip(v[0::2], v[1::2]))
+            assert poly[0] == (x0, y0) and poly[-1] == (x2, y2)
+            for j in range(2001):
+                t = j / 2000
+                px = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * x1 + t * t * x2
+                py = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * y1 + t * t * y2
+                d = min(_seg_dist(px, py, a, b) for a, b in zip(poly, poly[1:]))
+                worst_seen = max(worst_seen, d)
+                assert d <= 0.03 + 1e-6, f"{d:.4f} px from the curve {(x0, y0, x1, y1, x2, y2)}"
+        assert worst_seen > 0.015, f"worst chord only {worst_seen:.4f} px -- over-flattened"
+
+    def test_where_a_contour_starts_does_not_change_it(self, built, tmp_path):
+        """TrueType contours may start on an off-curve point, and the
+        walk handles three cases: start on the first point; start on the
+        last, when the first is off and the last on; start halfway
+        between them, when both are off. The same contour rotated into
+        each case must draw the same pixels."""
+        outl = _outlines(built)
+        g = _gids(built, "S")[0]
+        ends, pts = outl[g]
+        contour = pts[:ends[0] + 1]
+        n = len(contour)
+        on = [p[2] for p in contour]
+        starts = {
+            "on": next(k for k in range(n) if on[k]),
+            "off, last on": next(k for k in range(n) if not on[k] and on[k - 1]),
+            "off, last off": next(k for k in range(n) if not on[k] and not on[k - 1]),
+        }
+        prog = ["import font.f", "import raster.f"]
+        for name, k in enumerate(starts.values()):
+            rot = contour[k:] + contour[:k]
+            xs = ", ".join(str(p[0]) for p in rot)
+            ys = ", ".join(str(p[1]) for p in rot)
+            oc = ", ".join(str(p[2]) for p in rot)
+            prog += [f"arr[int] xs{name} = [{xs}]", f"arr[int] ys{name} = [{ys}]",
+                     f"arr[int] oc{name} = [{oc}]", f"arr[float] pts{name} = []",
+                     f"fntContourPath(xs{name}, ys{name}, oc{name}, 0, {n - 1}, 0.05, 10.0, 110.0, pts{name})",
+                     f"arr[int] ends{name} = [Math.floorDiv(pts{name}.length, 2)]",
+                     f"arr[int] px{name} = rasNewSurface(120, 120)",
+                     f"rasFillPath(px{name}, 120, 120, pts{name}, ends{name}, RAS_NONZERO, 0, 0, 0, 255)",
+                     f"img a{name} = imageFromPixels(px{name}, 120, 120)",
+                     f"log(a{name}.save('s{name}.png'))"]
+        prog_path = _build_render_program(built, "\n".join(prog) + "\n")
+        subprocess.run([prog_path], cwd=tmp_path, check=True, capture_output=True, timeout=300)
+        from tests.test_raster import _decode_png
+        imgs = []
+        for name in range(3):
+            _, _, rows, nch = _decode_png(str(tmp_path / f"s{name}.png"))
+            imgs.append([[row[x * nch + 3] for x in range(120)] for row in rows])
+        assert sum(v for r in imgs[0] for v in r) > 100000, "the S has to be drawn"
+        for other in imgs[1:]:
+            assert max(abs(a - b) for ra, rb in zip(imgs[0], other) for a, b in zip(ra, rb)) <= 1
+
+
+def _seg_dist(px, py, a, b):
+    (ax, ay), (bx, by) = a, b
+    dx, dy = bx - ax, by - ay
+    L = dx * dx + dy * dy
+    t = 0.0 if L == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
