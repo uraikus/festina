@@ -8706,12 +8706,20 @@ api.md says `fillAlpha` "applies uniformly to whatever's drawn next".
 Nothing tested a gradient under `fillAlpha`, so nothing noticed.
 
 The fix scales the gradient's stops by the alpha and makes that the
-source. A translucent source is right for every caller -- `cairo_fill`,
-`cairo_fill_preserve` before a border, `cairo_show_text` -- because none
-of them paints outside what it draws, and Cairo interpolates gradients
+source. A translucent source is right for every caller -- `cairo_fill`
+and `cairo_fill_preserve` before a border -- because neither paints
+outside what it draws, and Cairo interpolates gradients
 premultiplied, so two stops sharing an alpha give exactly the opaque
 gradient times that alpha. After: (255, 127, 127) inside, untouched
 white outside.
+
+(Corrected while specifying phase 5: this entry first listed
+`cairo_show_text` among the callers. It is not one. Both text call
+sites set a flat colour with `cairo_set_source_rgba`, so `drawText`
+ignores a gradient altogether -- measured: text drawn under a
+red-to-blue gradient came out 4,137 pixels of the earlier flat green
+and none of red or blue. runtime.md's phase 5 spec records that as an
+open behaviour question.)
 
 **How it was found is the part worth keeping.** raster.f's gradient
 test compared a 50%-alpha gradient against Cairo and failed by 127.

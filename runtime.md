@@ -98,8 +98,9 @@ window itself, which is what a window fundamentally is.
 
 ## Font discovery is the hard part of text, not glyph rasterisation
 
-`cairo_select_font_face(cr, "sans-serif", …)` appears at 8 call sites
-and hides the entire question of *which file is sans-serif on this
+`cairo_select_font_face(cr, g_font_family, …)` — one call site now,
+in `festina_apply_font`, with `"sans-serif"` the default family —
+hides the entire question of *which file is sans-serif on this
 machine* — fontconfig on Linux, DirectWrite on Windows, CoreText on
 macOS. Rasterising a glyph once you have its outline is ordinary
 computation and belongs in Festina; deciding which font to open is a
@@ -238,8 +239,9 @@ from `setup.md`'s table rather than merely unused.
 | 2 ✅ | `jpeg.f` | **libjpeg** | phase 0 |
 | 3 | `mp3.f` | **mpg123** | phase 0 |
 | 4 | `raster.f` — paths, AA fill, stroke, clip, gradients, compositing | — | phase 0 |
-| 5 | glyph rasterisation + the font-discovery decision | **Cairo** | phase 4 |
+| 5 | glyph rasterisation + the font-discovery decision | — | phase 4 |
 | 6 | PNG encode | — | the `blob` write half |
+| 7 | wiring 4 and 5 in, image sources, the window seam | **Cairo** | phases 4, 5, 6 |
 
 Phases 1–3 are independent of 4–5 and can land in any order. Phase 6
 is gated on a language feature that does not exist yet.
@@ -250,7 +252,8 @@ fallback needs it: `jpeg.f` refuses progressive, arithmetic and 12-bit
 files, and those load through the C path. Dropping the dependency
 means either covering progressive JPEG or deciding to refuse it
 outright — a user-visible choice, not a port detail — and neither has
-been made. The same will be true of Cairo at phase 5.
+been made. The same will be true of Cairo, at phase 7 — see phase 5's
+spec for why not 5.
 
 ### Phase 1, as built
 
@@ -693,7 +696,8 @@ canvas, and the shape itself was then filled at full opacity: opaque
 red inside a 50% rectangle, a blue tint four hundred pixels away.
 api.md documents `fillAlpha` as applying to every fill. The fix scales
 the gradient's own stops by the alpha, which makes the source
-translucent for every caller — fill, preserved fill and text — and a
+translucent for both callers — fill, and the preserved fill before a
+border (not text, which never reads the gradient; see phase 5) — and a
 regression test in `test_codegen.py` fails against the old code.
 
 One bound was written before it was measured: the soft-edge gradient
@@ -787,6 +791,181 @@ checks both directions (a gradient must not survive a restore to a
 colour, and a saved gradient must come back after `fillStyle`
 destroyed the live one) and fails against the old code. decisions.md
 #350.
+
+### Phase 5, specified
+
+Phase 4 drew shapes. Phase 5 draws text, and what text is today had to
+be measured before anything could be promised about it, because most
+of it turned out not to be what the API reads as.
+
+**What the language asks for.** `drawText(text, x, y)` and its
+`img.drawText` form, `measureTextWidth` and `measureTextHeight`, and a
+`font` of four parts: a family name, a size in px, `bold`, and
+`italic`/`oblique`. Behind them, four Cairo calls: `select_font_face`
+(once, in `festina_apply_font`), `set_font_size`, `show_text` (two call
+sites, canvas and image) and `text_extents` (the two measures). That is
+Cairo's "toy" text API, and the toy API decides a lot on the program's
+behalf.
+
+**What it actually does, measured** — on Linux (Ubuntu 24.04, Cairo
+1.18.0, the default font packages; CI's Linux runner installs the same
+`fonts-dejavu-core`):
+
+| question | answer |
+|---|---|
+| which file is `sans-serif` | DejaVu Sans Book, via fontconfig — TrueType (`glyf`) outlines, 2048 units per em. `serif` and `monospace` are DejaVu too; `fc-match` gives an unknown family DejaVu Sans |
+| advances | whole pixels. Hint metrics are ON, so `"iiiiiiiiii"` is exactly 10 × 4 at 13 px, and 13.5 px measures the same as 13 |
+| kerning | none. DejaVu has 2,727 kerning pairs (AV is −131/2048 em, To −348/2048, −2.7 px at 16 px), and `"AV"` measures exactly A + V |
+| ligatures | none. `"fi"` and `"ffl"` draw byte-identical to their pieces |
+| anti-aliasing | SUBPIXEL. Ubuntu's `fontconfig-config` enables `10-sub-pixel-rgb.conf` by default, so 1,044 of 1,072 inked pixels of black text are coloured, channel spread up to 86 |
+| hinting | `hintslight`, from the same default configuration |
+| `bold` | a real bold face: DejaVuSans-Bold.ttf |
+| `italic` | **nothing.** `fonts-dejavu-core` ships no oblique, fontconfig reports a 0.2 shear for synthesising one, and Cairo's toy face does not apply it: `font f = 'italic 40px'` draws byte-identical to upright text (0 of 72,000 channels differ; `bold` changes 3,114). api.md says `italic` sets the slant. No test looks at italic pixels — the three that mention it check IR |
+| a gradient | ignored. Both text call sites set the flat colour, so text drawn under a red-to-blue gradient came out 4,137 pixels of the earlier `fillStyle` green, none red or blue. api.md lists `drawText` among the fills a gradient replaces |
+
+Glyph origins are whole pixels unless a transform moves them, because
+`drawText` takes `int` coordinates and every advance is rounded. Under
+`scale` or `rotate` Cairo does position glyphs at fractions of a pixel
+(moving the origin in 0.25 px steps moved the ink by 0.19–0.32 px).
+
+**macOS and Windows are not measured**, and should not be guessed at.
+Cairo chooses a font backend per build — Quartz, DirectWrite or GDI,
+FreeType — so the same five words may reach CoreText on one platform
+and fontconfig on another. Run 171's `fc-match sans-serif` answered
+`verdana.ttf` on the Windows runner, but that is what fontconfig would
+pick, not proof of what Cairo's toy face uses there.
+
+**What that means.** Text is already the least portable thing the
+runtime draws: which face, whether it is hinted, whether it has colour
+fringes, and whether `italic` does anything all depend on the
+machine's font configuration, and an image a program saves carries
+those choices in its pixels. A Festina text path cannot be "identical
+to Cairo" when Cairo is not identical to itself. What it can be is
+identical to *a stated configuration*, and the spec has to choose one.
+
+**The proposal:**
+
+- **Greyscale anti-aliasing, not subpixel.** The destination is an
+  image that may be saved, scaled, rotated or read back with
+  `toPixels`; subpixel fringes are only correct on the physical LCD
+  they were computed for, and wrong everywhere else.
+- **Unhinted outlines, with rounded advances.** Keeping hint metrics
+  keeps every `measureTextWidth` result and every line of existing
+  layout the same. Dropping outline hinting changes how glyphs look:
+  against today's output, an unhinted greyscale rendering differs by a
+  mean of 24.4 / 17.3 / 20.0 grey levels over inked pixels at 12 / 16 /
+  32 px, max 209 / 116 / 193 — mostly stems moving to fractional
+  positions. Hinting alone accounts for most of it (mean 23.2 / 14.4 /
+  17.3 between hinted and unhinted greyscale), subpixel for the rest
+  (mean 12.2 / 10.2 / 8.1). Reproducing `hintslight` means reproducing
+  FreeType's light hinting mode, and native TrueType hinting is a
+  bytecode interpreter for the fonts' own instruction programs;
+  neither is in scope. **This is a visible change and it is the user's call.**
+- **No kerning, no ligatures**, to match. A later phase can add
+  kerning from `kern`/GPOS as a deliberate change; it would change
+  `measureTextWidth`, so it is not a port detail either.
+- **The open behaviours stay open until decided:** italic that does
+  nothing, and text that ignores gradients. Both are api.md promises
+  the runtime does not keep. Phase 5 can keep them, but that changes
+  output, so each needs a yes first; until then the port reproduces
+  what the runtime does.
+
+**What gets parsed.** TrueType `glyf` outlines, which is what DejaVu,
+Liberation, Arial and Verdana are: the table directory, `head`, `maxp`,
+`hhea`, `hmtx`, `cmap` formats 4 and 12, `loca` and `glyf`, simple and
+composite glyphs. Quadratic segments flatten with slice 3's derived
+tolerance (0.1 px) and fill through raster.f with the nonzero rule,
+which is the rule TrueType outlines are drawn to. Refused, falling
+through to Cairo the way `jpeg.f` refuses progressive files: CFF and
+CFF2 outlines (`OTTO`), collections (`ttcf`) until a slice needs one,
+bitmap-only fonts, and a font with no Unicode `cmap`. A code point with
+no glyph draws glyph 0, as the `cmap` says.
+
+**The oracles, and which are exact.**
+
+- *Outlines* are integers in font units, and FreeType's
+  `FT_Outline` for the same glyph with hinting off reports the same
+  integers. Parsing is compared exactly, every glyph of a file.
+- *Metrics* are integers after rounding: `measureTextWidth` and
+  `measureTextHeight` through font.f must equal the runtime's for the
+  same face, exactly, over a corpus of strings.
+- *Rasterised glyphs* are not exact. The reference is Cairo with its
+  options set explicitly — `ANTIALIAS_GRAY`, `HINT_STYLE_NONE`,
+  `HINT_METRICS_ON` — and the face loaded from the same FILE through
+  `cairo_ft_font_face_create_for_ft_face`, so the comparison is outline
+  rasterisation alone, independent of whatever fontconfig says on the
+  machine. A measured bound, as slices 2–7 carry, and the true-coverage
+  check slice 3 used for circles.
+
+The oracle program links `cairo-ft` and FreeType, which CI's Linux job
+already has through `libcairo2-dev`. That is a test-time use of
+libraries the runtime already links, not a new dependency.
+
+**Cairo is not removed by phase 5,** and the plan table saying so was
+wrong. Counting what the runtime calls Cairo for once text and phase
+4's shapes are both Festina's:
+
+| still Cairo | why | covered by |
+|---|---|---|
+| every draw call | raster.f is built and compared, not wired in: no draw call reaches it yet | phase 4's switch, not yet built |
+| `set_source_surface` + `paint`/`mask_surface`, `set_filter(GOOD)` | `drawImage`, `resize`, images under a transform — resampling | nothing yet |
+| `create_from_png_stream` | the fallback for PNGs `png.f` refuses | phase 1's refusals |
+| `write_to_png`, `write_to_png_stream` | saving | phase 6, gated on `blob` writes |
+| `xlib_surface_create`, `xlib_surface_set_size` | presenting to an X11 window | a platform seam — `XPutImage` would do; Win32 already reads raw pixels |
+
+So phase 5 delivers glyphs and the font decision, and removes nothing.
+Retiring Cairo is its own step, after phase 4's wiring, image sources
+and 6, and it is listed as one in the plan table.
+
+**Font discovery, with the new evidence.** Three options now, not two:
+
+- **Bundle a font.** One checked-in TrueType file — DejaVu Sans is
+  759,720 bytes, under the permissive Bitstream Vera licence with
+  DejaVu's own changes in the public domain — always
+  available, identical output on every platform, and the only option
+  under which the glyph oracle can run on macOS and Windows CI, where
+  DejaVu is not installed. Costs repository size and the user's system
+  fonts. It adds a file the project did not have, so under this
+  project's rule on dependencies it needs an explicit yes.
+- **A thin discovery shim in C** — "give me a path for this family" on
+  each platform. Honours system fonts. Keeps fontconfig on Linux, and
+  keeps output machine-dependent in exactly the ways measured above.
+- **A directory scan in Festina.** Read the `name` table of every file
+  under the platform's font directories (`/usr/share/fonts`,
+  `C:\Windows\Fonts`, `/System/Library/Fonts`) and match the family
+  there. No C and no fontconfig, and it honours installed fonts, but
+  it does not honour a user's fontconfig aliases, and it costs a scan
+  (59 fontconfig entries on this machine; hundreds on a desktop) once per process.
+
+My recommendation is to bundle one face as the default and scan for
+any family a program names explicitly: the default is what almost
+every program uses, and it is the part that most needs to be the same
+everywhere. That is a recommendation, not a decision; the choice is
+the user's, and the bundle needs permission.
+
+**Slices, in dependency order.** Each ends green and is useful alone:
+
+0. measure macOS and Windows: what Cairo's toy `sans-serif` resolves
+   to, its anti-aliasing, hint metrics and kerning there — a CI probe
+   step, the way the Windows crash was measured, removed once read
+1. `runtime/festina/font.f`: the table directory and the tables above,
+   simple glyphs to outlines in font units, compared exactly against
+   FreeType for every glyph of DejaVu Sans; the refusals, each tested
+2. composite glyphs — offsets, scaled components; point-matched
+   components refused until a font needs them
+3. glyph outlines through raster.f: quadratic flattening, scale and
+   y-flip, fractional origins, compared against the explicit-option
+   Cairo oracle with a measured bound
+4. layout: UTF-8 decoding, rounded advances, glyph 0 for the missing;
+   `measureTextWidth`/`measureTextHeight` reproduced exactly
+5. the font decision implemented, whichever it is
+6. wiring: `drawText`, `img.drawText` and both measures reach font.f
+   behind a switch, the way phase 4's wiring will, with refused fonts
+   falling through to Cairo
+
+Slices 1–4 need no decision and can start now. Slice 5 needs the font
+decision, and slice 6 needs the greyscale/unhinted change agreed,
+since that is when users would see it.
 
 ## Tests
 
