@@ -130,6 +130,15 @@ missing). No `llvm` line here either, for the same reason as macOS
 above: `mingw-w64-ucrt-x86_64-clang` already covers both the fast path
 and its fallback, no separate libLLVM package needed.
 
+**Cairo must be 1.18.6-2 or newer** (`pacman -Q
+mingw-w64-ucrt-x86_64-cairo`). With the 1.18.6-1 package, the test
+that draws text onto a loaded image aborted inside Cairo's text path —
+exit status `0xC0000409` — twenty times out of twenty on CI, and 0 of
+20 with MSYS2's -2 rebuild of the same version (decisions.md #348).
+What exactly triggers it was not narrowed down, so treat -1 as unsafe
+for text generally. A current `pacman -Syu` installs a good one; an
+MSYS2 install last updated before 25 September 2026 may not.
+
 Graphics (Win32) and HTTP/WebSocket (winsock2) both work out of the
 box. Audio (waveOut) is the one tier still gated behind
 `FESTINA_ENABLE_WINDOWS_AUDIO=1` — not for lack of code, but because

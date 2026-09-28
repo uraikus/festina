@@ -252,62 +252,12 @@ jobs:
         # gdb is here for decisions.md #348: a compiled program that
         # exits with a Windows fatal status gets re-run under it for a
         # backtrace (tests/conftest.py's _explain_windows_fatal_status).
-        # test_draw_text_writes_onto_the_image has been exiting
-        # 0xC0000409 under -n for three rounds, and `assert 3221226505
-        # == 0` is the whole of what CI has ever said about it -- three
-        # theories have been guessed from that number and all three
-        # were wrong. This is the alternative to a fourth.
+        # `assert 3221226505 == 0` was once the whole of what CI said
+        # about a crash, and three theories were guessed from it; the
+        # backtrace is what traced that one to MSYS2's cairo
+        # 1.18.6-1, fixed by 1.18.6-2. Kept for the next one.
       - name: Install Python test dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: Windows crash diagnostics
-        # decisions.md #348. The crash is INTERMITTENT -- run 174 was
-        # fully green, including the alone-and-serial probe that had
-        # failed the two runs before it. So the thing worth collecting
-        # is a RATE, not another yes/no: without one, no change can be
-        # shown to help, and four theories were argued from single
-        # draws.
-        #
-        # Twenty runs of the failing test, counted. Twenty standalone
-        # runs of the same drawing done as a compiled program, counted
-        # separately -- across two earlier runs those have never once
-        # crashed (0 of 80) while the pytest-driven test fails roughly
-        # two thirds of the time, and that gap is the sharpest clue
-        # available.
-        #
-        # continue-on-error, and every line is an explicit count: a
-        # step conclusion cannot report a rate, and reading one as if
-        # it could is the mistake this whole entry is now about.
-        continue-on-error: true
-        run: |
-          echo "fc-list count: $(fc-list 2>/dev/null | wc -l)"
-          set +e
-
-          fails=0
-          for i in $(seq 1 20); do
-            python -m pytest -q -p no:randomly \
-              "tests/test_codegen.py::TestImageDrawMethods::test_draw_text_writes_onto_the_image" \
-              >/dev/null 2>&1
-            [ $? -ne 0 ] && fails=$((fails + 1))
-          done
-          echo "RATE pytest-single: $fails/20 failed"
-
-          mkdir -p /tmp/dtx
-          cat > /tmp/dtx/loaded.f <<'FESTINA'
-          color black = 'black'
-          img src = blankImage(128, 64)
-          log(src.save('sheet.png'))
-          img sheet = 'sheet.png'
-          fillStyle(black)
-          sheet.drawText('hi', 4, 40)
-          log(sheet.save('out.png'))
-          FESTINA
-          python -m festina.cli compile /tmp/dtx/loaded.f -o /tmp/dtx/loaded.exe >/dev/null 2>&1
-          pfails=0
-          for i in $(seq 1 20); do
-            d=$(mktemp -d); ( cd "$d" && /tmp/dtx/loaded.exe >/dev/null 2>&1 )
-            [ $? -ne 0 ] && pfails=$((pfails + 1))
-          done
-          echo "RATE standalone-binary: $pfails/20 failed"
       - name: Run the test suite
         # decisions.md #345: this job was CANCELLED at the 45-minute cap
         # after 42:56, up from 18:31 eleven days earlier -- the suite
@@ -331,58 +281,6 @@ jobs:
         # budget raised twice is a budget nobody is managing. This is
         # the alternative to raising it a second time.
         run: python -m pytest tests/ -q -n auto --dist worksteal
-      - name: Put the old Cairo back
-        # decisions.md #348. Runs 170-173 (Sep 24) failed 6 of 6; runs
-        # 174-175 (Sep 25) passed 23 of 23 -- a step change, not
-        # intermittency, since a ~2/3 fault passing 21 straight is
-        # around 1e-10. Across that boundary exactly two MSYS2 packages
-        # changed: cairo 1.18.6-1 -> 1.18.6-2 and libwinpthread
-        # r420 -> r426. Cairo is the prime suspect -- the backtrace was
-        # twelve frames inside libcairo-2.dll ending in abort().
-        #
-        # A correlation is not a cause, so this puts the OLD cairo back
-        # and measures the same 20-run rate. The crash returning names
-        # cairo-1 as the fault and cairo-2 as the fix; it staying away
-        # moves suspicion to libwinpthread, which is the next thing to
-        # pin. Last in the job and `if: always()`, so the suite above
-        # ran on current packages and this cannot disturb it.
-        if: always()
-        continue-on-error: true
-        run: |
-          pacman -U --noconfirm \
-            https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-cairo-1.18.6-1-any.pkg.tar.zst \
-            || echo "DOWNGRADE FAILED -- the old package may no longer be in the archive"
-          echo "installed: $(pacman -Q mingw-w64-ucrt-x86_64-cairo)"
-          set +e
-          # Run 176 read 20/20 failed here -- with every run's output
-          # thrown away, so it showed the test exiting non-zero and not
-          # WHY. A lone downgrade can fail for reasons of its own. So
-          # each exit code is kept, and the first failure's output
-          # printed: the [crash] line and 0xC0000409 are what make it
-          # the same abort rather than a new breakage.
-          fails=0
-          codes=""
-          for i in $(seq 1 20); do
-            python -m pytest -q -p no:randomly \
-              "tests/test_codegen.py::TestImageDrawMethods::test_draw_text_writes_onto_the_image" \
-              > run.log 2>&1
-            rc=$?
-            codes="$codes $rc"
-            if [ $rc -ne 0 ]; then
-              fails=$((fails + 1))
-              if [ $fails -eq 1 ]; then
-                echo "---- first failure, run $i ----"
-                tail -n 60 run.log
-                echo "---- end ----"
-              fi
-            fi
-          done
-          echo "EXIT CODES:$codes"
-          echo "RATE with $(pacman -Q mingw-w64-ucrt-x86_64-cairo): $fails/20 failed"
-          # Back to current before the steps below compile the examples
-          # and the graphics runtime -- they must test what users get.
-          pacman -S --noconfirm mingw-w64-ucrt-x86_64-cairo
-          echo "restored: $(pacman -Q mingw-w64-ucrt-x86_64-cairo)"
       - name: Compile and run the core examples
         # windows.md Phase 0's exit criteria, verbatim: the four
         # windowless examples build and run natively as .exe.

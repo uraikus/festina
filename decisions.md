@@ -8658,6 +8658,26 @@ not proof. The step now keeps every exit code and prints the first
 failure's output, so one more run closes it. Until then the Windows
 diagnostic steps stay in place.
 
+**Run 177 closed it.** The first failure under cairo 1.18.6-1 was the
+original crash, frame for frame: exit 3221226505 (0xC0000409),
+`ucrtbase!abort` reached through twelve `libcairo-2.dll` frames under
+`festina_image_draw_text`, gdb reporting `unknown target exception
+0xc0000409`. Every one of the twenty exited non-zero; with -2 in the
+same job, 0 of 20. RESOLVED UPSTREAM: MSYS2's cairo 1.18.6-1, fixed
+by their 1.18.6-2 rebuild.
+
+So the two diagnostic steps are gone from ci.yml -- they cost minutes
+on every run and have answered their question. Kept: the gdb package
+and conftest's `_explain_windows_fatal_status`, which is what turned
+`assert 3221226505 == 0` into a backtrace and will do the same for the
+next crash. setup.md now names cairo 1.18.6-2 as the minimum on MSYS2.
+What inside Cairo aborts, and why the pytest-driven test did while the
+standalone drawText probe never crashed in any run, was not narrowed
+down (that probe's 0-of-80 tally spans both package versions, so it
+is not evidence either way on -1); it is Cairo's to know, and
+setup.md says so rather than naming a narrower trigger than was
+measured.
+
 (The same run's linux job hit its 45-minute cap: the bootstrap
 differential took 42:11 against 24:42 one run earlier, over the same
 1,217 tests. raster.f is the only corpus file that grew between them,
