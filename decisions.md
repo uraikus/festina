@@ -8911,3 +8911,40 @@ constructor, so a program without text needs no stub.
    under scripts/leak_stress.sh, which builds the text component and
    the font instrumented. Clean; with the C side's release of the mask
    put back, it reports 800 leaked arrays.
+
+353. A LOST WAKEUP IN THE HTTP CALLBACK POOL
+
+`test_multiple_concurrent_callbacks_all_complete` hung for its 15 s
+timeout once in the full-suite run of #352. It was not that change's:
+on the commit before, under four busy cores, it hung 1 run in 60, and
+0 in 30 on an idle machine -- a real bug that load makes likely.
+
+**Caught in the act, not argued about.** A reproducer ran the test's
+own server and client repeatedly under load and, on a hang, attached
+gdb to both before killing anything. Run 139: the server idle in
+poll(); the client's four async workers idle, waiting for new work --
+every request had FINISHED -- and the main thread in
+festina_run_http_loop, polling one descriptor, the workers' wake pipe,
+with no timeout. Finished work, and nobody told.
+
+**The cause.** festina_async_drain_completed took the finished-job list
+under the lock and THEN emptied the wake pipe. A worker appends its job
+and then writes its wake byte; one finishing between those two steps
+had its job land in the list after the take and its byte read and
+discarded by the drain. The job stayed queued with nothing in the pipe,
+and the next poll waited forever. The worker's comment said a dropped
+byte was harmless "since the drain takes the whole list" -- true of a
+byte dropped for a full pipe, not of one discarded AFTER the take.
+
+**The fix is the order:** empty the pipe, then take the list. A job
+that misses the take wrote its byte after the pipe was emptied, so the
+byte is still there and the next poll wakes.
+
+**The test that can see it.** Eight requests give the race eight
+chances per run. `test_no_completion_is_lost_across_many_rounds` sends
+600 rounds of 8, each round from the last callback of the one before:
+with the old order it failed 10 runs of 10 (150 rounds managed only 3
+of 5, too weak to keep); with the fix it passes in about two seconds.
+The original test ran 0 hangs in 300 under load after the fix, and the
+HTTP churn programs are clean under the leak harness. Windows has no
+worker pool (callbacks block there), so this never applied to it.

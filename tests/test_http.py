@@ -1155,6 +1155,52 @@ class TestHttpCallbackRuntime:
         assert result.returncode == 0, result.stdout
         assert "all 8 dispatched" in result.stdout
 
+    def test_no_completion_is_lost_across_many_rounds(self, compile_and_run_server,
+                                                        compile_and_run):
+        """decisions.md #353. The drain step used to take the finished-
+        job list and THEN empty the wake pipe, so a worker finishing in
+        between had its wake byte discarded with its job still queued --
+        and the loop polled the empty pipe with no timeout, forever. The
+        test above hit that about once in sixty runs under load: eight
+        requests give the race eight chances. This gives it 4,800 --
+        600 rounds of 8, each round sent from the last callback of the
+        one before. With the old order put back it failed 10 runs out of
+        10 (at 150 rounds, only 3 of 5 -- too weak to keep); with the new
+        it takes about two seconds, and the test above ran 0 hangs in
+        300 under load."""
+        server = compile_and_run_server("""
+        openPort(__PORT__)
+        on request(req:http) { req.ok() }
+        """)
+        result = compile_and_run(f"""
+        int done = 0
+        int round = 0
+        void func fire() {{
+            int i = 0
+            while i < 8 {{
+                http req = {{'url': 'http://127.0.0.1:{server.port}/', 'method': 'GET',
+                              'callback': onDone}}
+                req.send()
+                i = i + 1
+            }}
+        }}
+        void func onDone(r:http) {{
+            done = done + 1
+            if done == 8 {{
+                done = 0
+                round = round + 1
+                if round == 600 {{
+                    log('600 rounds')
+                    close(0)
+                }}
+                fire()
+            }}
+        }}
+        fire()
+        """)
+        assert result.returncode == 0, result.stdout
+        assert result.stdout.strip() == "600 rounds"
+
     def test_callback_fires_even_after_its_declaring_function_returns(
             self, compile_and_run_server, compile_and_run):
         # claude.md #163's own point about escape analysis: a callback-

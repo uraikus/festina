@@ -4188,16 +4188,26 @@ void festina_http_send_client_dispatch(void *payload) {
  * under the lock). */
 static void festina_async_drain_completed(void) {
     if (!g_async_pool_started) return;
-    pthread_mutex_lock(&g_async_lock);
-    FestinaAsyncJob *done = g_async_done_head;
-    g_async_done_head = g_async_done_tail = NULL;
-    pthread_mutex_unlock(&g_async_lock);
-
+    /* The pipe is emptied BEFORE the done list is taken, never after.
+     * A worker appends its job and THEN writes its wake byte; taking the
+     * list first let one finish in between -- its job landing in the
+     * list after the take, its byte read and thrown away by the drain --
+     * which left a finished request in the list with nothing in the pipe
+     * to say so, and the loop polling it with no timeout forever. That
+     * was test_multiple_concurrent_callbacks_all_complete's 15 s hang,
+     * about once in sixty runs under load (decisions.md #353). In this
+     * order a job that misses the take wrote its byte after the pipe was
+     * emptied, so the byte is still there and the next poll wakes. */
     char discard[64];
     while (read(g_async_wake_fds[0], discard, sizeof(discard)) > 0) { } /* drain the pipe --
                                                                           * O_NONBLOCK means this
                                                                           * returns (<=0) once empty
                                                                           * rather than blocking */
+    pthread_mutex_lock(&g_async_lock);
+    FestinaAsyncJob *done = g_async_done_head;
+    g_async_done_head = g_async_done_tail = NULL;
+    pthread_mutex_unlock(&g_async_lock);
+
     while (done) {
         FestinaAsyncJob *next = done->next;
         FestinaHttpValue *v = FESTINA_HTTP_FROM_PAYLOAD(done->payload);
