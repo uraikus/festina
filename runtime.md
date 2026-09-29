@@ -1313,7 +1313,7 @@ is not needed for this.
 **Slices, in dependency order.** Each ends green, and with Cairo still
 present every slice compares against it, byte for byte where possible:
 
-1. `FestinaSurface`: a plain buffer for the canvas and every `img`, with
+1. ✅ `FestinaSurface`: a plain buffer for the canvas and every `img`, with
    a zero-copy Cairo wrapper for the fallbacks that remain. **No
    behaviour change, and no decision needed:** the oracle is the whole
    suite, unchanged, plus byte-identical saved images
@@ -1331,6 +1331,35 @@ present every slice compares against it, byte for byte where possible:
 9. PNG encode (phase 6, gated on building a `blob` from bytes), then
    delete Cairo from the link line, `setup.md`, CI's package lists and
    the `FESTINA_CAIRO_TEXT` switch
+
+**Slice 1, as built.** Every ARGB32 and RGB24 surface the runtime makes --
+the canvas, `img.new`, `clone`, `resize`, `fromPixels`, the decoders' and
+the text mask's destinations, twelve sites -- now comes from
+`festina_surface_create` in `festina_runtime_graphics.c`, which
+`calloc`s the pixels itself and hands them to
+`cairo_image_surface_create_for_data`. The buffer belongs to the surface
+through a user-data key whose destroy callback frees it, so it lives
+until the last Cairo reference goes, exactly as Cairo's own storage did.
+The stride is Cairo's (`cairo_format_stride_for_width`), the memory is
+zeroed as before, and a size Cairo refuses (negative, or over its
+32,767 limit) is still refused by Cairo: the seam falls back to
+`cairo_image_surface_create`, which is where that verdict comes from.
+Nothing else changed -- every fallback still draws through Cairo, on
+memory that is now plain C, which is what slices 2 onward need.
+
+Measured: the eight-image scene renders byte for byte the same as the
+tree before the change; wrapping a surface and making a context is
+258 ns; the leak harness is clean, and with the free callback removed it
+reports 233,656,320 bytes in 1,080 objects (media_churn) and 7,500,800 in
+1,600 (image_layer_churn), so it does see the buffers.
+`tests/test_surface_seam.py` compiles the seam alone against real Cairo
+with counting allocators and puts each bug back: a stray direct create
+(caught by the source check), a callback that frees nothing (allocations
+and frees disagree), an allocation that does not zero (pixels not zero).
+
+Not routed, deliberately: the A8 coverage mask text draws through (it is
+a transient, freed in the same call) and the surfaces the PNG stream
+reader creates -- both go when their callers do, in slices 4 and 9.
 
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the

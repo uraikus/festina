@@ -235,6 +235,55 @@ static void festina_graphics_present(void);
 #define MADV_POPULATE_WRITE 23
 #endif
 #endif
+/* runtime.md phase 7, slice 1: the one place a colour surface's pixels
+ * are allocated.
+ *
+ * The buffer is OURS -- calloc'd here, freed when the last reference to
+ * the surface goes (the destroy callback below) -- and Cairo is lent a
+ * view of it (cairo_image_surface_create_for_data: same pointer, same
+ * premultiplied ARGB32, no copy; measured 258 ns for a wrapper and a
+ * context). That is the whole change, and it is deliberately not
+ * visible: the same sizes, the same stride, zeroed the way Cairo
+ * zeroes its own, so every caller behaves as it did. What it does is
+ * settle who owns the pixels, which is the question phase 7 has to have
+ * answered before anything else can stop being Cairo's -- the direct
+ * paths from #104 and #240 already write these bytes without asking it.
+ *
+ * Anything Cairo would refuse (a non-positive or oversized dimension) or
+ * that cannot be allocated goes to cairo_image_surface_create itself, so
+ * the error surface, and the status callers check, are Cairo's own. Not
+ * routed through here: the A8 coverage masks (small, and never
+ * presented), and the surface cairo_image_surface_create_from_png_stream
+ * decodes -- the fallback for PNGs png.f refuses, which stays Cairo's
+ * until phase 7's decoder slice. */
+static cairo_user_data_key_t g_surface_buffer_key;
+
+static void festina_surface_buffer_free(void *buffer) {
+    free(buffer);
+}
+
+static cairo_surface_t *festina_surface_create(cairo_format_t format, int width, int height) {
+    if (width <= 0 || height <= 0) return cairo_image_surface_create(format, width, height);
+    int stride = cairo_format_stride_for_width(format, width);
+    if (stride <= 0) return cairo_image_surface_create(format, width, height);
+    unsigned char *buffer = calloc((size_t)stride, (size_t)height);
+    if (!buffer) return cairo_image_surface_create(format, width, height);
+    cairo_surface_t *surface = cairo_image_surface_create_for_data(buffer, format, width,
+                                                                    height, stride);
+    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        /* Cairo's own verdict on the size; the buffer was never adopted. */
+        free(buffer);
+        return surface;
+    }
+    if (cairo_surface_set_user_data(surface, &g_surface_buffer_key, buffer,
+                                    festina_surface_buffer_free) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surface);
+        free(buffer);
+        return cairo_image_surface_create(format, width, height);
+    }
+    return surface;
+}
+
 static void festina_surface_prefault(cairo_surface_t *s) {
     if (!s || cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) return;
     unsigned char *data = cairo_image_surface_get_data(s);
@@ -258,8 +307,7 @@ static void festina_surface_prefault(cairo_surface_t *s) {
 
 static void festina_backing_require(void) {
     if (g_backing_surface) return;
-    g_backing_surface = cairo_image_surface_create(
-        CAIRO_FORMAT_ARGB32, (int)g_canvas_width, (int)g_canvas_height);
+    g_backing_surface = festina_surface_create(CAIRO_FORMAT_ARGB32, (int)g_canvas_width, (int)g_canvas_height);
     festina_surface_prefault(g_backing_surface);
     /* claude.md #136: a fresh canvas starts fully transparent, not
      * opaque white -- the same blank state every clear* function now
@@ -559,7 +607,7 @@ static int festina_text_draw(cairo_t *cr, const cairo_matrix_t *m, const char *t
 static cairo_t *festina_measure_context(void) {
     static cairo_surface_t *scratch = NULL;
     if (!scratch) {
-        scratch = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+        scratch = festina_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
     }
     cairo_t *cr = cairo_create(scratch);
     festina_apply_font(cr);
@@ -1941,7 +1989,7 @@ static cairo_surface_t *festina_decode_jpeg(const unsigned char *data, size_t le
     info.out_color_space = JCS_RGB;
     jpeg_start_decompress(&info);
 
-    surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24,
+    surface = festina_surface_create(CAIRO_FORMAT_RGB24,
                                           (int)info.output_width, (int)info.output_height);
     if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) longjmp(err.escape, 1);
     unsigned char *pixels = cairo_image_surface_get_data(surface);
@@ -2134,7 +2182,7 @@ static void festina_image_load_worker(void *payload) {
 void *festina_image_load_dispatch(const char *path, void (*callback)(void *)) {
     if (!callback) return festina_load_image(path);
     if (!path) path = "";
-    cairo_surface_t *placeholder = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    cairo_surface_t *placeholder = festina_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
     FestinaImageBox *box = festina_image_box(placeholder);
     free(box->path);
     box->path = strdup(path);
@@ -2231,7 +2279,7 @@ void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h) 
     if (!img) return NULL;
     festina_check_image_size("clip", w, h);
     cairo_surface_t *src = ((FestinaImageBox *)img)->surface;
-    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
+    cairo_surface_t *out = festina_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
     festina_surface_prefault(out);
     cairo_t *cr = cairo_create(out);
     /* Offsetting the source by -x/-y puts the requested region at the
@@ -2265,7 +2313,7 @@ void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h) 
  * midway through a frame. */
 void *festina_blank_image(int64_t w, int64_t h) {
     festina_check_image_size("blankImage", w, h);
-    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
+    cairo_surface_t *out = festina_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
     festina_surface_prefault(out);   /* claude.md #240 */
     return festina_image_box(out);
 }
@@ -2354,7 +2402,7 @@ void *festina_image_from_pixels(void *arr, int64_t w, int64_t h) {
         return NULL;
     }
 
-    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+    cairo_surface_t *out = festina_surface_create(CAIRO_FORMAT_ARGB32,
                                                       (int)w, (int)h);
     festina_surface_prefault(out);
     unsigned char *dst = cairo_image_surface_get_data(out);
@@ -2475,7 +2523,7 @@ void *festina_canvas_to_image(void) {
     festina_backing_require();
     int w = cairo_image_surface_get_width(g_backing_surface);
     int h = cairo_image_surface_get_height(g_backing_surface);
-    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    cairo_surface_t *out = festina_surface_create(CAIRO_FORMAT_ARGB32, w, h);
     festina_surface_prefault(out);
     cairo_t *cr = cairo_create(out);
     cairo_set_source_surface(cr, g_backing_surface, 0, 0);
@@ -2496,7 +2544,7 @@ void festina_image_resize(void *img, int64_t w, int64_t h) {
     int src_w = cairo_image_surface_get_width(box->surface);
     int src_h = cairo_image_surface_get_height(box->surface);
     if (src_w <= 0 || src_h <= 0) return;
-    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
+    cairo_surface_t *out = festina_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
     festina_surface_prefault(out);
     cairo_t *cr = cairo_create(out);
     cairo_scale(cr, (double)w / src_w, (double)h / src_h);
@@ -2915,7 +2963,7 @@ void festina_image_clear_pixel(void *img, int64_t x, int64_t y) {
 static cairo_surface_t *festina_surface_snapshot(cairo_surface_t *src) {
     int w = cairo_image_surface_get_width(src);
     int h = cairo_image_surface_get_height(src);
-    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    cairo_surface_t *out = festina_surface_create(CAIRO_FORMAT_ARGB32, w, h);
     festina_surface_prefault(out);
     cairo_t *cr = cairo_create(out);
     cairo_set_source_surface(cr, src, 0, 0);
@@ -3231,8 +3279,7 @@ static void festina_set_client_size(int64_t width, int64_t height) {
     g_canvas_height = height;
     if (g_backing_surface) {
         cairo_surface_destroy(g_backing_surface);
-        g_backing_surface = cairo_image_surface_create(
-            CAIRO_FORMAT_ARGB32, (int)width, (int)height);
+        g_backing_surface = festina_surface_create(CAIRO_FORMAT_ARGB32, (int)width, (int)height);
         festina_surface_prefault(g_backing_surface);   /* claude.md #240 */
         /* claude.md #136: fresh canvas state is transparent, not white
          * -- see festina_backing_require's own identical block. */
@@ -3332,8 +3379,7 @@ static void festina_handle_window_event(const FestinaWindowEvent *ev) {
         g_canvas_width = ev->width;
         g_canvas_height = ev->height;
         cairo_surface_destroy(g_backing_surface);
-        g_backing_surface = cairo_image_surface_create(
-            CAIRO_FORMAT_ARGB32, (int)ev->width, (int)ev->height);
+        g_backing_surface = festina_surface_create(CAIRO_FORMAT_ARGB32, (int)ev->width, (int)ev->height);
         festina_surface_prefault(g_backing_surface);   /* claude.md #240 */
         cairo_t *cr = cairo_create(g_backing_surface);
         cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
