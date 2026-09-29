@@ -2276,6 +2276,7 @@ class CodeGen:
             "declare void @festina_image_clear_rect(ptr, i64, i64, i64, i64)",
             "declare void @festina_image_clear_circle(ptr, i64, i64, i64)",
             "declare void @festina_image_clear_pixel(ptr, i64, i64)",
+            "declare void @festina_image_blend_row(ptr, i64, i64, i64, ptr, i64, i64, i64, double)",
             "declare void @festina_image_draw_image(ptr, ptr, i64, i64)",
             "declare void @festina_image_draw_image_scaled(ptr, ptr, i64, i64, i64, i64)",
             "declare void @festina_image_free(ptr)",
@@ -13579,6 +13580,8 @@ class CodeGen:
                 "clearRect": {4: ("festina_image_clear_rect", ["i64"] * 4)},
                 "clearCircle": {3: ("festina_image_clear_circle", ["i64"] * 3)},
                 "clearPixel": {2: ("festina_image_clear_pixel", ["i64"] * 2)},
+                "__blendRow": {8: ("festina_image_blend_row",
+                                   ["i64", "i64", "i64", "ptr"] + ["i64"] * 3 + ["double"])},
                 "drawImage": {3: ("festina_image_draw_image", ["ptr", "i64", "i64"]),
                               5: ("festina_image_draw_image_scaled", ["ptr"] + ["i64"] * 4)},
             }
@@ -13589,6 +13592,9 @@ class CodeGen:
                     fn, arg_irs = _IMAGE_LAYER_OPS[callee.prop][len(expr.args)]
                     sig = "".join(f", {ty} {v}" for ty, (v, _) in zip(arg_irs, emitted))
                     lines.append(f"  call void @{fn}(ptr {obj_val}{sig})")
+                    if callee.prop == "__blendRow":
+                        self.uses_graphics_code = True
+                        self._release_owned_receiver(expr.args[3], emitted[3][0], emitted[3][1], lines)
                     if callee.prop == "drawImage":
                         # An owning SOURCE (a clip()/blankImage() result
                         # passed straight in) is done with once painted --

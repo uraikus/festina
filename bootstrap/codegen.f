@@ -479,6 +479,7 @@ arr[text] CG_PRE = [
     'declare void @festina_image_clear_rect(ptr, i64, i64, i64, i64)',
     'declare void @festina_image_clear_circle(ptr, i64, i64, i64)',
     'declare void @festina_image_clear_pixel(ptr, i64, i64)',
+    'declare void @festina_image_blend_row(ptr, i64, i64, i64, ptr, i64, i64, i64, double)',
     'declare void @festina_image_draw_image(ptr, ptr, i64, i64)',
     'declare void @festina_image_draw_image_scaled(ptr, ptr, i64, i64, i64, i64)',
     'declare void @festina_image_free(ptr)',
@@ -2096,6 +2097,7 @@ map[text] CG_IMAGE_OPS = {
     'clearRect': '4:festina_image_clear_rect:i64,i64,i64,i64',
     'clearCircle': '3:festina_image_clear_circle:i64,i64,i64',
     'clearPixel': '2:festina_image_clear_pixel:i64,i64',
+    '__blendRow': '8:festina_image_blend_row:i64,i64,i64,ptr,i64,i64,i64,double',
     'drawImage': '3:festina_image_draw_image:ptr,i64,i64;5:festina_image_draw_image_scaled:ptr,i64,i64,i64,i64'
 }
 

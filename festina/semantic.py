@@ -616,6 +616,12 @@ _IMAGE_LAYER_METHODS = {
     "clearCircle": [(_INT, _INT, _INT)],
     "clearPixel": [(_INT, _INT)],
     "drawImage": [(_IMAGE, _INT, _INT), (_IMAGE, _INT, _INT, _INT, _INT)],
+    # runtime.md phase 7 slice 2: the row-compositing primitive raster.f
+    # draws onto an img through -- (row, x0, x1, coverage, r, g, b, alpha), alpha being
+    # fillAlpha's own 0..1 float.
+    # Not documented in api.md: it is the runtime's own seam, named with
+    # the leading underscores to say so.
+    "__blendRow": [(_INT, _INT, _INT, types_mod.ArrayType(_FLOAT), _INT, _INT, _INT, _FLOAT)],
 }
 
 # claude.md #151: http's fixed-arity, fixed-argument-type methods --
@@ -2819,7 +2825,8 @@ def analyze(program, filename="<string>"):
                              "drawRect", "drawPixel", "drawCircle", "drawText",
                              "drawImage", "translate", "rotate", "scale",
                              "resetTransform", "saveState", "restoreState",
-                             "clear", "clearRect", "clearCircle", "clearPixel"):
+                             "clear", "clearRect", "clearCircle", "clearPixel",
+                             "__blendRow"):
                 raise CompileError(
                     f"'{expr.prop}' is a method on img -- call it, "
                     f"e.g. `sheet.{expr.prop}(...)`",

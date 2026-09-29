@@ -1291,3 +1291,112 @@ void func rasClearPath(px:arr[int], sw:int, sh:int,
         row = row + 1
     }
 }
+
+// ---- Phase 7, slice 2: drawing onto an img ----
+//
+// Everything above draws into an `arr[int]`, four ints a pixel, which
+// is 32 bytes for the four bytes an image really holds and a copy in
+// and out of it besides (runtime.md, phase 7, Finding 2). These draw
+// onto the img itself instead. What is Festina's is unchanged: the path,
+// the stroke outline, the clip mask and the coverage of each row come
+// from the same functions, so a shape has the same coverage on either
+// target. What is the runtime's is the last step: the row's coverage
+// and the fill's colour go to img.__blendRow, which blends them into the
+// surface's own bytes with pixman's arithmetic (festina_image_blend_row).
+//
+// Solid colours only here; a gradient is slice 4's. The colour is r, g, b
+// in 0..255 and `a` is the fill's alpha as the float 0..1 that fillAlpha
+// holds -- a float, not a byte, because Cairo premultiplies the colour
+// from that double and a rounded byte would be a grey level off at alphas
+// like 0.7 (festina_image_blend_row has the detail).
+
+void func rasFillCoreImg(target:img, pts:arr[float], ends:arr[int], rule:int,
+                         cr:int, cg:int, cb:int, alpha:float,
+                         mask:arr[float], useMask:bool) {
+    int sw = target.width
+    int sh = target.height
+    if sw <= 0 || sh <= 0 { return }
+    if ends.length == 0 || pts.length < 6 { return }
+    if alpha <= 0.0 { return }
+
+    rasEnsureCov(sw)
+    if !rasPathExtent(pts, sh) { return }
+
+    int row = RAS_Y0
+    while row < RAS_Y1 {
+        rasRowCoverage(row, sw, pts, ends, rule)
+        if useMask {
+            int base = row * sw
+            int c = 0
+            while c < sw {
+                RAS_COV[c] = RAS_COV[c] * mask[base + c]
+                c = c + 1
+            }
+        }
+        target.__blendRow(row, 0, sw, RAS_COV, cr, cg, cb, alpha)
+        row = row + 1
+    }
+}
+
+void func rasFillPathImg(target:img, pts:arr[float], ends:arr[int], rule:int,
+                         r:int, g:int, b:int, a:float) {
+    arr[float] noMask = []
+    rasFillCoreImg(target, pts, ends, rule, r, g, b, a, noMask, false)
+}
+
+void func rasFillPathImgClip(target:img, pts:arr[float], ends:arr[int], rule:int,
+                             r:int, g:int, b:int, a:float, mask:arr[float]) {
+    rasFillCoreImg(target, pts, ends, rule, r, g, b, a, mask, true)
+}
+
+void func rasStrokePathImg(target:img, pts:arr[float], ends:arr[int], closed:arr[int],
+                           width:float, r:int, g:int, b:int, a:float) {
+    arr[float] outline = []
+    arr[int] outlineEnds = []
+    rasStrokeOutline(pts, ends, closed, width, outline, outlineEnds)
+    arr[float] noMask = []
+    rasFillCoreImg(target, outline, outlineEnds, RAS_NONZERO, r, g, b, a, noMask, false)
+}
+
+void func rasStrokePathImgClip(target:img, pts:arr[float], ends:arr[int], closed:arr[int],
+                               width:float, r:int, g:int, b:int, a:float,
+                               mask:arr[float]) {
+    arr[float] outline = []
+    arr[int] outlineEnds = []
+    rasStrokeOutline(pts, ends, closed, width, outline, outlineEnds)
+    rasFillCoreImg(target, outline, outlineEnds, RAS_NONZERO, r, g, b, a, mask, true)
+}
+
+// Under a transform, as the arr[int] forms are in slice 7: the path in
+// user space, the matrix applied to the geometry.
+void func rasFillPathTImg(target:img, pts:arr[float], ends:arr[int], rule:int,
+                          r:int, g:int, b:int, a:float, m:arr[float]) {
+    arr[float] noMask = []
+    rasFillCoreImg(target, rasTransformPoints(m, pts), ends, rule, r, g, b, a, noMask, false)
+}
+
+void func rasStrokePathTImg(target:img, pts:arr[float], ends:arr[int], closed:arr[int],
+                            width:float, r:int, g:int, b:int, a:float, m:arr[float]) {
+    arr[float] outline = []
+    arr[int] outlineEnds = []
+    rasStrokeOutline(pts, ends, closed, width, outline, outlineEnds)
+    arr[float] noMask = []
+    rasFillCoreImg(target, rasTransformPoints(m, outline), outlineEnds, RAS_NONZERO,
+                   r, g, b, a, noMask, false)
+}
+
+// The two shapes nearly every drawing call is.
+void func rasFillRectImg(target:img, x:float, y:float, w:float, h:float,
+                         r:int, g:int, b:int, a:float) {
+    arr[float] pts = [x, y, x + w, y, x + w, y + h, x, y + h]
+    arr[int] ends = [4]
+    rasFillPathImg(target, pts, ends, RAS_NONZERO, r, g, b, a)
+}
+
+void func rasFillCircleImg(target:img, cx:float, cy:float, radius:float,
+                           r:int, g:int, b:int, a:float) {
+    arr[float] pts = []
+    arr[int] ends = []
+    rasCircle(pts, ends, cx, cy, radius)
+    rasFillPathImg(target, pts, ends, RAS_NONZERO, r, g, b, a)
+}

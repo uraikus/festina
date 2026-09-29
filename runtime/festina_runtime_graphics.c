@@ -2615,6 +2615,92 @@ static cairo_t *festina_image_context(FestinaImageBox *box) {
     return cr;
 }
 
+/* runtime.md phase 7, slice 2: the row-compositing primitive -- the one
+ * thing raster.f needs from C to draw onto an img.
+ *
+ * raster.f (Festina) works out how much of each pixel of a row a shape
+ * covers, as floats 0..1 in `cov`; this blends the colour (r, g, b, a),
+ * with `alpha` the fill's own 0..1, into the surface's own bytes across [x0, x1) of
+ * row `row`, weighted by that coverage. The surface is a plain buffer
+ * (slice 1), so nothing is copied and no Cairo call is made -- this is
+ * text.f's architecture turned round: there Festina answered coverage
+ * and C composited it, and it is the same split here (runtime.md,
+ * "The architecture proposed", option A).
+ *
+ * The arithmetic is pixman's own, the same routines the solid-fill fast
+ * path (claude.md #240) and the text mask use: the coverage becomes a
+ * byte, the premultiplied colour is scaled by it with MUL_UN8, and that
+ * goes OVER the destination. So where raster.f and Cairo agree on how
+ * much of a pixel is covered, they agree on the pixel, byte for byte;
+ * what remains is the coverage itself, which is the rasteriser's
+ * business and is measured where it is drawn.
+ *
+ * Drawing invalidates the image's cached encoded bytes, as every other
+ * drawing call does (claude.md #101): an image loaded from a file keeps
+ * the file's own bytes for save() and `file:img` columns, and without
+ * this a picture drawn on with raster.f would be saved as it was loaded.
+ *
+ * A coverage of 0 touches nothing; `cov` shorter than [x0, x1), a row
+ * or column outside the surface, or a surface that is not an image
+ * surface are clipped away rather than read past. Returns nothing: a
+ * rasteriser drawing into a surface has no error to act on. */
+void festina_image_blend_row(void *img, int64_t row, int64_t x0, int64_t x1, void *cov,
+                             int64_t cr, int64_t cg, int64_t cb, double alpha) {
+    if (!img || !cov) return;
+    cairo_surface_t *s = ((FestinaImageBox *)img)->surface;
+    if (!s || cairo_surface_get_type(s) != CAIRO_SURFACE_TYPE_IMAGE) return;
+    cairo_format_t format = cairo_image_surface_get_format(s);
+    if (format != CAIRO_FORMAT_ARGB32 && format != CAIRO_FORMAT_RGB24) return;
+    int sw = cairo_image_surface_get_width(s);
+    int sh = cairo_image_surface_get_height(s);
+    if (row < 0 || row >= sh) return;
+    int64_t *payload = (int64_t *)cov;
+    int64_t n = payload[0];
+    const double *c;
+    memcpy(&c, &payload[1], sizeof(c));
+    if (!c) return;
+    if (x0 < 0) x0 = 0;
+    if (x1 > sw) x1 = sw;
+    if (x1 > n) x1 = n;
+    if (x0 >= x1) return;
+    if (!(alpha > 0.0)) return;
+    if (alpha > 1.0) alpha = 1.0;
+    if (cr < 0) cr = 0; else if (cr > 255) cr = 255;
+    if (cg < 0) cg = 0; else if (cg > 255) cg = 255;
+    if (cb < 0) cb = 0; else if (cb > 255) cb = 255;
+
+    cairo_surface_flush(s);
+    unsigned char *data = cairo_image_surface_get_data(s);
+    if (!data) return;
+    uint32_t *p = (uint32_t *)(data + row * cairo_image_surface_get_stride(s));
+    /* The source the way Cairo reduces every solid colour before it
+     * composites: alpha and each channel times alpha, in doubles, each
+     * to a 16-bit short and then its high byte (festina_channel_byte,
+     * which is the same route fillStyle's own colours take). Premultiplying
+     * from a rounded 8-bit alpha instead would be one grey level off at
+     * alphas like 0.7, which is why alpha arrives as the double the
+     * program set and not as a byte. Once per call, not per pixel. */
+    uint32_t sa = festina_channel_byte(alpha);
+    uint32_t pr = festina_channel_byte(((double)cr / 255.0) * alpha);
+    uint32_t pg = festina_channel_byte(((double)cg / 255.0) * alpha);
+    uint32_t pb = festina_channel_byte(((double)cb / 255.0) * alpha);
+    int opaque_dest = format == CAIRO_FORMAT_RGB24;
+    for (int64_t i = x0; i < x1; i++) {
+        double v = c[i];
+        if (!(v > 0.0)) continue;
+        uint32_t m = v >= 1.0 ? 255u : (uint32_t)(v * 255.0 + 0.5);
+        if (m == 0) continue;
+        uint32_t in = (festina_mul_un8(sa, m) << 24) | (festina_mul_un8(pr, m) << 16)
+                    | (festina_mul_un8(pg, m) << 8) | festina_mul_un8(pb, m);
+        uint32_t d = p[i];
+        if (opaque_dest) d |= 0xFF000000u;
+        d = festina_over_un8x4(in, d);
+        p[i] = opaque_dest ? (d | 0xFF000000u) : d;
+    }
+    cairo_surface_mark_dirty_rectangle(s, (int)x0, (int)row, (int)(x1 - x0), 1);
+    festina_image_bytes_now_stale(img);
+}
+
 /* claude.md #240: the img half of the solid-fill fast path -- the same
  * contract as the canvas's festina_canvas_direct_ok, against THIS
  * image's own transform. This is the path that made the layered-canvas
