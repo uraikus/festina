@@ -241,7 +241,7 @@ from `setup.md`'s table rather than merely unused.
 | 4 | `raster.f` — paths, AA fill, stroke, clip, gradients, compositing | — | phase 0 |
 | 5 | glyph rasterisation + the font-discovery decision | — | phase 4 |
 | 6 | PNG encode | — | the `blob` write half |
-| 7 | wiring 4 and 5 in, image sources, the window seam | **Cairo** | phases 4, 5, 6 |
+| 7 | wiring 4 and 5 in, image sources, the window seam — nine slices, five decisions; see "Phase 7, specified" | **Cairo** | phases 4, 5, 6 |
 
 Phases 1–3 are independent of 4–5 and can land in any order. Phase 6
 is gated on a language feature that does not exist yet.
@@ -1188,6 +1188,156 @@ without which two workers drawing text crashed every time;
 FESTINA_CAIRO_TEXT=1 is the switch back to Cairo; the packaged compiler
 carries the whole runtime directory; and text is under the leak
 harness for the first time.
+
+### Phase 7, specified
+
+Phases 4 and 5 built the rasteriser and the text path; phase 7 is where
+Cairo actually leaves. "Wiring 4 and 5 in" was how the plan table put
+it, and measuring what that means turned up four things the table did
+not know. The findings come first because they set the shape of the
+plan.
+
+**What Cairo still does, measured.** 96 of the 109 functions in
+`festina_runtime_graphics.c` that mention Cairo, by what would have to
+replace it (the other 13 only name a type):
+
+| what | functions | replacement |
+|---|---|---|
+| draw fallbacks: a context, then fill / stroke / paint | 36 | raster.f, once it is fast enough |
+| surface storage and access only | 17 | a plain buffer — mechanical |
+| transform state (`cairo_matrix_t`) | 10 | raster.f's matrix, phase 4 slice 7 |
+| images as sources (`set_source_surface`, `mask_surface`) | 10 | **nothing built** — blits and a resampler |
+| gradients / patterns | 6 | raster.f, phase 4 slice 6 |
+| text through the toy API | 5 | text.f for the default face; **nothing for the rest** |
+| path builders (`move_to` … `close_path`) | 4 | path arrays into raster.f |
+| X11 present and resize | 4 | `XPutImage` — six lines of Cairo today |
+| PNG decode / encode | 3 | png.f decodes; **encode needs the `blob` write half** |
+| image resample (`set_filter(GOOD)`) | 1 | **nothing built** |
+
+Every canvas and every `img` is a `cairo_surface_t`; the Win32 and
+macOS backends read only its data pointer, width, height and stride.
+
+**Finding 1: raster.f is not yet fast enough to be the backend.** Phase
+4 said a frame's rasterising would be "well under a millisecond". That
+was true of the inner blend loop and untrue of the path it sits in.
+Per shape, drawn 4,000 times onto an 800×600 surface, fills only (an
+earlier run compared raster.f's fill against Cairo's fill *and border*
+and flattered raster.f):
+
+| per shape | the runtime today | raster.f | ratio |
+|---|---|---|---|
+| opaque rectangle 120×80 | 2.1 us (direct-pixel path, #240) | 21.6 us | 10× |
+| opaque circle r = 50 | 11.7 us (cached coverage mask, #104) | 606.6 us | 52× |
+| 50% rectangle | 6.0 us (Cairo) | 17.2 us | 2.9× |
+| 50% circle | 63.3 us (Cairo) | 696.2 us | 11× |
+
+The C fast paths from #104 and #240 are the bar, not Cairo: they are
+what a game loop runs on, and text.f began 77 times slower than Cairo
+for want of exactly this measurement. A circle costs 7.7 million
+instructions — 41% in `rasRowCoverage`, then `rasAddSpan`,
+`rasBlendRowSource` and array reallocation — about 980 per pixel.
+There is real headroom (interior rows need no edge walk; sixteen
+sub-scanlines are more than most rows want), and it is a work item of
+its own, with a gate: no drawing call slower than the path it replaces.
+
+**Finding 2: pixels cannot travel as `arr[int]`.** `toPixels` plus
+`imageFromPixels` on 800×600 costs 6.9 ms, and raster.f's surface is an
+`int` per channel — 32 bytes a pixel against the surface's 4. So
+raster.f cannot draw onto a copy of the canvas per call, and it is
+eight times the memory traffic on its own arrays. Whatever draws must
+write the surface's own bytes.
+
+**Finding 3: the direct paths already do not need Cairo.** #104 and
+#240 write premultiplied ARGB32 words straight into the surface's
+memory; Cairo is only what allocates it and what the fallback calls.
+And a plain buffer can be handed to Cairo without a copy —
+`cairo_image_surface_create_for_data`, measured here: the pixels
+written through the wrapper are in the original buffer (50% red reads
+`0x80800000` in it), the pointer is shared, and a wrapper plus context
+costs 258 ns per call (133 ns on one kept wrapper). That is what makes
+removal incremental.
+
+**Finding 4: removing the fallback removes behaviour, not just
+pixels.** Today "not handled" means "Cairo does it". With Cairo gone:
+
+- **bold, italic and other families have no path.** text.f draws the
+  bundled regular face. Bold needs DejaVuSans-Bold (709 KB); italic
+  needs an oblique face `fonts-dejavu-core` does not ship (today's
+  italic draws upright anyway — runtime.md phase 5); another family
+  needs discovery (the directory scan option, which font.f can now
+  read TrueType from) or an error;
+- **png.f refuses 1, 2, 4 and 16-bit files and jpeg.f refuses
+  progressive ones** — the plan noted this for libjpeg at phase 2:
+  implement, or refuse outright, and either way it is a user-visible
+  choice;
+- **saving has no encoder.** `img.save`, `saveCanvas` and the bytes a
+  `file:img` column stores go through `cairo_surface_write_to_png`.
+  Encoding PNG in Festina needs to produce bytes, and there is still no
+  way to build a `blob` from an `arr[int]` — phase 6's gate, unchanged.
+
+**And the pixel-exactness cost.** Cairo and raster.f differ at
+anti-aliased edges by a measured 12–27 grey levels, so a saved image's
+bytes change at every curved or slanted edge. 111 tests read or compare
+pixels, 71 of them in `test_codegen.py`; most probe interiors, and how
+many pin an edge is a slice's measurement, not a guess made here.
+
+**The architecture proposed.** Three ways to give raster.f the surface:
+
+| | how | cost |
+|---|---|---|
+| A | **Festina computes coverage, C composites rows.** The surface is a plain C buffer; raster.f, given the `img`, hands each row's coverage to one C primitive that blends it into the surface's own bytes | one new internal `img` method; no copies; per-pixel work stays in C |
+| B | port the coverage engine to C | fastest; gives up the point of writing the runtime in Festina |
+| C | a pixel-buffer type in the language | the general answer, and a compiler change on the scale of `amor` |
+
+A, because it is what text.f already does — Festina answers coverage, C
+composites with the source it always set — and because compositing is
+the part that wants 4-byte words and no bounds ceremony. B is the
+fallback if A cannot reach the bar in Finding 1. C is worth having and
+is not needed for this.
+
+**Decisions this needs from the user** (none is a port detail):
+
+1. **Architecture:** A (recommended), B, or C.
+2. **Non-default text:** bundle a bold face and refuse or substitute
+   italic and other families; scan the system fonts for named families;
+   or keep Cairo as an optional dependency for exactly this. The last
+   is the only one under which Cairo is not removed.
+3. **Formats:** implement 1/2/4/16-bit PNG and progressive JPEG, or
+   refuse them with an error that says so.
+4. **Pixels:** accept that anti-aliased edges move by the measured
+   bound, and that tests pinning an edge are re-baselined rather than
+   loosened.
+5. **The bar:** "no drawing call slower than the path it replaces",
+   measured per shape as in Finding 1 — or a looser one.
+
+**Slices, in dependency order.** Each ends green, and with Cairo still
+present every slice compares against it, byte for byte where possible:
+
+1. `FestinaSurface`: a plain buffer for the canvas and every `img`, with
+   a zero-copy Cairo wrapper for the fallbacks that remain. **No
+   behaviour change, and no decision needed:** the oracle is the whole
+   suite, unchanged, plus byte-identical saved images
+2. the row-compositing primitive and raster.f driving an `img` directly
+   (decision 1); fills and paths, compared with Cairo
+3. coverage speed to the bar (decision 5) — measured per shape
+4. fills, strokes, paths, gradients, clip and transforms off Cairo: the
+   36 fallback functions lose their contexts, one group at a time
+5. images as sources: integer-offset blits (exact), scaled and rotated
+   draws, `resize`, `clip`, `clone` — a resampler, compared with a bound
+6. the decoder gaps (decision 3)
+7. presentation: `XPutImage`, and the window seam speaking a plain
+   surface (the Win32 and macOS backends already do)
+8. non-default text (decision 2)
+9. PNG encode (phase 6, gated on building a `blob` from bytes), then
+   delete Cairo from the link line, `setup.md`, CI's package lists and
+   the `FESTINA_CAIRO_TEXT` switch
+
+**What removing Cairo buys, and what it does not.** `libcairo2-dev`
+leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the
+crash class of decisions.md #348) and Homebrew's; libjpeg stays unless
+decision 3 says otherwise, libX11 stays (it is what opens a window).
+It does not make drawing faster — Finding 1 says the reverse until
+slice 3 — and it changes edge pixels.
 
 ## Tests
 
