@@ -1317,7 +1317,7 @@ present every slice compares against it, byte for byte where possible:
    a zero-copy Cairo wrapper for the fallbacks that remain. **No
    behaviour change, and no decision needed:** the oracle is the whole
    suite, unchanged, plus byte-identical saved images
-2. the row-compositing primitive and raster.f driving an `img` directly
+2. ✅ the row-compositing primitive and raster.f driving an `img` directly
    (decision 1); fills and paths, compared with Cairo
 3. coverage speed to the bar (decision 5) — measured per shape
 4. fills, strokes, paths, gradients, clip and transforms off Cairo: the
@@ -1360,6 +1360,66 @@ and frees disagree), an allocation that does not zero (pixels not zero).
 Not routed, deliberately: the A8 coverage mask text draws through (it is
 a transient, freed in the same call) and the surfaces the PNG stream
 reader creates -- both go when their callers do, in slices 4 and 9.
+
+**Slice 2, as built.** One new internal method,
+`img.__blendRow(row, x0, x1, coverage, r, g, b, alpha)`, is the whole of
+what raster.f needs from C: it blends a row of coverage (an `arr[float]`,
+0..1) into the surface's own bytes, clipped to the image and to the
+array, so nothing is copied and no Cairo call is made
+(`festina_image_blend_row`). It is named with underscores because it is
+the runtime's seam, not language surface, and is deliberately absent from
+api.md. raster.f gains `rasFillPathImg`, `rasStrokePathImg`, their
+`...Clip` and `...TImg` (transform) forms, and `rasFillRectImg` /
+`rasFillCircleImg`, all over the coverage functions the `arr[int]` target
+uses, so a shape has the same coverage on either.
+
+Three things the tests found rather than the design predicted:
+
+- **Alpha is a float, not a byte.** Cairo premultiplies a solid colour
+  from the double `fillAlpha` holds -- alpha and each channel times alpha,
+  each to a 16-bit short, then its high byte. Premultiplying from the
+  rounded 8-bit alpha (the first version) was up to two grey levels off,
+  over 135 pixels of a three-layer scene, at alphas like 0.4 and 0.7. The
+  primitive and the `...Img` functions take the double; the result is
+  byte-identical to Cairo wherever coverage is whole.
+- **Drawing has to drop the image's cached file bytes** (claude.md #101),
+  as every other drawing call does. The first version did not, and a JPEG
+  drawn on with raster.f was saved as the original file; the JPEG test
+  caught it, and `test_drawing_on_a_loaded_image_stops_it_saving_the_files_own_bytes`
+  holds it.
+- **Two mutations were invisible to output tests**: a row or span outside
+  the image, and a coverage array shorter than the span, draw nothing
+  anyone sees when they write past the buffer. `tests/test_blend_row.py`
+  cuts the real function out of the runtime, compiles it with
+  AddressSanitizer and calls it with every argument past its edge.
+
+Measured against Cairo (same scenes, saved PNGs compared): aligned
+opaque and translucent rectangles, over opaque, transparent and
+JPEG-backed (RGB24) grounds, are byte-identical; a half-transparent
+circle differs only on its rim (every differing pixel within 1.5 px of
+the edge, at most 27 levels); and the two raster.f targets agree to one
+grey level across fills, strokes, clips and transforms. The
+differential harnesses pass with the method ported to
+`bootstrap/codegen.f` (its declare line and its `CG_IMAGE_OPS` entry --
+claude.md #346's lesson, applied before the failure this time).
+
+**Speed, measured before slice 3 sets a bar** (800x600 image, per shape,
+single thread, idle machine; the current runtime is its direct
+fill path or Cairo):
+
+| shape | current runtime | raster.f -> img |
+|---|---|---|
+| opaque rect 40x30 | 0.2 us | 69 us |
+| opaque circle r=20 | 2.7 us | 146 us |
+| 50% rect 40x30 | 1.3 us | 82 us |
+| 50% circle r=20 | 29.8 us | 149 us |
+
+The circle is four times better than the `arr[int]` target's 606 us
+(per-pixel blends into 32-byte pixels were most of that) and a rect is
+worse than the 21.6 us of Finding 1, because every row's coverage is
+cleared, accumulated and blended across the WHOLE 800-pixel width for a
+40-pixel shape. Bounding each row to the shape's own span is slice 3's
+first job, and the numbers above are its baseline.
 
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the
