@@ -207,14 +207,27 @@ class TestEverythingElseStaysWithCairo:
         plain = _compile(tmp_path, cli_mod, _pixels_program(
             "fillStyle(0, 0, 0)\nchangeFont(20, null, null)\n", "a.drawText('Hello', 5, 40)\n"),
             name="plain")
-        # A throwaway Cairo run first. On CI's Windows job the FIRST
+        # Cairo, to a steady state first. On CI's Windows job the first
         # process to draw italic differed from every later one -- Cairo
-        # against Cairo, 6 channels -- while the four runs after it all
-        # agreed, ours included (run 180). Why is not established; a
-        # font cache warming on a fresh runner would explain it and has
-        # not been checked. The claim tested is that the fallback draws
-        # what Cairo draws, and that needs Cairo in a steady state.
-        _run(tmp_path, prog, cairo_only=True)
+        # against Cairo, 6 channels -- while the runs after it agreed,
+        # ours included (run 180). One throwaway run was not always
+        # enough: in run 184 the SECOND Cairo process still differed and
+        # the three after it agreed. Why is not established; a font cache
+        # warming on a fresh runner would explain it and has not been
+        # checked. The claim tested is that the fallback draws what Cairo
+        # draws, and that needs Cairo in a steady state -- defined here as
+        # two Cairo runs in a row that agree, within six -- and a Cairo
+        # that never settles is a failure that says so.
+        settled = None
+        previous = _run(tmp_path, prog, cairo_only=True)
+        for attempt in range(1, 7):
+            current = _run(tmp_path, prog, cairo_only=True)
+            if current == previous:
+                settled = attempt
+                break
+            previous = current
+        assert settled is not None, (
+            f"{name}: Cairo's own output did not settle in six consecutive runs")
         cairo1 = _run(tmp_path, prog, cairo_only=True)
         ours1 = _run(tmp_path, prog)
         cairo2 = _run(tmp_path, prog, cairo_only=True)

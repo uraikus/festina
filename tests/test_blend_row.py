@@ -113,9 +113,14 @@ def run(tmp_path_factory):
     out = d / "h"
     r = subprocess.run([cc, "-fsanitize=address,undefined", "-fno-sanitize-recover=undefined",
                         "-g", str(d / "h.c"), "-o", str(out)] + flags, capture_output=True, text=True)
-    if r.returncode != 0 and "sanitize" in r.stderr:
-        unavailable("this compiler cannot link -fsanitize=address")
-    assert r.returncode == 0, r.stderr
+    if r.returncode != 0:
+        # Distinguish "no sanitizer runtime" (MinGW: `cannot find -lasan`)
+        # from a harness that does not compile: the same program without
+        # the sanitizers must build, or this is a real error.
+        plain = subprocess.run([cc, str(d / "h.c"), "-o", str(d / "plain")] + flags,
+                               capture_output=True, text=True)
+        assert plain.returncode == 0, plain.stderr
+        unavailable("this compiler cannot link -fsanitize=address: " + r.stderr[-200:])
     return subprocess.run([str(out)], capture_output=True, text=True, timeout=60,
                           env=dict(os.environ, ASAN_OPTIONS="detect_leaks=0"))
 

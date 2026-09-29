@@ -5,13 +5,17 @@ limited to the columns the shape touches, each row's sub-scanlines
 walking only the edges that reach it, and the whole pixels inside a span
 summed once instead of added sixteen times -- and each of those is a
 place to be quietly wrong. So the output of the version before them is
-pinned: `tests/fixtures/raster_golden.f` draws 260 pseudo-random shapes
+pinned: `tests/fixtures/raster_golden.fsrc` draws 260 pseudo-random shapes
 (polygons under both fill rules, circles, fractional rectangles,
 strokes, clipped fills, transformed fills, gradients, clears) onto both
 raster.f targets, on an odd-sized surface with shapes running off every
 edge and one coverage buffer shared throughout, and logs a hash of each
 target's pixels. The two numbers below were recorded from the code as it
 stood at the end of slice 2 (commit e0ab0aa), before any of it.
+
+The scene's extension is `.fsrc`, not `.f`: the bootstrap differential
+compiles every `.f` file in the repository as its corpus, and this one
+imports raster.f from beside itself, which only the test arranges.
 
 If a deliberate change to coverage ever moves them, that is a decision
 (runtime.md, phase 7, decision 4) and not a number to update: look at
@@ -28,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_raster import _decode_png, _run, _with_raster   # noqa: E402
 
 _FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
-                        "raster_golden.f")
+                        "raster_golden.fsrc")
 
 #: The `arr[int]` target's pixels, then the `img` target's.
 GOLDEN = ("716613692", "119937398")
