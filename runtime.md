@@ -1319,7 +1319,7 @@ present every slice compares against it, byte for byte where possible:
    suite, unchanged, plus byte-identical saved images
 2. ✅ the row-compositing primitive and raster.f driving an `img` directly
    (decision 1); fills and paths, compared with Cairo
-3. coverage speed to the bar (decision 5) — measured per shape
+3. ◐ coverage speed to the bar (decision 5) — measured per shape; first pass done, see "Slice 3, first pass"
 4. fills, strokes, paths, gradients, clip and transforms off Cairo: the
    36 fallback functions lose their contexts, one group at a time
 5. images as sources: integer-offset blits (exact), scaled and rotated
@@ -1420,6 +1420,69 @@ worse than the 21.6 us of Finding 1, because every row's coverage is
 cleared, accumulated and blended across the WHOLE 800-pixel width for a
 40-pixel shape. Bounding each row to the shape's own span is slice 3's
 first job, and the numbers above are its baseline.
+
+**Slice 3, first pass.** The bar (decision 5) has not been answered, so
+this pass takes only speed-ups that change nothing visible: the pixels of every
+shape are the same. Each was found by profiling
+(callgrind, per-row instruction counts) before it was written:
+
+- **A row's work is limited to the columns the shape touches.** Every
+  row cleared, accumulated and blended the whole surface width; a 40-pixel
+  shape on 800 columns did 20 times the work. `RAS_LO`/`RAS_HI` track the
+  columns a row's spans reached; the clear, the clip multiply, the blend
+  and `__blendRow` use only those. (Invariant: `RAS_COV` is zero outside
+  them; a row puts back what it touched before it starts.)
+- **A sub-scanline walks only the edges that reach its row.** A circle's
+  sixty-odd edges were each tested by all sixteen sub-scanlines of every
+  row; now a row picks its active edges once, flattened, in the path's
+  order, so the crossings and their insertion order are unchanged.
+- **The whole pixels inside a span are summed once.** Each sub-scanline
+  added its weight to every interior pixel, sixteen times per pixel; a
+  difference array records where an interior starts and ends and the row
+  sums it once. The weights are powers of two, so those sums are exact.
+  This is the one change that can move a coverage by the last bit of a
+  double, where a pixel gets both partial and interior contributions and
+  the additions are associated differently; a visible pixel can move only
+  if a coverage lands within 1e-13 of a rounding boundary, and none does
+  on the 260-shape battery below.
+- In C: full coverage skips the multiplies (MUL_UN8 by 255 is the
+  identity, checked for all 256 values), and `festina_over_un8x4` is
+  written as pixman writes it, two channels to a lane. The new form is
+  held equal to the channel-at-a-time one on 200 million random pairs and
+  every combination of the edge values, and a test keeps that.
+
+`tests/test_raster_golden.py` pins the result: 260 pseudo-random shapes
+(both fill rules, circles, fractional rectangles, strokes, clipped and
+transformed fills, gradients, clears) on an odd-sized surface with shapes
+running off every edge, hashed on both targets, against the hashes the
+code produced at the end of slice 2. Nine bugs put back in the speed-ups
+(a too-strict edge filter, an interior never subtracted or started a
+pixel late, the touched range one short at either end, stale coverage
+left in the row, the difference array not cleared, the blend range one
+short) all fail it; a tenth, an edge test loosened by 0.01, changes
+nothing because no sub-scanline can sit that close to a row's top, and is
+noted as an equivalent mutant rather than a hole.
+
+Measured again as before (800x600, per shape, idle machine):
+
+| shape | current runtime | slice 2 | now |
+|---|---|---|---|
+| opaque rect 40x30 | 0.3 us | 69 us | 24 us |
+| opaque circle r=20 | 2.5 us | 146 us | 38 us |
+| 50% rect 40x30 | 1.3 us | 82 us | 31 us |
+| 50% circle r=20 | 32.7 us | 149 us | 42 us |
+
+So a general shape is now within 1.3x of Cairo (the 50% circle), and
+raster.f is still 20-80x the runtime's C fast paths on rectangles and
+circles. Those fast paths (#104, #240) are not Cairo and are not going
+away; what they cannot do is a translucent or fractional rectangle,
+which Cairo does in 1.3 us and this does in 31. What is left, in the
+order the profile says: a row whose active edges are all vertical (every
+rectangle) computes its crossings once and replays them, saving about
+half a row; the C side gaining a translucent/fractional rectangle path of
+its own, which is decision 5's question and not this slice's to settle;
+and the per-row edge collection, which rebuilds for every row what
+changes only at an edge's end.
 
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the

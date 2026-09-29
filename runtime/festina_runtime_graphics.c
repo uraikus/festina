@@ -1134,18 +1134,27 @@ static inline uint32_t festina_mul_un8(uint32_t a, uint32_t b) {
 
 /* `s` (premultiplied, already scaled by coverage) OVER `d`:
  * d = MUL_UN8(d, 255 - s.a) + s per channel, saturating -- pixman's
- * combine_over_u. */
+ * combine_over_u, written the way pixman writes it: two channels to a
+ * 32-bit lane (red and blue, then alpha and green), so the four
+ * multiplies are two and the four saturating adds are two.
+ * tests/test_blend_row.py holds it equal, over millions of random pairs
+ * and every edge value, to the channel-at-a-time definition it replaced. */
 static inline uint32_t festina_over_un8x4(uint32_t s, uint32_t d) {
     uint32_t sa = s >> 24;
     if (sa == 0xFF) return s;
     if (s == 0) return d;
-    uint32_t ia = 0xFF - sa, out = 0;
-    for (int shift = 0; shift < 32; shift += 8) {
-        uint32_t c = festina_mul_un8((d >> shift) & 0xFF, ia) + ((s >> shift) & 0xFF);
-        if (c > 0xFF) c = 0xFF;
-        out |= c << shift;
-    }
-    return out;
+    uint32_t ia = 0xFF - sa;
+    uint32_t rb = (d & 0x00FF00FFu) * ia + 0x00800080u;
+    rb = ((rb + ((rb >> 8) & 0x00FF00FFu)) >> 8) & 0x00FF00FFu;
+    uint32_t ag = ((d >> 8) & 0x00FF00FFu) * ia + 0x00800080u;
+    ag = ((ag + ((ag >> 8) & 0x00FF00FFu)) >> 8) & 0x00FF00FFu;
+    uint32_t t = rb + (s & 0x00FF00FFu);
+    t |= 0x10000100u - ((t >> 8) & 0x00FF00FFu);
+    rb = t & 0x00FF00FFu;
+    t = ag + ((s >> 8) & 0x00FF00FFu);
+    t |= 0x10000100u - ((t >> 8) & 0x00FF00FFu);
+    ag = t & 0x00FF00FFu;
+    return rb | (ag << 8);
 }
 
 /* One 8-bit channel exactly as Cairo derives it from a double: to a
@@ -2685,12 +2694,16 @@ void festina_image_blend_row(void *img, int64_t row, int64_t x0, int64_t x1, voi
     uint32_t pg = festina_channel_byte(((double)cg / 255.0) * alpha);
     uint32_t pb = festina_channel_byte(((double)cb / 255.0) * alpha);
     int opaque_dest = format == CAIRO_FORMAT_RGB24;
+    uint32_t full = (sa << 24) | (pr << 16) | (pg << 8) | pb;
     for (int64_t i = x0; i < x1; i++) {
         double v = c[i];
         if (!(v > 0.0)) continue;
         uint32_t m = v >= 1.0 ? 255u : (uint32_t)(v * 255.0 + 0.5);
         if (m == 0) continue;
-        uint32_t in = (festina_mul_un8(sa, m) << 24) | (festina_mul_un8(pr, m) << 16)
+        /* Full coverage, the interior of nearly every shape: MUL_UN8 by
+         * 255 is the identity, so the source is the colour as reduced. */
+        uint32_t in = m == 255u ? full
+                    : (festina_mul_un8(sa, m) << 24) | (festina_mul_un8(pr, m) << 16)
                     | (festina_mul_un8(pg, m) << 8) | festina_mul_un8(pb, m);
         uint32_t d = p[i];
         if (opaque_dest) d |= 0xFF000000u;

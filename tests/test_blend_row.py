@@ -132,3 +132,85 @@ def test_and_what_is_in_range_is_still_drawn(run):
     lines = [l for l in run.stdout.splitlines() if l.startswith("format")]
     same = "row 0 alpha 0 0, row 1 alpha 255 255 255, row 2 alpha 255 255 0"
     assert lines == [f"format 0: {same}", f"format 1: {same}"], lines
+
+
+# ---- festina_over_un8x4 against the definition it replaced ----
+#
+# The compositing step was written a channel at a time and then, for
+# speed, the way pixman writes it: two channels to a 32-bit lane. It is
+# what the direct fills, the text mask and __blendRow all composite with,
+# so a difference of one in any channel is a visible change everywhere;
+# this holds the fast form to the plain one on random pairs (half of
+# them shaped like real premultiplied sources) and on every combination
+# of the values where carries and rounding live.
+
+OVER_HARNESS = r"""
+#include <stdint.h>
+#include <stdio.h>
+%(parts)s
+
+static uint32_t reference(uint32_t s, uint32_t d) {
+    uint32_t sa = s >> 24;
+    if (sa == 0xFF) return s;
+    if (s == 0) return d;
+    uint32_t ia = 0xFF - sa, out = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
+        uint32_t c = festina_mul_un8((d >> shift) & 0xFF, ia) + ((s >> shift) & 0xFF);
+        if (c > 0xFF) c = 0xFF;
+        out |= c << shift;
+    }
+    return out;
+}
+
+int main(void) {
+    uint64_t x = 88172645463325252ULL;
+    long checked = 0, differ = 0;
+    for (long i = 0; i < 30000000L; i++) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        uint32_t s = (uint32_t)x, d = (uint32_t)(x >> 32);
+        if (i & 1) {
+            uint32_t a = s >> 24;
+            s = (a << 24) | ((((s >> 16) & 0xFF) %% (a + 1)) << 16)
+                          | ((((s >> 8) & 0xFF) %% (a + 1)) << 8) | ((s & 0xFF) %% (a + 1));
+        }
+        checked++;
+        if (reference(s, d) != festina_over_un8x4(s, d)) differ++;
+    }
+    uint32_t v[] = { 0, 1, 0x7F, 0x80, 0xFE, 0xFF };
+    for (int i = 0; i < 6 * 6 * 6 * 6; i++)
+        for (int j = 0; j < 6 * 6 * 6 * 6; j++) {
+            uint32_t s = 0, d = 0;
+            for (int k = 0, a = i, b = j; k < 4; k++, a /= 6, b /= 6) {
+                s |= v[a %% 6] << (8 * k);
+                d |= v[b %% 6] << (8 * k);
+            }
+            checked++;
+            if (reference(s, d) != festina_over_un8x4(s, d)) differ++;
+        }
+    printf("checked %%ld differ %%ld\n", checked, differ);
+    return 0;
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def over_run(tmp_path_factory):
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if not cc:
+        pytest.skip("no C compiler")
+    d = tmp_path_factory.mktemp("over")
+    src = open(GRAPHICS_C, encoding="utf-8").read()
+    parts = _cut(src, "static inline uint32_t festina_mul_un8",
+                 "/* One 8-bit channel exactly")
+    (d / "o.c").write_text(OVER_HARNESS % {"parts": parts})
+    out = d / "o"
+    r = subprocess.run([cc, "-O2", str(d / "o.c"), "-o", str(out)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return subprocess.run([str(out)], capture_output=True, text=True, timeout=120)
+
+
+def test_the_fast_over_equals_the_channel_at_a_time_definition(over_run):
+    m = re.search(r"checked (\d+) differ (\d+)", over_run.stdout)
+    assert m, over_run.stdout + over_run.stderr
+    assert int(m.group(1)) > 30_000_000
+    assert m.group(2) == "0", over_run.stdout

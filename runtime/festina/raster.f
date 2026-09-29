@@ -127,12 +127,24 @@ int RAS_EVENODD = 1
 // fill touches these and nothing else keeps a reference.
 arr[float] RAS_COV = []
 arr[float] RAS_XS = []
+
+// The whole pixels a span covers between its two partial ends get the
+// span's weight from every sub-scanline that reaches them -- sixteen
+// times each -- and adding it pixel by pixel was most of a shape's cost.
+// They are recorded instead as a difference: +weight where the interior
+// starts, -weight where it ends, and rasRowCoverage sums them across the
+// row once, at the end. Each weight is a power of two, so every sum of
+// them is exact whatever the order. Zero everywhere between rows.
+arr[float] RAS_DIFF = []
 arr[int] RAS_WS = []
 
 // Grow a float scratch array to at least n entries.
 void func rasEnsureCov(n:int) {
     while RAS_COV.length < n {
         RAS_COV.push(0.0)
+    }
+    while RAS_DIFF.length < n + 1 {
+        RAS_DIFF.push(0.0)
     }
 }
 
@@ -171,17 +183,77 @@ bool func rasPathExtent(pts:arr[float], sh:int) {
 // Pulled out of rasFillPath so that the same coverage can go to three
 // places -- blended onto pixels, stored as a clip mask, or multiplied
 // by one -- without three copies of the scanline loop to drift apart.
+// The columns of RAS_COV that can be non-zero: [RAS_LO, RAS_HI). Every
+// consumer of a row's coverage -- the blend, the clip multiply -- needs
+// only these, and clearing the row for the next one needs only these,
+// so a 40-pixel shape on an 800-pixel surface costs 40 pixels of each and
+// not 800. Everything outside is zero: rasRowCoverage puts the columns
+// it touched back to zero before it starts a row, and nothing else
+// writes outside what rasAddSpan reached (the clip multiply only scales
+// what is there).
+int RAS_LO = 0
+int RAS_HI = 0
+
+// The edges a row can meet, flattened: [ax, ay, bx, by] per edge, in the
+// path's own order. A sub-scanline needs only the edges whose y range
+// reaches this row, and a circle's sixty-odd edges are not that for
+// most rows -- so each row picks them once and its sixteen sub-scanlines
+// share the list. Horizontal edges are left out: they cross no
+// scanline. The crossings, and the order they are inserted in, are the
+// ones the full walk found, so the coverage is bit for bit the same.
+arr[float] RAS_AE = []
+
 void func rasRowCoverage(row:int, sw:int, pts:arr[float], ends:arr[int], rule:int) {
-    int c = 0
-    while c < sw {
+    int c = RAS_LO
+    while c < RAS_HI {
         RAS_COV[c] = 0.0
         c = c + 1
     }
+    RAS_LO = sw
+    RAS_HI = 0
     float invSub = 1.0 / RAS_SUB.toFloat()
+
+    float rowTop = row.toFloat()
+    float rowBottom = rowTop + 1.0
+    int nae = 0
+    int sub0 = 0
+    int from0 = 0
+    while sub0 < ends.length {
+        int to0 = ends[sub0]
+        int p0 = from0
+        while p0 < to0 {
+            int q0 = p0 + 1
+            if q0 == to0 { q0 = from0 }
+            float ay0 = pts[(p0 * 2) + 1]
+            float by0 = pts[(q0 * 2) + 1]
+            float lo0 = ay0
+            float hi0 = by0
+            if by0 < ay0 {
+                lo0 = by0
+                hi0 = ay0
+            }
+            if hi0 > rowTop && lo0 < rowBottom && hi0 > lo0 {
+                while RAS_AE.length < (nae + 1) * 4 { RAS_AE.push(0.0) }
+                int at0 = nae * 4
+                RAS_AE[at0] = pts[p0 * 2]
+                RAS_AE[at0 + 1] = ay0
+                RAS_AE[at0 + 2] = pts[q0 * 2]
+                RAS_AE[at0 + 3] = by0
+                nae = nae + 1
+            }
+            p0 = p0 + 1
+        }
+        from0 = to0
+        sub0 = sub0 + 1
+    }
+
+    // A sub-scanline crosses each active edge at most once.
+    while RAS_XS.length <= nae { RAS_XS.push(0.0) }
+    while RAS_WS.length <= nae { RAS_WS.push(0) }
 
     int s = 0
     while s < RAS_SUB {
-        float sy = row.toFloat() + ((s.toFloat() + 0.5) * invSub)
+        float sy = rowTop + ((s.toFloat() + 0.5) * invSub)
 
         // Crossings of this sub-scanline with every edge, kept
         // sorted by x as they are inserted: a scanline meets a
@@ -189,42 +261,32 @@ void func rasRowCoverage(row:int, sw:int, pts:arr[float], ends:arr[int], rule:in
         // insertion sort over parallel arrays avoids needing a
         // comparator over a struct.
         int nx = 0
-        int sub = 0
-        int from = 0
-        while sub < ends.length {
-            int to = ends[sub]
-            int p = from
-            while p < to {
-                int q = p + 1
-                if q == to { q = from }
-                float ax = pts[p * 2]
-                float ay = pts[(p * 2) + 1]
-                float bx = pts[q * 2]
-                float by = pts[(q * 2) + 1]
-                bool down = ay <= sy && by > sy
-                bool up = by <= sy && ay > sy
-                if down || up {
-                    float t = (sy - ay) / (by - ay)
-                    float xx = ax + (t * (bx - ax))
-                    int w = 1
-                    if up { w = -1 }
-                    // insert, keeping RAS_XS[0..nx) ascending
-                    while RAS_XS.length <= nx { RAS_XS.push(0.0) }
-                    while RAS_WS.length <= nx { RAS_WS.push(0) }
-                    int j = nx
-                    while j > 0 && RAS_XS[j - 1] > xx {
-                        RAS_XS[j] = RAS_XS[j - 1]
-                        RAS_WS[j] = RAS_WS[j - 1]
-                        j = j - 1
-                    }
-                    RAS_XS[j] = xx
-                    RAS_WS[j] = w
-                    nx = nx + 1
+        int e = 0
+        while e < nae {
+            int at = e * 4
+            float ax = RAS_AE[at]
+            float ay = RAS_AE[at + 1]
+            float bx = RAS_AE[at + 2]
+            float by = RAS_AE[at + 3]
+            bool down = ay <= sy && by > sy
+            bool up = by <= sy && ay > sy
+            if down || up {
+                float t = (sy - ay) / (by - ay)
+                float xx = ax + (t * (bx - ax))
+                int w = 1
+                if up { w = -1 }
+                // insert, keeping RAS_XS[0..nx) ascending
+                int j = nx
+                while j > 0 && RAS_XS[j - 1] > xx {
+                    RAS_XS[j] = RAS_XS[j - 1]
+                    RAS_WS[j] = RAS_WS[j - 1]
+                    j = j - 1
                 }
-                p = p + 1
+                RAS_XS[j] = xx
+                RAS_WS[j] = w
+                nx = nx + 1
             }
-            from = to
-            sub = sub + 1
+            e = e + 1
         }
 
         // Crossings to spans, by the fill rule.
@@ -255,6 +317,17 @@ void func rasRowCoverage(row:int, sw:int, pts:arr[float], ends:arr[int], rule:in
         s = s + 1
     }
 
+    // The interiors, summed. RAS_DIFF is left zero for the next row.
+    float run = 0.0
+    int d = RAS_LO
+    while d < RAS_HI {
+        run = run + RAS_DIFF[d]
+        RAS_DIFF[d] = 0.0
+        if run != 0.0 {
+            RAS_COV[d] = RAS_COV[d] + run
+        }
+        d = d + 1
+    }
 }
 
 // Fill a path.
@@ -287,8 +360,8 @@ void func rasFillCore(px:arr[int], sw:int, sh:int,
         rasRowCoverage(row, sw, pts, ends, rule)
         if useMask {
             int base = row * sw
-            int c = 0
-            while c < sw {
+            int c = RAS_LO
+            while c < RAS_HI {
                 RAS_COV[c] = RAS_COV[c] * mask[base + c]
                 c = c + 1
             }
@@ -306,15 +379,16 @@ void func rasAddSpan(sw:int, xa:float, xb:float, weight:float) {
     int ia = Math.floor(lo)
     int ib = Math.floor(hi)
     if ib >= sw { ib = sw - 1 }
+    if ia < RAS_LO { RAS_LO = ia }
+    if ib + 1 > RAS_HI { RAS_HI = ib + 1 }
     if ia == ib {
         RAS_COV[ia] = RAS_COV[ia] + ((hi - lo) * weight)
         return
     }
     RAS_COV[ia] = RAS_COV[ia] + (((ia + 1).toFloat() - lo) * weight)
-    int i = ia + 1
-    while i < ib {
-        RAS_COV[i] = RAS_COV[i] + weight
-        i = i + 1
+    if ib > ia + 1 {
+        RAS_DIFF[ia + 1] = RAS_DIFF[ia + 1] + weight
+        RAS_DIFF[ib] = RAS_DIFF[ib] - weight
     }
     RAS_COV[ib] = RAS_COV[ib] + ((hi - ib.toFloat()) * weight)
 }
@@ -329,8 +403,8 @@ void func rasAddSpan(sw:int, xa:float, xb:float, weight:float) {
 void func rasBlendRow(px:arr[int], sw:int, row:int,
                       cr:int, cg:int, cb:int, ca:int) {
     int base = row * sw * 4
-    int i = 0
-    while i < sw {
+    int i = RAS_LO
+    while i < RAS_HI {
         float cov = RAS_COV[i]
         if cov > 0.0 {
             if cov > 1.0 { cov = 1.0 }
@@ -1043,8 +1117,8 @@ void func rasBlendRowSource(px:arr[int], sw:int, row:int, src:arr[float]) {
     float b1 = src[k + 5]
     float fy = row.toFloat() + 0.5
     int base = row * sw * 4
-    int i = 0
-    while i < sw {
+    int i = RAS_LO
+    while i < RAS_HI {
         float cov = RAS_COV[i]
         if cov > 0.0 {
             if cov > 1.0 { cov = 1.0 }
@@ -1270,8 +1344,8 @@ void func rasClearPath(px:arr[int], sw:int, sh:int,
     while row < RAS_Y1 {
         rasRowCoverage(row, sw, pts, ends, rule)
         int base = row * sw * 4
-        int i = 0
-        while i < sw {
+        int i = RAS_LO
+        while i < RAS_HI {
             float cov = RAS_COV[i]
             if cov > 0.0 {
                 if cov > 1.0 { cov = 1.0 }
@@ -1327,13 +1401,13 @@ void func rasFillCoreImg(target:img, pts:arr[float], ends:arr[int], rule:int,
         rasRowCoverage(row, sw, pts, ends, rule)
         if useMask {
             int base = row * sw
-            int c = 0
-            while c < sw {
+            int c = RAS_LO
+            while c < RAS_HI {
                 RAS_COV[c] = RAS_COV[c] * mask[base + c]
                 c = c + 1
             }
         }
-        target.__blendRow(row, 0, sw, RAS_COV, cr, cg, cb, alpha)
+        target.__blendRow(row, RAS_LO, RAS_HI, RAS_COV, cr, cg, cb, alpha)
         row = row + 1
     }
 }
