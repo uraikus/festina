@@ -9041,3 +9041,16 @@ options that are not that are moving the bootstrap canaries into their
 own job, so the wall time is the longer of the two halves instead of
 their sum, or cutting the canary count; either changes what the linux
 check is called or covers, so it is the maintainer's to choose.
+
+**Resolved: the canaries are their own job.** `scripts/run_tests.sh`
+takes `--only=bootstrap` or `--only=rest`, and CI's `linux` job runs the
+second (with the WASM and packaging steps, `timeout-minutes` 30) while a
+new `bootstrap` job runs the first (60, the worst of the three measured
+runs plus setup). The wall time is the longer half, not the sum. Two
+consequences to know: the check that used to be called `linux` no longer
+covers the bootstrap harnesses, so a branch-protection rule that lists
+required checks has to list `bootstrap` as well; and the new job's
+dependency list is trimmed (no Node, Playwright, wasi or X server) on
+the reading that the harnesses build and compare compilers and open no
+window -- FESTINA_STRICT_DEPS=1 makes a wrong reading fail loudly, but
+the first run is what confirms it.

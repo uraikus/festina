@@ -34,22 +34,40 @@
 # detail: `load` hands each worker a consecutive chunk of the
 # collection up front, which puts every canary on one worker and drops
 # the return from 3.7x to 1.2x. #344 has the arithmetic.
+#
+# `--only=bootstrap` or `--only=rest` runs one of the two halves, for CI
+# to run them as two jobs at once (the wall time is then the longer half
+# instead of their sum). With neither, both run, as before. The flag must
+# come first; everything after it goes to pytest.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
+
+ONLY=both
+case "${1:-}" in
+    --only=bootstrap) ONLY=bootstrap; shift ;;
+    --only=rest) ONLY=rest; shift ;;
+    --only=*) echo "run_tests.sh: --only takes bootstrap or rest, not ${1#--only=}" >&2; exit 2 ;;
+esac
 
 BOOTSTRAP=(tests/test_bootstrap_*.py)
 IGNORES=()
 for f in "${BOOTSTRAP[@]}"; do IGNORES+=("--ignore=$f"); done
 
-echo "== bootstrap differential (parallel) =="
-python -m pytest "${BOOTSTRAP[@]}" -n auto --dist worksteal "$@"
-bootstrap_status=$?
+bootstrap_status=0
+rest_status=0
+if [ "$ONLY" != rest ]; then
+    echo "== bootstrap differential (parallel) =="
+    python -m pytest "${BOOTSTRAP[@]}" -n auto --dist worksteal "$@"
+    bootstrap_status=$?
+    echo
+fi
 
-echo
-echo "== everything else (serial) =="
-python -m pytest "${IGNORES[@]}" "$@"
-rest_status=$?
+if [ "$ONLY" != bootstrap ]; then
+    echo "== everything else (serial) =="
+    python -m pytest "${IGNORES[@]}" "$@"
+    rest_status=$?
+fi
 
 # Both always run: a red bootstrap differential should not hide a red
 # behavioural suite, and vice versa. pytest's exit code 5 means "no

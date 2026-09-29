@@ -288,7 +288,8 @@ all of that — 92.8%, measured — is the bootstrap differential, whose
 so `scripts/run_tests.sh` runs them one per CPU and runs the rest of
 the suite serially, finishing in 35-45 minutes. See
 [decisions.md](decisions.md) #344 for why the split is drawn there
-instead of parallelising everything.
+instead of parallelising everything. `scripts/run_tests.sh --only=bootstrap`
+and `--only=rest` run one half each; CI runs them as two jobs at once.
 
 For a single harness by hand, the one worth knowing is:
 

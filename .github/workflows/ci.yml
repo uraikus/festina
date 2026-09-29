@@ -33,20 +33,14 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-latest
-    # decisions.md #345. This was 30, and the two runs either side of
-    # that line tell the whole story: 29:52 (cleared it by eight
-    # seconds) and then 30:16 (cancelled). The work is real -- 161
-    # canaries, each building a whole compiler -- and it is already
-    # parallelised as far as four cores go (#344 took it from 1:49:52
-    # serial to about 30 minutes here). There is no further speedup to
-    # spend instead of minutes.
-    #
-    # #238 raised the windows budget once and recorded that a budget
-    # raised twice is a budget nobody is managing. That rule is about
-    # not papering over slowness nobody has looked at. This one has
-    # been looked at very closely, and 45 matches what windows already
-    # has rather than inventing a number.
-    timeout-minutes: 45
+    # Everything but the bootstrap canaries. decisions.md #345 raised this
+    # to 45 because the canaries (161 tests, each building a whole
+    # compiler) and the rest ran one after the other in this job; run 183
+    # was cancelled at that cap with nothing failing. The canaries are
+    # their own job now (`bootstrap` below), so the wall time of the two
+    # is the longer of them and not their sum, and this half -- about
+    # 10 minutes of tests plus setup -- gets 30 again.
+    timeout-minutes: 30
     env:
       FESTINA_STRICT_DEPS: "1"
     steps:
@@ -87,14 +81,14 @@ jobs:
           # shared-library dependencies via apt.
           pip install playwright
           python -m playwright install --with-deps chromium
-      - name: Run the test suite
-        # decisions.md #344: the bootstrap differential in parallel,
-        # everything else serially. 35-45 minutes against 1:49:52 for a
-        # plain serial run. The macOS and Windows jobs below keep using
-        # `pytest tests/` directly: the bootstrap harnesses are
-        # Linux-only (decisions.md #287) and skip there, so the split
-        # would buy them nothing.
-        run: scripts/run_tests.sh -q
+      - name: Run the test suite (everything but the bootstrap harnesses)
+        # decisions.md #344 split the suite into the bootstrap
+        # differential (parallel) and everything else (serial); the
+        # bootstrap half runs in the `bootstrap` job below. The macOS and
+        # Windows jobs keep using `pytest tests/` directly: the bootstrap
+        # harnesses are Linux-only (decisions.md #287) and skip there, so
+        # the split would buy them nothing.
+        run: scripts/run_tests.sh --only=rest -q
       - name: Compile and run a WASM example
         # claude.md #148/wasm.md's own exit criterion: a real .wasm
         # binary, built via `festina compile --target=wasm32-wasi`,
@@ -115,6 +109,40 @@ jobs:
           ./scripts/package_compiler.sh /tmp/festina-dist
           /tmp/festina-dist/festina compile examples/hello.f -o /tmp/festina-dist/hello
           /tmp/festina-dist/hello
+
+  bootstrap:
+    # The bootstrap differential harnesses (decisions.md #287, #344), on
+    # their own runner: 161 canaries that each build a whole compiler from
+    # a deliberately broken copy of bootstrap/, in parallel across the
+    # four cores. Measured on this runner: 24:42, 37:21 and 42:11 for the
+    # same tests on different runs -- the spread of a shared machine -- so
+    # 60 is the worst of those plus the setup, not a round number. It is
+    # a new job's budget, not a second raise of the linux one (#238).
+    #
+    # It installs what the harnesses build against and leaves out what
+    # they do not: no Node or Playwright (the browser and WASI tests),
+    # no wasi-libc, no X server or its tools. FESTINA_STRICT_DEPS=1 so a
+    # missing library fails here instead of skipping.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FESTINA_STRICT_DEPS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libsqlite3-dev \
+            libcairo2-dev libx11-dev libjpeg-dev \
+            libasound2-dev libmpg123-dev \
+            libmbedtls-dev fonts-dejavu-core
+          pip install -r requirements-dev.txt -r requirements-build.txt
+      - name: Run the bootstrap differential
+        run: scripts/run_tests.sh --only=bootstrap -q
 
   macos:
     # macos.md Phase 0. arm64; Apple clang from the preinstalled
