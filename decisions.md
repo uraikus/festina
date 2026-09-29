@@ -9007,3 +9007,37 @@ here; it is why text.f's pool is a plain array, with a comment saying
 so. A corpus file cannot use a global amor array until that port
 learns it.
 
+
+## CI run 183: the linux job hit its cap again, and what was and was not established
+
+Run 183 (dispatched on the phase 7 slice 1 commit) was green on macOS and
+Windows and **cancelled** on linux: the test step ran 44:35 and was
+stopped by the 45-minute `timeout-minutes` with the serial half 61%
+through, so nothing failed and nothing was skipped -- and it also did not
+pass, so it is not counted as green.
+
+Established:
+
+- The commit is not the cause. It adds five tests that take 0.2 s and
+  changes the pixel allocation, which the byte-identical and leak checks
+  cover; it touches no bootstrap corpus file, and the bootstrap codegen
+  harness measured 7:00 on four cores here on the slice 2 tree with the
+  slowest single case (`bootstrap/codegen.f`) at 109 s.
+- The parallel half (the canaries) took 37:21 on the runner; the same
+  half was measured at 1,685 s and 2,040 s locally by #344 and at
+  24:42 and 42:11 on two consecutive CI runs above. It is the same
+  1,2xx tests each time. That is the spread of a shared four-core
+  runner, which is what the entry above already said.
+- The serial half has grown with the graphics work (phases 4 to 7 added
+  raster, text, font and blend tests that compile and run programs), so
+  the sum of a slow parallel half and a longer serial half no longer fits
+  in 45 minutes on a slow runner. Runs 180 to 182 took 38:04, 38:52 and
+  41:10; this one needed more than 44:35.
+
+Not established: how much of the serial half is the new tests versus the
+runner. Not done: raising `timeout-minutes` (#345, and the rule in #238
+that a budget raised twice is a budget nobody is managing). The two
+options that are not that are moving the bootstrap canaries into their
+own job, so the wall time is the longer of the two halves instead of
+their sum, or cutting the canary count; either changes what the linux
+check is called or covers, so it is the maintainer's to choose.
