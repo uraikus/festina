@@ -890,6 +890,8 @@ void festina_image_clear(void *img);
 void festina_image_clear_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h);
 void festina_image_clear_circle(void *img, int64_t x, int64_t y, int64_t r);
 void festina_image_clear_pixel(void *img, int64_t x, int64_t y);
+void festina_image_clear_row(void *img, int64_t row, int64_t x0, int64_t x1, void *cov);
+void festina_image_blend_row_words(void *img, int64_t row, int64_t x0, int64_t x1, void *cov, void *words);
 void festina_image_blend_row(void *img, int64_t row, int64_t x0, int64_t x1, void *cov,
                              int64_t cr, int64_t cg, int64_t cb, double alpha);
 void festina_image_draw_image(void *dst, void *src, int64_t x, int64_t y);

@@ -1531,3 +1531,142 @@ void func rasFillCircleImg(target:img, cx:float, cy:float, radius:float,
     rasCircle(pts, ends, cx, cy, radius)
     rasFillPathImg(target, pts, ends, RAS_NONZERO, r, g, b, a)
 }
+
+// ---- Phase 7, slice 4: a gradient onto an img ----
+//
+// The same source arrays as slice 6 (rasLinear / rasRadial), minus the
+// trailing alpha, which arrives as its own float 0..1 -- the fillAlpha the
+// program set, as in the solid forms above:
+//
+//   linear  [1, x0, y0, x1, y1, r0, g0, b0, r1, g1, b1]
+//   radial  [2, cx, cy, radius, r0, g0, b0, r1, g1, b1]
+//
+// in USER space. A pixel's colour is worked out at its centre mapped back
+// through the inverse of the transform the shape is drawn under, which is
+// how Cairo holds a pattern: fixed in user space, carried along by the
+// matrix in force when the source was set. So a rotated or scaled
+// gradient is right for every matrix, radial under a non-uniform scale
+// included (its circles are ellipses on the surface).
+
+// The inverse of an affine matrix in Cairo's order [xx, yx, xy, yy, x0, y0];
+// the identity when it has none (a zero determinant).
+arr[float] func rasInvertMatrix(m:arr[float]) {
+    float det = (m[0] * m[3]) - (m[1] * m[2])
+    if det == 0.0 { return rasIdentity() }
+    float ia = m[3] / det
+    float ib = 0.0 - (m[1] / det)
+    float ic = 0.0 - (m[2] / det)
+    float id = m[0] / det
+    float ie = ((m[2] * m[5]) - (m[3] * m[4])) / det
+    float iff = ((m[1] * m[4]) - (m[0] * m[5])) / det
+    arr[float] inv = [ia, ib, ic, id, ie, iff]
+    return inv
+}
+
+arr[int] RAS_WORDS = []
+
+// Fill the device-space outline `dev` with a gradient, each pixel's source
+// premultiplied by the fill's alpha and handed to img.__blendRowWords with
+// the row's coverage.
+void func rasFillGradientImg(target:img, dev:arr[float], ends:arr[int], rule:int,
+                             src:arr[float], alpha:float, inv:arr[float], aa:bool) {
+    int sw = target.width
+    int sh = target.height
+    if sw <= 0 || sh <= 0 { return }
+    if ends.length == 0 || dev.length < 6 { return }
+    if alpha <= 0.0 { return }
+    // A radial gradient of no radius paints nothing, as in Cairo.
+    if src[0] == 2.0 && src[3] <= 0.0 { return }
+
+    int k = 5
+    if src[0] == 2.0 { k = 4 }
+    float r0 = src[k]
+    float g0 = src[k + 1]
+    float b0 = src[k + 2]
+    float dr = src[k + 3] - r0
+    float dg = src[k + 4] - g0
+    float db = src[k + 5] - b0
+    int pa = Math.round(Math.min(alpha, 1.0) * 255.0)
+    float a = Math.min(alpha, 1.0)
+
+    rasEnsureCov(sw)
+    while RAS_WORDS.length < sw { RAS_WORDS.push(0) }
+    if !rasPathExtent(dev, sh) { return }
+
+    int row = RAS_Y0
+    while row < RAS_Y1 {
+        if aa { rasRowCoverage(row, sw, dev, ends, rule) } else { rasRowCoverageNoAA(row, sw, dev, ends, rule) }
+        float fy = row.toFloat() + 0.5
+        int i = RAS_LO
+        while i < RAS_HI {
+            if RAS_COV[i] > 0.0 {
+                float fx = i.toFloat() + 0.5
+                float ux = (inv[0] * fx) + (inv[2] * fy) + inv[4]
+                float uy = (inv[1] * fx) + (inv[3] * fy) + inv[5]
+                float t = rasGradientT(src, ux, uy)
+                int pr = Math.round((r0 + (dr * t)) * a)
+                int pg = Math.round((g0 + (dg * t)) * a)
+                int pb = Math.round((b0 + (db * t)) * a)
+                RAS_WORDS[i] = (pa << 24) | (pr << 16) | (pg << 8) | pb
+            }
+            i = i + 1
+        }
+        target.__blendRowWords(row, RAS_LO, RAS_HI, RAS_COV, RAS_WORDS)
+        row = row + 1
+    }
+}
+
+// ---- Phase 7, slice 4: no antialiasing, and clearing ----
+
+// One row's coverage with no antialiasing: a pixel is in if its CENTRE
+// is inside the shape, which is what Cairo's ANTIALIAS_NONE does. One
+// sub-scanline through the row's middle, and a pixel is covered when at
+// least half of it is, which for a span is exactly "the span reaches its
+// centre".
+void func rasRowCoverageNoAA(row:int, sw:int, pts:arr[float], ends:arr[int], rule:int) {
+    int keep = RAS_SUB
+    RAS_SUB = 1
+    rasRowCoverage(row, sw, pts, ends, rule)
+    RAS_SUB = keep
+    int c = RAS_LO
+    while c < RAS_HI {
+        if RAS_COV[c] >= 0.5 { RAS_COV[c] = 1.0 } else { RAS_COV[c] = 0.0 }
+        c = c + 1
+    }
+}
+
+// A solid fill of the device-space outline without antialiasing.
+void func rasFillNoAAImg(target:img, dev:arr[float], ends:arr[int], rule:int,
+                         r:int, g:int, b:int, alpha:float) {
+    int sw = target.width
+    int sh = target.height
+    if sw <= 0 || sh <= 0 { return }
+    if ends.length == 0 || dev.length < 6 { return }
+    if alpha <= 0.0 { return }
+    rasEnsureCov(sw)
+    if !rasPathExtent(dev, sh) { return }
+    int row = RAS_Y0
+    while row < RAS_Y1 {
+        rasRowCoverageNoAA(row, sw, dev, ends, rule)
+        target.__blendRow(row, RAS_LO, RAS_HI, RAS_COV, r, g, b, alpha)
+        row = row + 1
+    }
+}
+
+// Clear the device-space outline to transparent -- Cairo's SOURCE operator
+// with a transparent source, which scales each pixel by one minus its
+// coverage (festina_image_clear_row).
+void func rasClearImg(target:img, dev:arr[float], ends:arr[int], rule:int, aa:bool) {
+    int sw = target.width
+    int sh = target.height
+    if sw <= 0 || sh <= 0 { return }
+    if ends.length == 0 || dev.length < 6 { return }
+    rasEnsureCov(sw)
+    if !rasPathExtent(dev, sh) { return }
+    int row = RAS_Y0
+    while row < RAS_Y1 {
+        if aa { rasRowCoverage(row, sw, dev, ends, rule) } else { rasRowCoverageNoAA(row, sw, dev, ends, rule) }
+        target.__clearRow(row, RAS_LO, RAS_HI, RAS_COV)
+        row = row + 1
+    }
+}

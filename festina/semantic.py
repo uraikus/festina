@@ -622,6 +622,11 @@ _IMAGE_LAYER_METHODS = {
     # Not documented in api.md: it is the runtime's own seam, named with
     # the leading underscores to say so.
     "__blendRow": [(_INT, _INT, _INT, types_mod.ArrayType(_FLOAT), _INT, _INT, _INT, _FLOAT)],
+    # ... and for a colour that changes along the row (a gradient): the
+    # source of each pixel as a premultiplied ARGB word.
+    "__blendRowWords": [(_INT, _INT, _INT, types_mod.ArrayType(_FLOAT), types_mod.ArrayType(_INT))],
+    # ... and clearing a row to transparent by coverage.
+    "__clearRow": [(_INT, _INT, _INT, types_mod.ArrayType(_FLOAT))],
 }
 
 # claude.md #151: http's fixed-arity, fixed-argument-type methods --
@@ -2826,7 +2831,7 @@ def analyze(program, filename="<string>"):
                              "drawImage", "translate", "rotate", "scale",
                              "resetTransform", "saveState", "restoreState",
                              "clear", "clearRect", "clearCircle", "clearPixel",
-                             "__blendRow"):
+                             "__blendRow", "__blendRowWords", "__clearRow"):
                 raise CompileError(
                     f"'{expr.prop}' is a method on img -- call it, "
                     f"e.g. `sheet.{expr.prop}(...)`",

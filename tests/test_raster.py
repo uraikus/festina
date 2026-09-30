@@ -32,6 +32,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from festina import imports as imports_mod   # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _cairo_is_the_oracle(monkeypatch):
+    """The Cairo side of every comparison here has to BE Cairo: since
+    runtime.md phase 7 slice 4 the runtime draws through raster.f itself,
+    which would make these comparisons raster.f against raster.f."""
+    monkeypatch.setenv("FESTINA_CAIRO_DRAW", "1")
+
+
 def _with_raster(tmp_path):
     """raster.f beside the test program, imported by name -- the same
     shape test_runtime_components.py uses, and for the same reason:

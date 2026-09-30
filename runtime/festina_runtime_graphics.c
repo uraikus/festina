@@ -148,6 +148,56 @@ static double g_fill_alpha = 1.0;
 /* A gradient set by fillLinearGradient/fillRadialGradient, used instead
  * of the flat fill colour until the next plain fillStyle() call. */
 static cairo_pattern_t *g_fill_gradient = NULL;
+/* The same gradient as plain numbers, for draw.f (runtime.md phase 7
+ * slice 4): the Cairo pattern above cannot be read without Cairo. kind is
+ * 0 for none, 1 linear, 2 radial; geom holds x0 y0 x1 y1, or cx cy
+ * radius; c0 and c1 are the two stop colours, 0..255. */
+typedef struct { int kind; double geom[4]; double c0[3], c1[3]; } FestinaGradientParams;
+static FestinaGradientParams g_grad;
+
+/* The transform's own arithmetic, in the layout of cairo_matrix_t (xx, yx,
+ * xy, yy, x0, y0) and to the formulas cairo-matrix.c uses, so a program's
+ * transform is computed without calling Cairo: each operation applies
+ * FIRST, then the matrix already there (new = op * old). The type stays
+ * cairo_matrix_t while Cairo still draws the fallbacks from it;
+ * tests/test_transform_matrix.py holds these equal to cairo_matrix_* bit
+ * for bit. */
+static void festina_matrix_identity(cairo_matrix_t *m) {
+    m->xx = 1.0; m->yx = 0.0; m->xy = 0.0; m->yy = 1.0; m->x0 = 0.0; m->y0 = 0.0;
+}
+
+/* result = a * b: a applies first, then b (cairo_matrix_multiply). */
+static void festina_matrix_multiply(cairo_matrix_t *result, const cairo_matrix_t *a, const cairo_matrix_t *b) {
+    cairo_matrix_t r;
+    r.xx = a->xx * b->xx + a->yx * b->xy;
+    r.yx = a->xx * b->yx + a->yx * b->yy;
+    r.xy = a->xy * b->xx + a->yy * b->xy;
+    r.yy = a->xy * b->yx + a->yy * b->yy;
+    r.x0 = a->x0 * b->xx + a->y0 * b->xy + b->x0;
+    r.y0 = a->x0 * b->yx + a->y0 * b->yy + b->y0;
+    *result = r;
+}
+
+static void festina_matrix_translate(cairo_matrix_t *m, double tx, double ty) {
+    cairo_matrix_t t;
+    festina_matrix_identity(&t);
+    t.x0 = tx; t.y0 = ty;
+    festina_matrix_multiply(m, &t, m);
+}
+
+static void festina_matrix_rotate(cairo_matrix_t *m, double radians) {
+    cairo_matrix_t r;
+    double s = sin(radians), c = cos(radians);
+    r.xx = c; r.yx = s; r.xy = -s; r.yy = c; r.x0 = 0.0; r.y0 = 0.0;
+    festina_matrix_multiply(m, &r, m);
+}
+
+static void festina_matrix_scale(cairo_matrix_t *m, double sx, double sy) {
+    cairo_matrix_t k;
+    festina_matrix_identity(&k);
+    k.xx = sx; k.yy = sy;
+    festina_matrix_multiply(m, &k, m);
+}
 
 /* saveState()/restoreState() save the whole drawing state, not just the
  * transform -- that is what the canvas save()/restore() this mirrors
@@ -167,6 +217,7 @@ typedef struct {
      * restore, so the saved pattern survives whatever fillStyle() or a
      * later gradient does to the live one in between. */
     cairo_pattern_t *gradient;
+    FestinaGradientParams grad;
     double border_r, border_g, border_b, line_width;
     int border_set;
     double font_size;
@@ -235,6 +286,50 @@ static void festina_graphics_present(void);
 #define MADV_POPULATE_WRITE 23
 #endif
 #endif
+/* claude.md #92: an `img` value is a pointer to one of these, not the
+ * Cairo surface directly. The indirection is what makes resize() work
+ * the way it reads -- `grass.resize(32, 32)` is a statement, so it has
+ * to change `grass` itself, and a Cairo surface cannot be resized in
+ * place. Boxing the surface means every binding that shares an image
+ * sees the new one, exactly as they shared the old. */
+typedef struct {
+    cairo_surface_t *surface;
+    /* claude.md #101: the bytes this image was LOADED from, kept so a
+     * `file:img` table column round-trips byte for byte rather than
+     * being re-encoded. NULL for an image that never came from a file
+     * (a clip() or a resize() result, or one decoded from a blob that
+     * has since been resized) -- festina_image_bytes encodes PNG on
+     * demand in that case, and caches it here. Usually SMALLER than
+     * the decoded surface it sits next to: a 128x64 PNG is a couple of
+     * kilobytes against 32KB of ARGB32, so keeping it is a modest
+     * overhead rather than a doubling. */
+    unsigned char *bytes;
+    size_t byte_count;
+    /* claude.md #110: the path this image was loaded from, so save()
+     * with no argument has somewhere to write. Empty (never NULL, so
+     * the shared festina_save_bytes need not special-case it) for an
+     * image that never came from a file -- a clip() or resize() result,
+     * or one decoded out of a database column. That is precisely the
+     * case save(path) exists for, and the case save() refuses. */
+    char *path;
+    /* claude.md #234 (uraikus/festina#93): this image's OWN transform
+     * (identity until the first img.translate()/rotate()/scale();
+     * `transform_ready` is the same lazy-init flag the canvas's
+     * g_transform_ready is) and its own saveState()/restoreState()
+     * stack of transforms. Completely independent of the canvas's
+     * g_transform -- an image is a portable asset with its own local
+     * coordinates -- and private to this one image, so a worker thread
+     * drawing into its own layer never touches shared state. The stack
+     * is allocated on the first img.saveState() and grows as needed
+     * (most images never save at all; a fixed 64-slot array of
+     * matrices would cost every 16x16 sprite 3KB it never uses). */
+    cairo_matrix_t transform;
+    int transform_ready;
+    cairo_matrix_t *state_stack;
+    int state_depth;
+    int state_cap;
+} FestinaImageBox;
+
 /* runtime.md phase 7, slice 1: the one place a colour surface's pixels
  * are allocated.
  *
@@ -482,6 +577,7 @@ static void festina_apply_font(cairo_t *cr) {
  * indifference to gradients are unchanged. FESTINA_CAIRO_TEXT=1 sends
  * everything back to Cairo -- the comparison the tests draw against. */
 #include "festina_text_hooks.h"
+#include "festina_draw_hooks.h"   /* runtime.md phase 7 slice 4: draw.f */
 
 static const FestinaTextHooks *g_text_hooks = NULL;
 
@@ -660,7 +756,7 @@ int64_t festina_measure_text_height(const char *text) {
  * set once apply to everything drawn afterwards. */
 static void festina_apply_transform(cairo_t *cr) {
     if (!g_transform_ready) {
-        cairo_matrix_init_identity(&g_transform);
+        festina_matrix_identity(&g_transform);
         g_transform_ready = 1;
     }
     cairo_set_matrix(cr, &g_transform);
@@ -738,6 +834,7 @@ void festina_set_alpha(double alpha) {
 }
 
 static void festina_clear_gradient(void) {
+    g_grad.kind = 0;
     if (g_fill_gradient) {
         cairo_pattern_destroy(g_fill_gradient);
         g_fill_gradient = NULL;
@@ -765,6 +862,11 @@ void festina_fill_linear_gradient(int64_t x0, int64_t y0, int64_t c0,
                                                    (double)x1, (double)y1);
     cairo_pattern_add_color_stop_rgb(g_fill_gradient, 0.0, r0, g0, b0);
     cairo_pattern_add_color_stop_rgb(g_fill_gradient, 1.0, r1, g1, b1);
+    g_grad.kind = 1;
+    g_grad.geom[0] = (double)x0; g_grad.geom[1] = (double)y0;
+    g_grad.geom[2] = (double)x1; g_grad.geom[3] = (double)y1;
+    g_grad.c0[0] = r0 * 255.0; g_grad.c0[1] = g0 * 255.0; g_grad.c0[2] = b0 * 255.0;
+    g_grad.c1[0] = r1 * 255.0; g_grad.c1[1] = g1 * 255.0; g_grad.c1[2] = b1 * 255.0;
     g_fill_none = 0;
 }
 
@@ -779,34 +881,38 @@ void festina_fill_radial_gradient(int64_t x, int64_t y, int64_t radius,
                                                    (double)x, (double)y, (double)radius);
     cairo_pattern_add_color_stop_rgb(g_fill_gradient, 0.0, ri, gi, bi);
     cairo_pattern_add_color_stop_rgb(g_fill_gradient, 1.0, ro, go, bo);
+    g_grad.kind = 2;
+    g_grad.geom[0] = (double)x; g_grad.geom[1] = (double)y; g_grad.geom[2] = (double)radius;
+    g_grad.c0[0] = ri * 255.0; g_grad.c0[1] = gi * 255.0; g_grad.c0[2] = bi * 255.0;
+    g_grad.c1[0] = ro * 255.0; g_grad.c1[1] = go * 255.0; g_grad.c1[2] = bo * 255.0;
     g_fill_none = 0;
 }
 
 /* ---- claude.md #94: transforms ---- */
 
 void festina_translate(int64_t x, int64_t y) {
-    if (!g_transform_ready) { cairo_matrix_init_identity(&g_transform); g_transform_ready = 1; }
-    cairo_matrix_translate(&g_transform, (double)x, (double)y);
+    if (!g_transform_ready) { festina_matrix_identity(&g_transform); g_transform_ready = 1; }
+    festina_matrix_translate(&g_transform, (double)x, (double)y);
 }
 
 void festina_rotate(double degrees) {
-    if (!g_transform_ready) { cairo_matrix_init_identity(&g_transform); g_transform_ready = 1; }
+    if (!g_transform_ready) { festina_matrix_identity(&g_transform); g_transform_ready = 1; }
     /* Degrees, not radians: this language has no angle type to make the
      * unit self-documenting, and degrees are what a program author
      * reaches for. Math.PI is available for anyone who wants radians. */
-    cairo_matrix_rotate(&g_transform, degrees * 3.14159265358979323846 / 180.0);
+    festina_matrix_rotate(&g_transform, degrees * 3.14159265358979323846 / 180.0);
 }
 
 void festina_scale(double sx, double sy) {
-    if (!g_transform_ready) { cairo_matrix_init_identity(&g_transform); g_transform_ready = 1; }
+    if (!g_transform_ready) { festina_matrix_identity(&g_transform); g_transform_ready = 1; }
     /* A zero scale collapses the matrix to something non-invertible,
      * which makes every later Cairo call on it fail silently. */
     if (sx == 0.0 || sy == 0.0) return;
-    cairo_matrix_scale(&g_transform, sx, sy);
+    festina_matrix_scale(&g_transform, sx, sy);
 }
 
 void festina_reset_transform(void) {
-    cairo_matrix_init_identity(&g_transform);
+    festina_matrix_identity(&g_transform);
     g_transform_ready = 1;
 }
 
@@ -815,12 +921,13 @@ void festina_save_state(void) {
         festina_fail("saveState(): nested too deeply (limit 64) -- is a "
                       "restoreState() missing?");
     }
-    if (!g_transform_ready) { cairo_matrix_init_identity(&g_transform); g_transform_ready = 1; }
+    if (!g_transform_ready) { festina_matrix_identity(&g_transform); g_transform_ready = 1; }
     FestinaCanvasState *st = &g_state_stack[g_state_depth++];
     st->transform = g_transform;
     st->fill_r = g_fill_r; st->fill_g = g_fill_g; st->fill_b = g_fill_b;
     st->alpha = g_fill_alpha; st->fill_none = g_fill_none;
     st->gradient = g_fill_gradient ? cairo_pattern_reference(g_fill_gradient) : NULL;
+    st->grad = g_grad;
     st->border_r = g_border_r; st->border_g = g_border_g; st->border_b = g_border_b;
     st->line_width = g_line_width; st->border_set = g_border_set;
     st->font_size = g_font_size; st->font_slant = g_font_slant;
@@ -839,6 +946,7 @@ void festina_restore_state(void) {
     g_fill_alpha = st->alpha; g_fill_none = st->fill_none;
     festina_clear_gradient();
     g_fill_gradient = st->gradient;     /* the saved reference, handed back */
+    g_grad = st->grad;
     st->gradient = NULL;
     g_border_r = st->border_r; g_border_g = st->border_g; g_border_b = st->border_b;
     g_line_width = st->line_width; g_border_set = st->border_set;
@@ -848,67 +956,6 @@ void festina_restore_state(void) {
 }
 
 /* ---- claude.md #94: paths ---- */
-
-void festina_begin_path(void) {
-    festina_backing_require();
-    if (g_path_cr) cairo_destroy(g_path_cr);
-    g_path_cr = festina_canvas_context();
-}
-
-static int festina_path_open(const char *fn) {
-    if (g_path_cr) return 1;
-    char msg[256];
-    snprintf(msg, sizeof(msg),
-             "%s(): no path is open -- call beginPath() first", fn);
-    festina_fail(msg);
-    return 0;
-}
-
-void festina_move_to(int64_t x, int64_t y) {
-    if (!festina_path_open("moveTo")) return;
-    cairo_move_to(g_path_cr, (double)x, (double)y);
-}
-
-void festina_line_to(int64_t x, int64_t y) {
-    if (!festina_path_open("lineTo")) return;
-    cairo_line_to(g_path_cr, (double)x, (double)y);
-}
-
-void festina_curve_to(int64_t cx1, int64_t cy1, int64_t cx2, int64_t cy2,
-                       int64_t x, int64_t y) {
-    if (!festina_path_open("curveTo")) return;
-    cairo_curve_to(g_path_cr, (double)cx1, (double)cy1, (double)cx2, (double)cy2,
-                    (double)x, (double)y);
-}
-
-void festina_close_path(void) {
-    if (!festina_path_open("closePath")) return;
-    cairo_close_path(g_path_cr);
-}
-
-/* Both of these consume the path, matching the canvas model where
- * fill()/stroke() end the current path -- keeping it would make a
- * second fill silently paint the same shape twice. */
-void festina_fill_path(void) {
-    if (!festina_path_open("fillPath")) return;
-    if (!g_fill_none) {
-        festina_set_fill_source(g_path_cr);
-        cairo_fill(g_path_cr);
-    }
-    cairo_destroy(g_path_cr);
-    g_path_cr = NULL;
-}
-
-void festina_stroke_path(void) {
-    if (!festina_path_open("strokePath")) return;
-    if (g_border_set && g_line_width > 0.0) {
-        cairo_set_source_rgba(g_path_cr, g_border_r, g_border_g, g_border_b, g_fill_alpha);
-        cairo_set_line_width(g_path_cr, g_line_width);
-        cairo_stroke(g_path_cr);
-    }
-    cairo_destroy(g_path_cr);
-    g_path_cr = NULL;
-}
 
 static void festina_fill_and_border(cairo_t *cr) {
     int border = g_border_set && g_line_width > 0.0;
@@ -1061,6 +1108,378 @@ static void festina_fill_and_border_with_colors(cairo_t *cr, int64_t fill_color,
  * off (read once). That is the test hook the byte-identity check uses
  * -- same program, same scene, two PNGs -- and the escape hatch if a
  * platform's pixman ever disagreed with the arithmetic here. */
+/* ---- runtime.md phase 7, slice 4: shapes drawn by draw.f ----------------
+ *
+ * The hooks draw.f registers (runtime/festina_draw_hooks.h). Where a draw
+ * call used to build a Cairo context, a path and a fill, it asks here
+ * first: the state it owns -- colours, alpha, line width, the transform
+ * -- is read into arguments, draw.f works out the outline, coverage and
+ * stroke in Festina, and the blending goes back through
+ * festina_image_blend_row into the surface's own bytes. A program that
+ * does not link draw.f has no hooks, and FESTINA_CAIRO_DRAW=1 in the
+ * environment turns them off; both draw through Cairo exactly as before.
+ *
+ * Calls are serialised by a
+ * spinlock: draw.f keeps one coverage row in a global, as text.f does,
+ * and the four threads of the layered-canvas benchmark draw into their own
+ * layers at once. (The direct-pixel fast paths above take no lock.) */
+static const FestinaDrawHooks *g_draw_hooks = NULL;
+static atomic_flag g_draw_lock = ATOMIC_FLAG_INIT;
+static atomic_int g_draw_enabled = -1;
+
+void festina_draw_register(const FestinaDrawHooks *hooks) {
+    g_draw_hooks = hooks;
+}
+
+static int festina_draw_ours(void) {
+    if (!g_draw_hooks) return 0;
+    int v = atomic_load_explicit(&g_draw_enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("FESTINA_CAIRO_DRAW");
+        v = (e && *e && *e != '0') ? 0 : 1;
+        atomic_store_explicit(&g_draw_enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+/* An arr[float] the way Festina lays one out -- a block holding the
+ * refcount and the {length, data} payload, the doubles in a second
+ * allocation -- with a refcount of one, for festina_release_array. */
+static void *festina_farray(const double *v, int64_t n) {
+    char *raw = calloc(1, 3 * sizeof(int64_t));
+    double *data = malloc((size_t)(n ? n : 1) * sizeof(double));
+    if (!raw || !data) festina_fail("out of memory drawing");
+    *(int64_t *)raw = 1;
+    int64_t *payload = (int64_t *)(raw + sizeof(int64_t));
+    payload[0] = n;
+    memcpy(&payload[1], &data, sizeof(data));
+    for (int64_t i = 0; i < n; i++) data[i] = v[i];
+    return payload;
+}
+
+static int festina_draw_byte(double unit) {
+    int v = (int)(unit * 255.0 + 0.5);
+    return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+/* One rectangle (a, b, c, d = x, y, w, h) or circle (a, b, c = cx, cy, r)
+ * in user space under `m`, filled and/or stroked the way
+ * festina_fill_and_border_override decides, through draw.f. Returns 1 if
+ * drawn (or if there was nothing to draw) and 0 if the caller has to draw
+ * it the old way. */
+static int festina_raster_shape(FestinaImageBox *box, const cairo_matrix_t *m, int circle,
+                                double a, double b, double c, double d,
+                                int fill_overridden, int64_t fill_color,
+                                int border_overridden, int64_t border_color) {
+    if (!festina_draw_ours()) return 0;
+    if (!box || !box->surface || cairo_surface_get_type(box->surface) != CAIRO_SURFACE_TYPE_IMAGE) return 0;
+    cairo_format_t fmt = cairo_image_surface_get_format(box->surface);
+    if (fmt != CAIRO_FORMAT_ARGB32 && fmt != CAIRO_FORMAT_RGB24) return 0;
+    int fill_none = fill_overridden ? (fill_color < 0) : g_fill_none;
+    int border_set = border_overridden ? (border_color >= 0) : g_border_set;
+    int border = border_set && g_line_width > 0.0;
+    if (fill_none && !border) return 1;
+    int br, bg, bb;
+    /* The fill's source: a flat colour, or the gradient (an explicit
+     * colour argument bypasses it, as it always did). */
+    double src[11];
+    int64_t nsrc = 4;
+    if (fill_overridden) {
+        src[0] = 0; src[1] = (double)((fill_color >> 16) & 0xFF);
+        src[2] = (double)((fill_color >> 8) & 0xFF); src[3] = (double)(fill_color & 0xFF);
+    } else if (g_fill_gradient && g_grad.kind != 0) {
+        int k = 0;
+        src[k++] = (double)g_grad.kind;
+        int ng = g_grad.kind == 1 ? 4 : 3;
+        for (int i = 0; i < ng; i++) src[k++] = g_grad.geom[i];
+        for (int i = 0; i < 3; i++) src[k++] = g_grad.c0[i];
+        for (int i = 0; i < 3; i++) src[k++] = g_grad.c1[i];
+        nsrc = k;
+    } else {
+        src[0] = 0; src[1] = (double)festina_draw_byte(g_fill_r);
+        src[2] = (double)festina_draw_byte(g_fill_g); src[3] = (double)festina_draw_byte(g_fill_b);
+    }
+    if (border_overridden) {
+        br = (int)((border_color >> 16) & 0xFF); bg = (int)((border_color >> 8) & 0xFF); bb = (int)(border_color & 0xFF);
+    } else {
+        br = festina_draw_byte(g_border_r); bg = festina_draw_byte(g_border_g); bb = festina_draw_byte(g_border_b);
+    }
+    void *fsrc = festina_farray(src, nsrc);
+    double mv[6] = { m->xx, m->yx, m->xy, m->yy, m->x0, m->y0 };
+    void *matrix = festina_farray(mv, 6);
+    while (atomic_flag_test_and_set_explicit(&g_draw_lock, memory_order_acquire)) { /* spin */ }
+    if (circle) {
+        g_draw_hooks->circle(box, a, b, c, !fill_none, fsrc, border, br, bg, bb,
+                             g_line_width, g_fill_alpha, matrix);
+    } else {
+        g_draw_hooks->rect(box, a, b, c, d, !fill_none, fsrc, border, br, bg, bb,
+                           g_line_width, g_fill_alpha, matrix);
+    }
+    atomic_flag_clear_explicit(&g_draw_lock, memory_order_release);
+    festina_release_array(matrix);
+    festina_release_array(fsrc);
+    return 1;
+}
+
+/* The canvas as a target: its backing surface in a box that lives for
+ * the call, and the transform it is drawn under (the identity until one
+ * is set). */
+static int festina_canvas_raster_shape(int circle, double a, double b, double c, double d,
+                                       int fill_overridden, int64_t fill_color,
+                                       int border_overridden, int64_t border_color) {
+    FestinaImageBox box;
+    memset(&box, 0, sizeof(box));
+    box.surface = g_backing_surface;
+    cairo_matrix_t ident;
+    festina_matrix_identity(&ident);
+    return festina_raster_shape(&box, g_transform_ready ? &g_transform : &ident, circle,
+                                a, b, c, d, fill_overridden, fill_color,
+                                border_overridden, border_color);
+}
+
+/* drawPixel through draw.f: point-sampled, fill only. */
+static int festina_raster_pixel(FestinaImageBox *box, const cairo_matrix_t *m, int64_t x, int64_t y,
+                                int fill_overridden, int64_t fill_color) {
+    if (!festina_draw_ours()) return 0;
+    if (!box || !box->surface || cairo_surface_get_type(box->surface) != CAIRO_SURFACE_TYPE_IMAGE) return 0;
+    int fill_none = fill_overridden ? (fill_color < 0) : g_fill_none;
+    if (fill_none) return 1;
+    double src[11];
+    int64_t nsrc = 4;
+    if (fill_overridden) {
+        src[0] = 0; src[1] = (double)((fill_color >> 16) & 0xFF);
+        src[2] = (double)((fill_color >> 8) & 0xFF); src[3] = (double)(fill_color & 0xFF);
+    } else if (g_fill_gradient && g_grad.kind != 0) {
+        int k = 0;
+        src[k++] = (double)g_grad.kind;
+        int ng = g_grad.kind == 1 ? 4 : 3;
+        for (int i = 0; i < ng; i++) src[k++] = g_grad.geom[i];
+        for (int i = 0; i < 3; i++) src[k++] = g_grad.c0[i];
+        for (int i = 0; i < 3; i++) src[k++] = g_grad.c1[i];
+        nsrc = k;
+    } else {
+        src[0] = 0; src[1] = (double)festina_draw_byte(g_fill_r);
+        src[2] = (double)festina_draw_byte(g_fill_g); src[3] = (double)festina_draw_byte(g_fill_b);
+    }
+    double mv[6] = { m->xx, m->yx, m->xy, m->yy, m->x0, m->y0 };
+    void *matrix = festina_farray(mv, 6);
+    void *fsrc = festina_farray(src, nsrc);
+    while (atomic_flag_test_and_set_explicit(&g_draw_lock, memory_order_acquire)) { /* spin */ }
+    g_draw_hooks->pixel(box, (double)x, (double)y, 1, fsrc, g_fill_alpha, matrix);
+    atomic_flag_clear_explicit(&g_draw_lock, memory_order_release);
+    festina_release_array(matrix);
+    festina_release_array(fsrc);
+    return 1;
+}
+
+/* clearRect / clearCircle / clearPixel through draw.f (kind 0, 1, 2). */
+static int festina_raster_clear(FestinaImageBox *box, const cairo_matrix_t *m, int64_t kind,
+                                double a, double b, double c, double d) {
+    if (!festina_draw_ours()) return 0;
+    if (!box || !box->surface || cairo_surface_get_type(box->surface) != CAIRO_SURFACE_TYPE_IMAGE) return 0;
+    double mv[6] = { m->xx, m->yx, m->xy, m->yy, m->x0, m->y0 };
+    void *matrix = festina_farray(mv, 6);
+    while (atomic_flag_test_and_set_explicit(&g_draw_lock, memory_order_acquire)) { /* spin */ }
+    g_draw_hooks->clear(box, kind, a, b, c, d, matrix);
+    atomic_flag_clear_explicit(&g_draw_lock, memory_order_release);
+    festina_release_array(matrix);
+    return 1;
+}
+
+/* Clearing a whole surface: every byte to zero, which is what SOURCE with
+ * a transparent source leaves in both colour formats. */
+static void festina_surface_zero(cairo_surface_t *s) {
+    if (!s || cairo_surface_get_type(s) != CAIRO_SURFACE_TYPE_IMAGE) return;
+    cairo_surface_flush(s);
+    unsigned char *data = cairo_image_surface_get_data(s);
+    if (!data) return;
+    memset(data, 0, (size_t)cairo_image_surface_get_stride(s) * (size_t)cairo_image_surface_get_height(s));
+    cairo_surface_mark_dirty(s);
+}
+
+static void festina_canvas_box(FestinaImageBox *box) {
+    memset(box, 0, sizeof(*box));
+    box->surface = g_backing_surface;
+}
+
+static const cairo_matrix_t *festina_canvas_matrix(cairo_matrix_t *ident) {
+    festina_matrix_identity(ident);
+    return g_transform_ready ? &g_transform : ident;
+}
+
+/* runtime.md phase 7 slice 4: when draw.f is drawing, the path is kept as
+ * plain numbers -- one code per segment and the coordinates they consume
+ * -- together with the transform in force at beginPath(), which is where
+ * a Cairo context would have fixed it too. fillPath()/strokePath() hand it
+ * to draw.f in one call. With Cairo drawing (no draw.f, or
+ * FESTINA_CAIRO_DRAW=1) the Cairo context below is kept as it always was. */
+static int g_path_ours = 0;
+static int64_t *g_path_ops = NULL;
+static int64_t g_path_nops = 0, g_path_ops_cap = 0;
+static double *g_path_coords = NULL;
+static int64_t g_path_ncoords = 0, g_path_coords_cap = 0;
+static cairo_matrix_t g_path_matrix;
+
+static void festina_path_reset_ours(void) {
+    g_path_nops = 0;
+    g_path_ncoords = 0;
+}
+
+static void festina_path_push(int64_t op, const double *c, int n) {
+    if (g_path_nops == g_path_ops_cap) {
+        g_path_ops_cap = g_path_ops_cap ? g_path_ops_cap * 2 : 16;
+        g_path_ops = realloc(g_path_ops, (size_t)g_path_ops_cap * sizeof(int64_t));
+        if (!g_path_ops) festina_fail("out of memory building a path");
+    }
+    if (g_path_ncoords + n > g_path_coords_cap) {
+        while (g_path_ncoords + n > g_path_coords_cap) g_path_coords_cap = g_path_coords_cap ? g_path_coords_cap * 2 : 64;
+        g_path_coords = realloc(g_path_coords, (size_t)g_path_coords_cap * sizeof(double));
+        if (!g_path_coords) festina_fail("out of memory building a path");
+    }
+    g_path_ops[g_path_nops++] = op;
+    for (int i = 0; i < n; i++) g_path_coords[g_path_ncoords++] = c[i];
+}
+
+/* An arr[int], the way festina_farray makes an arr[float]. */
+static void *festina_iarray(const int64_t *v, int64_t n) {
+    char *raw = calloc(1, 3 * sizeof(int64_t));
+    int64_t *data = malloc((size_t)(n ? n : 1) * sizeof(int64_t));
+    if (!raw || !data) festina_fail("out of memory drawing");
+    *(int64_t *)raw = 1;
+    int64_t *payload = (int64_t *)(raw + sizeof(int64_t));
+    payload[0] = n;
+    memcpy(&payload[1], &data, sizeof(data));
+    for (int64_t i = 0; i < n; i++) data[i] = v[i];
+    return payload;
+}
+
+void festina_begin_path(void) {
+    festina_backing_require();
+    if (g_path_cr) { cairo_destroy(g_path_cr); g_path_cr = NULL; }
+    if (festina_draw_ours()) {
+        g_path_ours = 1;
+        festina_path_reset_ours();
+        festina_matrix_identity(&g_path_matrix);
+        if (g_transform_ready) g_path_matrix = g_transform;
+        return;
+    }
+    g_path_ours = 0;
+    g_path_cr = festina_canvas_context();
+}
+
+static int festina_path_open(const char *fn) {
+    if (g_path_cr || g_path_ours) return 1;
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "%s(): no path is open -- call beginPath() first", fn);
+    festina_fail(msg);
+    return 0;
+}
+
+void festina_move_to(int64_t x, int64_t y) {
+    if (!festina_path_open("moveTo")) return;
+    if (g_path_ours) { double c[2] = { (double)x, (double)y }; festina_path_push(0, c, 2); return; }
+    cairo_move_to(g_path_cr, (double)x, (double)y);
+}
+
+void festina_line_to(int64_t x, int64_t y) {
+    if (!festina_path_open("lineTo")) return;
+    if (g_path_ours) { double c[2] = { (double)x, (double)y }; festina_path_push(1, c, 2); return; }
+    cairo_line_to(g_path_cr, (double)x, (double)y);
+}
+
+void festina_curve_to(int64_t cx1, int64_t cy1, int64_t cx2, int64_t cy2,
+                       int64_t x, int64_t y) {
+    if (!festina_path_open("curveTo")) return;
+    if (g_path_ours) {
+        double c[6] = { (double)cx1, (double)cy1, (double)cx2, (double)cy2, (double)x, (double)y };
+        festina_path_push(2, c, 6);
+        return;
+    }
+    cairo_curve_to(g_path_cr, (double)cx1, (double)cy1, (double)cx2, (double)cy2,
+                    (double)x, (double)y);
+}
+
+void festina_close_path(void) {
+    if (!festina_path_open("closePath")) return;
+    if (g_path_ours) { festina_path_push(3, NULL, 0); return; }
+    cairo_close_path(g_path_cr);
+}
+
+/* The open path through draw.f: filled with the fill source, or stroked in
+ * the border colour, then consumed. */
+static void festina_path_through_draw(int fill, int border) {
+    FestinaImageBox box;
+    cairo_matrix_t ident;
+    (void)ident;
+    festina_canvas_box(&box);
+    double src[11];
+    int64_t nsrc = 4;
+    if (g_fill_gradient && g_grad.kind != 0) {
+        int k = 0;
+        src[k++] = (double)g_grad.kind;
+        int ng = g_grad.kind == 1 ? 4 : 3;
+        for (int i = 0; i < ng; i++) src[k++] = g_grad.geom[i];
+        for (int i = 0; i < 3; i++) src[k++] = g_grad.c0[i];
+        for (int i = 0; i < 3; i++) src[k++] = g_grad.c1[i];
+        nsrc = k;
+    } else {
+        src[0] = 0; src[1] = (double)festina_draw_byte(g_fill_r);
+        src[2] = (double)festina_draw_byte(g_fill_g); src[3] = (double)festina_draw_byte(g_fill_b);
+    }
+    double mv[6] = { g_path_matrix.xx, g_path_matrix.yx, g_path_matrix.xy, g_path_matrix.yy,
+                     g_path_matrix.x0, g_path_matrix.y0 };
+    void *matrix = festina_farray(mv, 6);
+    void *fsrc = festina_farray(src, nsrc);
+    void *ops = festina_iarray(g_path_ops, g_path_nops);
+    void *coords = festina_farray(g_path_coords, g_path_ncoords);
+    while (atomic_flag_test_and_set_explicit(&g_draw_lock, memory_order_acquire)) { /* spin */ }
+    g_draw_hooks->path(&box, ops, coords, fill, fsrc, border,
+                       festina_draw_byte(g_border_r), festina_draw_byte(g_border_g), festina_draw_byte(g_border_b),
+                       g_line_width, g_fill_alpha, matrix);
+    atomic_flag_clear_explicit(&g_draw_lock, memory_order_release);
+    festina_release_array(matrix);
+    festina_release_array(fsrc);
+    festina_release_array(ops);
+    festina_release_array(coords);
+}
+
+/* Both of these consume the path, matching the canvas model where
+ * fill()/stroke() end the current path -- keeping it would make a
+ * second fill silently paint the same shape twice. */
+void festina_fill_path(void) {
+    if (!festina_path_open("fillPath")) return;
+    if (g_path_ours) {
+        if (!g_fill_none) festina_path_through_draw(1, 0);
+        g_path_ours = 0;
+        festina_path_reset_ours();
+        return;
+    }
+    if (!g_fill_none) {
+        festina_set_fill_source(g_path_cr);
+        cairo_fill(g_path_cr);
+    }
+    cairo_destroy(g_path_cr);
+    g_path_cr = NULL;
+}
+
+void festina_stroke_path(void) {
+    if (!festina_path_open("strokePath")) return;
+    if (g_path_ours) {
+        if (g_border_set && g_line_width > 0.0) festina_path_through_draw(0, 1);
+        g_path_ours = 0;
+        festina_path_reset_ours();
+        return;
+    }
+    if (g_border_set && g_line_width > 0.0) {
+        cairo_set_source_rgba(g_path_cr, g_border_r, g_border_g, g_border_b, g_fill_alpha);
+        cairo_set_line_width(g_path_cr, g_line_width);
+        cairo_stroke(g_path_cr);
+    }
+    cairo_destroy(g_path_cr);
+    g_path_cr = NULL;
+}
+
 #define FESTINA_COVERAGE_MAX_RADIUS 128
 
 typedef struct {
@@ -1087,10 +1506,37 @@ static const FestinaCircleCoverage *festina_circle_coverage(int64_t r) {
         atomic_load_explicit(&g_circle_coverage[r], memory_order_acquire);
     if (have) return have;
 
+    int size = (int)(r * 2) + 2;
+    if (festina_draw_ours()) {
+        /* Phase 7 slice 4: the coverage comes from draw.f, the rasteriser
+         * every other circle is drawn by. */
+        while (atomic_flag_test_and_set_explicit(&g_draw_lock, memory_order_acquire)) { /* spin */ }
+        int64_t *arr = g_draw_hooks->circle_mask(r);
+        atomic_flag_clear_explicit(&g_draw_lock, memory_order_release);
+        if (!arr) return NULL;
+        if (arr[0] != (int64_t)size * size) { festina_release_array(arr); return NULL; }
+        const int64_t *d;
+        memcpy(&d, &arr[1], sizeof(d));
+        FestinaCircleCoverage *made = malloc(sizeof(*made) + (size_t)size * (size_t)size);
+        if (!made) { festina_release_array(arr); return NULL; }
+        made->size = size;
+        for (int64_t i = 0; i < (int64_t)size * size; i++) {
+            int64_t v = d[i];
+            made->cov[i] = (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+        festina_release_array(arr);
+        FestinaCircleCoverage *expected = NULL;
+        if (!atomic_compare_exchange_strong_explicit(&g_circle_coverage[r], &expected, made,
+                                                     memory_order_acq_rel, memory_order_acquire)) {
+            free(made);
+            return expected;
+        }
+        return made;
+    }
+
     /* Rasterize exactly the way festina_circle_mask does, so the shape
      * is Cairo's own: an A8 surface of 2r+2 pixels, the arc centred on
      * it, filled with the default antialiasing. */
-    int size = (int)(r * 2) + 2;
     cairo_surface_t *mask = cairo_image_surface_create(CAIRO_FORMAT_A8, size, size);
     if (cairo_surface_status(mask) != CAIRO_STATUS_SUCCESS) {
         cairo_surface_destroy(mask);
@@ -1465,6 +1911,7 @@ void festina_render(void) {
  * so there is nothing to restore afterward. */
 void festina_clear_canvas(void) {
     festina_backing_require();
+    if (festina_draw_ours()) { festina_surface_zero(g_backing_surface); return; }
     cairo_t *cr = cairo_create(g_backing_surface);
     /* Deliberately NOT the current transform: clearing is about the
      * canvas itself, and a rotated "clear everything" that leaves
@@ -1480,6 +1927,11 @@ void festina_clear_canvas(void) {
  * coordinates the drawing calls around it use. */
 void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     festina_backing_require();
+    {
+        FestinaImageBox box; cairo_matrix_t ident;
+        festina_canvas_box(&box);
+        if (festina_raster_clear(&box, festina_canvas_matrix(&ident), 0, (double)x, (double)y, (double)w, (double)h)) return;
+    }
     cairo_t *cr = festina_canvas_context();
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
@@ -1495,8 +1947,13 @@ void festina_clear_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
  * to maintain than it would ever save here. */
 void festina_clear_circle(int64_t x, int64_t y, int64_t r) {
     festina_backing_require();
-    cairo_t *cr = festina_canvas_context();
     if (r < 0) r = 0;
+    {
+        FestinaImageBox box; cairo_matrix_t ident;
+        festina_canvas_box(&box);
+        if (festina_raster_clear(&box, festina_canvas_matrix(&ident), 1, (double)x, (double)y, (double)r, 0)) return;
+    }
+    cairo_t *cr = festina_canvas_context();
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
     cairo_arc(cr, (double)x, (double)y, (double)r, 0.0, 2.0 * 3.14159265358979323846);
@@ -1509,6 +1966,11 @@ void festina_clear_circle(int64_t x, int64_t y, int64_t r) {
  * around the fill. */
 void festina_clear_pixel(int64_t x, int64_t y) {
     festina_backing_require();
+    {
+        FestinaImageBox box; cairo_matrix_t ident;
+        festina_canvas_box(&box);
+        if (festina_raster_clear(&box, festina_canvas_matrix(&ident), 2, (double)x, (double)y, 0, 0)) return;
+    }
     cairo_t *cr = festina_canvas_context();
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
     cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
@@ -1557,6 +2019,7 @@ void festina_draw_rect(int64_t x, int64_t y, int64_t w, int64_t h) {
     if (festina_canvas_direct_ok(&tx, &ty) &&
         festina_direct_rect(g_backing_surface, x, y, tx, ty, w, h,
                             festina_solid_pixel_from_style())) return;
+    if (festina_canvas_raster_shape(0, (double)x, (double)y, (double)w, (double)h, 0, 0, 0, 0)) return;
     cairo_t *cr = festina_canvas_context();
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border(cr); /* claude.md #89 */
@@ -1572,6 +2035,7 @@ void festina_draw_rect_color(int64_t x, int64_t y, int64_t w, int64_t h, int64_t
     if (festina_canvas_direct_override_ok(color, g_border_set && g_line_width > 0.0, &tx, &ty) &&
         festina_direct_rect(g_backing_surface, x, y, tx, ty, w, h,
                             festina_solid_pixel_from_color(color))) return;
+    if (festina_canvas_raster_shape(0, (double)x, (double)y, (double)w, (double)h, 1, color, 0, 0)) return;
     cairo_t *cr = festina_canvas_context();
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border_with_color(cr, color);
@@ -1588,6 +2052,7 @@ void festina_draw_rect_colors(int64_t x, int64_t y, int64_t w, int64_t h,
     if (festina_canvas_direct_override_ok(fill_color, border_color >= 0 && g_line_width > 0.0, &tx, &ty) &&
         festina_direct_rect(g_backing_surface, x, y, tx, ty, w, h,
                             festina_solid_pixel_from_color(fill_color))) return;
+    if (festina_canvas_raster_shape(0, (double)x, (double)y, (double)w, (double)h, 1, fill_color, 1, border_color)) return;
     cairo_t *cr = festina_canvas_context();
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border_with_colors(cr, fill_color, border_color);
@@ -1607,10 +2072,15 @@ void festina_draw_pixel(int64_t x, int64_t y) {
     /* claude.md #240: a pixel never strokes, so only the fill half of
      * the solid-fill contract applies (not festina_solid_style_ok's
      * border check). */
-    if (festina_direct_fill_enabled() && !g_fill_none && !g_fill_gradient && g_fill_alpha == 1.0 &&
+    if (festina_direct_fill_enabled() && !g_fill_none && !g_fill_gradient &&
         festina_canvas_integer_offset(&tx, &ty) &&
         festina_direct_rect(g_backing_surface, x, y, tx, ty, 1, 1,
                             festina_solid_pixel_from_style())) return;
+    {
+        FestinaImageBox box; cairo_matrix_t ident;
+        festina_canvas_box(&box);
+        if (festina_raster_pixel(&box, festina_canvas_matrix(&ident), x, y, 0, 0)) return;
+    }
     cairo_t *cr = festina_canvas_context();
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
     cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
@@ -1635,6 +2105,11 @@ void festina_draw_pixel_color(int64_t x, int64_t y, int64_t color) {
     if (festina_canvas_direct_override_ok(color, 0, &tx, &ty) &&
         festina_direct_rect(g_backing_surface, x, y, tx, ty, 1, 1,
                             festina_solid_pixel_from_color(color))) return;
+    {
+        FestinaImageBox box; cairo_matrix_t ident;
+        festina_canvas_box(&box);
+        if (festina_raster_pixel(&box, festina_canvas_matrix(&ident), x, y, 1, color)) return;
+    }
     cairo_t *cr = festina_canvas_context();
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
     cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
@@ -1814,6 +2289,7 @@ void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
     if (festina_canvas_direct_ok(&tx, &ty) &&
         festina_direct_circle(g_backing_surface, x, y, tx, ty, r,
                               festina_solid_pixel_from_style())) return;
+    if (festina_canvas_raster_shape(1, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0, 0, 0, 0, 0)) return;
     cairo_t *cr = festina_canvas_context();
     if (festina_circle_fast_path_ok(r)) {
         cairo_surface_t *mask = festina_circle_mask(r);
@@ -1844,6 +2320,7 @@ void festina_draw_circle_color(int64_t x, int64_t y, int64_t r, int64_t color) {
     if (festina_canvas_direct_override_ok(color, g_border_set && g_line_width > 0.0, &tx, &ty) &&
         festina_direct_circle(g_backing_surface, x, y, tx, ty, r,
                               festina_solid_pixel_from_color(color))) return;
+    if (festina_canvas_raster_shape(1, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0, 1, color, 0, 0)) return;
     cairo_t *cr = festina_canvas_context();
     cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border_with_color(cr, color);
@@ -1857,6 +2334,7 @@ void festina_draw_circle_colors(int64_t x, int64_t y, int64_t r,
     if (festina_canvas_direct_override_ok(fill_color, border_color >= 0 && g_line_width > 0.0, &tx, &ty) &&
         festina_direct_circle(g_backing_surface, x, y, tx, ty, r,
                               festina_solid_pixel_from_color(fill_color))) return;
+    if (festina_canvas_raster_shape(1, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0, 1, fill_color, 1, border_color)) return;
     cairo_t *cr = festina_canvas_context();
     cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border_with_colors(cr, fill_color, border_color);
@@ -1881,49 +2359,6 @@ void festina_draw_text(const char *text, int64_t x, int64_t y) {
     cairo_destroy(cr);
 }
 
-/* claude.md #92: an `img` value is a pointer to one of these, not the
- * Cairo surface directly. The indirection is what makes resize() work
- * the way it reads -- `grass.resize(32, 32)` is a statement, so it has
- * to change `grass` itself, and a Cairo surface cannot be resized in
- * place. Boxing the surface means every binding that shares an image
- * sees the new one, exactly as they shared the old. */
-typedef struct {
-    cairo_surface_t *surface;
-    /* claude.md #101: the bytes this image was LOADED from, kept so a
-     * `file:img` table column round-trips byte for byte rather than
-     * being re-encoded. NULL for an image that never came from a file
-     * (a clip() or a resize() result, or one decoded from a blob that
-     * has since been resized) -- festina_image_bytes encodes PNG on
-     * demand in that case, and caches it here. Usually SMALLER than
-     * the decoded surface it sits next to: a 128x64 PNG is a couple of
-     * kilobytes against 32KB of ARGB32, so keeping it is a modest
-     * overhead rather than a doubling. */
-    unsigned char *bytes;
-    size_t byte_count;
-    /* claude.md #110: the path this image was loaded from, so save()
-     * with no argument has somewhere to write. Empty (never NULL, so
-     * the shared festina_save_bytes need not special-case it) for an
-     * image that never came from a file -- a clip() or resize() result,
-     * or one decoded out of a database column. That is precisely the
-     * case save(path) exists for, and the case save() refuses. */
-    char *path;
-    /* claude.md #234 (uraikus/festina#93): this image's OWN transform
-     * (identity until the first img.translate()/rotate()/scale();
-     * `transform_ready` is the same lazy-init flag the canvas's
-     * g_transform_ready is) and its own saveState()/restoreState()
-     * stack of transforms. Completely independent of the canvas's
-     * g_transform -- an image is a portable asset with its own local
-     * coordinates -- and private to this one image, so a worker thread
-     * drawing into its own layer never touches shared state. The stack
-     * is allocated on the first img.saveState() and grows as needed
-     * (most images never save at all; a fixed 64-slot array of
-     * matrices would cost every 16x16 sprite 3KB it never uses). */
-    cairo_matrix_t transform;
-    int transform_ready;
-    cairo_matrix_t *state_stack;
-    int state_depth;
-    int state_cap;
-} FestinaImageBox;
 
 /* claude.md #118: the box is REFERENCE COUNTED now, behind the same
  * i64 header immediately before the payload that structs/arrays/maps/
@@ -2638,6 +3073,23 @@ static void festina_image_bytes_now_stale(void *img) {
     box->byte_count = 0;
 }
 
+/* An img as a target: its own transform (the identity until it has one). */
+static int festina_image_raster_shape(FestinaImageBox *box, int circle,
+                                      double a, double b, double c, double d,
+                                      int fill_overridden, int64_t fill_color,
+                                      int border_overridden, int64_t border_color) {
+    cairo_matrix_t ident;
+    festina_matrix_identity(&ident);
+    return festina_raster_shape(box, box->transform_ready ? &box->transform : &ident, circle,
+                                a, b, c, d, fill_overridden, fill_color,
+                                border_overridden, border_color);
+}
+
+static const cairo_matrix_t *festina_image_matrix(FestinaImageBox *box, cairo_matrix_t *ident) {
+    festina_matrix_identity(ident);
+    return box->transform_ready ? &box->transform : ident;
+}
+
 /* claude.md #234: the img counterpart of festina_canvas_context -- a
  * fresh context on this image's own surface carrying this IMAGE's own
  * transform (identity, and no cairo_set_matrix call at all, until the
@@ -2745,6 +3197,95 @@ void festina_image_blend_row(void *img, int64_t row, int64_t x0, int64_t x1, voi
     festina_image_bytes_now_stale(img);
 }
 
+/* The same row blend for a colour that changes along the row -- a
+ * gradient: `words[i]` is pixel i's source, premultiplied ARGB as a 32-bit
+ * word (alpha already in it), and `cov` its coverage. Each is scaled by its
+ * coverage byte and goes OVER the destination with pixman's arithmetic,
+ * exactly as festina_image_blend_row does for one colour; clipped the same
+ * way, to the image and to both arrays. */
+void festina_image_blend_row_words(void *img, int64_t row, int64_t x0, int64_t x1, void *cov, void *words) {
+    if (!img || !cov || !words) return;
+    cairo_surface_t *s = ((FestinaImageBox *)img)->surface;
+    if (!s || cairo_surface_get_type(s) != CAIRO_SURFACE_TYPE_IMAGE) return;
+    cairo_format_t format = cairo_image_surface_get_format(s);
+    if (format != CAIRO_FORMAT_ARGB32 && format != CAIRO_FORMAT_RGB24) return;
+    int sw = cairo_image_surface_get_width(s);
+    int sh = cairo_image_surface_get_height(s);
+    if (row < 0 || row >= sh) return;
+    int64_t *cp = (int64_t *)cov, *wp = (int64_t *)words;
+    int64_t n = cp[0] < wp[0] ? cp[0] : wp[0];
+    const double *c;
+    const int64_t *w;
+    memcpy(&c, &cp[1], sizeof(c));
+    memcpy(&w, &wp[1], sizeof(w));
+    if (!c || !w) return;
+    if (x0 < 0) x0 = 0;
+    if (x1 > sw) x1 = sw;
+    if (x1 > n) x1 = n;
+    if (x0 >= x1) return;
+    cairo_surface_flush(s);
+    unsigned char *data = cairo_image_surface_get_data(s);
+    if (!data) return;
+    uint32_t *p = (uint32_t *)(data + row * cairo_image_surface_get_stride(s));
+    int opaque_dest = format == CAIRO_FORMAT_RGB24;
+    for (int64_t i = x0; i < x1; i++) {
+        double v = c[i];
+        if (!(v > 0.0)) continue;
+        uint32_t m = v >= 1.0 ? 255u : (uint32_t)(v * 255.0 + 0.5);
+        if (m == 0) continue;
+        uint32_t sp = (uint32_t)w[i];
+        uint32_t in = m == 255u ? sp
+                    : (festina_mul_un8(sp >> 24, m) << 24) | (festina_mul_un8((sp >> 16) & 0xFF, m) << 16)
+                    | (festina_mul_un8((sp >> 8) & 0xFF, m) << 8) | festina_mul_un8(sp & 0xFF, m);
+        uint32_t d = p[i];
+        if (opaque_dest) d |= 0xFF000000u;
+        d = festina_over_un8x4(in, d);
+        p[i] = opaque_dest ? (d | 0xFF000000u) : d;
+    }
+    cairo_surface_mark_dirty_rectangle(s, (int)x0, (int)row, (int)(x1 - x0), 1);
+    festina_image_bytes_now_stale(img);
+}
+
+/* Clearing through a coverage row: Cairo's SOURCE operator with a
+ * transparent source, which leaves each pixel scaled by one minus its
+ * coverage -- all four premultiplied channels, so the colour fades with
+ * the alpha -- and a pixel fully covered becomes 0. */
+void festina_image_clear_row(void *img, int64_t row, int64_t x0, int64_t x1, void *cov) {
+    if (!img || !cov) return;
+    cairo_surface_t *s = ((FestinaImageBox *)img)->surface;
+    if (!s || cairo_surface_get_type(s) != CAIRO_SURFACE_TYPE_IMAGE) return;
+    cairo_format_t format = cairo_image_surface_get_format(s);
+    if (format != CAIRO_FORMAT_ARGB32 && format != CAIRO_FORMAT_RGB24) return;
+    int sw = cairo_image_surface_get_width(s);
+    int sh = cairo_image_surface_get_height(s);
+    if (row < 0 || row >= sh) return;
+    int64_t *cp = (int64_t *)cov;
+    int64_t n = cp[0];
+    const double *c;
+    memcpy(&c, &cp[1], sizeof(c));
+    if (!c) return;
+    if (x0 < 0) x0 = 0;
+    if (x1 > sw) x1 = sw;
+    if (x1 > n) x1 = n;
+    if (x0 >= x1) return;
+    cairo_surface_flush(s);
+    unsigned char *data = cairo_image_surface_get_data(s);
+    if (!data) return;
+    uint32_t *p = (uint32_t *)(data + row * cairo_image_surface_get_stride(s));
+    for (int64_t i = x0; i < x1; i++) {
+        double v = c[i];
+        if (!(v > 0.0)) continue;
+        uint32_t m = v >= 1.0 ? 255u : (uint32_t)(v * 255.0 + 0.5);
+        if (m == 0) continue;
+        if (m == 255u) { p[i] = 0; continue; }
+        uint32_t d = p[i], ia = 255u - m;
+        p[i] = (festina_mul_un8(d >> 24, ia) << 24) | (festina_mul_un8((d >> 16) & 0xFF, ia) << 16)
+             | (festina_mul_un8((d >> 8) & 0xFF, ia) << 8) | festina_mul_un8(d & 0xFF, ia);
+    }
+    cairo_surface_mark_dirty_rectangle(s, (int)x0, (int)row, (int)(x1 - x0), 1);
+    festina_image_bytes_now_stale(img);
+}
+
 /* claude.md #240: the img half of the solid-fill fast path -- the same
  * contract as the canvas's festina_canvas_direct_ok, against THIS
  * image's own transform. This is the path that made the layered-canvas
@@ -2772,6 +3313,10 @@ void festina_image_draw_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t
         festina_image_bytes_now_stale(img);
         return;
     }
+    if (festina_image_raster_shape(box, 0, (double)x, (double)y, (double)w, (double)h, 0, 0, 0, 0)) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
     cairo_t *cr = festina_image_context(box);
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border(cr);
@@ -2785,6 +3330,10 @@ void festina_image_draw_rect_color(void *img, int64_t x, int64_t y, int64_t w, i
     int64_t tx, ty;
     if (festina_image_direct_override_ok(box, color, g_border_set && g_line_width > 0.0, &tx, &ty) &&
         festina_direct_rect(box->surface, x, y, tx, ty, w, h, festina_solid_pixel_from_color(color))) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
+    if (festina_image_raster_shape(box, 0, (double)x, (double)y, (double)w, (double)h, 1, color, 0, 0)) {
         festina_image_bytes_now_stale(img);
         return;
     }
@@ -2806,6 +3355,10 @@ void festina_image_draw_rect_colors(void *img, int64_t x, int64_t y, int64_t w, 
         festina_image_bytes_now_stale(img);
         return;
     }
+    if (festina_image_raster_shape(box, 0, (double)x, (double)y, (double)w, (double)h, 1, fill_color, 1, border_color)) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
     cairo_t *cr = festina_image_context(box);
     cairo_rectangle(cr, (double)x, (double)y, (double)w, (double)h);
     festina_fill_and_border_with_colors(cr, fill_color, border_color);
@@ -2819,11 +3372,18 @@ void festina_image_draw_pixel(void *img, int64_t x, int64_t y) {
     if (!img) return;
     FestinaImageBox *box = (FestinaImageBox *)img;
     int64_t tx, ty;
-    if (festina_direct_fill_enabled() && !g_fill_none && !g_fill_gradient && g_fill_alpha == 1.0 &&
+    if (festina_direct_fill_enabled() && !g_fill_none && !g_fill_gradient &&
         festina_matrix_integer_offset(&box->transform, box->transform_ready, &tx, &ty) &&
         festina_direct_rect(box->surface, x, y, tx, ty, 1, 1, festina_solid_pixel_from_style())) {
         festina_image_bytes_now_stale(img);
         return;
+    }
+    {
+        cairo_matrix_t ident;
+        if (festina_raster_pixel(box, festina_image_matrix(box, &ident), x, y, 0, 0)) {
+            festina_image_bytes_now_stale(img);
+            return;
+        }
     }
     cairo_t *cr = festina_image_context(box);
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
@@ -2848,6 +3408,13 @@ void festina_image_draw_pixel_color(void *img, int64_t x, int64_t y, int64_t col
         festina_direct_rect(box->surface, x, y, tx, ty, 1, 1, festina_solid_pixel_from_color(color))) {
         festina_image_bytes_now_stale(img);
         return;
+    }
+    {
+        cairo_matrix_t ident;
+        if (festina_raster_pixel(box, festina_image_matrix(box, &ident), x, y, 1, color)) {
+            festina_image_bytes_now_stale(img);
+            return;
+        }
     }
     cairo_t *cr = festina_image_context(box);
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
@@ -2884,6 +3451,10 @@ void festina_image_draw_circle(void *img, int64_t x, int64_t y, int64_t r) {
         festina_image_bytes_now_stale(img);
         return;
     }
+    if (festina_image_raster_shape(box, 1, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0, 0, 0, 0, 0)) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
     cairo_t *cr = festina_image_context(box);
     cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border(cr);
@@ -2901,6 +3472,10 @@ void festina_image_draw_circle_color(void *img, int64_t x, int64_t y, int64_t r,
         festina_image_bytes_now_stale(img);
         return;
     }
+    if (festina_image_raster_shape(box, 1, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0, 1, color, 0, 0)) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
     cairo_t *cr = festina_image_context(box);
     cairo_arc(cr, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0.0, 2.0 * 3.14159265358979323846);
     festina_fill_and_border_with_color(cr, color);
@@ -2915,6 +3490,10 @@ void festina_image_draw_circle_colors(void *img, int64_t x, int64_t y, int64_t r
     int64_t tx, ty;
     if (festina_image_direct_override_ok(box, fill_color, border_color >= 0 && g_line_width > 0.0, &tx, &ty) &&
         festina_direct_circle(box->surface, x, y, tx, ty, r, festina_solid_pixel_from_color(fill_color))) {
+        festina_image_bytes_now_stale(img);
+        return;
+    }
+    if (festina_image_raster_shape(box, 1, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0, 1, fill_color, 1, border_color)) {
         festina_image_bytes_now_stale(img);
         return;
     }
@@ -2958,7 +3537,7 @@ void festina_image_draw_text(void *img, const char *text, int64_t x, int64_t y) 
 
 static void festina_image_transform_require(FestinaImageBox *box) {
     if (!box->transform_ready) {
-        cairo_matrix_init_identity(&box->transform);
+        festina_matrix_identity(&box->transform);
         box->transform_ready = 1;
     }
 }
@@ -2967,7 +3546,7 @@ void festina_image_translate(void *img, int64_t x, int64_t y) {
     if (!img) return;
     FestinaImageBox *box = (FestinaImageBox *)img;
     festina_image_transform_require(box);
-    cairo_matrix_translate(&box->transform, (double)x, (double)y);
+    festina_matrix_translate(&box->transform, (double)x, (double)y);
 }
 
 void festina_image_rotate(void *img, double degrees) {
@@ -2975,7 +3554,7 @@ void festina_image_rotate(void *img, double degrees) {
     FestinaImageBox *box = (FestinaImageBox *)img;
     festina_image_transform_require(box);
     /* Degrees, exactly like the canvas's rotate() -- see its comment. */
-    cairo_matrix_rotate(&box->transform, degrees * 3.14159265358979323846 / 180.0);
+    festina_matrix_rotate(&box->transform, degrees * 3.14159265358979323846 / 180.0);
 }
 
 void festina_image_scale(void *img, double sx, double sy) {
@@ -2985,13 +3564,13 @@ void festina_image_scale(void *img, double sx, double sy) {
     /* Same guard as festina_scale: a zero scale would leave a
      * non-invertible matrix every later call silently fails on. */
     if (sx == 0.0 || sy == 0.0) return;
-    cairo_matrix_scale(&box->transform, sx, sy);
+    festina_matrix_scale(&box->transform, sx, sy);
 }
 
 void festina_image_reset_transform(void *img) {
     if (!img) return;
     FestinaImageBox *box = (FestinaImageBox *)img;
-    cairo_matrix_init_identity(&box->transform);
+    festina_matrix_identity(&box->transform);
     box->transform_ready = 1;
 }
 
@@ -3038,6 +3617,11 @@ void festina_image_restore_state(void *img) {
  * clearPixel honour the canvas's. */
 void festina_image_clear(void *img) {
     if (!img) return;
+    if (festina_draw_ours()) {
+        festina_surface_zero(((FestinaImageBox *)img)->surface);
+        festina_image_bytes_now_stale(img);
+        return;
+    }
     cairo_t *cr = cairo_create(((FestinaImageBox *)img)->surface);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
@@ -3048,6 +3632,14 @@ void festina_image_clear(void *img) {
 
 void festina_image_clear_rect(void *img, int64_t x, int64_t y, int64_t w, int64_t h) {
     if (!img) return;
+    {
+        cairo_matrix_t ident;
+        FestinaImageBox *box = (FestinaImageBox *)img;
+        if (festina_raster_clear(box, festina_image_matrix(box, &ident), 0, (double)x, (double)y, (double)w, (double)h)) {
+            festina_image_bytes_now_stale(img);
+            return;
+        }
+    }
     cairo_t *cr = festina_image_context((FestinaImageBox *)img);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, 0, 0, 0, 0);
@@ -3059,6 +3651,14 @@ void festina_image_clear_rect(void *img, int64_t x, int64_t y, int64_t w, int64_
 
 void festina_image_clear_circle(void *img, int64_t x, int64_t y, int64_t r) {
     if (!img) return;
+    {
+        cairo_matrix_t ident;
+        FestinaImageBox *box = (FestinaImageBox *)img;
+        if (festina_raster_clear(box, festina_image_matrix(box, &ident), 1, (double)x, (double)y, (double)(r < 0 ? 0 : r), 0)) {
+            festina_image_bytes_now_stale(img);
+            return;
+        }
+    }
     cairo_t *cr = festina_image_context((FestinaImageBox *)img);
     if (r < 0) r = 0;
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
@@ -3071,6 +3671,14 @@ void festina_image_clear_circle(void *img, int64_t x, int64_t y, int64_t r) {
 
 void festina_image_clear_pixel(void *img, int64_t x, int64_t y) {
     if (!img) return;
+    {
+        cairo_matrix_t ident;
+        FestinaImageBox *box = (FestinaImageBox *)img;
+        if (festina_raster_clear(box, festina_image_matrix(box, &ident), 2, (double)x, (double)y, 0, 0)) {
+            festina_image_bytes_now_stale(img);
+            return;
+        }
+    }
     cairo_t *cr = festina_image_context((FestinaImageBox *)img);
     cairo_antialias_t save_aa = cairo_get_antialias(cr);
     cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);

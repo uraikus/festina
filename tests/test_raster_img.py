@@ -35,6 +35,15 @@ from tests.test_raster import (   # noqa: E402
 
 _FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
+
+@pytest.fixture(autouse=True)
+def _cairo_is_the_oracle(monkeypatch):
+    """The Cairo side of every comparison here has to BE Cairo. Since
+    runtime.md phase 7 slice 4 the runtime draws through raster.f itself
+    (and stamps circles from its coverage), so without this the oracle
+    would be raster.f compared with raster.f."""
+    monkeypatch.setenv("FESTINA_CAIRO_DRAW", "1")
+
 _HEAD = ("color bg = '#204060'\ncolor red = '#ff0000'\ncolor grn = '#00ff00'\n"
          "color yel = '#ffff00'\n")
 

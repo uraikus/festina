@@ -194,11 +194,32 @@ if [ $GFX_OK = 1 ]; then
     fi
 fi
 
+# runtime.md phase 7 slice 4: draw.f, which draws every shape the graphics
+# runtime used to hand to Cairo, and the C that registers it. Built the
+# same way as the text component; without it the harness would exercise
+# the Cairo fallbacks and never the drawing it now ships.
+DRAW_OK=0
+if [ $GFX_OK = 1 ]; then
+    if (cd "$ROOT" && python3 -c 'from festina import cli; print(cli.component_ir("draw"), end="")') > "$WORK/draw.ll" 2> "$WORK/draw.err" \
+        && (cd "$ROOT" && python3 -c 'from festina import cli; print(cli.draw_glue_source(), end="")') > "$WORK/draw_glue.c" 2>> "$WORK/draw.err"; then
+        sed -E 's/^(define [^{]+) \{/\1 sanitize_address {/' "$WORK/draw.ll" > "$WORK/draw.asan.ll"
+        "$IR_CC" -fsanitize=address -g -O1 -c "$WORK/draw.asan.ll" -o "$WORK/rt_draw.o" 2> "$WORK/draw.cc.err" \
+            && "$SAN_CC" -fsanitize=address -g -O0 -c "$WORK/draw_glue.c" -I "$ROOT/runtime" -o "$WORK/rt_draw_glue.o" 2>> "$WORK/draw.cc.err" \
+            && DRAW_OK=1
+    fi
+    if [ $DRAW_OK = 0 ]; then
+        echo "leak_stress: could not build the Festina draw component" >&2
+        sed 's/^/    /' "$WORK/draw.err" "$WORK/draw.cc.err" 2>/dev/null >&2
+        exit 1
+    fi
+fi
+
 LIBS=(-lsqlite3 -lm -pthread)
 OBJS=("$WORK/rt_core.o" "$WORK/rt_async.o" "$WORK/rt_thread.o" "$WORK/rt_http.o")
 [ $GFX_OK = 1 ] && { OBJS+=("$WORK/rt_graphics.o"); LIBS+=($(pkg-config --libs cairo-xlib x11 libjpeg)); }
 [ $IMG_OK = 1 ] && OBJS+=("$WORK/rt_imageload.o")
 [ $TEXT_OK = 1 ] && OBJS+=("$WORK/rt_text.o" "$WORK/rt_text_font.o")
+[ $DRAW_OK = 1 ] && OBJS+=("$WORK/rt_draw.o" "$WORK/rt_draw_glue.o")
 [ $AUD_OK = 1 ] && { OBJS+=("$WORK/rt_audio.o"); LIBS+=($(pkg-config --libs alsa libmpg123)); }
 [ $HTTPS_OK = 1 ] && { OBJS+=("$WORK/rt_https.o"); LIBS+=($(pkg-config --libs mbedtls mbedx509 mbedcrypto)); }
 

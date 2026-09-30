@@ -2277,6 +2277,8 @@ class CodeGen:
             "declare void @festina_image_clear_circle(ptr, i64, i64, i64)",
             "declare void @festina_image_clear_pixel(ptr, i64, i64)",
             "declare void @festina_image_blend_row(ptr, i64, i64, i64, ptr, i64, i64, i64, double)",
+            "declare void @festina_image_blend_row_words(ptr, i64, i64, i64, ptr, ptr)",
+            "declare void @festina_image_clear_row(ptr, i64, i64, i64, ptr)",
             "declare void @festina_image_draw_image(ptr, ptr, i64, i64)",
             "declare void @festina_image_draw_image_scaled(ptr, ptr, i64, i64, i64, i64)",
             "declare void @festina_image_free(ptr)",
@@ -13582,6 +13584,9 @@ class CodeGen:
                 "clearPixel": {2: ("festina_image_clear_pixel", ["i64"] * 2)},
                 "__blendRow": {8: ("festina_image_blend_row",
                                    ["i64", "i64", "i64", "ptr"] + ["i64"] * 3 + ["double"])},
+                "__blendRowWords": {5: ("festina_image_blend_row_words",
+                                        ["i64", "i64", "i64", "ptr", "ptr"])},
+                "__clearRow": {4: ("festina_image_clear_row", ["i64", "i64", "i64", "ptr"])},
                 "drawImage": {3: ("festina_image_draw_image", ["ptr", "i64", "i64"]),
                               5: ("festina_image_draw_image_scaled", ["ptr"] + ["i64"] * 4)},
             }
@@ -13592,9 +13597,12 @@ class CodeGen:
                     fn, arg_irs = _IMAGE_LAYER_OPS[callee.prop][len(expr.args)]
                     sig = "".join(f", {ty} {v}" for ty, (v, _) in zip(arg_irs, emitted))
                     lines.append(f"  call void @{fn}(ptr {obj_val}{sig})")
-                    if callee.prop == "__blendRow":
+                    if callee.prop in ("__blendRow", "__blendRowWords", "__clearRow"):
                         self.uses_graphics_code = True
-                        self._release_owned_receiver(expr.args[3], emitted[3][0], emitted[3][1], lines)
+                        for k in range(3, len(expr.args)):
+                            if callee.prop == "__blendRow" and k != 3:
+                                continue
+                            self._release_owned_receiver(expr.args[k], emitted[k][0], emitted[k][1], lines)
                     if callee.prop == "drawImage":
                         # An owning SOURCE (a clip()/blankImage() result
                         # passed straight in) is done with once painted --

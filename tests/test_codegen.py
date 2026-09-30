@@ -14876,7 +14876,15 @@ class TestSolidFillFastPath:
 
     def _run(self, compile_and_run, monkeypatch, program, direct=True):
         monkeypatch.delenv("DISPLAY", raising=False)
-        env = {} if direct else {"FESTINA_NO_DIRECT_FILL": "1"}
+        # Both switches: the oracle is CAIRO drawing the scene, and since
+        # runtime.md phase 7 slice 4 a call the direct path declines goes to
+        # draw.f, not Cairo, unless FESTINA_CAIRO_DRAW says otherwise.
+        # The direct run keeps FESTINA_CAIRO_DRAW too, so what the direct path
+        # declines (a radius past its cache, say) is drawn by Cairo in BOTH
+        # runs and the comparison stays the direct path against Cairo.
+        env = {"FESTINA_CAIRO_DRAW": "1"}
+        if not direct:
+            env["FESTINA_NO_DIRECT_FILL"] = "1"
         result = compile_and_run(program, env=env)
         assert result.returncode == 0, result.stderr
         assert all(line == "true" for line in result.stdout.split()), result.stdout

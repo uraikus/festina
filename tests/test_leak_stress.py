@@ -447,6 +447,10 @@ class TestLeakStress:
             # program draws: Cairo's text path was untestable here, its
             # fontconfig caches being process-lifetime.
             "draw_text_churn.f",
+            # runtime.md phase 7 slice 4: every shape drawn through draw.f
+            # -- the matrix, fill source and path arrays C builds and
+            # releases each call, and draw.f's coverage globals.
+            "draw_shapes_churn.f",
             "regex_and_files_churn.f",  # regex compilation, file and time text
             "structs_and_rows_churn.f", # structs, query rows, scope exits
             "text_churn.f",             # text, the copy-managed one

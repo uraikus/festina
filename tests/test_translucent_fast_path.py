@@ -12,7 +12,7 @@ and goes OVER the pixels with pixman's arithmetic, and a circle's
 cached coverage scales it first.
 
 The oracle is the one #240 used: the same scene drawn with the fast path
-on and with FESTINA_NO_DIRECT_FILL=1, which sends every call to Cairo,
+on and with FESTINA_NO_DIRECT_FILL=1 FESTINA_CAIRO_DRAW=1, which send every call to Cairo,
 and the two saved images must be byte-identical. Alphas are ones that do
 not round trivially (0.4 and 0.7 are not a whole number of 255ths), so a
 premultiply from a rounded byte would show.
@@ -67,7 +67,9 @@ def _program(png_canvas, png_layer):
 
 def _draw(compile_and_run, monkeypatch, canvas, layer, direct):
     monkeypatch.delenv("DISPLAY", raising=False)
-    env = {} if direct else {"FESTINA_NO_DIRECT_FILL": "1"}
+    env = {"FESTINA_CAIRO_DRAW": "1"}
+    if not direct:
+        env["FESTINA_NO_DIRECT_FILL"] = "1"
     result = compile_and_run(_program(canvas, layer), env=env)
     assert result.returncode == 0, result.stderr
     assert result.stdout.split() == ["true", "true"], result.stdout
