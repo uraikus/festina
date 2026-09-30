@@ -341,36 +341,39 @@ class TestPngDecode:
         self._check(tmp_path, cli_mod, png, w, h,
                     self._expected(w, h, 2, pix))
 
-    def test_an_unsupported_file_is_refused_rather_than_half_decoded(
-            self, tmp_path, cli_mod):
-        """16-bit and interlaced PNGs are not supported, and the
-        decoder says so instead of producing plausible-looking wrong
-        pixels. A caller can fall back; it cannot un-see a bad image."""
-        import random
+    def _decode_text(self, tmp_path, cli_mod, png):
+        _with_components(tmp_path, "inflate", "png")
+        literal = ", ".join(str(b) for b in png)
+        return _run_festina(tmp_path, cli_mod,
+                            "import png.f\n\n"
+                            f"arr[int] d = [{literal}]\n"
+                            "arr[int] px = pngDecode(d)\n"
+                            "log(`${px.length} ${PNG_W} ${PNG_ERR}`)\n")
+
+    def test_what_is_not_a_png_is_refused_with_a_reason(self, tmp_path, cli_mod):
+        """Since runtime.md phase 7 slice 6 every PNG decodes (see
+        tests/test_png_full.py); what is refused is what is not one, and
+        the decoder says why instead of producing plausible-looking wrong
+        pixels: a depth the colour type may not have, an interlace method
+        that does not exist, a truncated body."""
         import struct
-        random.seed(31)
 
         def chunk(tag, data):
             return (struct.pack(">I", len(data)) + tag + data
                     + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
 
-        w, h = 4, 4
-        raw = b"".join(bytes([0]) + bytes(w * 3) for _ in range(h))
-        png = (b"\x89PNG\r\n\x1a\n"
-               # interlace=1 (Adam7)
-               + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 1))
-               + chunk(b"IDAT", zlib.compress(raw, 6))
-               + chunk(b"IEND", b""))
-        _with_components(tmp_path, "inflate", "png")
-        literal = ", ".join(str(b) for b in png)
-        got = _run_festina(tmp_path, cli_mod,
-                           "import png.f\n\n"
-                           f"arr[int] d = [{literal}]\n"
-                           "arr[int] px = pngDecode(d)\n"
-                           "log(`${px.length} ${PNG_W} ${PNG_ERR}`)\n")
-        assert got == "0 0 5", (
-            "an interlaced PNG must be refused with a reason, not "
-            "decoded as if it were progressive")
+        def png(colour, depth, interlace, rows):
+            raw = b"".join(bytes([0]) + bytes(r) for r in rows)
+            return (b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, depth, colour, 0, 0, interlace))
+                    + chunk(b"IDAT", zlib.compress(raw, 6))
+                    + chunk(b"IEND", b""))
+
+        assert self._decode_text(tmp_path, cli_mod, png(2, 4, 0, [[0] * 8] * 4)) == "0 0 4"   # RGB at 4 bits
+        assert self._decode_text(tmp_path, cli_mod, png(3, 16, 0, [[0] * 8] * 4)) == "0 0 4"  # palette at 16
+        assert self._decode_text(tmp_path, cli_mod, png(2, 8, 2, [[0] * 12] * 4)) == "0 0 5"  # interlace 2
+        assert self._decode_text(tmp_path, cli_mod, png(1, 8, 0, [[0] * 12] * 4)) == "0 0 6"  # colour type 1
+        assert self._decode_text(tmp_path, cli_mod, png(2, 8, 0, [[0] * 12] * 2)) == "0 0 7"  # two rows of four
 
 
 class TestJpegDecode:

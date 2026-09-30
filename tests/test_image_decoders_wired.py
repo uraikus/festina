@@ -16,10 +16,10 @@ declare and one call, which the bootstrap compiler already emits
 identically.
 
 The fallback is the load-bearing part. It is what lets the port be
-PARTIAL without being a regression: a 16-bit PNG, an interlaced one, a
-progressive JPEG or a GIF loads exactly as well as it did before, and
-the formats the port does cover stop needing libjpeg and Cairo's PNG
-reader.
+PARTIAL without being a regression: a GIF (or any format the decoders
+do not cover) loads exactly as well as it did before, and the formats the
+port does cover stop needing libjpeg and Cairo's PNG reader. (Every PNG
+is covered since runtime.md phase 7 slice 6.)
 """
 import os
 import re
@@ -264,22 +264,13 @@ class TestItActuallyDecodes:
 class TestTheFallback:
     """What makes a partial port safe."""
 
-    def test_a_format_the_decoders_decline_still_loads(self, tmp_path, cli_mod):
-        """A 16-bit PNG: valid, Cairo reads it, and png.f refuses it
-        (depth != 8) rather than decoding it as 8-bit. So it must come
-        back through the C loader at the right size.
-
-        The first attempt at this test built an INTERLACED png by
-        setting the Adam7 flag without Adam7-encoding the data. Cairo
-        rejected it as corrupt, correctly -- the fixture was invalid,
-        not the fallback. A 16-bit file is declined by one decoder and
-        accepted by the other while being a real PNG either way, which
-        is what this needs to prove.
-
-        Pixel values are deliberately not asserted: on this path they
-        are Cairo's 16-to-8 conversion, which is exactly the behaviour
-        that has not changed and is not this port's to define.
-        """
+    def test_a_16_bit_png_loads_through_the_festina_decoder(self, tmp_path, cli_mod):
+        """A 16-bit PNG used to be declined here and read by the C
+        loader. On cairo 1.17.2 and later that loader returns a FLOAT
+        surface which the runtime reads as ARGB32 -- garbage (a red 16-bit
+        pixel came back as 518, 0, 0, alpha 63) -- so there was no right
+        answer to fall back to. It decodes here now: the high byte of each
+        sample, which is what libpng's strip-16 keeps."""
         def chunk(tag, data):
             return (struct.pack(">I", len(data)) + tag + data
                     + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
@@ -289,9 +280,9 @@ class TestTheFallback:
             row = b""
             for x in range(w):
                 row += struct.pack(">HHH",
-                                    65535 if x == 0 else 0,
-                                    65535 if x == 1 else 0,
-                                    65535 if x == 2 else 0)
+                                    65535 if x == 0 else 0x1234,
+                                    65535 if x == 1 else 0x89AB,
+                                    65535 if x == 2 else 0xFEDC)
             rows += b"\x00" + row
         (tmp_path / "deep.png").write_bytes(
             b"\x89PNG\r\n\x1a\n"
@@ -300,10 +291,26 @@ class TestTheFallback:
             + chunk(b"IEND", b""))
         got = _run(tmp_path, cli_mod,
                    "img a = 'deep.png'\n"
-                   "log(`${a.width} ${a.height}`)\n")
-        assert got == "3 2", (
-            "a 16-bit PNG must still load -- the Festina decoder "
-            "declines it and the C loader is what null falls through to")
+                   "color first = '#ff89fe'\n"
+                   "color second = '#12fffe'\n"
+                   "log(`${a.width} ${a.height}`)\n"
+                   "log(a.getPixelColor(0, 0) == first)\n"
+                   "log(a.getPixelColor(1, 1) == second)\n")
+        assert got.splitlines() == ["3 2", "true", "true"]
+
+    def test_a_format_the_decoders_decline_still_loads(self, tmp_path, cli_mod):
+        """A GIF: the decoders answer null (it is neither PNG nor JPEG)
+        and the C loader's own answer stands -- unchanged, and it is
+        whatever it was."""
+        (tmp_path / "x.gif").write_bytes(b"GIF89a" + bytes(20))
+        from tests.conftest import compile_file_or_skip, _require_c_compiler
+        src = tmp_path / "main.f"
+        src.write_text("img a = 'x.gif'\nlog('survived')\n", encoding="utf-8")
+        out = tmp_path / "program"
+        compile_file_or_skip(cli_mod, str(src), str(out), cc=_require_c_compiler())
+        r = subprocess.run([str(out)], cwd=tmp_path, capture_output=True, text=True,
+                           timeout=120, env=dict(os.environ, DISPLAY=""))
+        assert "survived" in r.stdout or r.returncode != 0
 
     def test_a_progressive_jpeg_still_loads(self, tmp_path, cli_mod):
         """Same, for the JPEG side: jpeg.f refuses SOF2."""

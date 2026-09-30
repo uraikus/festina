@@ -1344,7 +1344,7 @@ present every slice compares against it, byte for byte where possible:
    36 fallback functions lose their contexts, one group at a time
 5. images as sources: integer-offset blits (exact), scaled and rotated
    draws, `resize`, `clip`, `clone` — a resampler, compared with a bound
-6. the decoder gaps (decision 3)
+6. ◐ the decoder gaps (decision 3): PNG done (see "Slice 6, PNG"); progressive JPEG next
 7. presentation: `XPutImage`, and the window seam speaking a plain
    surface (the Win32 and macOS backends already do)
 8. non-default text (decision 2)
@@ -1571,6 +1571,44 @@ Per shape now (800x600; the direct path is what a drawing call runs):
 | opaque circle r=20 | 3.0 us | 16 us | 35 us |
 | 50% rect 40x30 | 1.6 us | 1.4 us | 16 us |
 | 50% circle r=20 | 8.0 us | 28 us | 43-48 us |
+
+**Slice 6, PNG.** png.f now decodes every PNG: all five colour types at
+every depth the format allows for each (1, 2, 4, 8, 16 -- grey, RGB,
+palette, grey+alpha, RGBA), Adam7 interlaced or not, and tRNS in all
+three of its meanings (a palette alpha per entry; a colour key for grey;
+a colour key for RGB, compared at the file's own depth). It replaces the
+"refuse what is not 8-bit and non-interlaced" stance of phase 1, because
+after slice 9 there is no libpng to hand a refused file to.
+
+The oracle is written in Python from the spec and from what Cairo's
+reader does where the spec leaves a choice, and that second half is
+checked against Cairo itself through ctypes rather than assumed:
+`tests/test_png_full.py` encodes every colour type x depth x
+(plain, Adam7) x eight sizes (including 1x1, 1x5 and 5x1, where whole
+Adam7 passes are empty), with rows filtered through all five filter
+types and the IDAT split across chunks; Cairo reads every case it can
+(everything but 16-bit) to exactly the expectation, and png.f matches the
+expectation on all of them. Eleven bugs put back (Adam7 start and step,
+low byte instead of high, sub-byte scaled by shift, key compared after
+the 16-bit cut or on one sample fewer, filter distance for sub-byte
+pixels, bit order, row rounding, an empty pass consumed, palette alpha
+ignored) each fail it; one -- an RGB key ignoring blue -- passed until the
+generator was made to produce pixels that miss the key by one in a
+single sample, and that is in it now.
+
+Where a choice was made: 1/2/4-bit grey scales to the full range (0,
+85, 170, 255 for two bits); a 16-bit sample keeps its high byte
+(`png_set_strip_16`); no gamma is applied whatever gAMA, sRGB or iCCP
+say. **A finding the work turned up:** on cairo 1.17.2 and later the C
+loader returns a *float* surface for a 16-bit PNG, which the runtime
+reads as ARGB32, so a 16-bit file was already loading as garbage (a red
+pixel came back as 518, 0, 0, alpha 63). png.f is the first correct
+16-bit path.
+
+Decode speed is what it was for 8-bit files and is not good: a
+1024x1024 RGBA file takes 0.5 s (0.8 s interlaced), against tens of
+milliseconds for libpng. It is the inflate loop and per-byte pushes, and
+it is worth its own measurement before slice 9 makes it the only path.
 
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the
