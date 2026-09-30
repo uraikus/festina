@@ -1344,7 +1344,7 @@ present every slice compares against it, byte for byte where possible:
    36 fallback functions lose their contexts, one group at a time
 5. images as sources: integer-offset blits (exact), scaled and rotated
    draws, `resize`, `clip`, `clone` — a resampler, compared with a bound
-6. ◐ the decoder gaps (decision 3): PNG done (see "Slice 6, PNG"); progressive JPEG next
+6. ✅ the decoder gaps (decision 3): every PNG and progressive JPEG (see "Slice 6, PNG" and "Slice 6, JPEG")
 7. presentation: `XPutImage`, and the window seam speaking a plain
    surface (the Win32 and macOS backends already do)
 8. non-default text (decision 2)
@@ -1609,6 +1609,55 @@ Decode speed is what it was for 8-bit files and is not good: a
 1024x1024 RGBA file takes 0.5 s (0.8 s interlaced), against tens of
 milliseconds for libpng. It is the inflate loop and per-byte pushes, and
 it is worth its own measurement before slice 9 makes it the only path.
+
+**Slice 6, JPEG.** jpeg.f now decodes progressive files (SOF2: spectral
+selection and successive approximation, DC and AC, first and refinement
+scans, end-of-band runs), and extended sequential (SOF1). Doing that
+needed the decoder to stop assuming one scan: the scans now deposit
+quantised coefficients into one array and the transform happens once, at
+the end. That restructuring also fixed what the single-scan assumption
+had been getting wrong without saying so:
+
+- a baseline file written as SEVERAL scans (one component each) decoded
+  only its first scan -- two thirds of the picture silently gray;
+- a restart marker followed by entropy data that began with a stuffed
+  0xFF 0x00 made the restart code skip to the end of the file;
+- three components were always YCbCr: a JPEG coded as RGB (an Adobe
+  marker with transform 0, or ids 'R', 'G', 'B') came out with its colours
+  scrambled; JFIF, Adobe and the component ids now decide, as in libjpeg;
+- the chroma upsampler clamped to the block-padded plane instead of the
+  component's real size, so the last column or row of a 4:2:2 or 4:4:0
+  picture interpolated against padding: off by up to 29 in a sample.
+
+**The oracle the phase 2 tests claimed was not one.** "Agrees with libjpeg
+to within one unit" loaded its fixture with `img = 'x.jpg'`, which has
+gone through jpeg.f first since the decoders were wired in (#346): it
+compared jpeg.f with itself, and could not have failed. It is replaced.
+`tests/test_jpeg_full.py` holds jpeg.f to libjpeg's own stored output on
+twenty files (`tests/fixtures/jpeg/`, made by `make_fixtures.c` with
+libjpeg): baseline and progressive, 4:4:4 / 4:2:0 / 4:2:2 / 4:4:0 / grey
+/ RGB-coded, restart intervals, baseline in three scans, sizes from 1x1
+to 129x97. Every sample is within 3 of libjpeg and under 2% are off by
+two or more (three independent rounding choices: float against integer
+DCT, float against fixed-point colour conversion, bilinear against
+integer triangle chroma), and each progressive file decodes to exactly
+what its baseline twin -- the same coefficients, a different scan
+structure -- decodes to. Thirteen bugs put back in the progressive
+machinery, the scan walk, the restart code, the upsampler clamp and the
+quantiser latch fail it; one (refinement adding a bit that is already
+set) does not, and cannot, for any valid file: the refinement bit is
+never set at the point it is added, so that check is for corrupt input.
+
+Still refused, with a reason and not decoded as something else:
+arithmetic coding, lossless and differential frames, 12-bit samples, and
+four components (CMYK). The C loader could not convert CMYK either;
+arithmetic coding it could, if libjpeg was built with it, so **that one
+is a regression when libjpeg goes** -- rare in practice, and not implemented
+here because nothing in the decision asked for it.
+
+Speed: a 1024x768 progressive file 0.29 s, a 645 KB baseline one 0.44 s
+(libjpeg does those in tens of milliseconds); the loops are the ones phase
+2 wrote, correctness first, and they are worth measuring before slice 9.
 
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the

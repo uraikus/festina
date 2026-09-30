@@ -312,20 +312,35 @@ class TestTheFallback:
                            timeout=120, env=dict(os.environ, DISPLAY=""))
         assert "survived" in r.stdout or r.returncode != 0
 
-    def test_a_progressive_jpeg_still_loads(self, tmp_path, cli_mod):
-        """Same, for the JPEG side: jpeg.f refuses SOF2."""
+    def test_a_progressive_jpeg_loads_through_the_festina_decoder(self, tmp_path, cli_mod):
+        """jpeg.f refused SOF2 and libjpeg read it; now jpeg.f reads it.
+        The fixture is libjpeg's own progressive coding of a picture whose
+        baseline twin is also in tests/fixtures/jpeg/, and the two load to
+        the same pixels."""
+        d = os.path.join(_FIXTURES, "jpeg")
+        for n in ("base_420", "prog_420"):
+            (tmp_path / f"{n}.jpg").write_bytes(open(os.path.join(d, f"{n}.jpg"), "rb").read())
+        got = _run(tmp_path, cli_mod,
+                   "img a = 'base_420.jpg'\nimg b = 'prog_420.jpg'\n"
+                   "log(`${a.width} ${a.height} ${b.width} ${b.height}`)\n"
+                   "arr[int] pa = a.toPixels()\narr[int] pb = b.toPixels()\n"
+                   "int bad = 0\nint i = 0\n"
+                   "while i < pa.length {\n    if pa[i] != pb[i] { bad = bad + 1 }\n    i = i + 1\n}\n"
+                   "log(bad)\n")
+        assert got.splitlines() == ["37 23 37 23", "0"]
+
+    def test_an_arithmetic_coded_jpeg_is_left_to_the_c_loader(self, tmp_path, cli_mod):
+        """The decoders still refuse arithmetic coding; the program must
+        not die on it, and the C loader's answer stands."""
         raw = bytearray(open(os.path.join(_FIXTURES, "gradient.jpg"), "rb").read())
         for i in range(len(raw) - 1):
             if raw[i] == 0xFF and raw[i + 1] == 0xC0:
-                raw[i + 1] = 0xC2
+                raw[i + 1] = 0xC9
                 break
-        (tmp_path / "prog.jpg").write_bytes(bytes(raw))
-        # libjpeg may or may not accept this hand-edited file; what is
-        # being asserted is that the program does not DIE on it -- the
-        # Festina decoder declining must hand over, not crash.
+        (tmp_path / "arith.jpg").write_bytes(bytes(raw))
         from tests.conftest import compile_file_or_skip, _require_c_compiler
         src = tmp_path / "main.f"
-        src.write_text("img a = 'prog.jpg'\nlog('survived')\n", encoding="utf-8")
+        src.write_text("img a = 'arith.jpg'\nlog('survived')\n", encoding="utf-8")
         out = tmp_path / "program"
         compile_file_or_skip(cli_mod, str(src), str(out), cc=_require_c_compiler())
         r = subprocess.run([str(out)], cwd=tmp_path, capture_output=True, text=True,
