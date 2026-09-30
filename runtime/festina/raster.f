@@ -216,6 +216,7 @@ void func rasRowCoverage(row:int, sw:int, pts:arr[float], ends:arr[int], rule:in
     float rowTop = row.toFloat()
     float rowBottom = rowTop + 1.0
     int nae = 0
+    bool uniform = true
     int sub0 = 0
     int from0 = 0
     while sub0 < ends.length {
@@ -240,6 +241,9 @@ void func rasRowCoverage(row:int, sw:int, pts:arr[float], ends:arr[int], rule:in
                 RAS_AE[at0 + 2] = pts[q0 * 2]
                 RAS_AE[at0 + 3] = by0
                 nae = nae + 1
+                if pts[p0 * 2] != pts[q0 * 2] || lo0 > rowTop || hi0 < rowBottom {
+                    uniform = false
+                }
             }
             p0 = p0 + 1
         }
@@ -251,8 +255,19 @@ void func rasRowCoverage(row:int, sw:int, pts:arr[float], ends:arr[int], rule:in
     while RAS_XS.length <= nae { RAS_XS.push(0.0) }
     while RAS_WS.length <= nae { RAS_WS.push(0) }
 
+    // A row every active edge of which is vertical and crosses all of it
+    // -- the inside rows of any rectangle -- meets every sub-scanline at
+    // the same x. With at most two such edges there is at most one span,
+    // so the sixteen sub-scanlines are one, added sixteen times over.
+    int reps = 1
+    int last = RAS_SUB
+    if uniform && nae <= 2 {
+        reps = RAS_SUB
+        last = 1
+    }
+
     int s = 0
-    while s < RAS_SUB {
+    while s < last {
         float sy = rowTop + ((s.toFloat() + 0.5) * invSub)
 
         // Crossings of this sub-scanline with every edge, kept
@@ -310,7 +325,11 @@ void func rasRowCoverage(row:int, sw:int, pts:arr[float], ends:arr[int], rule:in
                 spanStart = RAS_XS[k]
             }
             if wasIn && !inside {
-                rasAddSpan(sw, spanStart, RAS_XS[k], invSub)
+                if reps == 1 {
+                    rasAddSpan(sw, spanStart, RAS_XS[k], invSub)
+                } else {
+                    rasAddSpanRepeated(sw, spanStart, RAS_XS[k], invSub, reps)
+                }
             }
             k = k + 1
         }
@@ -391,6 +410,44 @@ void func rasAddSpan(sw:int, xa:float, xb:float, weight:float) {
         RAS_DIFF[ib] = RAS_DIFF[ib] - weight
     }
     RAS_COV[ib] = RAS_COV[ib] + ((hi - ib.toFloat()) * weight)
+}
+
+// rasAddSpan `reps` times over, for a span every sub-scanline of a row
+// meets identically. The two partial pixels are added one repetition at a
+// time -- the same additions in the same order, so the same rounding --
+// and the whole pixels between them get reps * weight at once, which is
+// exact (weight is a power of two, as rasRowCoverage's is) and is what
+// reps additions of it would sum to.
+void func rasAddSpanRepeated(sw:int, xa:float, xb:float, weight:float, reps:int) {
+    float lo = rasMaxF(xa, 0.0)
+    float hi = rasMinF(xb, sw.toFloat())
+    if hi <= lo { return }
+    int ia = Math.floor(lo)
+    int ib = Math.floor(hi)
+    if ib >= sw { ib = sw - 1 }
+    if ia < RAS_LO { RAS_LO = ia }
+    if ib + 1 > RAS_HI { RAS_HI = ib + 1 }
+    int r = 0
+    if ia == ib {
+        float only = (hi - lo) * weight
+        while r < reps {
+            RAS_COV[ia] = RAS_COV[ia] + only
+            r = r + 1
+        }
+        return
+    }
+    float left = ((ia + 1).toFloat() - lo) * weight
+    float right = (hi - ib.toFloat()) * weight
+    while r < reps {
+        RAS_COV[ia] = RAS_COV[ia] + left
+        RAS_COV[ib] = RAS_COV[ib] + right
+        r = r + 1
+    }
+    if ib > ia + 1 {
+        float whole = weight * reps.toFloat()
+        RAS_DIFF[ia + 1] = RAS_DIFF[ia + 1] + whole
+        RAS_DIFF[ib] = RAS_DIFF[ib] - whole
+    }
 }
 
 // Composite one row of accumulated coverage onto the surface.

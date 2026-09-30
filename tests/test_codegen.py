@@ -14862,8 +14862,9 @@ class TestSolidFillFastPath:
     on an img. Circle coverage is rasterized once per radius by Cairo
     itself and blended by hand with pixman's own 8-bit arithmetic, so
     the result is byte-identical to what Cairo's mask stamp (claude.md
-    #104) produced; anything outside the contract (fillAlpha below 1,
-    a gradient, a border, a scale/rotation/fractional translation, a
+    #104) produced (a translucent colour takes it too, since runtime.md
+    phase 7: tests/test_translucent_fast_path.py); anything outside the
+    contract (a gradient, a border, a scale/rotation/fractional translation, a
     colour of `none`, a radius over 128) falls through to the Cairo path
     it always had. The FESTINA_NO_DIRECT_FILL=1 environment switch turns
     the fast path off, which is what lets these tests draw the SAME

@@ -1504,6 +1504,74 @@ its own, which is decision 5's question and not this slice's to settle;
 and the per-row edge collection, which rebuilds for every row what
 changes only at an edge's end.
 
+**Slice 3, second pass (decision 5: "examine ways to make it faster").**
+What was tried, with what it measured, in the order it was done:
+
+- **Rows every rectangle has: landed.** An inside row whose active edges
+  are all vertical and cross the whole row meets all sixteen
+  sub-scanlines at the same x, so it is computed once and its additions
+  repeated (the two partial pixels one repetition at a time, so the same
+  rounding; the whole pixels between them as sixteen times a power of
+  two, which is exact). Rectangle rows went from 12.9k instructions to
+  2.7k; the 40x30 rectangle from 24 us to 9-12 us. Held bit for bit by
+  the golden scene (five bugs put back in it, all caught).
+- **Opaque full coverage in C: landed.** `__blendRow` writes the pixel
+  where the coverage is 1 and the colour opaque (blend cost 42M -> 23M
+  instructions on the same rectangles).
+- **Translucent flat colours through the direct-pixel path: landed, and
+  the biggest.** The #240 fast path took only an opaque colour; a
+  translucent circle went to Cairo at 28 us and a translucent rectangle
+  at 1.3 us. The direct path now takes them (`festina_solid_pixel_premul`
+  reduces the colour the way Cairo does, the cached circle coverage
+  scales it, OVER does the rest). Translucent circle 27.9 -> 8.0 us;
+  translucent 40x30 rectangle 1.35 (Cairo) -> 1.57 us, level, not
+  faster: clang vectorises the OVER at about 12 instructions a pixel and
+  the arithmetic is the limit. `tests/test_translucent_fast_path.py`
+  draws seven alphas of stacked rectangles, circles and pixels on a
+  canvas and an img with the fast path on and off, byte-identical; four
+  bugs put back fail it. A probe of 20,000 random shapes against Cairo
+  found the identity holds for every alpha below 0.996 with no
+  exception.
+- **Tried, no gain, reverted:** a precomputed slope per edge (removes a
+  divide per crossing: 3% fewer instructions, no change in time), and a
+  compositing loop with the source's half hoisted out (no change).
+
+**A finding, not fixed.** The same probe shows that from alpha 0.9961
+upward -- which is where Cairo calls a colour opaque, and so includes the
+opaque #240 path that has been in since claude.md #240 -- about 1.3% of
+partly covered pixels differ from Cairo by one grey level in one channel
+when the pixel underneath is translucent. It is not the coverage (that is
+Cairo's own) and not the two-step rounding I tried (single rounding, both
+floor and round, are worse, wrong on most pixels). Cairo's source for its
+opaque span path was not read. The existing tests do not see it because
+their scenes lay opaque shapes on a few uniform colours. With Cairo
+leaving, the edge pixels of those shapes change anyway (decision 4), so
+this is noted rather than chased.
+
+**Ideas left, and why.** *Runs instead of a dense coverage row*: pass
+each row's interior as (start, end, value) runs and let C add them,
+which removes the per-pixel diff pass and the zeroing loop; estimated 2x
+on rectangles, about 10% on circles, and a new C signature to keep in
+step; worth doing if rectangles through raster.f matter once slice 4 is
+in. *Analytic area coverage* (accumulate signed area per cell instead of
+sampling sixteen sub-scanlines): removes the 16x on every edge and is the
+one thing that would speed circles several times over, but it is exact
+only for shapes whose windings do not cancel, and a stroke's outline is a
+union of overlapping quads under the non-zero rule, so it needs a
+fallback for overlapping geometry and changes edge pixels (accepted, by
+decision 4) -- its own slice, with its own tests. *SIMD by hand*: the
+platform matrix (x86, ARM, MinGW) makes it a maintenance cost against a
+gain that clang's own vectoriser already takes some of.
+
+Per shape now (800x600; the direct path is what a drawing call runs):
+
+| shape | direct path | Cairo | raster.f -> img |
+|---|---|---|---|
+| opaque rect 40x30 | 0.2 us | 0.8 us | 9-12 us |
+| opaque circle r=20 | 3.0 us | 16 us | 35 us |
+| 50% rect 40x30 | 1.6 us | 1.4 us | 16 us |
+| 50% circle r=20 | 8.0 us | 28 us | 43-48 us |
+
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the
 crash class of decisions.md #348) and Homebrew's; libjpeg stays unless

@@ -1015,7 +1015,8 @@ static void festina_fill_and_border_with_colors(cairo_t *cr, int64_t fill_color,
 
 /* ---- claude.md #240: the solid-fill fast path -------------------------
  *
- * The overwhelmingly common draw call -- a flat, fully opaque colour,
+ * The overwhelmingly common draw call -- a flat colour (opaque, and since
+ * runtime.md phase 7 translucent too, over what is there),
  * no border, no gradient, an integer position on an untransformed (or
  * whole-pixel-translated) surface -- does not need a rasterizer at
  * all. A rectangle at integer coordinates covers whole pixels, so its
@@ -1039,7 +1040,7 @@ static void festina_fill_and_border_with_colors(cairo_t *cr, int64_t fill_color,
  * cairo_mask_surface produced -- verified by drawing the same scene both
  * ways and comparing the PNGs (tests/test_codegen.py's
  * TestSolidFillFastPath), not by eyeballing. Anything outside the
- * contract -- fillAlpha() below 1, an active gradient, a border, a
+ * contract -- an active gradient, a border, a
  * rotation/scale/fractional translation, a colour of `none`, a radius
  * over FESTINA_COVERAGE_MAX_RADIUS -- takes the Cairo path exactly as
  * before, so nothing observable changes except the time.
@@ -1168,14 +1169,29 @@ static inline uint32_t festina_channel_byte(double d) {
     return (uint32_t)(uint16_t)(d * 65535.0 + 0.5) >> 8;
 }
 
+/* The solid source as Cairo reduces it, premultiplied: alpha and each
+ * channel times alpha, in doubles, each to a 16-bit short and then its
+ * high byte -- the same route festina_image_blend_row takes, so the
+ * bytes that go OVER the destination are the ones cairo_fill's solid
+ * source would have made. At alpha 1.0 it is the opaque pixel the fast
+ * path always wrote (channel_byte of r/255 is the identity on a byte),
+ * and so is it at 0.999: an alpha of 0.9961 or more is byte 255, and a
+ * channel times such an alpha does not drop a byte -- which is also
+ * where Cairo itself starts calling a colour opaque. */
+static inline uint32_t festina_solid_pixel_premul(double r, double g, double b, double alpha) {
+    if (alpha > 1.0) alpha = 1.0;
+    if (alpha < 0.0) alpha = 0.0;
+    return (festina_channel_byte(alpha) << 24) | (festina_channel_byte(r * alpha) << 16)
+         | (festina_channel_byte(g * alpha) << 8) | festina_channel_byte(b * alpha);
+}
+
 static inline uint32_t festina_solid_pixel_from_style(void) {
-    return 0xFF000000u | (festina_channel_byte(g_fill_r) << 16)
-                       | (festina_channel_byte(g_fill_g) << 8)
-                       | festina_channel_byte(g_fill_b);
+    return festina_solid_pixel_premul(g_fill_r, g_fill_g, g_fill_b, g_fill_alpha);
 }
 
 static inline uint32_t festina_solid_pixel_from_color(int64_t color) {
-    return 0xFF000000u | ((uint32_t)color & 0xFFFFFFu);
+    return festina_solid_pixel_premul(((color >> 16) & 0xFF) / 255.0, ((color >> 8) & 0xFF) / 255.0,
+                                      (color & 0xFF) / 255.0, g_fill_alpha);
 }
 
 /* The style-state half of the contract for the plain (fillStyle-driven)
@@ -1184,14 +1200,12 @@ static inline uint32_t festina_solid_pixel_from_color(int64_t color) {
  * any gradient (they always did -- see festina_fill_and_border_override). */
 static int festina_solid_style_ok(void) {
     if (g_fill_none || g_fill_gradient) return 0;
-    if (g_fill_alpha != 1.0) return 0;
     if (g_border_set && g_line_width > 0.0) return 0;
     return 1;
 }
 
 static int festina_solid_override_ok(int64_t color, int border_effective) {
     if (color < 0 || border_effective) return 0;
-    if (g_fill_alpha != 1.0) return 0;
     return 1;
 }
 
@@ -1236,7 +1250,8 @@ static uint32_t *festina_direct_target(cairo_surface_t *s, int *stride_px, int *
     return (uint32_t *)data;
 }
 
-/* Fills the integer rectangle (x+tx, y+ty, w, h) with an opaque pixel.
+/* Fills the integer rectangle (x+tx, y+ty, w, h) with a solid pixel
+ * (premultiplied; translucent goes OVER what is there).
  * Returns 0 -- having touched nothing -- when the fast path does not
  * apply, so the caller falls through to Cairo. A negative width or
  * height extends the other way, as cairo_rectangle's does. */
@@ -1254,16 +1269,27 @@ static int festina_direct_rect(cairo_surface_t *s, int64_t x, int64_t y, int64_t
     int64_t x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
     int64_t x1 = x + w > sw ? sw : x + w, y1 = y + h > sh ? sh : y + h;
     if (x0 >= x1 || y0 >= y1) return 1;    /* nothing inside the surface: drawn, trivially */
-    for (int64_t row = y0; row < y1; row++) {
-        uint32_t *p = data + row * stride_px + x0;
-        for (int64_t i = 0, n = x1 - x0; i < n; i++) p[i] = pixel;
+    if ((pixel >> 24) == 0xFF) {
+        for (int64_t row = y0; row < y1; row++) {
+            uint32_t *p = data + row * stride_px + x0;
+            for (int64_t i = 0, n = x1 - x0; i < n; i++) p[i] = pixel;
+        }
+    } else if (pixel != 0) {
+        /* A translucent colour: the same OVER on every pixel. clang
+         * vectorises this at -O2 (about 12 instructions a pixel); a version
+         * with the source's half of the arithmetic hoisted out of the loop
+         * was measured and was no faster. */
+        for (int64_t row = y0; row < y1; row++) {
+            uint32_t *p = data + row * stride_px + x0;
+            for (int64_t i = 0, n = x1 - x0; i < n; i++) p[i] = festina_over_un8x4(pixel, p[i]);
+        }
     }
     cairo_surface_mark_dirty_rectangle(s, (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
     return 1;
 }
 
 /* Stamps the cached coverage for radius r, centred on (cx+tx, cy+ty),
- * blending an opaque pixel by coverage. Same fallthrough contract as
+ * blending a solid pixel by coverage. Same fallthrough contract as
  * festina_direct_rect. */
 static int festina_direct_circle(cairo_surface_t *s, int64_t cx, int64_t cy, int64_t tx, int64_t ty,
                                  int64_t r, uint32_t pixel) {
@@ -1286,8 +1312,8 @@ static int festina_direct_circle(cairo_surface_t *s, int64_t cx, int64_t cy, int
         for (int64_t col = x0; col < x1; col++) {
             uint32_t a = m[col - ox];
             if (a == 0) continue;
-            if (a == 0xFF) { p[col] = pixel; continue; }
-            uint32_t in = (festina_mul_un8(a, 0xFF) << 24)
+            if (a == 0xFF) { p[col] = festina_over_un8x4(pixel, p[col]); continue; }
+            uint32_t in = (festina_mul_un8(pixel >> 24, a) << 24)
                         | (festina_mul_un8((pixel >> 16) & 0xFF, a) << 16)
                         | (festina_mul_un8((pixel >> 8) & 0xFF, a) << 8)
                         | festina_mul_un8(pixel & 0xFF, a);
@@ -1782,8 +1808,9 @@ void festina_draw_circle(int64_t x, int64_t y, int64_t r) {
     festina_backing_require();
     int64_t tx, ty;
     /* claude.md #240: the opaque flat-colour case skips Cairo entirely;
-     * a gradient or a fillAlpha() below 1 still gets #104's mask stamp
-     * just below, and everything else the tessellating fallback. */
+     * a gradient still gets #104's mask stamp just below, and everything
+     * else the tessellating fallback. (Phase 7: a translucent flat colour
+     * takes the direct path too -- see festina_solid_pixel_premul.) */
     if (festina_canvas_direct_ok(&tx, &ty) &&
         festina_direct_circle(g_backing_surface, x, y, tx, ty, r,
                               festina_solid_pixel_from_style())) return;
@@ -2698,6 +2725,10 @@ void festina_image_blend_row(void *img, int64_t row, int64_t x0, int64_t x1, voi
     for (int64_t i = x0; i < x1; i++) {
         double v = c[i];
         if (!(v > 0.0)) continue;
+        /* Opaque colour, full coverage: the pixel is the colour. OVER of
+         * an opaque source returns the source (festina_over_un8x4's first
+         * line), so this skips the coverage byte and the loads. */
+        if (v >= 1.0 && sa == 255u) { p[i] = full; continue; }
         uint32_t m = v >= 1.0 ? 255u : (uint32_t)(v * 255.0 + 0.5);
         if (m == 0) continue;
         /* Full coverage, the interior of nearly every shape: MUL_UN8 by
