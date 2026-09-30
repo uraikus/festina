@@ -1310,6 +1310,26 @@ is not needed for this.
 5. **The bar:** "no drawing call slower than the path it replaces",
    measured per shape as in Finding 1 — or a looser one.
 
+**Decisions, answered** (the user, 2026-09-30):
+
+1. **Architecture: A.** Festina computes coverage, C composites rows.
+2. **Non-default text: scan the system fonts for named families, and fall
+   back when one is unavailable.** Slice 8 is therefore font discovery on
+   three platforms plus a rule for what "unavailable" draws (the bundled
+   face, and bold or italic asked of a family that lacks them, are
+   slice 8's to specify and to put in front of the user before it is
+   built). Cairo is removed.
+3. **Formats: implement.** 1-, 2-, 4- and 16-bit PNG and progressive
+   JPEG, in slice 6.
+4. **Pixels: accept** the measured edge movement; tests that pin an edge
+   are re-baselined against the new value with the reason written next to
+   it, never loosened.
+5. **The bar: no fixed number; examine every way to make it faster.** The
+   proposed bar stays the yardstick each slice measures against, but what
+   is asked for is the work: find the speed-ups (the profile and the
+   arithmetic, not the tolerance) and land the ones that hold, with the
+   measurement beside each.
+
 **Slices, in dependency order.** Each ends green, and with Cairo still
 present every slice compares against it, byte for byte where possible:
 

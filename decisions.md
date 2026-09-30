@@ -9065,3 +9065,17 @@ sanitizer link error the harness asserted on, and the italic Cairo
 process-order effect again -- still unexplained, now waited out by a
 settle loop); run 185 is those fixed. One run is a sample (#287), so the
 30- and 60-minute caps stay as set until several more say otherwise.
+
+## Phase 7: the five decisions, answered (2026-09-30)
+
+Recorded here as well as in runtime.md so the reasons live with the
+project's other decisions. Architecture A; system-font scanning with a
+fallback for non-default text; every PNG depth and progressive JPEG
+implemented; edge-pixel movement accepted, with edge-pinning tests
+re-baselined and never loosened; and, for the performance bar, a
+mandate to keep finding speed rather than a number to meet. The
+consequences, in order: slice 6 grows (decoders, not refusals); slice 8
+grows (font discovery is per-platform work, and what an unavailable
+family draws must be settled with the user before it is built); slice 4
+may move edge pixels and says so when it does; and slice 3 stays open
+until the profile has nothing exact left to give.
