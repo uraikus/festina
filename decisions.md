@@ -9054,3 +9054,14 @@ dependency list is trimmed (no Node, Playwright, wasi or X server) on
 the reading that the harnesses build and compare compilers and open no
 window -- FESTINA_STRICT_DEPS=1 makes a wrong reading fail loudly, but
 the first run is what confirms it.
+
+**Verified on CI (run 185, all four jobs green, commit afbc265):** linux's
+test step 15:36 (job 16:09), bootstrap 24:37 (job 24:57), macOS 17:43,
+Windows 26:10; the longest job, and so the wall time, is Windows, at
+29 minutes, where the single linux job had needed more than 44:35. Run
+184, the first with the split, found three things the split did not
+cause (a `.f` test scene picked up by the bootstrap corpus, a MinGW
+sanitizer link error the harness asserted on, and the italic Cairo
+process-order effect again -- still unexplained, now waited out by a
+settle loop); run 185 is those fixed. One run is a sample (#287), so the
+30- and 60-minute caps stay as set until several more say otherwise.
