@@ -1455,7 +1455,7 @@ void func rasFillCoreImg(target:img, pts:arr[float], ends:arr[int], rule:int,
 
     int row = RAS_Y0
     while row < RAS_Y1 {
-        rasRowCoverage(row, sw, pts, ends, rule)
+        rasCoverImg(row, sw, pts, ends, rule)
         if useMask {
             int base = row * sw
             int c = RAS_LO
@@ -1595,7 +1595,7 @@ void func rasFillGradientImg(target:img, dev:arr[float], ends:arr[int], rule:int
 
     int row = RAS_Y0
     while row < RAS_Y1 {
-        if aa { rasRowCoverage(row, sw, dev, ends, rule) } else { rasRowCoverageNoAA(row, sw, dev, ends, rule) }
+        if aa { rasCoverImg(row, sw, dev, ends, rule) } else { rasRowCoverageNoAA(row, sw, dev, ends, rule) }
         float fy = row.toFloat() + 0.5
         int i = RAS_LO
         while i < RAS_HI {
@@ -1665,8 +1665,286 @@ void func rasClearImg(target:img, dev:arr[float], ends:arr[int], rule:int, aa:bo
     if !rasPathExtent(dev, sh) { return }
     int row = RAS_Y0
     while row < RAS_Y1 {
-        if aa { rasRowCoverage(row, sw, dev, ends, rule) } else { rasRowCoverageNoAA(row, sw, dev, ends, rule) }
+        if aa { rasCoverImg(row, sw, dev, ends, rule) } else { rasRowCoverageNoAA(row, sw, dev, ends, rule) }
         target.__clearRow(row, RAS_LO, RAS_HI, RAS_COV)
         row = row + 1
+    }
+}
+
+// ---- Phase 7, slice 4: axis-aligned boxes, analytically ----
+//
+// A rectangle that is only scaled and moved (no rotation, no skew) is a
+// box on the surface, and a box's coverage needs no edge walk and no
+// sub-scanlines: a pixel's coverage is the product of how much of its
+// width and how much of its height the box covers. A border is the
+// difference of two boxes. Most rectangles a program draws are these, and
+// the general scanline path spent hundreds of thousands of instructions on
+// a 40x30 one with a border.
+//
+// Whole-pixel boxes come out exactly as Cairo draws them (coverage 0 or 1,
+// or 1/2 at the edge of an odd-width line); fractional edges get the exact
+// area where the scanline path samples sixteen times in y.
+
+// How much of the unit interval [c, c+1] the span [a0, a1] covers.
+float func rasOverlap(a0:float, a1:float, c:int) {
+    float lo = rasMaxF(a0, c.toFloat())
+    float hi = rasMinF(a1, (c + 1).toFloat())
+    if hi > lo { return hi - lo }
+    return 0.0
+}
+
+arr[float] RAS_BOXX = []
+arr[float] RAS_BOXI = []
+
+// Fill the box [ox0, ox1] x [oy0, oy1], less the box [ix0, ix1] x [iy0,
+// iy1] when `hasInner` -- all in device pixels -- with a solid colour at
+// `alpha`, row by row through img.__blendRow.
+void func rasBoxImg(target:img, ox0:float, oy0:float, ox1:float, oy1:float,
+                    ix0:float, iy0:float, ix1:float, iy1:float, hasInner:bool,
+                    r:int, g:int, b:int, alpha:float) {
+    int sw = target.width
+    int sh = target.height
+    if sw <= 0 || sh <= 0 { return }
+    if alpha <= 0.0 { return }
+    if ox1 <= ox0 || oy1 <= oy0 { return }
+    int cx0 = rasClamp(Math.floor(ox0), 0, sw)
+    int cx1 = rasClamp(Math.floor(ox1) + 1, 0, sw)
+    int ry0 = rasClamp(Math.floor(oy0), 0, sh)
+    int ry1 = rasClamp(Math.floor(oy1) + 1, 0, sh)
+    if cx1 <= cx0 || ry1 <= ry0 { return }
+
+    rasEnsureCov(sw)
+    while RAS_BOXX.length < sw { RAS_BOXX.push(0.0) }
+    while RAS_BOXI.length < sw { RAS_BOXI.push(0.0) }
+    int c = cx0
+    while c < cx1 {
+        RAS_BOXX[c] = rasOverlap(ox0, ox1, c)
+        RAS_BOXI[c] = 0.0
+        if hasInner { RAS_BOXI[c] = rasOverlap(ix0, ix1, c) }
+        c = c + 1
+    }
+    int row = ry0
+    float lastYo = -1.0
+    float lastYi = -1.0
+    while row < ry1 {
+        float yo = rasOverlap(oy0, oy1, row)
+        float yi = 0.0
+        if hasInner { yi = rasOverlap(iy0, iy1, row) }
+        // Every row with the same vertical overlaps has the same coverage
+        // -- all of a box's middle -- and the blend does not touch RAS_COV,
+        // so the row before's is reused as it stands.
+        if yo != lastYo || yi != lastYi {
+            // Put back what the last row wrote, then write this one: RAS_COV
+            // is zero outside RAS_LO .. RAS_HI, and stays so.
+            int z = RAS_LO
+            while z < RAS_HI {
+                RAS_COV[z] = 0.0
+                z = z + 1
+            }
+            RAS_LO = cx0
+            RAS_HI = cx1
+            c = cx0
+            while c < cx1 {
+                float v = (RAS_BOXX[c] * yo) - (RAS_BOXI[c] * yi)
+                if v > 0.0 { RAS_COV[c] = v }
+                c = c + 1
+            }
+            lastYo = yo
+            lastYi = yi
+        }
+        target.__blendRow(row, cx0, cx1, RAS_COV, r, g, b, alpha)
+        row = row + 1
+    }
+}
+
+// ---- Phase 7, slice 4: exact area coverage, for shapes that cannot overlap ----
+//
+// The scanline path samples sixteen lines through each row and walks every
+// edge for each. That is what a path of any kind needs -- self-crossing,
+// the even-odd rule, a stroke's union of overlapping quads -- but a circle,
+// a rotated rectangle or a ring is one simple loop (or two, wound opposite
+// ways), and for those a pixel's coverage is just the signed area the
+// edges cut out of it, summed along the row. One pass over the few edges
+// that cross a row, exact in both directions, and no sixteen-fold repeat.
+//
+// For each edge piece inside the row's band, the area to the right of it
+// within each pixel is accumulated into RAS_ACC (the technique of font-rs
+// and stb_truetype); the running sum along the row is the coverage, clamped
+// to 1. Shapes whose windings could cancel or double up must not use this:
+// draw.f uses it only for the outlines it builds itself.
+
+arr[float] RAS_ACC = []
+int RAS_ACC_LO = 0
+int RAS_ACC_HI = 0
+
+// One piece of an edge inside a row's band, from x = xs to x = xe, carrying
+// the signed height d (positive going down). Clipped to the surface: left
+// of 0 it all lands on pixel 0 (everything to its right is inside), right
+// of sw it is dropped.
+void func rasAreaPiece(xs:float, xe:float, d:float, swf:float) {
+    if xs <= 0.0 && xe <= 0.0 {
+        RAS_ACC[0] = RAS_ACC[0] + d
+        RAS_ACC_LO = 0
+        if RAS_ACC_HI < 1 { RAS_ACC_HI = 1 }
+        return
+    }
+    if xs >= swf && xe >= swf { return }
+    if (xs < 0.0) != (xe < 0.0) {
+        float t = (0.0 - xs) / (xe - xs)
+        rasAreaPiece(xs, 0.0, d * t, swf)
+        rasAreaPiece(0.0, xe, d * (1.0 - t), swf)
+        return
+    }
+    if (xs > swf) != (xe > swf) {
+        float t = (swf - xs) / (xe - xs)
+        rasAreaPiece(xs, swf, d * t, swf)
+        rasAreaPiece(swf, xe, d * (1.0 - t), swf)
+        return
+    }
+
+    float x0 = rasMinF(xs, xe)
+    float x1 = rasMaxF(xs, xe)
+    int x0i = Math.floor(x0)
+    int x1i = Math.floor(x1) + 1
+    if x0i < RAS_ACC_LO { RAS_ACC_LO = x0i }
+    if x1i + 1 > RAS_ACC_HI { RAS_ACC_HI = x1i + 1 }
+    float x0floor = x0i.toFloat()
+    if x1i <= (x0i + 1) {
+        // Within one pixel: its share and the next one's.
+        float xmf = (0.5 * (xs + xe)) - x0floor
+        RAS_ACC[x0i] = RAS_ACC[x0i] + (d - (d * xmf))
+        RAS_ACC[x0i + 1] = RAS_ACC[x0i + 1] + (d * xmf)
+        return
+    }
+    float s = 1.0 / (x1 - x0)
+    float x0f = x0 - x0floor
+    float a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f)
+    float x1f = x1 - x1i.toFloat() + 1.0
+    float am = 0.5 * s * x1f * x1f
+    RAS_ACC[x0i] = RAS_ACC[x0i] + (d * a0)
+    if x1i == (x0i + 2) {
+        RAS_ACC[x0i + 1] = RAS_ACC[x0i + 1] + (d * (1.0 - a0 - am))
+    } else {
+        float a1 = s * (1.5 - x0f)
+        RAS_ACC[x0i + 1] = RAS_ACC[x0i + 1] + (d * (a1 - a0))
+        int xi = x0i + 2
+        while xi < (x1i - 1) {
+            RAS_ACC[xi] = RAS_ACC[xi] + (d * s)
+            xi = xi + 1
+        }
+        float a2 = a1 + ((x1i - x0i - 3).toFloat() * s)
+        RAS_ACC[x1i - 1] = RAS_ACC[x1i - 1] + (d * (1.0 - a2 - am))
+    }
+    RAS_ACC[x1i] = RAS_ACC[x1i] + (d * am)
+}
+
+// One pixel row's coverage of a simple closed outline (or loops wound
+// opposite ways), into RAS_COV like rasRowCoverage, with the same
+// RAS_LO .. RAS_HI contract.
+void func rasRowCoverageArea(row:int, sw:int, pts:arr[float], ends:arr[int]) {
+    int c = RAS_LO
+    while c < RAS_HI {
+        RAS_COV[c] = 0.0
+        c = c + 1
+    }
+    RAS_LO = sw
+    RAS_HI = 0
+    while RAS_ACC.length < sw + 3 { RAS_ACC.push(0.0) }
+    RAS_ACC_LO = sw
+    RAS_ACC_HI = 0
+    float top = row.toFloat()
+    float bottom = top + 1.0
+    float swf = sw.toFloat()
+
+    int sub = 0
+    int from = 0
+    while sub < ends.length {
+        int to = ends[sub]
+        int p = from
+        while p < to {
+            int q = p + 1
+            if q == to { q = from }
+            float ax = pts[p * 2]
+            float ay = pts[(p * 2) + 1]
+            float bx = pts[q * 2]
+            float by = pts[(q * 2) + 1]
+            if ay != by {
+                float dir = 1.0
+                float x0 = ax
+                float y0 = ay
+                float x1 = bx
+                float y1 = by
+                if ay > by {
+                    dir = -1.0
+                    x0 = bx
+                    y0 = by
+                    x1 = ax
+                    y1 = ay
+                }
+                // x0,y0 is the upper end now.
+                float yt = rasMaxF(y0, top)
+                float yb = rasMinF(y1, bottom)
+                if yb > yt {
+                    float slope = (x1 - x0) / (y1 - y0)
+                    float xs = x0 + ((yt - y0) * slope)
+                    float xe = x0 + ((yb - y0) * slope)
+                    rasAreaPiece(xs, xe, (yb - yt) * dir, swf)
+                }
+            }
+            p = p + 1
+        }
+        from = to
+        sub = sub + 1
+    }
+
+    // The running sum is the coverage.
+    int lo = rasMax0(RAS_ACC_LO)
+    int hi = RAS_ACC_HI
+    if hi > sw { hi = sw }
+    float run = 0.0
+    c = lo
+    while c < hi {
+        run = run + RAS_ACC[c]
+        float v = Math.abs(run)
+        if v > 1.0 { v = 1.0 }
+        RAS_COV[c] = v
+        c = c + 1
+    }
+    // An edge dropped off the right of the surface leaves the sum standing
+    // inside the shape out to the last column.
+    if Math.abs(run) > 0.0001 {
+        float v = Math.abs(run)
+        if v > 1.0 { v = 1.0 }
+        while c < sw {
+            RAS_COV[c] = v
+            c = c + 1
+        }
+        hi = sw
+    }
+    // Put the accumulators back to zero: RAS_ACC is zero outside its range.
+    c = lo
+    while c < (RAS_ACC_HI + 1) && c < (sw + 3) {
+        RAS_ACC[c] = 0.0
+        c = c + 1
+    }
+    RAS_LO = lo
+    RAS_HI = hi
+}
+
+int func rasMax0(v:int) {
+    if v < 0 { return 0 }
+    return v
+}
+
+// Which coverage the Img fills use: the sampled one, which any path needs,
+// or the exact-area one, which draw.f asks for around the simple outlines
+// it builds itself (a circle, a ring, a parallelogram).
+bool RAS_SIMPLE = false
+
+void func rasCoverImg(row:int, sw:int, pts:arr[float], ends:arr[int], rule:int) {
+    if RAS_SIMPLE {
+        rasRowCoverageArea(row, sw, pts, ends)
+    } else {
+        rasRowCoverage(row, sw, pts, ends, rule)
     }
 }

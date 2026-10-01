@@ -154,13 +154,14 @@ def _draw(compile_and_run, monkeypatch, canvas, layer, cairo):
 
 def _premul(path):
     w, h, stride, bpp, out = _png_raw(path)
-    assert bpp == 4
+    assert bpp in (3, 4)   # a picture with no transparency saves as RGB
     px = []
     for y in range(h):
         row = []
         for x in range(w):
-            o = y * stride + x * 4
-            r, g, b, a = out[o:o + 4]
+            o = y * stride + x * bpp
+            r, g, b = out[o:o + 3]
+            a = out[o + 3] if bpp == 4 else 255
             row.append(((r * a + 127) // 255, (g * a + 127) // 255, (b * a + 127) // 255, a))
         px.append(row)
     return w, h, px
@@ -249,3 +250,75 @@ def test_a_stamped_circle_is_the_circle_draw_f_draws(compile_and_run, tmp_path, 
         assert worst <= 1, (kind, worst)
         drawn = sum(1 for row in a for p in row if p[3])
         assert drawn > 8000, drawn
+
+
+def test_whole_pixel_boxes_with_borders_are_cairos_to_one_level(compile_and_run, tmp_path,
+                                                                 monkeypatch):
+    """A rectangle that is only scaled and moved is drawn analytically (a
+    box, and its border the difference of two boxes) rather than through the
+    scanline path. At whole-pixel coordinates there is one right answer --
+    coverage 0, 1, or 1/2 at the edge of an odd-width line -- and Cairo
+    draws it, so these are compared to Cairo at one level (the rounding of
+    a translucent blend): every line width from 1 to 6, translucent and
+    opaque, negative extents, and a border so wide the inner box
+    disappears."""
+    monkeypatch.delenv("DISPLAY", raising=False)
+    body = ""
+    for i, lw in enumerate((1, 2, 3, 4, 5, 6)):
+        body += (f"lineWidth({lw})\nfillAlpha({1.0 if i % 2 == 0 else 0.5})\n"
+                 f"{{T}}drawRect({8 + 40 * i}, 8, 30, 24, red)\n"
+                 f"{{T}}drawRect({8 + 40 * i}, 40, 9, 9, red)\n")
+    body += ("lineWidth(12)\nfillAlpha(1.0)\n{T}drawRect(10, 70, 8, 8, red)\n"
+             "lineWidth(2)\n{T}drawRect(70, 90, -20, -15, red)\n"
+             "fillAlpha(0.6)\n{T}translate(5, 3)\n{T}drawRect(100, 70, 30, 20, red)\n"
+             "{T}resetTransform()\n{T}scale(2.0, 1.0)\n{T}drawRect(60, 100, 20, 10, red)\n"
+             "fillAlpha(1.0)\n{T}resetTransform()\n")
+    head = _HEAD + "borderColor(ink)\n"
+    program = (head + "clearCanvas()\nfillStyle(white)\n" + "drawRect(0, 0, 260, 130)\nfillStyle(red)\n"
+               + body.format(T="") + "img a = blankImage(260, 130)\n"
+               + "a.drawRect(0, 0, 260, 130, white)\nfillStyle(red)\n" + body.format(T="a.")
+               + "log(a.save('layer.png'))\nlog(saveCanvas('canvas.png'))\n")
+    for name, env in (("o", {}), ("c", {"FESTINA_CAIRO_DRAW": "1"})):
+        result = compile_and_run(program, env=env)
+        assert result.returncode == 0 and result.stdout.split() == ["true", "true"], result.stderr
+        for kind in ("layer", "canvas"):
+            os.replace(tmp_path / f"{kind}.png", tmp_path / f"{name}_{kind}.png")
+    for kind in ("layer", "canvas"):
+        worst, differing, _ = _compare(str(tmp_path / f"o_{kind}.png"), str(tmp_path / f"c_{kind}.png"))
+        assert worst <= 1, (kind, worst, differing)
+        w, h, px = _premul(str(tmp_path / f"o_{kind}.png"))
+        assert sum(1 for row in px for p in row if p[:3] != (255, 255, 255) and p[3]) > 3000
+
+
+def test_rotated_borders_and_thin_rectangles_are_cairos_picture(compile_and_run, tmp_path,
+                                                                 monkeypatch):
+    """A bordered rectangle under any matrix is drawn as the ring between
+    the rectangle grown by half the pen and shrunk by it, each corner
+    mitred, filled with the exact area -- unless the pen leaves no hole, or
+    the rectangle has no width, where the general stroker is used. Rotated,
+    skewed and unevenly scaled, wide pens and thin rectangles, against
+    Cairo's own stroke of the same rectangle: the edges' coverage differs
+    a little (exact against sampled), the picture does not."""
+    monkeypatch.delenv("DISPLAY", raising=False)
+    body = ("fillAlpha(1.0)\nlineWidth(3)\n{T}translate(40, 40)\n{T}rotate(25.0)\n"
+            "{T}drawRect(0, 0, 50, 30, red)\n{T}resetTransform()\n"
+            "lineWidth(7)\nfillAlpha(0.6)\n{T}translate(130, 30)\n{T}rotate(70.0)\n"
+            "{T}drawRect(-10, -8, 40, 22, red)\n{T}resetTransform()\n"
+            "lineWidth(2)\nfillAlpha(1.0)\n{T}translate(30, 100)\n{T}scale(2.0, 0.6)\n{T}rotate(15.0)\n"
+            "{T}drawRect(0, 0, 40, 30, red)\n{T}resetTransform()\n"
+            "lineWidth(5)\n{T}translate(120, 90)\n{T}rotate(40.0)\n"
+            "{T}drawRect(0, 0, 4, 40, red)\n{T}drawRect(20, 0, 5, 5, red)\n{T}drawRect(40, 0, 30, 0, red)\n"
+            "{T}resetTransform()\n")
+    program = (_HEAD + "borderColor(ink)\nclearCanvas()\nfillStyle(white)\ndrawRect(0, 0, 220, 160)\nfillStyle(red)\n"
+               + body.format(T="") + "img a = blankImage(220, 160)\n"
+               + "a.drawRect(0, 0, 220, 160, white)\nfillStyle(red)\n" + body.format(T="a.")
+               + "log(a.save('layer.png'))\nlog(saveCanvas('canvas.png'))\n")
+    for name, env in (("o", {}), ("c", {"FESTINA_CAIRO_DRAW": "1"})):
+        result = compile_and_run(program, env=env)
+        assert result.returncode == 0 and result.stdout.split() == ["true", "true"], result.stderr
+        for kind in ("layer", "canvas"):
+            os.replace(tmp_path / f"{kind}.png", tmp_path / f"{name}_{kind}.png")
+    for kind in ("layer", "canvas"):
+        worst, differing, flat_bad = _compare(str(tmp_path / f"o_{kind}.png"), str(tmp_path / f"c_{kind}.png"))
+        assert worst <= 24, (kind, worst, differing)
+        assert not flat_bad, (kind, flat_bad[:5])

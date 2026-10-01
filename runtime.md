@@ -1340,8 +1340,9 @@ present every slice compares against it, byte for byte where possible:
 2. ✅ the row-compositing primitive and raster.f driving an `img` directly
    (decision 1); fills and paths, compared with Cairo
 3. ◐ coverage speed to the bar (decision 5) — measured per shape; first pass done, see "Slice 3, first pass"
-4. fills, strokes, paths, gradients, clip and transforms off Cairo: the
-   36 fallback functions lose their contexts, one group at a time
+4. ◐ fills, strokes, paths, gradients and transforms off Cairo (done: see
+   "Slice 4, drawing"); clip, `drawImage` and the rest of the fallback
+   functions wait for slice 5, where their sources are
 5. images as sources: integer-offset blits (exact), scaled and rotated
    draws, `resize`, `clip`, `clone` — a resampler, compared with a bound
 6. ✅ the decoder gaps (decision 3): every PNG and progressive JPEG (see "Slice 6, PNG" and "Slice 6, JPEG")
@@ -1658,6 +1659,75 @@ here because nothing in the decision asked for it.
 Speed: a 1024x768 progressive file 0.29 s, a 645 KB baseline one 0.44 s
 (libjpeg does those in tens of milliseconds); the loops are the ones phase
 2 wrote, correctness first, and they are worth measuring before slice 9.
+
+**Slice 4, drawing.** Everything the runtime draws with a fill or a stroke
+-- `drawRect`, `drawCircle`, `drawPixel`, the three `clear` calls, paths
+(`beginPath` .. `fillPath` / `strokePath`), gradient fills, and every
+matrix over them -- is computed by a new component, `draw.f`, and no longer
+builds a Cairo context. It is the architecture the decision chose (A, and
+text.f's precedent): the C side keeps the state (colours, alpha, line width,
+gradient, transform) and calls through the hook table in
+`runtime/festina_draw_hooks.h`, registered by a constructor exactly as
+text.f is; `draw.f` makes the outline, its coverage and its stroke with
+raster.f, and the blend goes back through `img.__blendRow` /
+`__blendRowWords` / `__clearRow` into the surface's own bytes (those three
+are internal -- the leading underscores keep them out of `api.md` -- and,
+like every img method, need their entry in `semantic.py`, `codegen.py`, and
+BOTH codegens' `declare` lists and the bootstrap's op table). The direct
+pixel path of claude.md #240 stays, and now also covers translucent
+colours (`festina_solid_pixel_premul`). `FESTINA_CAIRO_DRAW=1` still
+draws the old way: it is the oracle until slice 9, and the tests that
+compare the two set it in both runs.
+
+*What changed on screen.* Edge pixels, within decision 4 (accepted): a
+circle's, a rotated rectangle's and a ring's coverage is now exact area
+(below), where Cairo's is sampled, so they differ from Cairo by a few
+levels on the edge and nowhere else (the tests check both halves: a bound,
+and that no pixel with four identical neighbours differs). Whole-pixel
+boxes, with or without borders, are Cairo's to one level.
+
+*Where the speed came from.* Measured before each, on this container:
+- a box (a rectangle that is only scaled and moved, solid fill) is two
+  overlap products per row instead of a path: bordered rectangle
+  54 -> 11 us; identical rows (the box's middle) reuse the last row's
+  coverage;
+- a circle's stroke is the ring between two circles, a rectangle's the
+  ring between the rectangle grown and shrunk by half the pen (each corner
+  mitred, so under any matrix the offsets are again rectangles) -- two
+  polygons, where the general stroker makes a quad and a join per segment.
+  A pen that leaves no hole, or a rectangle with no width, still goes to
+  the stroker; so does a circle under a non-uniform scale or a skew;
+- `rasRowCoverageArea`: the exact signed area each edge cuts from each
+  pixel, summed along the row (the technique of font-rs and stb_truetype),
+  one pass instead of sixteen sampled lines. It is exact only for a simple
+  loop (or two wound opposite ways), so it is a mode (`RAS_SIMPLE`) that
+  `draw.f` switches on around the outlines it builds itself -- circle,
+  ring, parallelogram, clear -- and never around a path or a stroke's
+  union of quads. Tests: `tests/test_raster_area.py` checks it against
+  an oracle that does not lean on the sampler (rectangles are exactly the
+  product of their overlaps, including off every side of the surface and
+  at half pixels; the coverage of any inside shape sums to its shoelace
+  area, a ring's hole subtracting) and bounds it against the sampled one.
+  Three of its bugs were found by writing those tests first (an edge
+  clipped at the left that recursed for ever, a left clip that left the
+  sum unstarted, a right clip that lost the interior), and each is
+  put back on purpose in the mutation checks.
+
+| shape (800x600, per call) | Cairo | draw.f |
+|---|---|---|
+| bordered rect 50x30 | 4 us | 11 us |
+| rotated rect, fill | 4 us | 6 us |
+| rotated rect, bordered | 28-35 us | 38-41 us |
+| bordered circle r=20 | 66 us | 62-69 us |
+| circle r=100, fill (direct stamp) | 46 us | 47 us |
+| clearCircle r=50 | 25 us | 58 us |
+
+(One run each, a process baseline subtracted; the noise is about 30 %.)
+The remaining distance is the compiled Festina loops that walk a row
+(bounds-checked, a few times C's cost) and `festina_image_blend_row`'s
+per-pixel loop; handing runs rather than pixels to C, and a span-fill
+primitive for opaque interiors, are the next things to try. Status stays
+open until that is measured.
 
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the

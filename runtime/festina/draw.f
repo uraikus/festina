@@ -41,6 +41,16 @@ void func drawFillNoAA(target:img, pts:arr[float], ends:arr[int], src:arr[float]
     }
 }
 
+// drawFill for an outline that is one simple loop -- or two wound opposite
+// ways -- so its coverage can be the exact area (raster.f, rasRowCoverageArea)
+// and not the sampled one. Only the shapes drawn here may ask for it.
+void func drawFillSimple(target:img, pts:arr[float], ends:arr[int], src:arr[float],
+                         alpha:float, m:arr[float]) {
+    RAS_SIMPLE = true
+    drawFill(target, pts, ends, src, alpha, m)
+    RAS_SIMPLE = false
+}
+
 // drawRect: the rectangle (x, y, w, h) in USER space under the matrix m
 // (Cairo's order: xx, yx, xy, yy, x0, y0), filled and then stroked, each
 // in its own colour and both at `alpha`. A negative w or h extends the
@@ -49,12 +59,61 @@ void func festinaDrawRect(target:img, x:float, y:float, w:float, h:float,
                           fillOn:bool, fillSrc:arr[float],
                           borderOn:bool, br:int, bg:int, bb:int, width:float,
                           alpha:float, m:arr[float]) {
+    // Only scaled and moved: a box on the surface, drawn analytically
+    // (rasBoxImg) -- a solid fill and the border, which is the difference
+    // of two boxes. A gradient fill, a rotation or a skew take the general
+    // path below.
+    if m[1] == 0.0 && m[2] == 0.0 && m[0] > 0.0 && m[3] > 0.0 && (fillSrc[0] == 0.0 || !fillOn) {
+        float ax = (m[0] * x) + m[4]
+        float bx = (m[0] * (x + w)) + m[4]
+        float ay = (m[3] * y) + m[5]
+        float by = (m[3] * (y + h)) + m[5]
+        float x0 = rasMinF(ax, bx)
+        float x1 = rasMaxF(ax, bx)
+        float y0 = rasMinF(ay, by)
+        float y1 = rasMaxF(ay, by)
+        if fillOn {
+            rasBoxImg(target, x0, y0, x1, y1, 0.0, 0.0, 0.0, 0.0, false,
+                      Math.round(fillSrc[1]), Math.round(fillSrc[2]), Math.round(fillSrc[3]), alpha)
+        }
+        if borderOn {
+            // The pen is width wide in USER space, so it is width * scale
+            // on the surface, half of it either side of the edge.
+            float hx = m[0] * width * 0.5
+            float hy = m[3] * width * 0.5
+            bool inner = (x0 + hx) < (x1 - hx) && (y0 + hy) < (y1 - hy)
+            rasBoxImg(target, x0 - hx, y0 - hy, x1 + hx, y1 + hy,
+                      x0 + hx, y0 + hy, x1 - hx, y1 - hy, inner, br, bg, bb, alpha)
+        }
+        return
+    }
     arr[float] pts = [x, y, x + w, y, x + w, y + h, x, y + h]
     arr[int] ends = [4]
     arr[int] closed = [1]
-    if fillOn { drawFill(target, pts, ends, fillSrc, alpha, m) }
+    if fillOn { drawFillSimple(target, pts, ends, fillSrc, alpha, m) }
     if borderOn {
-        rasStrokePathTImg(target, pts, ends, closed, width, br, bg, bb, alpha, m)
+        // Stroked in USER space, so under any matrix the border is the
+        // ring between the rectangle grown by half the pen and shrunk by
+        // it (mitred corners make the offsets rectangles again), as long
+        // as the pen leaves a hole. A degenerate or too-thin rectangle
+        // goes to the general stroker.
+        float hw = width * 0.5
+        float nx = rasMinF(x, x + w)
+        float ny = rasMinF(y, y + h)
+        float aw = Math.abs(w)
+        float ah = Math.abs(h)
+        if aw > width && ah > width {
+            arr[float] ring = [nx - hw, ny - hw, nx + aw + hw, ny - hw,
+                               nx + aw + hw, ny + ah + hw, nx - hw, ny + ah + hw,
+                               nx + hw, ny + hw, nx + hw, ny + ah - hw,
+                               nx + aw - hw, ny + ah - hw, nx + aw - hw, ny + hw]
+            arr[int] ringEnds = [4, 8]
+            RAS_SIMPLE = true
+            rasFillPathTImg(target, ring, ringEnds, RAS_NONZERO, br, bg, bb, alpha, m)
+            RAS_SIMPLE = false
+        } else {
+            rasStrokePathTImg(target, pts, ends, closed, width, br, bg, bb, alpha, m)
+        }
     }
 }
 
@@ -80,19 +139,58 @@ void func drawCirclePoints(pts:arr[float], ends:arr[int], cx:float, cy:float, r:
 }
 
 // drawCircle: centre (cx, cy), radius, the same way.
+// Whether the matrix is a similarity -- a rotation and/or a UNIFORM scale,
+// reflection allowed -- under which the stroke of a circle is again a ring
+// of circles; any other matrix (a non-uniform scale, a skew) makes the
+// stroke an ellipse's offset curve and needs the general stroker.
+bool func drawIsSimilarity(m:arr[float]) {
+    float a = (m[0] * m[0]) + (m[1] * m[1])
+    float b = (m[2] * m[2]) + (m[3] * m[3])
+    float dot = (m[0] * m[2]) + (m[1] * m[3])
+    float scale = a + b
+    if scale <= 0.0 { return false }
+    return Math.abs(a - b) <= (scale * 0.000000001) && Math.abs(dot) <= (scale * 0.000000001)
+}
+
 void func festinaDrawCircle(target:img, cx:float, cy:float, radius:float,
                             fillOn:bool, fillSrc:arr[float],
                             borderOn:bool, br:int, bg:int, bb:int, width:float,
                             alpha:float, m:arr[float]) {
+    if radius <= 0.0 { return }
     arr[float] pts = []
     arr[int] ends = []
-    arr[int] closed = [1]
-    if radius <= 0.0 { return }
     drawCirclePoints(pts, ends, cx, cy, radius, m)
     if ends.length == 0 { return }
-    if fillOn { drawFill(target, pts, ends, fillSrc, alpha, m) }
+    if fillOn { drawFillSimple(target, pts, ends, fillSrc, alpha, m) }
     if borderOn {
-        rasStrokePathTImg(target, pts, ends, closed, width, br, bg, bb, alpha, m)
+        float half = width * 0.5
+        if drawIsSimilarity(m) {
+            // The stroke is the ring between two circles: the outer one
+            // counter-clockwise and the inner one reversed, filled
+            // non-zero -- two polygons of n chords where the general
+            // stroker makes a quad and a join for each of n segments.
+            arr[float] ring = []
+            arr[int] ringEnds = []
+            drawCirclePoints(ring, ringEnds, cx, cy, radius + half, m)
+            if radius > half {
+                arr[float] inner = []
+                arr[int] innerEnds = []
+                drawCirclePoints(inner, innerEnds, cx, cy, radius - half, m)
+                int k = Math.floorDiv(inner.length, 2) - 1
+                while k >= 0 {
+                    ring.push(inner[k * 2])
+                    ring.push(inner[(k * 2) + 1])
+                    k = k - 1
+                }
+                ringEnds.push(Math.floorDiv(ring.length, 2))
+            }
+            RAS_SIMPLE = true
+            rasFillPathTImg(target, ring, ringEnds, RAS_NONZERO, br, bg, bb, alpha, m)
+            RAS_SIMPLE = false
+        } else {
+            arr[int] closed = [1]
+            rasStrokePathTImg(target, pts, ends, closed, width, br, bg, bb, alpha, m)
+        }
     }
 }
 
@@ -121,7 +219,9 @@ void func festinaClear(target:img, kind:int, a:float, b:float, c:float, d:float,
         ends = [4]
     }
     if ends.length == 0 { return }
+    RAS_SIMPLE = kind != 2
     rasClearImg(target, rasTransformPoints(m, pts), ends, RAS_NONZERO, kind != 2)
+    RAS_SIMPLE = false
 }
 
 // A path the program built with beginPath / moveTo / lineTo / curveTo /
@@ -213,8 +313,8 @@ void func festinaDrawPath(target:img, ops:arr[int], coords:arr[float],
 // (2r + 2) x (2r + 2) square, one byte a pixel, row by row -- what the
 // runtime's direct circle stamp (claude.md #104, #240) caches per radius
 // and blends by hand. Made here, by the same rasteriser that draws every
-// other circle, so a circle stamped at an integer centre and one drawn
-// through festinaDrawCircle agree.
+// other circle -- exact-area coverage included -- so a circle stamped at an
+// integer centre and one drawn through festinaDrawCircle agree.
 arr[int] func festinaCircleMask(r:int) {
     int size = (r * 2) + 2
     arr[int] out = []
@@ -226,7 +326,7 @@ arr[int] func festinaCircleMask(r:int) {
     rasEnsureCov(size)
     int row = 0
     while row < size {
-        rasRowCoverage(row, size, pts, ends, RAS_NONZERO)
+        rasRowCoverageArea(row, size, pts, ends)
         int c = 0
         while c < size {
             float v = RAS_COV[c]
