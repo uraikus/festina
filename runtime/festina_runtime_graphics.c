@@ -2738,6 +2738,603 @@ int64_t festina_image_get_pixel_color(void *img, int64_t x, int64_t y) {
     return festina_pixel_color_from_surface(((FestinaImageBox *)img)->surface, x, y);
 }
 
+/* ---- runtime.md phase 7, slice 5: images as sources ---------------------
+ *
+ * Cairo did three things with an image as a source: copy a piece of it
+ * (clip, a canvas snapshot, a self-draw's copy-first), put it on a
+ * surface at a whole-pixel offset, and resample it under a matrix --
+ * drawImage's scaled and region forms, resize, and any image drawn under
+ * a rotated, scaled or fractionally moved transform. All three are done
+ * here now, on the surfaces' own bytes, with pixman's arithmetic:
+ *
+ *   * a copy is a row copy (CAIRO_OPERATOR_SOURCE with an ARGB32 source
+ *     was one too); a source with no alpha channel gets alpha 255;
+ *   * a whole-pixel translation is a blit: nothing is interpolated, and
+ *     the pixel is the source's, OVER the destination under fillAlpha;
+ *   * everything else is looked up through the inverse matrix. What
+ *     Cairo's CAIRO_FILTER_GOOD does -- measured against libcairo 1.18,
+ *     not read from its source -- is, per axis of the SOURCE: a scale
+ *     above 0.75 is bilinear, interpolating the four nearest texels with
+ *     pixman's 7-bit weights; a scale of 0.75 or less is a box (the
+ *     average of the source area the pixel covers). Outside the image is
+ *     transparent, so the edge pixels fade over the half pixel beyond it.
+ *     The one exception found: a matrix that is only a scale whose two
+ *     factors multiply to 1 (0.5 by 2, say) is sampled nearest.
+ *
+ * The positions are computed once per pixel from the inverse matrix in
+ * doubles, where pixman starts from the matrix rounded to 16.16 and
+ * a translation that depends on the paint's extents; the two agree to
+ * within a hundred-and-twenty-eighth of a pixel, which moves an
+ * interpolated channel by at most two levels (tests/test_image_sources.py
+ * measures it). Whole-pixel and exact-power-of-two cases agree exactly. */
+
+static atomic_int g_image_ours = -1;
+
+/* FESTINA_CAIRO_DRAW=1 keeps the Cairo code of every image source as it
+ * was -- the oracle the tests compare with until Cairo goes. */
+static int festina_image_ours(void) {
+    int v = atomic_load_explicit(&g_image_ours, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("FESTINA_CAIRO_DRAW");
+        v = (e && *e && *e != '0') ? 0 : 1;
+        atomic_store_explicit(&g_image_ours, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static int festina_matrix_invert_to(cairo_matrix_t *out, const cairo_matrix_t *m) {
+    double det = m->xx * m->yy - m->yx * m->xy;
+    if (!(fabs(det) > 1e-300) || !isfinite(det)) return 0;
+    out->xx = m->yy / det;
+    out->yx = -m->yx / det;
+    out->xy = -m->xy / det;
+    out->yy = m->xx / det;
+    out->x0 = (m->xy * m->y0 - m->yy * m->x0) / det;
+    out->y0 = (m->yx * m->x0 - m->xx * m->y0) / det;
+    return 1;
+}
+
+typedef struct {
+    const uint32_t *px;
+    int w, h;
+    size_t stride;       /* in 32-bit words */
+    uint32_t force_alpha;/* 0xFF000000 for RGB24, else 0 */
+} FestinaSrcView;
+
+static int festina_src_view(FestinaSrcView *v, cairo_surface_t *s) {
+    if (!s || cairo_surface_get_type(s) != CAIRO_SURFACE_TYPE_IMAGE) return 0;
+    cairo_format_t f = cairo_image_surface_get_format(s);
+    if (f != CAIRO_FORMAT_ARGB32 && f != CAIRO_FORMAT_RGB24) return 0;
+    cairo_surface_flush(s);
+    unsigned char *d = cairo_image_surface_get_data(s);
+    if (!d) return 0;
+    v->px = (const uint32_t *)d;
+    v->w = cairo_image_surface_get_width(s);
+    v->h = cairo_image_surface_get_height(s);
+    v->stride = (size_t)cairo_image_surface_get_stride(s) / 4;
+    v->force_alpha = f == CAIRO_FORMAT_RGB24 ? 0xFF000000u : 0u;
+    return v->w > 0 && v->h > 0;
+}
+
+static inline uint32_t festina_src_px(const FestinaSrcView *v, int x, int y) {
+    if ((unsigned)x >= (unsigned)v->w || (unsigned)y >= (unsigned)v->h) return 0;
+    return v->px[(size_t)y * v->stride + (size_t)x] | v->force_alpha;
+}
+
+/* pixman's bilinear interpolation of four premultiplied texels with 7-bit
+ * weights: each channel the weighted sum, shifted down by 14. Two channels
+ * to a 32-bit lane of a 64-bit word, so four products add up in two
+ * multiplies a texel. */
+static inline uint64_t festina_spread(uint32_t x) {
+    uint64_t a = x & 0x00FF00FFu;
+    return (a | (a << 16)) & 0x000000FF000000FFull;
+}
+
+static inline uint32_t festina_bilinear(uint32_t tl, uint32_t tr, uint32_t bl, uint32_t br,
+                                        int dx, int dy) {
+    uint64_t w0 = (uint64_t)((128 - dx) * (128 - dy));
+    uint64_t w1 = (uint64_t)(dx * (128 - dy));
+    uint64_t w2 = (uint64_t)((128 - dx) * dy);
+    uint64_t w3 = (uint64_t)(dx * dy);
+    uint64_t rb = festina_spread(tl) * w0 + festina_spread(tr) * w1
+                + festina_spread(bl) * w2 + festina_spread(br) * w3;
+    uint64_t ag = festina_spread(tl >> 8) * w0 + festina_spread(tr >> 8) * w1
+                + festina_spread(bl >> 8) * w2 + festina_spread(br >> 8) * w3;
+    uint32_t b = (uint32_t)((rb >> 14) & 0xFF), r = (uint32_t)((rb >> 46) & 0xFF);
+    uint32_t g = (uint32_t)((ag >> 14) & 0xFF), a = (uint32_t)((ag >> 46) & 0xFF);
+    return b | (g << 8) | (r << 16) | (a << 24);
+}
+
+/* A pixel times a byte, pixman's UN8x4_MUL_UN8: every channel
+ * festina_mul_un8(channel, m). */
+static inline uint32_t festina_scale_un8x4(uint32_t s, uint32_t m) {
+    uint32_t rb = (s & 0x00FF00FFu) * m + 0x00800080u;
+    rb = ((rb + ((rb >> 8) & 0x00FF00FFu)) >> 8) & 0x00FF00FFu;
+    uint32_t ag = ((s >> 8) & 0x00FF00FFu) * m + 0x00800080u;
+    ag = ((ag + ((ag >> 8) & 0x00FF00FFu)) >> 8) & 0x00FF00FFu;
+    return rb | (ag << 8);
+}
+
+/* festina_over_un8x4 with no early returns, so a row of them vectorises:
+ * the same arithmetic -- an opaque source multiplies the destination by
+ * zero, a transparent one by 255 -- and so the same result. */
+static inline uint32_t festina_over_flat(uint32_t s, uint32_t d) {
+    uint32_t ia = 0xFFu - (s >> 24);
+    uint32_t rb = (d & 0x00FF00FFu) * ia + 0x00800080u;
+    rb = ((rb + ((rb >> 8) & 0x00FF00FFu)) >> 8) & 0x00FF00FFu;
+    uint32_t ag = ((d >> 8) & 0x00FF00FFu) * ia + 0x00800080u;
+    ag = ((ag + ((ag >> 8) & 0x00FF00FFu)) >> 8) & 0x00FF00FFu;
+    uint32_t t = rb + (s & 0x00FF00FFu);
+    t |= 0x10000100u - ((t >> 8) & 0x00FF00FFu);
+    rb = t & 0x00FF00FFu;
+    t = ag + ((s >> 8) & 0x00FF00FFu);
+    t |= 0x10000100u - ((t >> 8) & 0x00FF00FFu);
+    ag = t & 0x00FF00FFu;
+    return rb | (ag << 8);
+}
+
+/* A source pixel under fillAlpha's mask byte (255 = none), OVER the
+ * destination pixel -- festina_image_blend_row's arithmetic. */
+static inline void festina_put_over(uint32_t *dp, uint32_t s, uint32_t m, int opaque_dest) {
+    if (m != 255u) s = festina_scale_un8x4(s, m);
+    if (s == 0) return;
+    uint32_t d = *dp;
+    if (opaque_dest) d |= 0xFF000000u;
+    d = festina_over_un8x4(s, d);
+    *dp = opaque_dest ? (d | 0xFF000000u) : d;
+}
+
+/* The overlap of [a, b] with [c, c + 1]. */
+static inline double festina_overlap(double a, double b, int64_t c) {
+    double lo = a > (double)c ? a : (double)c;
+    double hi = b < (double)c + 1.0 ? b : (double)c + 1.0;
+    return hi > lo ? hi - lo : 0.0;
+}
+
+/* One axis of an axis-aligned resample: for each destination index, the
+ * run of source indices that make it and the weights of each, summing to
+ * 65536 (less where the run leaves the image, which is transparent). */
+typedef struct {
+    int64_t *first;     /* per destination index: first source index kept */
+    int32_t *count;     /* ... and how many; 0 = nothing of the image */
+    uint32_t *w;        /* count[k] weights at w[k * maxn] */
+    int maxn;
+} FestinaTaps;
+
+typedef enum { FESTINA_TAPS_BILINEAR, FESTINA_TAPS_BOX, FESTINA_TAPS_NEAREST } FestinaTapKind;
+
+static void festina_taps_free(FestinaTaps *t) {
+    free(t->first); free(t->count); free(t->w);
+    memset(t, 0, sizeof(*t));
+}
+
+/* Destination indices [d0, d1) of an axis that maps to source position
+ * u = scale * (d + 0.5) + shift (scale and shift are the inverse
+ * matrix's), against a source of `size` pixels. */
+static int festina_taps_build(FestinaTaps *t, FestinaTapKind kind, int64_t d0, int64_t d1,
+                              double scale, double shift, double window, int64_t size) {
+    int64_t n = d1 - d0;
+    memset(t, 0, sizeof(*t));
+    int maxn = 2;
+    if (kind == FESTINA_TAPS_NEAREST) maxn = 1;
+    if (kind == FESTINA_TAPS_BOX) {
+        double w = window < 0 ? -window : window;
+        if (w > 4096.0) w = 4096.0;
+        maxn = (int)ceil(w) + 2;
+    }
+    t->maxn = maxn;
+    t->first = calloc((size_t)n, sizeof(int64_t));
+    t->count = calloc((size_t)n, sizeof(int32_t));
+    t->w = calloc((size_t)n * (size_t)maxn, sizeof(uint32_t));
+    if (!t->first || !t->count || !t->w) { festina_taps_free(t); return 0; }
+    for (int64_t k = 0; k < n; k++) {
+        double u = scale * ((double)(d0 + k) + 0.5) + shift;
+        uint32_t *w = t->w + (size_t)k * (size_t)maxn;
+        int64_t i0;
+        int cnt;
+        uint32_t tmp[2];
+        if (kind == FESTINA_TAPS_NEAREST) {
+            int64_t fu = (int64_t)floor(u * 65536.0 + 0.5);
+            i0 = (fu - 1) >> 16;
+            cnt = 1;
+            tmp[0] = 65536u;
+        } else if (kind == FESTINA_TAPS_BILINEAR) {
+            int64_t fu = (int64_t)floor(u * 65536.0 - 32768.0);
+            i0 = fu >> 16;
+            int f = (int)((fu >> 9) & 127);
+            cnt = 2;
+            tmp[0] = (uint32_t)(128 - f) << 9;
+            tmp[1] = (uint32_t)f << 9;
+        } else {
+            double half = 0.5 * (window < 0 ? -window : window);
+            if (half > 2048.0) half = 2048.0;
+            double lo = u - half, hi = u + half;
+            i0 = (int64_t)floor(lo);
+            cnt = (int)ceil(hi) - (int)i0;
+            if (cnt > maxn) cnt = maxn;
+            double full = hi - lo;
+            double cum = 0.0;
+            uint32_t prev = 0;
+            for (int j = 0; j < cnt; j++) {
+                cum += festina_overlap(lo, hi, i0 + j);
+                uint32_t at = (uint32_t)floor(cum / full * 65536.0 + 0.5);
+                w[j] = at - prev;
+                prev = at;
+            }
+        }
+        /* Keep only the part inside the image. */
+        int64_t a = 0, b = cnt;
+        while (a < b && (i0 + a < 0 || i0 + a >= size)) a++;
+        while (b > a && (i0 + b - 1 < 0 || i0 + b - 1 >= size)) b--;
+        if (kind == FESTINA_TAPS_BOX) {
+            if (a > 0) memmove(w, w + a, (size_t)(b - a) * sizeof(uint32_t));
+        } else {
+            for (int64_t j = a; j < b; j++) w[j - a] = tmp[j];
+        }
+        t->first[k] = i0 + a;
+        t->count[k] = (int32_t)(b - a);
+    }
+    return 1;
+}
+
+/* n source pixels OVER n destination pixels, under mask byte m. The two
+ * rows never overlap (a self-draw is copied first), which `restrict` says,
+ * and the loop has no branches: the compiler turns it into vector code. */
+static void festina_over_run(uint32_t *restrict dp, const uint32_t *restrict sp, int64_t n,
+                             uint32_t fa, uint32_t dmask, uint32_t m) {
+    if (m == 255u) {
+        for (int64_t i = 0; i < n; i++)
+            dp[i] = festina_over_flat(sp[i] | fa, dp[i] | dmask) | dmask;
+    } else {
+        for (int64_t i = 0; i < n; i++)
+            dp[i] = festina_over_flat(festina_scale_un8x4(sp[i] | fa, m), dp[i] | dmask) | dmask;
+    }
+}
+
+/* A whole-pixel translation: the pixel is the source's. */
+static void festina_blit_rows(uint32_t *dd, size_t dstride_words, const FestinaSrcView *sv,
+                              int64_t ox, int64_t oy, int64_t x0, int64_t y0, int64_t x1, int64_t y1,
+                              uint32_t m, int opaque_dest) {
+    int64_t xa = x0 > ox ? x0 : ox;
+    int64_t xb = x1 < ox + sv->w ? x1 : ox + sv->w;
+    if (xa >= xb) return;
+    uint32_t fa = sv->force_alpha;
+    for (int64_t y = y0; y < y1; y++) {
+        int64_t sy = y - oy;
+        if (sy < 0 || sy >= sv->h) continue;
+        uint32_t *dp = dd + (size_t)y * dstride_words;
+        const uint32_t *sp = sv->px + (size_t)sy * sv->stride - ox;
+        festina_over_run(dp + xa, sp + xa, xb - xa, fa, opaque_dest ? 0xFF000000u : 0u, m);
+    }
+}
+
+/* Axis-aligned, and bilinear in both directions (every scale above 0.75,
+ * any flip, any whole or fractional move): pixman's own arithmetic, bit
+ * for bit. The sum  tl*(128-dx)*(128-dy) + tr*dx*(128-dy) + bl*(128-dx)*dy
+ * + br*dx*dy  is  (128-dx)*V[i] + dx*V[i+1]  with V[i] = top*(128-dy) +
+ * bottom*dy, an integer identity -- so each destination row blends its two
+ * source rows once into V (two channels to a lane pair, unrounded), and
+ * each pixel is then two multiplies a lane pair. V is padded by a
+ * transparent column each side, so the interior has no bounds to test. */
+static void festina_resample_bilinear(uint32_t *dd, size_t dstride_words, const FestinaSrcView *sv,
+                                      const cairo_matrix_t *inv, int64_t x0, int64_t y0,
+                                      int64_t x1, int64_t y1, uint32_t m, int opaque_dest) {
+    int64_t n = x1 - x0;
+    int64_t *ixs = malloc((size_t)n * sizeof(int64_t));
+    uint8_t *dxs = malloc((size_t)n);
+    size_t vw = (size_t)sv->w + 2;
+    uint64_t *vrb = malloc(2 * vw * sizeof(uint64_t));
+    uint32_t *r0 = malloc(2 * vw * sizeof(uint32_t));
+    uint32_t *line = malloc((size_t)n * sizeof(uint32_t));
+    if (!ixs || !dxs || !vrb || !r0 || !line) { free(ixs); free(dxs); free(vrb); free(r0); free(line); return; }
+    uint64_t *vag = vrb + vw;
+    uint32_t *r1 = r0 + vw;
+    for (int64_t k = 0; k < n; k++) {
+        double u = inv->xx * ((double)(x0 + k) + 0.5) + inv->x0;
+        int64_t fu = (int64_t)floor(u * 65536.0 - 32768.0);
+        ixs[k] = fu >> 16;
+        dxs[k] = (uint8_t)((fu >> 9) & 127);
+    }
+    int64_t have_iy = INT64_MIN;
+    int have_dy = -1;
+    for (int64_t y = y0; y < y1; y++) {
+        double v = inv->yy * ((double)y + 0.5) + inv->y0;
+        int64_t fv = (int64_t)floor(v * 65536.0 - 32768.0);
+        int64_t iy = fv >> 16;
+        int dy = (int)((fv >> 9) & 127);
+        if (iy < -1 || iy >= sv->h) continue;
+        if (iy != have_iy || dy != have_dy) {
+            for (int pass = 0; pass < 2; pass++) {
+                int64_t want = iy + pass;
+                uint32_t *buf = pass ? r1 : r0;
+                buf[0] = 0; buf[vw - 1] = 0;
+                if (want < 0 || want >= sv->h) memset(buf + 1, 0, (size_t)sv->w * sizeof(uint32_t));
+                else {
+                    const uint32_t *sp = sv->px + (size_t)want * sv->stride;
+                    if (!sv->force_alpha) memcpy(buf + 1, sp, (size_t)sv->w * sizeof(uint32_t));
+                    else for (int i = 0; i < sv->w; i++) buf[1 + i] = sp[i] | sv->force_alpha;
+                }
+            }
+            uint64_t wa = (uint64_t)(128 - dy), wb = (uint64_t)dy;
+            for (size_t i = 0; i < vw; i++) {
+                vrb[i] = festina_spread(r0[i]) * wa + festina_spread(r1[i]) * wb;
+                vag[i] = festina_spread(r0[i] >> 8) * wa + festina_spread(r1[i] >> 8) * wb;
+            }
+            have_iy = iy;
+            have_dy = dy;
+        }
+        for (int64_t k = 0; k < n; k++) {
+            int64_t ix = ixs[k];
+            if (ix < -1 || ix >= sv->w) { line[k] = 0; continue; }
+            uint64_t wl = (uint64_t)(128 - dxs[k]), wr = (uint64_t)dxs[k];
+            uint64_t rb = vrb[ix + 1] * wl + vrb[ix + 2] * wr;
+            uint64_t ag = vag[ix + 1] * wl + vag[ix + 2] * wr;
+            line[k] = (uint32_t)((rb >> 14) & 0xFF) | (uint32_t)(((ag >> 14) & 0xFF) << 8)
+                    | (uint32_t)(((rb >> 46) & 0xFF) << 16) | (uint32_t)(((ag >> 46) & 0xFF) << 24);
+        }
+        festina_over_run(dd + (size_t)y * dstride_words + x0, line, n, 0u,
+                         opaque_dest ? 0xFF000000u : 0u, m);
+    }
+    free(ixs); free(dxs); free(vrb); free(r0); free(line);
+}
+
+/* Axis-aligned, with a box or nearest axis in it: each axis reduced by its
+ * own weights, rows first. Weights are 16-bit fractions that sum to
+ * 65536. Two channels share a 64-bit word, a lane of 32 bits each: a row
+ * reduced horizontally is kept to 8 fractional bits (at most 65280), and
+ * the vertical sum of those under weights summing to 65536 stays under
+ * 2^32 -- no lane spills into its neighbour -- and rounds once at the end. */
+typedef struct { uint64_t rb, ag; } FestinaHRow;
+
+static void festina_resample_separable(uint32_t *dd, size_t dstride_words, const FestinaSrcView *sv,
+                                       const FestinaTaps *tx, const FestinaTaps *ty,
+                                       int64_t x0, int64_t y0, int64_t x1, int64_t y1,
+                                       uint32_t m, int opaque_dest) {
+    int64_t n = x1 - x0;
+    int slots = ty->maxn + 1;
+    FestinaHRow *rows = malloc((size_t)slots * (size_t)n * sizeof(FestinaHRow));
+    int64_t *tag = malloc((size_t)slots * sizeof(int64_t));
+    const FestinaHRow **hr = malloc((size_t)slots * sizeof(*hr));
+    uint32_t *line = malloc((size_t)n * sizeof(uint32_t));
+    if (!rows || !tag || !hr || !line) { free(rows); free(tag); free(hr); free(line); return; }
+    for (int i = 0; i < slots; i++) tag[i] = INT64_MIN;
+    const uint32_t fa = sv->force_alpha;
+    for (int64_t y = y0; y < y1; y++) {
+        int64_t k = y - y0;
+        int cy = ty->count[k];
+        if (cy <= 0) continue;
+        int64_t sy0 = ty->first[k];
+        const uint32_t *wy = ty->w + (size_t)k * (size_t)ty->maxn;
+        /* The horizontally reduced rows this destination row needs. */
+        for (int j = 0; j < cy; j++) {
+            int64_t sr = sy0 + j;
+            int slot = (int)(((sr % slots) + slots) % slots);
+            if (tag[slot] == sr) continue;
+            tag[slot] = sr;
+            const uint32_t *sp = sv->px + (size_t)sr * sv->stride;
+            FestinaHRow *out = rows + (size_t)slot * (size_t)n;
+            for (int64_t c = 0; c < n; c++) {
+                int cx = tx->count[c];
+                uint64_t rb = 0, ag = 0;
+                const uint32_t *wx = tx->w + (size_t)c * (size_t)tx->maxn;
+                const uint32_t *p = sp + tx->first[c];
+                for (int i = 0; i < cx; i++) {
+                    uint32_t px = p[i] | fa;
+                    uint64_t w = wx[i];
+                    rb += festina_spread(px) * w;
+                    ag += festina_spread(px >> 8) * w;
+                }
+                out[c].rb = ((rb + 0x0000008000000080ull) >> 8) & 0x0000FFFF0000FFFFull;
+                out[c].ag = ((ag + 0x0000008000000080ull) >> 8) & 0x0000FFFF0000FFFFull;
+            }
+        }
+        for (int j = 0; j < cy; j++) {
+            int slot = (int)((((sy0 + j) % slots) + slots) % slots);
+            hr[j] = rows + (size_t)slot * (size_t)n;
+        }
+        for (int64_t c = 0; c < n; c++) {
+            if (tx->count[c] <= 0) { line[c] = 0; continue; }
+            uint64_t rb = 0x0000000000800000ull + 0x0080000000000000ull, ag = rb;
+            for (int j = 0; j < cy; j++) {
+                uint64_t w = wy[j];
+                rb += hr[j][c].rb * w;
+                ag += hr[j][c].ag * w;
+            }
+            line[c] = (uint32_t)((rb >> 24) & 0xFF) | (uint32_t)(((ag >> 24) & 0xFF) << 8)
+                    | (uint32_t)(((rb >> 56) & 0xFF) << 16) | (uint32_t)(((ag >> 56) & 0xFF) << 24);
+        }
+        festina_over_run(dd + (size_t)y * dstride_words + x0, line, n, 0u,
+                         opaque_dest ? 0xFF000000u : 0u, m);
+    }
+    free(rows); free(tag); free(hr); free(line);
+}
+
+/* Anything else -- a rotation or a skew: a point at a time through the
+ * inverse matrix, bilinear (pixman's arithmetic) or, where a source axis
+ * shrinks to 0.75 or less, a box of that axis' size around the point. */
+static void festina_resample_general(uint32_t *dd, size_t dstride_words, const FestinaSrcView *sv,
+                                     const cairo_matrix_t *inv, double fsx, double fsy,
+                                     int64_t x0, int64_t y0, int64_t x1, int64_t y1,
+                                     uint32_t m, int opaque_dest) {
+    int box_x = fsx <= 0.75, box_y = fsy <= 0.75;
+    double wu = box_x ? 1.0 / fsx : 0.0;   /* the box's width in source pixels */
+    double wv = box_y ? 1.0 / fsy : 0.0;
+    for (int64_t y = y0; y < y1; y++) {
+        uint32_t *dp = dd + (size_t)y * dstride_words;
+        double py = (double)y + 0.5;
+        double u = inv->xx * ((double)x0 + 0.5) + inv->xy * py + inv->x0;
+        double v = inv->yx * ((double)x0 + 0.5) + inv->yy * py + inv->y0;
+        for (int64_t x = x0; x < x1; x++, u += inv->xx, v += inv->yx) {
+            uint32_t s;
+            if (!box_x && !box_y) {
+                int64_t fu = (int64_t)floor(u * 65536.0 - 32768.0);
+                int64_t fv = (int64_t)floor(v * 65536.0 - 32768.0);
+                int64_t ix = fu >> 16, iy = fv >> 16;
+                if (ix < -1 || ix >= sv->w || iy < -1 || iy >= sv->h) continue;
+                int dx = (int)((fu >> 9) & 127), dy = (int)((fv >> 9) & 127);
+                if (ix >= 0 && iy >= 0 && ix + 1 < sv->w && iy + 1 < sv->h) {
+                    const uint32_t *r0 = sv->px + (size_t)iy * sv->stride + (size_t)ix;
+                    const uint32_t *r1 = r0 + sv->stride;
+                    uint32_t fa = sv->force_alpha;
+                    s = festina_bilinear(r0[0] | fa, r0[1] | fa, r1[0] | fa, r1[1] | fa, dx, dy);
+                } else {
+                    s = festina_bilinear(festina_src_px(sv, (int)ix, (int)iy), festina_src_px(sv, (int)ix + 1, (int)iy),
+                                         festina_src_px(sv, (int)ix, (int)iy + 1), festina_src_px(sv, (int)ix + 1, (int)iy + 1),
+                                         dx, dy);
+                }
+            } else {
+                /* Weights per axis in doubles: a box on the axes that
+                 * shrink, bilinear on the others. */
+                double alo = 0, ahi = 0, blo = 0, bhi = 0;
+                int64_t ia, ib;
+                int na, nb, bil_u = 0, bil_v = 0;
+                if (box_x) { alo = u - 0.5 * wu; ahi = u + 0.5 * wu; ia = (int64_t)floor(alo); na = (int)ceil(ahi) - (int)ia; }
+                else { int64_t fu = (int64_t)floor(u * 65536.0 - 32768.0); ia = fu >> 16; bil_u = (int)((fu >> 9) & 127); na = 2; }
+                if (box_y) { blo = v - 0.5 * wv; bhi = v + 0.5 * wv; ib = (int64_t)floor(blo); nb = (int)ceil(bhi) - (int)ib; }
+                else { int64_t fv = (int64_t)floor(v * 65536.0 - 32768.0); ib = fv >> 16; bil_v = (int)((fv >> 9) & 127); nb = 2; }
+                if (ia + na <= 0 || ia >= sv->w || ib + nb <= 0 || ib >= sv->h) continue;
+                double acc[4] = {0, 0, 0, 0};
+                for (int j = 0; j < nb; j++) {
+                    double wy = box_y ? festina_overlap(blo, bhi, ib + j) / wv : (j ? bil_v : 128 - bil_v) / 128.0;
+                    if (wy == 0.0) continue;
+                    for (int i = 0; i < na; i++) {
+                        double wx = box_x ? festina_overlap(alo, ahi, ia + i) / wu : (i ? bil_u : 128 - bil_u) / 128.0;
+                        if (wx == 0.0) continue;
+                        uint32_t p = festina_src_px(sv, (int)(ia + i), (int)(ib + j));
+                        if (!p) continue;
+                        double w = wx * wy;
+                        acc[0] += (double)(p & 0xFF) * w;
+                        acc[1] += (double)((p >> 8) & 0xFF) * w;
+                        acc[2] += (double)((p >> 16) & 0xFF) * w;
+                        acc[3] += (double)(p >> 24) * w;
+                    }
+                }
+                uint32_t c[4];
+                for (int k = 0; k < 4; k++) { double r = floor(acc[k] + 0.5); c[k] = r > 255.0 ? 255u : (uint32_t)r; }
+                s = c[0] | (c[1] << 8) | (c[2] << 16) | (c[3] << 24);
+            }
+            if (s) festina_put_over(&dp[x], s, m, opaque_dest);
+        }
+    }
+}
+
+/* Composite `src` onto `dst` through `fwd` (source pixels -> device
+ * pixels) at `alpha`, within the device rectangle [cx0, cx1) x [cy0, cy1).
+ * Both must be image surfaces of ARGB32 or RGB24. */
+static void festina_composite_image(cairo_surface_t *dst, cairo_surface_t *srcs,
+                                    const cairo_matrix_t *fwd, double alpha,
+                                    int64_t cx0, int64_t cy0, int64_t cx1, int64_t cy1) {
+    if (!(alpha > 0.0)) return;
+    FestinaSrcView sv;
+    if (!festina_src_view(&sv, srcs)) return;
+    if (!dst || cairo_surface_get_type(dst) != CAIRO_SURFACE_TYPE_IMAGE) return;
+    cairo_format_t df = cairo_image_surface_get_format(dst);
+    if (df != CAIRO_FORMAT_ARGB32 && df != CAIRO_FORMAT_RGB24) return;
+    int dw = cairo_image_surface_get_width(dst);
+    int dh = cairo_image_surface_get_height(dst);
+    if (cx0 < 0) cx0 = 0;
+    if (cy0 < 0) cy0 = 0;
+    if (cx1 > dw) cx1 = dw;
+    if (cy1 > dh) cy1 = dh;
+    if (cx0 >= cx1 || cy0 >= cy1) return;
+    uint32_t m = alpha >= 1.0 ? 255u : festina_channel_byte(alpha);
+    if (m == 0) return;
+    int opaque_dest = df == CAIRO_FORMAT_RGB24;
+    cairo_matrix_t inv;
+    if (!festina_matrix_invert_to(&inv, fwd)) return;
+
+    /* The pixels the image can reach: its transformed corners, a half
+     * source pixel wider (the filters spread that far past the edge). */
+    double xs[4] = {0, (double)sv.w, 0, (double)sv.w};
+    double ys[4] = {0, 0, (double)sv.h, (double)sv.h};
+    double bx0 = 1e300, by0 = 1e300, bx1 = -1e300, by1 = -1e300;
+    for (int i = 0; i < 4; i++) {
+        double x = fwd->xx * xs[i] + fwd->xy * ys[i] + fwd->x0;
+        double y = fwd->yx * xs[i] + fwd->yy * ys[i] + fwd->y0;
+        if (x < bx0) bx0 = x;
+        if (x > bx1) bx1 = x;
+        if (y < by0) by0 = y;
+        if (y > by1) by1 = y;
+    }
+    if (!isfinite(bx0) || !isfinite(by0) || !isfinite(bx1) || !isfinite(by1)) return;
+    if (bx1 < (double)cx0 - 2.0 || bx0 > (double)cx1 + 2.0
+        || by1 < (double)cy0 - 2.0 || by0 > (double)cy1 + 2.0) return;
+    /* In destination pixels that is half the scale, and never under one. */
+    double fsx = hypot(fwd->xx, fwd->yx);
+    double fsy = hypot(fwd->xy, fwd->yy);
+    double grow = ceil(0.5 * (fsx > fsy ? fsx : fsy)) + 1.0;
+    if (grow > 1e6) grow = 1e6;
+    int64_t x0 = (int64_t)floor(bx0 - grow), x1 = (int64_t)ceil(bx1 + grow);
+    int64_t y0 = (int64_t)floor(by0 - grow), y1 = (int64_t)ceil(by1 + grow);
+    if (x0 < cx0) x0 = cx0;
+    if (y0 < cy0) y0 = cy0;
+    if (x1 > cx1) x1 = cx1;
+    if (y1 > cy1) y1 = cy1;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    cairo_surface_flush(dst);
+    unsigned char *dbytes = cairo_image_surface_get_data(dst);
+    if (!dbytes) return;
+    uint32_t *dd = (uint32_t *)dbytes;
+    size_t dstride_words = (size_t)cairo_image_surface_get_stride(dst) / 4;
+
+    if (fwd->xx == 1.0 && fwd->yy == 1.0 && fwd->xy == 0.0 && fwd->yx == 0.0
+        && fwd->x0 == floor(fwd->x0) && fwd->y0 == floor(fwd->y0)
+        && fabs(fwd->x0) < 1e9 && fabs(fwd->y0) < 1e9) {
+        festina_blit_rows(dd, dstride_words, &sv, (int64_t)fwd->x0, (int64_t)fwd->y0,
+                          x0, y0, x1, y1, m, opaque_dest);
+    } else if (fwd->xy == 0.0 && fwd->yx == 0.0) {
+        /* Per axis of the source: its size under the matrix picks the
+         * filter. A scale-only matrix whose two factors multiply to 1
+         * (0.5 by 2, say) is sampled nearest, which is what Cairo does. */
+        int box_x = fsx <= 0.75, box_y = fsy <= 0.75;
+        int nearest = (box_x || box_y) && fabs(fsx * fsy - 1.0) < 1e-9;
+        if (!box_x && !box_y && !nearest) {
+            festina_resample_bilinear(dd, dstride_words, &sv, &inv, x0, y0, x1, y1, m, opaque_dest);
+        } else {
+            FestinaTaps tx, ty;
+            FestinaTapKind kx = nearest ? FESTINA_TAPS_NEAREST : box_x ? FESTINA_TAPS_BOX : FESTINA_TAPS_BILINEAR;
+            FestinaTapKind ky = nearest ? FESTINA_TAPS_NEAREST : box_y ? FESTINA_TAPS_BOX : FESTINA_TAPS_BILINEAR;
+            if (festina_taps_build(&tx, kx, x0, x1, inv.xx, inv.x0, box_x ? 1.0 / fsx : 0.0, sv.w)) {
+                if (festina_taps_build(&ty, ky, y0, y1, inv.yy, inv.y0, box_y ? 1.0 / fsy : 0.0, sv.h))
+                    festina_resample_separable(dd, dstride_words, &sv, &tx, &ty, x0, y0, x1, y1, m, opaque_dest);
+                festina_taps_free(&ty);
+            }
+            festina_taps_free(&tx);
+        }
+    } else {
+        festina_resample_general(dd, dstride_words, &sv, &inv, fsx, fsy, x0, y0, x1, y1, m, opaque_dest);
+    }
+    cairo_surface_mark_dirty_rectangle(dst, (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
+}
+
+/* src copied into the new surface `dst`, the source's pixel (sx + i,
+ * sy + j) landing on the destination's (i, j); what falls outside the
+ * source stays as it is (transparent, in a fresh surface). */
+static void festina_surface_copy_region(cairo_surface_t *dst, cairo_surface_t *srcs,
+                                        int64_t sx, int64_t sy) {
+    FestinaSrcView sv;
+    if (!festina_src_view(&sv, srcs)) return;
+    cairo_surface_flush(dst);
+    unsigned char *dd = cairo_image_surface_get_data(dst);
+    if (!dd) return;
+    int dw = cairo_image_surface_get_width(dst);
+    int dh = cairo_image_surface_get_height(dst);
+    size_t dstride = (size_t)cairo_image_surface_get_stride(dst);
+    int64_t xa = sx < 0 ? -sx : 0;
+    int64_t xb = (int64_t)sv.w - sx < dw ? (int64_t)sv.w - sx : dw;
+    if (xa >= xb) return;
+    for (int64_t j = 0; j < dh; j++) {
+        int64_t srow = sy + j;
+        if (srow < 0 || srow >= sv.h) continue;
+        const uint32_t *sp = sv.px + (size_t)srow * sv.stride + (size_t)(sx + xa);
+        uint32_t *dp = (uint32_t *)(dd + (size_t)j * dstride) + xa;
+        if (!sv.force_alpha) memcpy(dp, sp, (size_t)(xb - xa) * 4);
+        else for (int64_t i = 0; i < xb - xa; i++) dp[i] = sp[i] | sv.force_alpha;
+    }
+    cairo_surface_mark_dirty(dst);
+}
+
 /* claude.md #92: a rectangle lifted out of a larger image -- the
  * spritesheet operation. Returns a NEW image; the source is untouched,
  * so one sheet can be clipped as many times as a program likes.
@@ -2752,6 +3349,10 @@ void *festina_image_clip(void *img, int64_t x, int64_t y, int64_t w, int64_t h) 
     cairo_surface_t *src = ((FestinaImageBox *)img)->surface;
     cairo_surface_t *out = festina_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
     festina_surface_prefault(out);
+    if (festina_image_ours()) {
+        festina_surface_copy_region(out, src, x, y);
+        return festina_image_box(out);
+    }
     cairo_t *cr = cairo_create(out);
     /* Offsetting the source by -x/-y puts the requested region at the
      * new surface's origin. */
@@ -2996,6 +3597,10 @@ void *festina_canvas_to_image(void) {
     int h = cairo_image_surface_get_height(g_backing_surface);
     cairo_surface_t *out = festina_surface_create(CAIRO_FORMAT_ARGB32, w, h);
     festina_surface_prefault(out);
+    if (festina_image_ours()) {
+        festina_surface_copy_region(out, g_backing_surface, 0, 0);
+        return festina_image_box(out);
+    }
     cairo_t *cr = cairo_create(out);
     cairo_set_source_surface(cr, g_backing_surface, 0, 0);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE); /* claude.md #240: see festina_image_clip */
@@ -3017,6 +3622,18 @@ void festina_image_resize(void *img, int64_t w, int64_t h) {
     if (src_w <= 0 || src_h <= 0) return;
     cairo_surface_t *out = festina_surface_create(CAIRO_FORMAT_ARGB32, (int)w, (int)h);
     festina_surface_prefault(out);
+    if (festina_image_ours()) {
+        cairo_matrix_t fwd;
+        festina_matrix_identity(&fwd);
+        festina_matrix_scale(&fwd, (double)w / src_w, (double)h / src_h);
+        festina_composite_image(out, box->surface, &fwd, 1.0, 0, 0, w, h);
+        cairo_surface_destroy(box->surface);
+        box->surface = out;
+        free(box->bytes);
+        box->bytes = NULL;
+        box->byte_count = 0;
+        return;
+    }
     cairo_t *cr = cairo_create(out);
     cairo_scale(cr, (double)w / src_w, (double)h / src_h);
     cairo_set_source_surface(cr, box->surface, 0, 0);
@@ -3703,6 +4320,10 @@ static cairo_surface_t *festina_surface_snapshot(cairo_surface_t *src) {
     int h = cairo_image_surface_get_height(src);
     cairo_surface_t *out = festina_surface_create(CAIRO_FORMAT_ARGB32, w, h);
     festina_surface_prefault(out);
+    if (festina_image_ours()) {
+        festina_surface_copy_region(out, src, 0, 0);
+        return out;
+    }
     cairo_t *cr = cairo_create(out);
     cairo_set_source_surface(cr, src, 0, 0);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE); /* claude.md #240: see festina_image_clip */
@@ -3722,6 +4343,14 @@ void festina_image_draw_image(void *dst, void *src, int64_t x, int64_t y) {
     cairo_surface_t *source = ((FestinaImageBox *)src)->surface;
     cairo_surface_t *copy = NULL;
     if (source == d->surface) { copy = festina_surface_snapshot(source); source = copy; }
+    if (festina_image_ours()) {
+        cairo_matrix_t ident, fwd = *festina_image_matrix(d, &ident);
+        festina_matrix_translate(&fwd, (double)x, (double)y);
+        festina_composite_image(d->surface, source, &fwd, g_fill_alpha, 0, 0, INT32_MAX, INT32_MAX);
+        if (copy) cairo_surface_destroy(copy);
+        festina_image_bytes_now_stale(dst);
+        return;
+    }
     cairo_t *cr = festina_image_context(d);
     cairo_set_source_surface(cr, source, (double)x, (double)y);
     cairo_paint_with_alpha(cr, g_fill_alpha);
@@ -3744,6 +4373,15 @@ void festina_image_draw_image_scaled(void *dst, void *src, int64_t x, int64_t y,
     if (src_w <= 0 || src_h <= 0) return;
     cairo_surface_t *copy = NULL;
     if (source == d->surface) { copy = festina_surface_snapshot(source); source = copy; }
+    if (festina_image_ours()) {
+        cairo_matrix_t ident, fwd = *festina_image_matrix(d, &ident);
+        festina_matrix_translate(&fwd, (double)x, (double)y);
+        festina_matrix_scale(&fwd, (double)w / (double)src_w, (double)h / (double)src_h);
+        festina_composite_image(d->surface, source, &fwd, g_fill_alpha, 0, 0, INT32_MAX, INT32_MAX);
+        if (copy) cairo_surface_destroy(copy);
+        festina_image_bytes_now_stale(dst);
+        return;
+    }
     cairo_t *cr = festina_image_context(d);
     cairo_translate(cr, (double)x, (double)y);
     cairo_scale(cr, (double)w / (double)src_w, (double)h / (double)src_h);
@@ -3827,6 +4465,13 @@ void *festina_image_clone(void *img) {
 void festina_draw_image(void *img, int64_t x, int64_t y) {
     festina_backing_require();
     if (!img) return;
+    if (festina_image_ours()) {
+        cairo_matrix_t ident, fwd = *festina_canvas_matrix(&ident);
+        festina_matrix_translate(&fwd, (double)x, (double)y);
+        festina_composite_image(g_backing_surface, ((FestinaImageBox *)img)->surface, &fwd,
+                                g_fill_alpha, 0, 0, INT32_MAX, INT32_MAX);
+        return;
+    }
     cairo_t *cr = festina_canvas_context();
     cairo_set_source_surface(cr, ((FestinaImageBox *)img)->surface, (double)x, (double)y);
     cairo_paint_with_alpha(cr, g_fill_alpha);
@@ -3853,6 +4498,13 @@ void festina_draw_image_scaled(void *img, int64_t x, int64_t y, int64_t w, int64
     int src_w = cairo_image_surface_get_width(surface);
     int src_h = cairo_image_surface_get_height(surface);
     if (src_w <= 0 || src_h <= 0) return;
+    if (festina_image_ours()) {
+        cairo_matrix_t ident, fwd = *festina_canvas_matrix(&ident);
+        festina_matrix_translate(&fwd, (double)x, (double)y);
+        festina_matrix_scale(&fwd, (double)w / (double)src_w, (double)h / (double)src_h);
+        festina_composite_image(g_backing_surface, surface, &fwd, g_fill_alpha, 0, 0, INT32_MAX, INT32_MAX);
+        return;
+    }
     cairo_t *cr = festina_canvas_context();
     cairo_save(cr);
     cairo_translate(cr, (double)x, (double)y);
@@ -3878,6 +4530,29 @@ void festina_draw_image_region(void *img, int64_t sx, int64_t sy, int64_t sw, in
     festina_backing_require();
     if (!img || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
     cairo_surface_t *surface = ((FestinaImageBox *)img)->surface;
+    if (festina_image_ours()) {
+        /* The destination rectangle clips the draw. Under a transform
+         * that leaves it on whole pixels -- the identity and any integer
+         * move, a scale by whole numbers -- the clip is a pixel
+         * rectangle; anywhere else it is an antialiased shape, which
+         * stays with Cairo until the clip is a mask here too. */
+        cairo_matrix_t ident, fwd = *festina_canvas_matrix(&ident);
+        if (fwd.xy == 0.0 && fwd.yx == 0.0) {
+            double ex0 = fwd.xx * (double)dx + fwd.x0, ex1 = fwd.xx * (double)(dx + dw) + fwd.x0;
+            double ey0 = fwd.yy * (double)dy + fwd.y0, ey1 = fwd.yy * (double)(dy + dh) + fwd.y0;
+            if (ex0 > ex1) { double t = ex0; ex0 = ex1; ex1 = t; }
+            if (ey0 > ey1) { double t = ey0; ey0 = ey1; ey1 = t; }
+            if (ex0 == floor(ex0) && ex1 == floor(ex1) && ey0 == floor(ey0) && ey1 == floor(ey1)
+                && fabs(ex0) < 1e9 && fabs(ex1) < 1e9 && fabs(ey0) < 1e9 && fabs(ey1) < 1e9) {
+                festina_matrix_translate(&fwd, (double)dx, (double)dy);
+                festina_matrix_scale(&fwd, (double)dw / (double)sw, (double)dh / (double)sh);
+                festina_matrix_translate(&fwd, -(double)sx, -(double)sy);
+                festina_composite_image(g_backing_surface, surface, &fwd, g_fill_alpha,
+                                        (int64_t)ex0, (int64_t)ey0, (int64_t)ex1, (int64_t)ey1);
+                return;
+            }
+        }
+    }
     cairo_t *cr = festina_canvas_context();
     cairo_save(cr);
     cairo_rectangle(cr, (double)dx, (double)dy, (double)dw, (double)dh);

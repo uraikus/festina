@@ -1343,8 +1343,11 @@ present every slice compares against it, byte for byte where possible:
 4. ◐ fills, strokes, paths, gradients and transforms off Cairo (done: see
    "Slice 4, drawing"); clip, `drawImage` and the rest of the fallback
    functions wait for slice 5, where their sources are
-5. images as sources: integer-offset blits (exact), scaled and rotated
-   draws, `resize`, `clip`, `clone` — a resampler, compared with a bound
+5. ◐ images as sources: integer-offset blits (exact), scaled and rotated
+   draws, `resize`, `clip`, canvas snapshots — a resampler, compared with
+   a bound (done: see "Slice 5, images as sources"; left: the region form
+   under a transform that leaves its rectangle off the pixel grid, and
+   `clone`, which waits for slice 9's PNG encode)
 6. ✅ the decoder gaps (decision 3): every PNG and progressive JPEG (see "Slice 6, PNG" and "Slice 6, JPEG")
 7. presentation: `XPutImage`, and the window seam speaking a plain
    surface (the Win32 and macOS backends already do)
@@ -1728,6 +1731,137 @@ The remaining distance is the compiled Festina loops that walk a row
 per-pixel loop; handing runs rather than pixels to C, and a span-fill
 primitive for opaque interiors, are the next things to try. Status stays
 open until that is measured.
+
+**Slice 5, images as sources.** Every way the runtime used an image as a
+Cairo source -- `clip`, a canvas snapshot (`saveCanvas()` and the
+copy-first of an image drawn onto itself), `drawImage` in its whole,
+scaled and region forms on the canvas and on an `img`, `resize`, and any
+of them under a rotated, scaled or fractionally moved transform -- is now
+done in C on the surfaces' own bytes (`festina_composite_image` and
+`festina_surface_copy_region` in `festina_runtime_graphics.c`), with
+pixman's arithmetic. It is C and not Festina deliberately: the work is
+the inner loop of a blend, four-byte words and no bounds ceremony, which
+is why architecture A gave compositing to C in the first place (a Festina
+version would be the same loop at several times the cost; text.f, a
+coverage computation, is ~12x Cairo for exactly that reason).
+`FESTINA_CAIRO_DRAW=1` keeps the Cairo code of each as it was, which is
+the oracle the tests compare with until slice 9.
+
+*What Cairo does, measured, not read.* Everything below was found by
+drawing known pictures through libcairo 1.18 and fitting models to them;
+the source was not consulted.
+
+- A **copy** (`CAIRO_OPERATOR_SOURCE`, ARGB32 to ARGB32) is a row copy; a
+  source with no alpha channel (RGB24) gets alpha 255.
+- A **whole-pixel translation** (the identity scale, an integer move)
+  interpolates nothing: the pixel is the source's, OVER the destination
+  under `fillAlpha` (the alpha reduced to a byte the way every other
+  colour is: 16-bit short, high byte). A fractional move, a flip or a
+  turn of 90 degrees is not a translation and interpolates.
+- Everything else is `CAIRO_FILTER_GOOD`, which is, **per axis of the
+  source**: a scale **above 0.75** is *bilinear* -- the four nearest
+  texels with pixman's 7-bit weights, each channel the weighted sum
+  shifted down 14 (reproduced bit for bit; the fit to Cairo is exact
+  wherever the 16.16 fixed-point positions are exact, which includes
+  every power of two); a scale of **0.75 or less** is a *box* -- the
+  average of the source area the pixel covers, within 1.6 levels of the
+  true area average. Outside the image is transparent, so an image's edge
+  fades over the half pixel beyond it (a halo that grows with the scale:
+  a 4x enlargement shades two pixels past the edge).
+- **One exception**, found by classifying a grid of scale pairs: a matrix
+  that is only a scale whose factors multiply to 1 (0.5 by 2.0, 0.4 by
+  2.5, 0.6 by 1.667) is sampled **nearest**, with pixman's one-unit bias
+  at exact boundaries. A uniform scale of 1, a flip, a shear and a
+  rotation are all bilinear, whatever their determinant.
+- Under a rotation the box (a downscale) is an axis-aligned window in
+  *source* space of the axis sizes around the mapped centre; the fit is
+  within 1 level.
+
+*What is left unmatched, on purpose.* Cairo samples at positions from the
+matrix rounded to 16.16 and then shifted by the centre of the paint's
+extents, so its sample can sit up to 1/128 pixel off the exact one; here
+the position is the exact inverse matrix. Where the exact position falls
+on a weight boundary (an enlargement by 3, say, at the pixels that land on
+a source pixel) the two round differently: at most 4 levels of 255,
+one or two typically, and nowhere in the interior of a flat region. This
+is why the bound is 4 and not 0, and the tests also bound the mean
+(under 2 over the differing pixels), so a few big differences cannot hide
+among many small ones.
+
+*How it is built.* One entry point, which clips to the image's own reach
+(its transformed corners, a half source pixel wider scaled) and then
+picks: a whole-pixel translation is a run of `restrict`ed, branch-free
+OVERs that the compiler vectorises (`festina_over_flat` is
+`festina_over_un8x4` with the early returns taken out, equal for every
+input because an opaque source multiplies the destination by zero and a
+transparent one by 255); an axis-aligned matrix that is bilinear both
+ways keeps pixman's 2-D formula but computes it per row as
+`(128-dx)*V[i] + dx*V[i+1]` with `V` the two source rows blended once --
+an integer identity, so still bit for bit; an axis-aligned matrix with a
+box or nearest axis reduces each axis by 16-bit weights summing to 65536
+(rows horizontally first, held to 8 fractional bits so the vertical sum
+fits a 32-bit lane and rounds once); anything rotated goes a point at a
+time. Two channels share a 64-bit word in every one of them.
+
+*The region form* (`drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)`) clips
+to the destination rectangle. Under the identity, a whole-pixel move or a
+scale that leaves that rectangle on whole pixels, the clip is a pixel
+rectangle and the draw is the engine's with a rectangle; the source beyond
+the sub-rectangle still takes part in the interpolation at its edges, as
+it does in Cairo. Under a transform that leaves the rectangle on
+fractions of pixels the clip is an antialiased shape, which stays with
+Cairo for now. **That, and `clone`** (a PNG round trip, waiting for
+slice 9's encoder), **are what is left of Cairo as a source.**
+
+*Tests.* `tests/test_image_sources.py` draws the same scene both ways from
+sources built identically by `imageFromPixels` (random RGBA, with
+transparent, translucent and opaque pixels) and compares premultiplied
+pixels: whole-pixel blits at several alphas, under a canvas translation,
+off every edge, canvas and `img` -- exactly equal; copies, clips that
+reach past the source, canvas snapshots, an image drawn onto itself --
+exactly equal; 22 resampling scenes (2x and 4x exact; the rest within 4)
+on both targets, covering enlargements, mild and strong reductions, each
+axis choosing for itself, the 2.0-by-0.5 exception, flips, rotations by
+30, 90 and with scale, partly and wholly off the canvas, zero sizes; the
+region form with sources and destinations past each other's edges, at
+alpha, translated and scaled; `resize` to eight sizes; and a JPEG. Twelve
+put-back bugs each fail it (the 0.75 threshold moved, the exception
+removed, the halo cut to a pixel, the alpha ignored, the bilinear
+rounding changed, a copy offset by one, a blit offset by one, the box
+unnormalised, the region clip dropped, the bilinear axes swapped, the
+self-draw copy skipped in the engine's path); two do not and are
+equivalent: dropping alpha 255 for an RGB24 source (every producer of one
+writes 0xFF there already) and clamping a premultiplied channel to its
+alpha (a weighted average of valid pixels is already valid, so the clamp
+was removed). `tests/stress/image_sources_churn.f` runs all of it under
+AddressSanitizer and LeakSanitizer, off every edge, at scales from one
+pixel to eight times.
+
+*Speed* (800x600 canvas, per call, one run each, the process baseline
+subtracted; Cairo with `FESTINA_CAIRO_DRAW=1`):
+
+| call | Cairo | here |
+|---|---|---|
+| `drawImage` 64x48 whole-pixel | 2.9 us | 4.8 us |
+| same at `fillAlpha(0.5)` | 4.8 us | 7.5 us |
+| `drawImage` 512x384 whole-pixel | 163 us | 316 us |
+| 64x48 enlarged to 128x96 | 48 us | 85 us |
+| 64x48 to 100x75 | 29 us | 54 us |
+| 64x48 rotated 30 degrees | 56 us | 102 us |
+| 512x384 reduced to 160x120 | 1,830 us | 838 us |
+| 512x384 reduced to 256x192 | 161 us | 1,130 us |
+| `clip` 40x30 | 1.6 us | 1.2 us |
+
+The first version of the engine was 4-8x Cairo on blits and 3.5-4x on
+enlargements and 22x on halving; what closed most of it was the
+branch-free vectorisable OVER (blits 5.9x -> 1.6x), the per-row `V`
+identity (enlargements 3.8x -> 1.8x), taking a division out of the
+vertical loop (halving 22x -> 7x), and handing the whole row to the
+vectorised OVER at the end of each path. The one that stays far behind is
+the box reduction with small, even weights (halving): 7x, ~240
+instructions per output pixel, the horizontal pass over every source row;
+a vertical-first pass over contiguous rows, and SIMD, are the ideas left.
+Large reductions are faster than Cairo's own.
 
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the

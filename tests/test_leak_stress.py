@@ -451,6 +451,9 @@ class TestLeakStress:
             # -- the matrix, fill source and path arrays C builds and
             # releases each call, and draw.f's coverage globals.
             "draw_shapes_churn.f",
+            # runtime.md phase 7 slice 5: every way an image is a source,
+            # and the resampler's scratch tables.
+            "image_sources_churn.f",
             "regex_and_files_churn.f",  # regex compilation, file and time text
             "structs_and_rows_churn.f", # structs, query rows, scope exits
             "text_churn.f",             # text, the copy-managed one
