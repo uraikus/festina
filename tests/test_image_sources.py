@@ -214,13 +214,8 @@ _RESAMPLED = {
     # each axis chooses for itself
     "x_up_y_down": ("{T}drawImage(src, 10, 10, 40, 6)\n", BOUND),
     "x_down_y_up": ("{T}drawImage(src, 10, 10, 8, 40)\n", BOUND),
-    # a scale-only matrix whose two factors multiply to 1 is sampled nearest
-    "nearest_2_by_half": ("{T}scale(2.0, 0.5)\n{T}drawImage(src, 5, 20)\n{T}resetTransform()\n", BOUND),
-    "nearest_half_by_2": ("{T}scale(0.5, 2.0)\n{T}drawImage(src, 20, 5)\n{T}resetTransform()\n", BOUND),
-    # ... and to within 1/512 of 1: Cairo's own edge, measured by bisection
-    "nearest_det_1.0015": ("{T}scale(2.0, 0.50075)\n{T}drawImage(src, 5, 20)\n{T}resetTransform()\n", BOUND),
-    "nearest_det_0.9985": ("{T}scale(2.0, 0.49925)\n{T}drawImage(src, 5, 20)\n{T}resetTransform()\n", BOUND),
-    "bilinear_box_det_1.003": ("{T}scale(2.0, 0.5015)\n{T}drawImage(src, 5, 20)\n{T}resetTransform()\n", BOUND),
+    # a determinant just off 1 -- see test_an_area_preserving_scale_follows_the_general_rule
+    "general_at_det_1.003": ("{T}scale(2.0, 0.5015)\n{T}drawImage(src, 5, 20)\n{T}resetTransform()\n", BOUND),
     "canvas_scale_2.5": ("{T}scale(2.5, 2.5)\n{T}drawImage(src, 3, 3)\n{T}resetTransform()\n", BOUND),
     "mirrored": ("{T}translate(60, 10)\n{T}scale(-1.0, 1.0)\n{T}drawImage(src, 0, 0)\n{T}resetTransform()\n", BOUND),
     "rotate_30": ("{T}translate(60, 30)\n{T}rotate(30.0)\n{T}drawImage(src, 0, 0)\n{T}resetTransform()\n", BOUND),
@@ -347,21 +342,103 @@ def test_a_region_clipped_off_the_pixel_grid_agrees_with_cairo(compile_and_run, 
     assert total / max(count, 1) <= 3.0, (name, total / count)
 
 
-def test_zz_diagnostic_nearest_scale_pair(compile_and_run, tmp_path, monkeypatch):
-    """TEMPORARY (Windows CI run 191 failed the two 'scale factors multiply
-    to 1' scenes by 156 levels; this dumps both pictures to see why)."""
+
+# ---- the area-preserving scale: no Cairo as the oracle ---------------------
+
+def _source_pixels(w=17, h=13):
+    """The premultiplied pixels _SOURCE builds, regenerated here from the
+    same generator, so the expected picture can be computed without Cairo."""
+    seed = [20241]
+
+    def rnd(n):
+        seed[0] = (seed[0] * 1103515245 + 12345) % 2147483648
+        return (seed[0] // 65536) % n
+    out = []
+    for _ in range(w * h):
+        kind = rnd(8)
+        a = 255
+        if kind == 0:
+            a = 0
+        if kind == 1:
+            a = 1 + rnd(254)
+        if kind == 2:
+            a = 128
+        r, g, b = rnd(256), rnd(256), rnd(256)
+        out.append(tuple((c * a + 127) // 255 for c in (r, g, b)) + (a,))
+    return out
+
+
+def _expected(src, w, h, sx, sy, ox, oy, size):
+    """The picture of `src` scaled by (sx, sy) with its corner at (ox, oy),
+    over white, from the rule: per axis, bilinear above 0.75 and a box at
+    or below. Pixel centres, transparent outside the image."""
+    import math
+
+    def at(i, j):
+        return src[j * w + i] if 0 <= i < w and 0 <= j < h else (0, 0, 0, 0)
+
+    def taps(s, d, n, o):
+        """[(index, weight)] of destination pixel d along one axis."""
+        c = (d + 0.5 - o) / s
+        if s > 0.75:
+            u = c - 0.5
+            i = math.floor(u * 128) // 128
+            f = math.floor(u * 128) % 128 / 128.0
+            return [(i, 1.0 - f), (i + 1, f)]
+        lo, hi = c - 0.5 / s, c + 0.5 / s
+        return [(j, (min(hi, j + 1) - max(lo, j)) * s) for j in range(math.floor(lo), math.ceil(hi))]
+    out = []
+    for y in range(size[1]):
+        row = []
+        for x in range(size[0]):
+            acc = [0.0] * 4
+            for j, wy in taps(sy, y, h, oy):
+                for i, wx in taps(sx, x, w, ox):
+                    p = at(i, j)
+                    for k in range(4):
+                        acc[k] += p[k] * wx * wy
+            a = round(acc[3])
+            row.append(tuple(min(255, round(acc[k]) + 255 - a) for k in range(3)) + (255,))
+        out.append(row)
+    return out
+
+
+@pytest.mark.parametrize("on_img", [False, True], ids=["canvas", "img"])
+@pytest.mark.parametrize("sx,sy,call,ox,oy", [
+    (2.0, 0.5, "scale(2.0, 0.5)\n{T}drawImage(src, 5, 20)", 10, 10),
+    (0.5, 2.0, "scale(0.5, 2.0)\n{T}drawImage(src, 20, 5)", 10, 10),
+    (2.0, 0.50075, "scale(2.0, 0.50075)\n{T}drawImage(src, 5, 20)", 10, 20 * 0.50075),
+    (0.4, 2.5, "scale(0.4, 2.5)\n{T}drawImage(src, 25, 4)", 10, 10),
+])
+def test_an_area_preserving_scale_follows_the_general_rule(compile_and_run, tmp_path, monkeypatch,
+                                                           on_img, sx, sy, call, ox, oy):
+    """A scale-only matrix whose factors multiply to 1 (0.5 by 2.0, 0.4 by
+    2.5) is sampled NEAREST by Cairo over pixman 0.42 (Ubuntu's) and
+    through the general rule -- bilinear on the axis that grows, a box on
+    the one that shrinks -- by the Cairo MSYS2 ships (CI run 191 showed the
+    Windows pictures smooth and 156 levels from nearest). Both are
+    Cairo's, so Cairo cannot be the oracle for these scenes; the rule the
+    engine follows is the general one, the newer behaviour and the one
+    without a discontinuity at determinant 1, and what is checked here is
+    that picture, computed independently from the source pixels. Re-baselined
+    from a comparison with Cairo (runtime.md, phase 7, decision 4), not
+    loosened: the scenes next to these, at a determinant of 1.003, are still
+    compared with Cairo and agree on every platform."""
     monkeypatch.delenv("DISPLAY", raising=False)
-    body = "scale(2.0, 0.5)\ndrawImage(src, 5, 20)\nresetTransform()\n"
-    ours, cairo = _both(compile_and_run, tmp_path, body)
-    body2 = "scale(2.0, 0.5001)\ndrawImage(src, 5, 20)\nresetTransform()\n"
-    ours2, cairo2 = _both(compile_and_run, tmp_path, body2)
-    lines = []
-    for tag, pic in (("ours", ours), ("cairo", cairo), ("ours@.5001", ours2), ("cairo@.5001", cairo2)):
-        _, _, px = pic
-        for y in range(9, 17):
-            lines.append("%s y=%d " % (tag, y) + " ".join("%02x%02x%02x%02x" % tuple(px[y][x]) for x in range(9, 21)))
-    if sys.platform != "win32":
-        return
-    raise AssertionError("DIAG\n" + "\n".join(lines)
-                         + "\nworst ours-vs-cairo %s ; ours@.5001-vs-cairo@.5001 %s ; cairo-vs-cairo@.5001 %s"
-                         % (_diff(ours, cairo)[:2], _diff(ours2, cairo2)[:2], _diff(cairo, cairo2)[:2]))
+    T = "t." if on_img else ""
+    body = f"{T}{call.format(T=T)}\n{T}resetTransform()\n"
+    ours = _scene(compile_and_run, tmp_path, body, "ours.png", on_img=on_img)
+    _, _, got = ours
+    # the white ground is the top-left _W x _H of either target
+    w, h = _W, _H
+    want = _expected(_source_pixels(), 17, 13, sx, sy, ox, oy, (w, h))
+    worst = 0
+    differing = 0
+    for y in range(h):
+        for x in range(w):
+            d = max(abs(p - q) for p, q in zip(got[y][x], want[y][x]))
+            if d:
+                differing += 1
+                worst = max(worst, d)
+    assert _busy(ours) > 30
+    assert worst <= 4, (worst, differing)

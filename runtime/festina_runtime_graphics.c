@@ -2759,7 +2759,8 @@ int64_t festina_image_get_pixel_color(void *img, int64_t x, int64_t y) {
  *     average of the source area the pixel covers). Outside the image is
  *     transparent, so the edge pixels fade over the half pixel beyond it.
  *     The one exception found: a matrix that is only a scale whose two
- *     factors multiply to 1 (0.5 by 2, say) is sampled nearest.
+ *     factors multiply to 1 (0.5 by 2, say) is sampled nearest on Cairo
+ *     over pixman 0.42, and not on MSYS2's: not followed here.
  *
  * The positions are computed once per pixel from the inverse matrix in
  * doubles, where pixman starts from the matrix rounded to 16.16 and
@@ -2901,7 +2902,7 @@ typedef struct {
     int maxn;
 } FestinaTaps;
 
-typedef enum { FESTINA_TAPS_BILINEAR, FESTINA_TAPS_BOX, FESTINA_TAPS_NEAREST } FestinaTapKind;
+typedef enum { FESTINA_TAPS_BILINEAR, FESTINA_TAPS_BOX } FestinaTapKind;
 
 static void festina_taps_free(FestinaTaps *t) {
     free(t->first); free(t->count); free(t->w);
@@ -2916,7 +2917,6 @@ static int festina_taps_build(FestinaTaps *t, FestinaTapKind kind, int64_t d0, i
     int64_t n = d1 - d0;
     memset(t, 0, sizeof(*t));
     int maxn = 2;
-    if (kind == FESTINA_TAPS_NEAREST) maxn = 1;
     if (kind == FESTINA_TAPS_BOX) {
         double w = window < 0 ? -window : window;
         if (w > 4096.0) w = 4096.0;
@@ -2933,12 +2933,7 @@ static int festina_taps_build(FestinaTaps *t, FestinaTapKind kind, int64_t d0, i
         int64_t i0;
         int cnt;
         uint32_t tmp[2];
-        if (kind == FESTINA_TAPS_NEAREST) {
-            int64_t fu = (int64_t)floor(u * 65536.0 + 0.5);
-            i0 = (fu - 1) >> 16;
-            cnt = 1;
-            tmp[0] = 65536u;
-        } else if (kind == FESTINA_TAPS_BILINEAR) {
+        if (kind == FESTINA_TAPS_BILINEAR) {
             int64_t fu = (int64_t)floor(u * 65536.0 - 32768.0);
             i0 = fu >> 16;
             int f = (int)((fu >> 9) & 127);
@@ -3092,7 +3087,7 @@ static void festina_resample_bilinear(uint32_t *dd, size_t dstride_words, const 
     free(ixs); free(dxs); free(vrb); free(r0); free(line);
 }
 
-/* Axis-aligned, with a box or nearest axis in it: each axis reduced by its
+/* Axis-aligned, with a box axis in it: each axis reduced by its
  * own weights, rows first. Weights are 16-bit fractions that sum to
  * 65536. Two channels share a 64-bit word, a lane of 32 bits each: a row
  * reduced horizontally is kept to 8 fractional bits (at most 65280), and
@@ -3399,17 +3394,18 @@ static void festina_composite_image(cairo_surface_t *dst, cairo_surface_t *srcs,
                           x0, y0, x1, y1, m, opaque_dest, mask, mx0, my0, mw);
     } else if (fwd->xy == 0.0 && fwd->yx == 0.0) {
         /* Per axis of the source: its size under the matrix picks the
-         * filter. A scale-only matrix whose two factors multiply to 1
-         * (0.5 by 2, say) -- to within 1/512 -- is sampled nearest, which is what
-         * Cairo 1.18 does. */
+         * filter, bilinear above 0.75 and a box at or below. (Cairo on
+         * pixman 0.42 samples NEAREST when the two factors multiply to 1
+         * within 1/512 and one of them reduces -- 0.5 by 2.0, say -- and
+         * Cairo on MSYS2 does not; the general rule is what the newer
+         * one does, and the one followed here.) */
         int box_x = fsx <= 0.75, box_y = fsy <= 0.75;
-        int nearest = (box_x || box_y) && fabs(fsx * fsy - 1.0) < 1.0 / 512.0;
-        if (!box_x && !box_y && !nearest) {
+        if (!box_x && !box_y) {
             festina_resample_bilinear(dd, dstride_words, &sv, &inv, x0, y0, x1, y1, m, opaque_dest, mask, mx0, my0, mw);
         } else {
             FestinaTaps tx, ty;
-            FestinaTapKind kx = nearest ? FESTINA_TAPS_NEAREST : box_x ? FESTINA_TAPS_BOX : FESTINA_TAPS_BILINEAR;
-            FestinaTapKind ky = nearest ? FESTINA_TAPS_NEAREST : box_y ? FESTINA_TAPS_BOX : FESTINA_TAPS_BILINEAR;
+            FestinaTapKind kx = box_x ? FESTINA_TAPS_BOX : FESTINA_TAPS_BILINEAR;
+            FestinaTapKind ky = box_y ? FESTINA_TAPS_BOX : FESTINA_TAPS_BILINEAR;
             if (festina_taps_build(&tx, kx, x0, x1, inv.xx, inv.x0, box_x ? 1.0 / fsx : 0.0, sv.w)) {
                 if (festina_taps_build(&ty, ky, y0, y1, inv.yy, inv.y0, box_y ? 1.0 / fsy : 0.0, sv.h))
                     festina_resample_separable(dd, dstride_words, &sv, &tx, &ty, x0, y0, x1, y1, m, opaque_dest, mask, mx0, my0, mw);

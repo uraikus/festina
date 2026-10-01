@@ -1767,11 +1767,26 @@ the source was not consulted.
   true area average. Outside the image is transparent, so an image's edge
   fades over the half pixel beyond it (a halo that grows with the scale:
   a 4x enlargement shades two pixels past the edge).
-- **One exception**, found by classifying a grid of scale pairs: a matrix
-  that is only a scale whose factors multiply to 1 (0.5 by 2.0, 0.4 by
-  2.5, 0.6 by 1.667) is sampled **nearest**, with pixman's one-unit bias
-  at exact boundaries. A uniform scale of 1, a flip, a shear and a
-  rotation are all bilinear, whatever their determinant.
+- **One quirk, not followed.** On Cairo 1.18.0 over pixman 0.42 (Ubuntu's),
+  a matrix that is only a scale whose two factors multiply to 1 within
+  1/512 (0.5 by 2.0, 0.4 by 2.5; the edge was found by bisecting the
+  determinant) is sampled **nearest**, with pixman's one-unit bias at exact
+  boundaries. The first version of the engine copied it. Windows CI (run
+  191) showed that the Cairo MSYS2 ships does not: its pictures for 2.0 by
+  0.5 are smooth, 156 levels from nearest, and equal, to within a level, to
+  the general rule (bilinear on the axis that grows, a box on the one that
+  shrinks; checked by hand against its dumped pixels). So Cairo is not one
+  oracle here, and the engine follows the general rule -- the newer
+  behaviour, and the one with no discontinuity at a determinant of 1. The
+  Cairo comparison for those scenes became a comparison with a picture
+  computed independently from the source pixels
+  (`test_an_area_preserving_scale_follows_the_general_rule`; re-baselined,
+  not loosened, decision 4), and the scene at a determinant of 1.003, where
+  every Cairo agrees, is still compared with Cairo. A uniform scale of 1,
+  a flip, a shear and a rotation are bilinear whatever the determinant.
+  (macOS' Homebrew Cairo 1.18.4 passed the earlier tests, but a long run of
+  the macOS suite is skipped and it is not known whether these scenes were
+  among them; nothing is claimed from it.)
 - Under a rotation the box (a downscale) is an axis-aligned window in
   *source* space of the axis sizes around the mapped centre; the fit is
   within 1 level.
@@ -1823,15 +1838,15 @@ transparent, translucent and opaque pixels) and compares premultiplied
 pixels: whole-pixel blits at several alphas, under a canvas translation,
 off every edge, canvas and `img` -- exactly equal; copies, clips that
 reach past the source, canvas snapshots, an image drawn onto itself --
-exactly equal; 22 resampling scenes (2x and 4x exact; the rest within 4)
+exactly equal; 21 resampling scenes against Cairo (2x and 4x exact; the rest within 4) and four against the model
 on both targets, covering enlargements, mild and strong reductions, each
-axis choosing for itself, the 2.0-by-0.5 exception, flips, rotations by
+axis choosing for itself, the area-preserving scale pairs (against an independent model, not Cairo), flips, rotations by
 30, 90 and with scale, partly and wholly off the canvas, zero sizes; the
 region form with sources and destinations past each other's edges, at
 alpha, translated and scaled, and eight more under a turn, a half-pixel
 scale, a mirror and a draw partly off the canvas, whose clip is a mask;
 `resize` to eight sizes; and a JPEG. Sixteen put-back bugs each fail it
-(the 0.75 threshold moved, the exception removed, the halo cut to a pixel,
+(the 0.75 threshold moved, the box threshold moved to 0.45 (which only the model scenes see), the halo cut to a pixel,
 the alpha ignored, the bilinear rounding changed, a copy offset by one, a
 blit offset by one, the box unnormalised, the region clip dropped, the
 bilinear axes swapped, the self-draw copy skipped in the engine's path,
