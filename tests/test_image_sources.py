@@ -217,6 +217,10 @@ _RESAMPLED = {
     # a scale-only matrix whose two factors multiply to 1 is sampled nearest
     "nearest_2_by_half": ("{T}scale(2.0, 0.5)\n{T}drawImage(src, 5, 20)\n{T}resetTransform()\n", BOUND),
     "nearest_half_by_2": ("{T}scale(0.5, 2.0)\n{T}drawImage(src, 20, 5)\n{T}resetTransform()\n", BOUND),
+    # ... and to within 1/512 of 1: Cairo's own edge, measured by bisection
+    "nearest_det_1.0015": ("{T}scale(2.0, 0.50075)\n{T}drawImage(src, 5, 20)\n{T}resetTransform()\n", BOUND),
+    "nearest_det_0.9985": ("{T}scale(2.0, 0.49925)\n{T}drawImage(src, 5, 20)\n{T}resetTransform()\n", BOUND),
+    "bilinear_box_det_1.003": ("{T}scale(2.0, 0.5015)\n{T}drawImage(src, 5, 20)\n{T}resetTransform()\n", BOUND),
     "canvas_scale_2.5": ("{T}scale(2.5, 2.5)\n{T}drawImage(src, 3, 3)\n{T}resetTransform()\n", BOUND),
     "mirrored": ("{T}translate(60, 10)\n{T}scale(-1.0, 1.0)\n{T}drawImage(src, 0, 0)\n{T}resetTransform()\n", BOUND),
     "rotate_30": ("{T}translate(60, 30)\n{T}rotate(30.0)\n{T}drawImage(src, 0, 0)\n{T}resetTransform()\n", BOUND),
@@ -341,3 +345,23 @@ def test_a_region_clipped_off_the_pixel_grid_agrees_with_cairo(compile_and_run, 
     assert _busy(ours) > 100
     assert worst <= 16, (name, worst, count)
     assert total / max(count, 1) <= 3.0, (name, total / count)
+
+
+def test_zz_diagnostic_nearest_scale_pair(compile_and_run, tmp_path, monkeypatch):
+    """TEMPORARY (Windows CI run 191 failed the two 'scale factors multiply
+    to 1' scenes by 156 levels; this dumps both pictures to see why)."""
+    monkeypatch.delenv("DISPLAY", raising=False)
+    body = "scale(2.0, 0.5)\ndrawImage(src, 5, 20)\nresetTransform()\n"
+    ours, cairo = _both(compile_and_run, tmp_path, body)
+    body2 = "scale(2.0, 0.5001)\ndrawImage(src, 5, 20)\nresetTransform()\n"
+    ours2, cairo2 = _both(compile_and_run, tmp_path, body2)
+    lines = []
+    for tag, pic in (("ours", ours), ("cairo", cairo), ("ours@.5001", ours2), ("cairo@.5001", cairo2)):
+        _, _, px = pic
+        for y in range(9, 17):
+            lines.append("%s y=%d " % (tag, y) + " ".join("%02x%02x%02x%02x" % tuple(px[y][x]) for x in range(9, 21)))
+    if sys.platform != "win32":
+        return
+    raise AssertionError("DIAG\n" + "\n".join(lines)
+                         + "\nworst ours-vs-cairo %s ; ours@.5001-vs-cairo@.5001 %s ; cairo-vs-cairo@.5001 %s"
+                         % (_diff(ours, cairo)[:2], _diff(ours2, cairo2)[:2], _diff(cairo, cairo2)[:2]))

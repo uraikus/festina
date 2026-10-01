@@ -3400,9 +3400,10 @@ static void festina_composite_image(cairo_surface_t *dst, cairo_surface_t *srcs,
     } else if (fwd->xy == 0.0 && fwd->yx == 0.0) {
         /* Per axis of the source: its size under the matrix picks the
          * filter. A scale-only matrix whose two factors multiply to 1
-         * (0.5 by 2, say) is sampled nearest, which is what Cairo does. */
+         * (0.5 by 2, say) -- to within 1/512 -- is sampled nearest, which is what
+         * Cairo 1.18 does. */
         int box_x = fsx <= 0.75, box_y = fsy <= 0.75;
-        int nearest = (box_x || box_y) && fabs(fsx * fsy - 1.0) < 1e-9;
+        int nearest = (box_x || box_y) && fabs(fsx * fsy - 1.0) < 1.0 / 512.0;
         if (!box_x && !box_y && !nearest) {
             festina_resample_bilinear(dd, dstride_words, &sv, &inv, x0, y0, x1, y1, m, opaque_dest, mask, mx0, my0, mw);
         } else {
