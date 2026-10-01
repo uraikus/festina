@@ -1345,9 +1345,8 @@ present every slice compares against it, byte for byte where possible:
    functions wait for slice 5, where their sources are
 5. ◐ images as sources: integer-offset blits (exact), scaled and rotated
    draws, `resize`, `clip`, canvas snapshots — a resampler, compared with
-   a bound (done: see "Slice 5, images as sources"; left: the region form
-   under a transform that leaves its rectangle off the pixel grid, and
-   `clone`, which waits for slice 9's PNG encode)
+   a bound (done: see "Slice 5, images as sources"; left: `clone`, which
+   waits for slice 9's PNG encode)
 6. ✅ the decoder gaps (decision 3): every PNG and progressive JPEG (see "Slice 6, PNG" and "Slice 6, JPEG")
 7. presentation: `XPutImage`, and the window seam speaking a plain
    surface (the Win32 and macOS backends already do)
@@ -1804,14 +1803,19 @@ fits a 32-bit lane and rounds once); anything rotated goes a point at a
 time. Two channels share a 64-bit word in every one of them.
 
 *The region form* (`drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh)`) clips
-to the destination rectangle. Under the identity, a whole-pixel move or a
-scale that leaves that rectangle on whole pixels, the clip is a pixel
-rectangle and the draw is the engine's with a rectangle; the source beyond
-the sub-rectangle still takes part in the interpolation at its edges, as
-it does in Cairo. Under a transform that leaves the rectangle on
-fractions of pixels the clip is an antialiased shape, which stays with
-Cairo for now. **That, and `clone`** (a PNG round trip, waiting for
-slice 9's encoder), **are what is left of Cairo as a source.**
+to the destination rectangle, and the source beyond the sub-rectangle still
+takes part in the interpolation at its edges, as it does in Cairo. Under
+the identity, a whole-pixel move or a scale that leaves the rectangle's
+edges between pixels the clip is a pixel rectangle. Under any other
+transform (a turn, a half-pixel scale) it is a parallelogram with partly
+covered edge pixels, and the draw is scaled, pixel by pixel, by the exact
+area the parallelogram shares with the pixel (a convex polygon clipped to
+the pixel's square), on top of `fillAlpha`. Cairo's clip is a mask of the
+same kind from its scan converter, so interior and exterior agree exactly
+and the edge pixels within 13 levels (about 5% of a pixel's coverage, the
+usual difference between an exact and a sampled slanted edge; decision 4).
+**`clone` (a PNG round trip, waiting for slice 9's encoder) is what is
+left of Cairo as a source.**
 
 *Tests.* `tests/test_image_sources.py` draws the same scene both ways from
 sources built identically by `imageFromPixels` (random RGBA, with
@@ -1824,18 +1828,22 @@ on both targets, covering enlargements, mild and strong reductions, each
 axis choosing for itself, the 2.0-by-0.5 exception, flips, rotations by
 30, 90 and with scale, partly and wholly off the canvas, zero sizes; the
 region form with sources and destinations past each other's edges, at
-alpha, translated and scaled; `resize` to eight sizes; and a JPEG. Twelve
-put-back bugs each fail it (the 0.75 threshold moved, the exception
-removed, the halo cut to a pixel, the alpha ignored, the bilinear
-rounding changed, a copy offset by one, a blit offset by one, the box
-unnormalised, the region clip dropped, the bilinear axes swapped, the
-self-draw copy skipped in the engine's path); two do not and are
+alpha, translated and scaled, and eight more under a turn, a half-pixel
+scale, a mirror and a draw partly off the canvas, whose clip is a mask;
+`resize` to eight sizes; and a JPEG. Sixteen put-back bugs each fail it
+(the 0.75 threshold moved, the exception removed, the halo cut to a pixel,
+the alpha ignored, the bilinear rounding changed, a copy offset by one, a
+blit offset by one, the box unnormalised, the region clip dropped, the
+bilinear axes swapped, the self-draw copy skipped in the engine's path,
+the clip mask ignored, its coverage not scaled by the alpha in either of
+the two places that apply it, its area not halved); three do not, and are
 equivalent: dropping alpha 255 for an RGB24 source (every producer of one
-writes 0xFF there already) and clamping a premultiplied channel to its
-alpha (a weighted average of valid pixels is already valid, so the clamp
-was removed). `tests/stress/image_sources_churn.f` runs all of it under
-AddressSanitizer and LeakSanitizer, off every edge, at scales from one
-pixel to eight times.
+writes 0xFF there already), clamping a premultiplied channel to its alpha
+(a weighted average of valid pixels is already valid, so the clamp was
+removed), and skipping the "wholly outside" shortcut when building the
+mask (it only saves time). `tests/stress/image_sources_churn.f` runs all
+of it under AddressSanitizer and LeakSanitizer, off every edge, at scales
+from one pixel to eight times.
 
 *Speed* (800x600 canvas, per call, one run each, the process baseline
 subtracted; Cairo with `FESTINA_CAIRO_DRAW=1`):

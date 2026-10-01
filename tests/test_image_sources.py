@@ -313,3 +313,31 @@ def test_a_source_with_no_alpha_channel_draws_opaque(compile_and_run, tmp_path, 
     worst, count, _ = _diff(pics["ours"], pics["cairo"])
     assert worst <= BOUND, (worst, count)
     assert _busy(pics["ours"]) > 400
+
+
+_REGIONS_OFF_GRID = {
+    "rotated": "translate(100, 40)\nrotate(25.0)\ndrawImage(src, 3, 2, 9, 7, 0, 0, 36, 28)\nresetTransform()\n",
+    "rotated_at_alpha": "fillAlpha(0.6)\ntranslate(60, 70)\nrotate(70.0)\ndrawImage(src, 0, 0, 17, 13, 0, 0, 34, 26)\nfillAlpha(1.0)\nresetTransform()\n",
+    "half_pixel_edges": "scale(0.5, 0.5)\ndrawImage(src, 2, 2, 9, 7, 31, 33, 40, 30)\nresetTransform()\n",
+    "half_pixel_edges_at_alpha": "fillAlpha(0.5)\nscale(0.5, 0.5)\ndrawImage(src, 2, 2, 9, 7, 31, 33, 40, 30)\nfillAlpha(1.0)\nresetTransform()\n",
+    "scaled_by_1_5": "scale(1.5, 1.5)\ndrawImage(src, 0, 0, 17, 13, 9, 9, 33, 27)\nresetTransform()\n",
+    "rotated_down": "translate(150, 90)\nrotate(15.0)\nscale(0.6, 0.6)\ndrawImage(src, 1, 1, 15, 11, 0, 0, 30, 22)\nresetTransform()\n",
+    "mirrored": "translate(120, 10)\nscale(-1.0, 1.0)\ndrawImage(src, 2, 2, 12, 9, 5, 5, 24, 18)\nresetTransform()\n",
+    "rotated_partly_off": "translate(5, 5)\nrotate(40.0)\ndrawImage(src, 0, 0, 17, 13, -10, -4, 60, 40)\nresetTransform()\n",
+}
+
+
+@pytest.mark.parametrize("name", list(_REGIONS_OFF_GRID))
+def test_a_region_clipped_off_the_pixel_grid_agrees_with_cairo(compile_and_run, tmp_path,
+                                                               monkeypatch, name):
+    """Where the destination rectangle's edges fall inside pixels (a turn,
+    a half-pixel scale), the clip is partial coverage at the edge: the draw
+    is scaled by the exact area the rectangle shares with the pixel, where
+    Cairo's scan converter samples it. Interior and exterior agree exactly;
+    the edge pixels within a few levels more than the interpolation does."""
+    monkeypatch.delenv("DISPLAY", raising=False)
+    ours, cairo = _both(compile_and_run, tmp_path, _REGIONS_OFF_GRID[name])
+    worst, count, total = _diff(ours, cairo)
+    assert _busy(ours) > 100
+    assert worst <= 16, (name, worst, count)
+    assert total / max(count, 1) <= 3.0, (name, total / count)
