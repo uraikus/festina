@@ -781,6 +781,10 @@ class TestAudioFeatureConfig:
         monkeypatch.setattr(cli_mod, "_check_feature_supported",
                             lambda name, platform_name=None: calls.append(name))
         monkeypatch.setattr(cli_mod, "_ensure_runtime_object", lambda *a, **k: "/tmp/fake.o")
+        # The Festina-written components (draw.f, phase 7) and their glue
+        # are compiled by the same call and need a real clang: record, don't build.
+        monkeypatch.setattr(cli_mod, "_ensure_festina_component", lambda *a, **k: "/tmp/fake.o")
+        monkeypatch.setattr(cli_mod, "_ensure_draw_glue_object", lambda *a, **k: "/tmp/fake.o")
         monkeypatch.setattr(cli_mod, "_feature_extra_object", lambda *a, **k: None)
         monkeypatch.setattr(cli_mod, "_pkg_config", lambda *a, **k: [])
         monkeypatch.setattr(cli_mod, "_sqlite_link_flags", lambda cc: ([], False))
@@ -815,6 +819,10 @@ class TestAudioFeatureConfig:
         monkeypatch.setattr(cli_mod, "_check_feature_supported",
                             lambda name, platform_name=None: calls.append(name))
         monkeypatch.setattr(cli_mod, "_ensure_runtime_object", lambda *a, **k: "/tmp/fake.o")
+        # The Festina-written components (draw.f, phase 7) and their glue
+        # are compiled by the same call and need a real clang: record, don't build.
+        monkeypatch.setattr(cli_mod, "_ensure_festina_component", lambda *a, **k: "/tmp/fake.o")
+        monkeypatch.setattr(cli_mod, "_ensure_draw_glue_object", lambda *a, **k: "/tmp/fake.o")
         monkeypatch.setattr(cli_mod, "_feature_extra_object", lambda *a, **k: None)
         monkeypatch.setattr(cli_mod, "_pkg_config", lambda *a, **k: [])
         monkeypatch.setattr(cli_mod, "_sqlite_link_flags", lambda cc: ([], False))
