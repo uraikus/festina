@@ -5061,7 +5061,6 @@ void festina_run_event_loop(void) {
 #include <X11/Xlib.h>
 #include <X11/Xutil.h> /* XLookupString/XKeysymToString -- `on keyDown`/`on keyUp` */
 #include <X11/XKBlib.h> /* XkbSetDetectableAutoRepeat -- claude.md #98 */
-#include <cairo/cairo-xlib.h>
 
 /* Motif WM hints -- the widely-honored (if not core-protocol) X11
  * convention for requesting a window with no title bar/border/menu. */
@@ -5074,7 +5073,26 @@ typedef struct {
 static Display *g_display = NULL;
 static Window g_window;
 static Atom g_wm_delete_atom;
-static cairo_surface_t *g_window_surface = NULL;
+/* runtime.md phase 7, slice 7: the window shows the canvas through
+ * XPutImage, not through a Cairo Xlib surface. The canvas is a plain
+ * buffer of premultiplied ARGB words; the server wants opaque pixels in
+ * its visual's layout, so each present composites the canvas over the
+ * window's white ground into a scratch buffer (a transparent canvas pixel
+ * shows white, as it does on the Win32 backend, which ignores alpha) and
+ * puts that. The common visual -- 24 or 32 bits, red 0xFF0000, green
+ * 0xFF00, blue 0xFF, least significant byte first -- takes the words as
+ * they are; any other TrueColor layout is converted pixel by pixel. */
+static int festina_host_is_little_endian(void) {
+    const uint16_t one = 1;
+    return *(const unsigned char *)&one == 1;
+}
+static GC g_gc = NULL;
+static Visual *g_visual = NULL;
+static int g_depth = 0;
+static int g_present_fast = 0;
+static XImage *g_ximage = NULL;
+static uint32_t *g_scratch = NULL;      /* the fast path's words, owned here */
+static int g_ximage_w = 0, g_ximage_h = 0;
 /* Whether the X server could turn on detectable auto-repeat (XKB). When
  * it can, a held key produces a single KeyPress and one KeyRelease when
  * it is finally let go. When it cannot, X synthesizes a
@@ -5195,13 +5213,35 @@ void festina_window_open(int64_t width, int64_t height, const char *title) {
     XSetErrorHandler(prev_error_handler);
     XFlush(g_display);
 
-    g_window_surface = cairo_xlib_surface_create(g_display, g_window, DefaultVisual(g_display, screen),
-                                                  (int)width, (int)height);
+    g_visual = DefaultVisual(g_display, screen);
+    g_depth = DefaultDepth(g_display, screen);
+    if (g_visual->class != TrueColor && g_visual->class != DirectColor) {
+        festina_fail("this X display's default visual is not TrueColor, "
+                     "which is the only layout the window presents to");
+    }
+    g_gc = XCreateGC(g_display, g_window, 0, NULL);
+    g_present_fast = (g_depth == 24 || g_depth == 32)
+        && g_visual->red_mask == 0xFF0000UL && g_visual->green_mask == 0xFF00UL
+        && g_visual->blue_mask == 0xFFUL && ImageByteOrder(g_display) == LSBFirst
+        && festina_host_is_little_endian();
+}
+
+/* Frees the image (and, in the fast path, the scratch buffer it points
+ * at, which XDestroyImage must not free). */
+static void festina_x11_drop_image(void) {
+    if (g_ximage) {
+        if (g_present_fast) g_ximage->data = NULL;
+        XDestroyImage(g_ximage);
+        g_ximage = NULL;
+    }
+    free(g_scratch);
+    g_scratch = NULL;
+    g_ximage_w = g_ximage_h = 0;
 }
 
 void festina_window_close(void) {
-    cairo_surface_destroy(g_window_surface);
-    g_window_surface = NULL;
+    festina_x11_drop_image();
+    if (g_gc) { XFreeGC(g_display, g_gc); g_gc = NULL; }
     XDestroyWindow(g_display, g_window);
     XCloseDisplay(g_display);
     g_display = NULL;
@@ -5271,14 +5311,12 @@ double festina_window_device_pixel_ratio(void) {
  * size (festina_runtime_graphics.c's own portable half) already
  * updates the canvas's own size for whenever one does; this function's
  * only job is telling the ALREADY-open native window to match.
- * cairo_xlib_surface_set_size keeps the Cairo-side surface's own
- * cached dimensions in step with the just-resized drawable -- without
- * it, festina_window_present would keep blitting at the OLD size into
- * a window that has already changed underneath it. */
+ * (When Cairo drew the window its surface kept cached dimensions that had
+ * to be told; presenting through XPutImage has none: each present takes
+ * its size from the canvas.) */
 void festina_window_resize(int64_t width, int64_t height) {
     if (!g_display) return;
     XResizeWindow(g_display, g_window, (unsigned int)width, (unsigned int)height);
-    cairo_xlib_surface_set_size(g_window_surface, (int)width, (int)height);
     XFlush(g_display);
 }
 
@@ -5352,12 +5390,86 @@ void festina_window_set_cursor_visible(int8_t visible) {
     XFlush(g_display);
 }
 
+/* Bits of a colour mask: where its lowest set bit is and how many there
+ * are, for packing an 8-bit channel into a pixel of any TrueColor layout. */
+static void festina_x11_mask(unsigned long mask, int *shift, int *width) {
+    int sh = 0, wd = 0;
+    if (mask) {
+        while (!((mask >> sh) & 1UL)) sh++;
+        while ((mask >> (sh + wd)) & 1UL) wd++;
+    }
+    *shift = sh;
+    *width = wd;
+}
+
 void festina_window_present(cairo_surface_t *backing) {
-    cairo_t *cr = cairo_create(g_window_surface);
-    cairo_set_source_surface(cr, backing, 0, 0);
-    cairo_paint(cr);
-    cairo_destroy(cr);
-    cairo_surface_flush(g_window_surface);
+    if (!g_display || !g_gc || !backing) return;
+    if (cairo_surface_get_type(backing) != CAIRO_SURFACE_TYPE_IMAGE) return;
+    int w = cairo_image_surface_get_width(backing);
+    int h = cairo_image_surface_get_height(backing);
+    if (w <= 0 || h <= 0) return;
+    cairo_surface_flush(backing);
+    const unsigned char *data = cairo_image_surface_get_data(backing);
+    int stride = cairo_image_surface_get_stride(backing);
+    if (!data) return;
+
+    if (!g_ximage || g_ximage_w != w || g_ximage_h != h) {
+        festina_x11_drop_image();
+        if (g_present_fast) {
+            g_scratch = malloc((size_t)w * (size_t)h * sizeof(uint32_t));
+            if (!g_scratch) festina_fail("out of memory presenting the canvas");
+            g_ximage = XCreateImage(g_display, g_visual, (unsigned)g_depth, ZPixmap, 0,
+                                    (char *)g_scratch, (unsigned)w, (unsigned)h, 32, 0);
+            if (!g_ximage || g_ximage->bits_per_pixel != 32 || g_ximage->bytes_per_line != w * 4) {
+                /* the server's pixmap format for this depth is not the 32-bit words
+                 * assumed: take the general path from here on */
+                if (g_ximage) { g_ximage->data = NULL; XDestroyImage(g_ximage); g_ximage = NULL; }
+                free(g_scratch);
+                g_scratch = NULL;
+                g_present_fast = 0;
+            }
+        }
+        if (!g_present_fast) {
+            char *buf = malloc((size_t)w * (size_t)h * 4);
+            if (!buf) festina_fail("out of memory presenting the canvas");
+            g_ximage = XCreateImage(g_display, g_visual, (unsigned)g_depth, ZPixmap, 0, buf,
+                                    (unsigned)w, (unsigned)h, 32, 0);
+            if (!g_ximage) { free(buf); festina_fail("could not create an image to present"); }
+        }
+        g_ximage_w = w;
+        g_ximage_h = h;
+    }
+
+    if (g_present_fast) {
+        /* Over white: a premultiplied channel is at most the alpha, so adding
+         * (255 - alpha) to every channel never carries into its neighbour. */
+        for (int y = 0; y < h; y++) {
+            const uint32_t *src = (const uint32_t *)(data + (size_t)y * (size_t)stride);
+            uint32_t *dst = g_scratch + (size_t)y * (size_t)w;
+            for (int x = 0; x < w; x++) {
+                uint32_t p = src[x];
+                dst[x] = (p & 0x00FFFFFFu) + (0xFFu - (p >> 24)) * 0x010101u;
+            }
+        }
+    } else {
+        int rs, rw, gs, gw, bs, bw;
+        festina_x11_mask(g_visual->red_mask, &rs, &rw);
+        festina_x11_mask(g_visual->green_mask, &gs, &gw);
+        festina_x11_mask(g_visual->blue_mask, &bs, &bw);
+        for (int y = 0; y < h; y++) {
+            const uint32_t *src = (const uint32_t *)(data + (size_t)y * (size_t)stride);
+            for (int x = 0; x < w; x++) {
+                uint32_t p = src[x];
+                uint32_t ia = 0xFFu - (p >> 24);
+                uint32_t r = ((p >> 16) & 0xFFu) + ia, g = ((p >> 8) & 0xFFu) + ia, b = (p & 0xFFu) + ia;
+                unsigned long v = ((unsigned long)(r >> (8 - rw)) << rs)
+                                | ((unsigned long)(g >> (8 - gw)) << gs)
+                                | ((unsigned long)(b >> (8 - bw)) << bs);
+                XPutPixel(g_ximage, x, y, v);
+            }
+        }
+    }
+    XPutImage(g_display, g_window, g_gc, g_ximage, 0, 0, 0, 0, (unsigned)w, (unsigned)h);
     XFlush(g_display);
 }
 
@@ -5439,8 +5551,12 @@ void festina_window_events_drain(void (*handler)(const FestinaWindowEvent *event
              * (Cairo/X11 own the pixels), so simply flushing it again
              * is enough; there is no "last backing surface" to
              * re-fetch here since nothing about it changed. */
-            cairo_surface_flush(g_window_surface);
-            XFlush(g_display);
+            /* The server keeps nothing for a window without backing
+             * store, and a compositor-less exposure clears it: paint it
+             * again from the canvas, once the last of a burst of Expose
+             * events has arrived. */
+            if (ev.xexpose.count == 0 && g_window_open && g_backing_surface)
+                festina_window_present(g_backing_surface);
             continue;
         } else if (ev.type == ButtonPress || ev.type == ButtonRelease) {
             /* claude.md #181: X11's core protocol has no dedicated
@@ -5501,10 +5617,8 @@ void festina_window_events_drain(void (*handler)(const FestinaWindowEvent *event
             int64_t new_w = ev.xconfigure.width;
             int64_t new_h = ev.xconfigure.height;
             if (new_w != g_canvas_width || new_h != g_canvas_height) {
-                /* claude.md #123: resize THIS backend's own on-screen
-                 * surface before handing the event to shared code --
-                 * see festina_runtime_window.h's own note on why. */
-                cairo_xlib_surface_set_size(g_window_surface, new_w, new_h);
+                /* (Nothing to resize here: a present takes its size from the
+                 * canvas -- see festina_window_resize.) */
                 wev.kind = FESTINA_WEVENT_RESIZE;
                 wev.width = new_w;
                 wev.height = new_h;

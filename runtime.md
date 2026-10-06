@@ -1348,8 +1348,9 @@ present every slice compares against it, byte for byte where possible:
    a bound (done: see "Slice 5, images as sources"; left: `clone`, which
    waits for slice 9's PNG encode)
 6. ✅ the decoder gaps (decision 3): every PNG and progressive JPEG (see "Slice 6, PNG" and "Slice 6, JPEG")
-7. presentation: `XPutImage`, and the window seam speaking a plain
-   surface (the Win32 and macOS backends already do)
+7. ✅ presentation: `XPutImage`, and the window seam speaking a plain
+   surface (the Win32 and macOS backends already did) -- see "Slice 7,
+   presentation"
 8. non-default text (decision 2)
 9. PNG encode (phase 6, gated on building a `blob` from bytes), then
    delete Cairo from the link line, `setup.md`, CI's package lists and
@@ -1885,6 +1886,54 @@ the box reduction with small, even weights (halving): 7x, ~240
 instructions per output pixel, the horizontal pass over every source row;
 a vertical-first pass over contiguous rows, and SIMD, are the ideas left.
 Large reductions are faster than Cairo's own.
+
+**Slice 7, presentation.** The X11 window no longer has a Cairo surface:
+`festina_window_present` composites the canvas into a scratch buffer and
+`XPutImage`s it (`festina_runtime_graphics.c`, the X11 block). The Win32
+and Cocoa backends already read the canvas's raw pixels, so the seam
+(`festina_runtime_window.h`) is unchanged; `cairo_xlib_surface_*` is
+gone from the runtime. (The package list still says `cairo-xlib`: Cairo is
+removed in slice 9, and `libx11-dev` is the only one of the two that stays.)
+
+- *The pixels.* The canvas is premultiplied ARGB; the window is opaque. A
+  canvas pixel is shown over the window's white ground, per channel
+  `premultiplied + (255 - alpha)` -- which never carries into a neighbouring
+  channel, because a premultiplied channel is at most the alpha, so it is
+  one add and one multiply a word and the compiler vectorises it. A
+  24- or 32-bit TrueColor visual in the usual layout (red 0xFF0000, green
+  0xFF00, blue 0xFF, least significant byte first) takes the words as they
+  are; any other TrueColor layout -- a 16-bit display is the one measured --
+  is packed pixel by pixel from the channels and the visual's masks. A
+  palette display (PseudoColor) is refused at `render()` with "the default
+  visual is not TrueColor": **that is a regression for such a display**, which
+  Cairo's Xlib backend drove with a colour cube; none is among the machines
+  the project is tested on, and nothing in a modern X server offers one.
+- *Two behaviours changed, both defects of the Cairo version.* The window
+  was painted OVER what it already held, so a canvas cleared to transparent
+  left the previous frame on screen; it now shows white. And an Expose
+  (uncovering, un-minimising) only flushed a surface that, with no backing
+  store, had been cleared by the server, so the window stayed blank until the
+  next draw; it now paints the canvas again, once per burst of Expose events.
+  Both were found by tests that fail on the old code
+  (`tests/test_x11_present.py`, run against it: the clear and the uncover
+  tests fail, the others pass).
+- *Resize.* A present takes its size from the canvas; the image is rebuilt
+  when it changes. `cairo_xlib_surface_set_size`'s bookkeeping went with
+  the surface.
+- *Tests.* `tests/x11_pixels.py` reads a live window with `XGetImage`
+  through libX11 itself (no `xwd`); `tests/test_x11_present.py` runs a
+  program under Xvfb and checks: the window is the canvas saved with
+  `saveCanvas` composited over white, to within one level, over opaque,
+  translucent, transparent and cleared pixels; a clear really clears; an
+  unmap/map repaints; a resize shows the new canvas at its new size; a
+  16-bit screen is within the 5-bit quantisation; an 8-bit screen is refused
+  with a reason. Five put-back bugs fail it (white ground dropped, no
+  repaint on Expose, image not rebuilt on resize, red and blue swapped and
+  the white ground dropped in the general path). The present path is clean
+  under ASan, LSan and UBSan, across seven canvas sizes and both depths.
+- *Speed.* A frame -- draw and present, 800x600, Xvfb -- is 0.55-0.7 ms for
+  Cairo and for this, within the noise of one another: the cost is the
+  socket, not the conversion.
 
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the
