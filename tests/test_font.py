@@ -64,11 +64,11 @@ ORACLE_C = r"""
 #include FT_TRUETYPE_TABLES_H   /* FT_Get_CMap_Format: macOS's clang refuses it undeclared */
 #include <stdio.h>
 #include <stdlib.h>
-/* argv: font, cmap format to force (0 = FreeType's own choice).
+/* argv: font, cmap format to force (0 = FreeType's own choice), face index.
  * Composites are composed, as a renderer sees them. */
 int main(int argc, char **argv) {
     FT_Library lib; FT_Face f;
-    if (FT_Init_FreeType(&lib) || FT_New_Face(lib, argv[1], 0, &f)) { puts("OPENFAIL"); return 0; }
+    if (FT_Init_FreeType(&lib) || FT_New_Face(lib, argv[1], argc > 3 ? atoi(argv[3]) : 0, &f)) { puts("OPENFAIL"); return 0; }
     int want = atoi(argv[2]);
     if (want) {
         for (int i = 0; i < f->num_charmaps; i++) {
@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
 """
 
 
-def _dump_program(cmap_format=0, composites=False):
+def _dump_program(cmap_format=0, composites=False, face=0):
     """The Festina side of the comparison, printing exactly the lines
     the oracle prints. A glyph font.f refuses prints its error code, so
     a refusal can never be mistaken for an agreement."""
@@ -114,7 +114,7 @@ def _dump_program(cmap_format=0, composites=False):
         "    bytes.push(raw.byteAt(i))\n"
         "    i = i + 1\n"
         "}\n"
-        "int e = fntOpen(bytes)\n"
+        f"int e = fntOpenFace(bytes, {face})\n"
         "if e != 0 { log(`OPENFAIL ${e}`) }\n"
         + select +
         "log(`upem ${FNT_UPEM} glyphs ${FNT_NGLYPHS}`)\n"
@@ -210,9 +210,9 @@ def _run_in(tmp_path, program, font_bytes, env=None):
     return r.stdout.splitlines()
 
 
-def _oracle(built, font_path, cmap_format=0):
+def _oracle(built, font_path, cmap_format=0, face=0):
     """FreeType's view: composites composed, as a renderer sees them."""
-    args = [built.build_oracle(), font_path, str(cmap_format)]
+    args = [built.build_oracle(), font_path, str(cmap_format), str(face)]
     r = subprocess.run(args, capture_output=True, text=True, timeout=300, check=True)
     return r.stdout.splitlines()
 
@@ -482,6 +482,90 @@ class TestOutlinesMatchFreeType:
         assert len(_mappings(theirs)) >= 10
 
 
+# ---- collections ----
+
+def _build_ttc(fonts, version=0x00010000):
+    """A TrueType collection of whole fonts: the header, then each font
+    with its table directory's offsets moved to where the font now sits
+    (they are absolute in a collection)."""
+    head = 12 + 4 * len(fonts)
+    out = bytearray(struct.pack(">4sIi", b"ttcf", version, len(fonts)))
+    offsets, body = [], bytearray()
+    for data in fonts:
+        base = head + len(body)
+        offsets.append(base)
+        font = bytearray(data)
+        n = struct.unpack(">H", font[4:6])[0]
+        for i in range(n):
+            rec = 12 + 16 * i
+            off = struct.unpack(">I", font[rec + 8:rec + 12])[0]
+            font[rec + 8:rec + 12] = struct.pack(">I", off + base)
+        body += font
+        body += b"\0" * (-len(body) % 4)
+    for o in offsets:
+        out += struct.pack(">I", o)
+    return bytes(out + body)
+
+
+class TestCollections:
+
+    def _two(self):
+        small = _build_small_font(_font("DejaVuSans.ttf"), "Handgloves 0123 xyz")
+        return [open(_font("DejaVuSans.ttf"), "rb").read(), small]
+
+    @pytest.mark.parametrize("face", [0, 1])
+    def test_each_face_of_a_collection_matches_freetype(self, built, tmp_path, face):
+        """Face 0 and face 1 of a collection read exactly as FreeType reads
+        them from the same file: every glyph, advance and mapping."""
+        ttc = _build_ttc(self._two())
+        path = tmp_path / "set.ttc"
+        path.write_bytes(ttc)
+        theirs = _oracle(built, str(path), face=face)
+        assert theirs[0] != "OPENFAIL", "FreeType must accept the built collection"
+        ours = _run_in(tmp_path / "run", built.build_program(_dump_program(face=face)), ttc)
+        same, bad = _compare(ours, theirs)
+        assert not bad, bad[:2]
+        assert _mappings(ours) == _mappings(theirs)
+        assert same > 10 and len(_mappings(theirs)) >= 10
+
+    def test_the_two_faces_are_not_the_same_face(self, built, tmp_path):
+        ttc = _build_ttc(self._two())
+        a = _run_in(tmp_path / "a", built.build_program(_dump_program(face=0)), ttc)
+        b = _run_in(tmp_path / "b", built.build_program(_dump_program(face=1)), ttc)
+        assert _mappings(a) != _mappings(b)
+
+    def test_a_face_that_is_not_there_is_refused(self, built, tmp_path):
+        ttc = _build_ttc(self._two())
+        assert _open_result(built, tmp_path, ttc) == 0
+        lines = _run_in(tmp_path / "x", built.build_program(_dump_program(face=2)), ttc)
+        assert lines[0] == f"OPENFAIL {E_COLLECTION}"
+        lines = _run_in(tmp_path / "y", built.build_program(_dump_program(face=1)),
+                        open(_font("DejaVuSans.ttf"), "rb").read())
+        assert lines[0] == f"OPENFAIL {E_COLLECTION}", "a plain font has no face 1"
+
+    @pytest.mark.parametrize("cut", [11, 12, 15, 16, 40])
+    def test_a_truncated_collection_is_refused_not_read_past(self, built, tmp_path, cut):
+        ttc = _build_ttc(self._two())
+        assert _open_result(built, tmp_path, ttc[:cut]) in (E_SHORT, E_COLLECTION)
+
+    def test_a_face_offset_past_the_end_is_refused(self, built, tmp_path):
+        ttc = bytearray(_build_ttc(self._two()))
+        ttc[12:16] = struct.pack(">I", len(ttc) + 100)
+        assert _open_result(built, tmp_path, bytes(ttc)) == E_COLLECTION
+
+    def test_a_collection_of_collections_is_refused(self, built, tmp_path):
+        ttc = bytearray(_build_ttc(self._two()))
+        inner = struct.unpack(">I", ttc[12:16])[0]
+        ttc[inner:inner + 4] = b"ttcf"
+        assert _open_result(built, tmp_path, bytes(ttc)) == E_COLLECTION
+
+    def test_a_collection_member_with_cff_is_refused_as_cff(self, built, tmp_path):
+        ttc = bytearray(_build_ttc(self._two()))
+        inner = struct.unpack(">I", ttc[12:16])[0]
+        ttc[inner:inner + 4] = b"OTTO"
+        assert _open_result(built, tmp_path, bytes(ttc)) == E_CFF
+
+
 # ---- what font.f refuses, and how ----
 
 def _open_result(built, tmp_path, font_bytes):
@@ -502,7 +586,9 @@ class TestRefusals:
         data[0:4] = b"OTTO"
         assert _open_result(built, tmp_path, bytes(data)) == E_CFF
 
-    def test_a_collection_is_refused(self, built, tmp_path):
+    def test_a_damaged_collection_is_refused(self, built, tmp_path):
+        """A plain font relabelled 'ttcf': its bytes 4-8 are not a collection
+        version, so this is no collection, and nothing is read from it."""
         data = bytearray(open(_font("DejaVuSans.ttf"), "rb").read())
         data[0:4] = b"ttcf"
         assert _open_result(built, tmp_path, bytes(data)) == E_COLLECTION

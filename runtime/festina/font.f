@@ -7,8 +7,8 @@
 // glyph is a lookup and a decode.
 //
 // ANSWERING AN ERROR IS THE CONTRACT, as it is for png.f and jpeg.f.
-// Anything this does not handle -- CFF outlines, a collection, a font
-// with no Unicode cmap -- comes back as a nonzero FNT_ERR, and the
+// Anything this does not handle -- CFF outlines, a damaged collection, a
+// font with no Unicode cmap -- comes back as a nonzero FNT_ERR, and the
 // caller falls through to Cairo for it. A truncated or corrupt file
 // does the same rather than reading past the end: every multi-byte
 // read goes through fntU16/fntU32, which check the range first.
@@ -22,13 +22,17 @@ int FNT_ERR = 0
 int FNT_E_SHORT = 1          // a read fell outside the file
 int FNT_E_NOT_SFNT = 2       // not a TrueType/OpenType file at all
 int FNT_E_CFF = 3            // CFF or CFF2 outlines ('OTTO') -- refused
-int FNT_E_COLLECTION = 4     // a .ttc -- refused until a slice needs one
+int FNT_E_COLLECTION = 4     // a .ttc that is damaged, or has no such face
 int FNT_E_TABLE = 5          // a required table is missing
 int FNT_E_NO_CMAP = 6        // no Unicode cmap in a format read here
 int FNT_E_GLYPH = 7          // a glyph index out of range, or a bad glyph
 int FNT_E_COMPONENT = 8      // a component placed by point matching, or
                              // with a scaled offset -- refused until a
                              // font needs one
+
+// Where the face's table directory starts: 0 for a plain font, the face's
+// own offset inside a collection. Table offsets are absolute either way.
+int FNT_DIR = 0
 
 int FNT_UPEM = 0
 int FNT_NGLYPHS = 0
@@ -87,10 +91,10 @@ int func fntU32(at:int) {
 // sets E_SHORT. Either way every later read inside a table found here
 // can only fail on a corrupt glyph, never on the table itself.
 int func fntFindTable(tag:int, minLen:int) {
-    int n = fntU16(4)
+    int n = fntU16(FNT_DIR + 4)
     int i = 0
     while i < n {
-        int rec = 12 + (i * 16)
+        int rec = FNT_DIR + 12 + (i * 16)
         if fntU32(rec) == tag {
             int off = fntU32(rec + 8)
             int len = fntU32(rec + 12)
@@ -103,33 +107,69 @@ int func fntFindTable(tag:int, minLen:int) {
 }
 
 int func fntTableLength(tag:int) {
-    int n = fntU16(4)
+    int n = fntU16(FNT_DIR + 4)
     int i = 0
     while i < n {
-        int rec = 12 + (i * 16)
+        int rec = FNT_DIR + 12 + (i * 16)
         if fntU32(rec) == tag { return fntU32(rec + 12) }
         i = i + 1
     }
     return 0
 }
 
+// The number of faces in a collection, 1 for a plain font, or 0 when the
+// bytes are neither a font nor a sound collection.
+int func fntFaceCount(src:arr[int]) {
+    if src.length < 12 { return 0 }
+    FNT_IN = src
+    FNT_ERR = 0
+    int tag = fntU32(0)
+    if tag != 1953784678 {                                              // not 'ttcf'
+        if tag == 65536 || tag == 1953658213 || tag == 1330926671 { return 1 }
+        return 0
+    }
+    int ver = fntU32(4)
+    if ver != 65536 && ver != 131072 { return 0 }                       // 1.0, 2.0
+    int n = fntU32(8)
+    if n < 1 || n > 65535 || !fntHas(12, n * 4) { return 0 }
+    return n
+}
+
 // Open a font. Returns FNT_ERR: 0 when every table this file needs is
 // present and inside the file.
 int func fntOpen(src:arr[int]) {
+    return fntOpenFace(src, 0)
+}
+
+// Open face `index` of a collection (0 for a plain font, whose only face
+// it is).
+int func fntOpenFace(src:arr[int], index:int) {
     FNT_IN = src
     FNT_ERR = 0
+    FNT_DIR = 0
     FNT_CMAP_SUB = 0
     FNT_CMAP_FMT = 0
     if src.length < 12 { FNT_ERR = FNT_E_SHORT return FNT_ERR }
 
     int version = fntU32(0)
+    if version == 1953784678 {                                                 // 'ttcf'
+        int faces = fntFaceCount(src)
+        FNT_ERR = 0
+        if faces < 1 || index < 0 || index >= faces { FNT_ERR = FNT_E_COLLECTION return FNT_ERR }
+        FNT_DIR = fntU32(12 + (index * 4))
+        if !fntHas(FNT_DIR, 12) { FNT_DIR = 0 FNT_ERR = FNT_E_COLLECTION return FNT_ERR }
+        version = fntU32(FNT_DIR)
+    } else if index != 0 {
+        FNT_ERR = FNT_E_COLLECTION
+        return FNT_ERR
+    }
     if version == 1330926671 { FNT_ERR = FNT_E_CFF return FNT_ERR }          // 'OTTO'
-    if version == 1953784678 { FNT_ERR = FNT_E_COLLECTION return FNT_ERR }   // 'ttcf'
+    if version == 1953784678 { FNT_ERR = FNT_E_COLLECTION return FNT_ERR }   // a collection inside one
     if version != 65536 && version != 1953658213 {                           // 1.0, 'true'
         FNT_ERR = FNT_E_NOT_SFNT
         return FNT_ERR
     }
-    if !fntHas(12, fntU16(4) * 16) { FNT_ERR = FNT_E_SHORT return FNT_ERR }
+    if !fntHas(FNT_DIR + 12, fntU16(FNT_DIR + 4) * 16) { FNT_ERR = FNT_E_SHORT return FNT_ERR }
 
     FNT_HEAD = fntFindTable(1751474532, 54)      // 'head'
     FNT_MAXP = fntFindTable(1835104368, 6)       // 'maxp'
