@@ -1351,7 +1351,7 @@ present every slice compares against it, byte for byte where possible:
 7. ✅ presentation: `XPutImage`, and the window seam speaking a plain
    surface (the Win32 and macOS backends already did) -- see "Slice 7,
    presentation"
-8. ◐ non-default text (decision 2): families found by scanning the system's fonts, with the fallbacks decided below -- see "Slice 8, non-default text"
+8. ✅ non-default text (decision 2): families found by scanning the system's fonts, with the fallbacks decided -- see "Slice 8, non-default text" and "Slice 8, as built"
 9. PNG encode (phase 6, gated on building a `blob` from bytes), then
    delete Cairo from the link line, `setup.md`, CI's package lists and
    the `FESTINA_CAIRO_TEXT` switch
@@ -1997,6 +1997,76 @@ What follows from them, written down so the tests can be written first:
 - *What is not decided and not built:* aliases (Arial to Liberation Sans, as
   fontconfig does), fallback glyphs for characters a face lacks (glyph 0,
   as now), and hinting.
+
+**Slice 8, as built.** Four pieces, each tested against something other
+than itself.
+
+- *font.f reads collections* (`fntFaceCount`, `fntOpenFace(src, index)`).
+  Table offsets inside a collection are absolute, so only the directory's
+  base moves. Compared with FreeType face for face on a collection built
+  from two fonts; truncated, out-of-range, nested and CFF-member
+  collections are refused without reading past the end.
+- *`runtime/festina_fontscan.h`* (plain C, static, self-contained): the
+  directory walk (sorted by name, so ties are the same every run), the
+  per-face reads (table directory, then `name`, `OS/2` and `head` only), the
+  family choice and the generic lists. Scanning 1,500 faces takes 25 ms
+  warm, about 17 us a face; this machine's 47 take 1 ms; and none of it
+  happens until a program names a family other than `sans-serif` (a test
+  puts a FIFO named `trap.ttf` in the directory, which would hang whoever
+  opened it). Checked against FreeType over the machine's real fonts
+  (family, weight class, slant, face by face) and, because real fonts do
+  not exercise the cases that matter, over fonts built in the test: name ID
+  16 over ID 1, English over other languages, Macintosh-only and
+  Unicode-platform names, a name outside the BMP, the 1-9 weight scale and a
+  missing `OS/2`, collections, CFF and damaged files that must not be
+  listed, nearest-weight choice and what each combination of missing styles
+  synthesizes, generics in list order, quoted and listed families, the
+  bundled fallback. 46 tests; thirteen put-back bugs each fail them.
+- *text.f draws more than one face and synthesizes.* `festinaTextMask`,
+  `Width` and `Height` take a face id (so its glyph cache and open font are
+  its own), the face's index in a collection, and a style (1 bold, 2
+  italic). Italic shears the outline by 0.2126, FreeType's
+  `FT_GlyphSlot_Oblique`. Bold is `FT_GlyphSlot_Embolden`'s idea -- thicken by
+  px/24, keep the left edge and the baseline -- done as the glyph's path
+  plus a stroke of it, both in ONE non-zero fill so the coverage is the
+  exact union (the first version added or took the larger of two coverages
+  and lost a quarter of the thickening along every edge, which FreeType's
+  bitmap showed at once); the glyph's contours are turned round when they
+  are wound against the stroker's pieces. The advance grows by
+  `floor(px * 64 / 24)` in 26.6 units, and measureTextHeight's top by the
+  same. Against FreeType 2.13, glyph by glyph (seven glyphs, three sizes):
+  italic within 20 of 255 at any pixel, 2.5 on average, ink within 1.5%;
+  bold within 80 at the worst pixel, 5.5 on average, ink within 3.5%
+  (the worst: '@' at 12 px). Bold advances equal FreeType's at every size
+  that is not a multiple of 3; at those, FreeType 2.13 adds one 26.6 unit
+  less (it gives 31, not 32, at 12 px) and a string can measure a pixel
+  more here -- a difference in the oracle's rounding that this does not copy.
+- *The runtime* (`festina_runtime_graphics.c`) resolves the family list and
+  style to a face (cached on the three), reads the file once, hands text.f a
+  face id and style, and keeps every loaded face for the life of the process.
+  A face text.f cannot open (a listed file with no Unicode cmap, say) is
+  marked bad, the call is made again on the bundled face, and the face is the
+  bundled one from then on -- with the style that was asked for synthesized,
+  for the measures as for the drawing. At most 16 faces (and 512 MB of
+  arr[int]s, since a Festina `arr[int]` is eight bytes a byte) are loaded;
+  past that, the bundled face. A file over 16 MB is "not found".
+
+*What changed on screen,* each a decision recorded above: italic slants for
+the first time; `bold` in the default family is synthesized from DejaVu Sans
+(not the machine's own bold, which was Inter Bold here and DejaVu Sans Bold
+on Linux CI); a missing family is DejaVu Sans, not whatever fontconfig
+substituted (it turned "Arial" into Liberation Sans here); `serif` and
+`monospace` are the listed families, or DejaVu Sans. The three
+`test_text_wired.py` cases that asserted bold, italic and "another family"
+draw exactly what Cairo draws were re-baselined to
+`tests/test_text_styles.py`, not loosened; a scale or rotation still goes
+to Cairo and still draws what it draws.
+
+*Not done, and noted:* aliases (Arial to Liberation Sans, as fontconfig
+does), hinting, kerning, and text under a scale or rotation -- the last is
+slice 9's, since Cairo's text API goes with Cairo. On macOS and Windows the
+scan has been compiled and run only by CI; `festina_fontscan.h`'s Windows
+branch (FindFirstFileW, `_wfopen`) has not run anywhere yet.
 
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the

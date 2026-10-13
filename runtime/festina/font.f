@@ -764,9 +764,21 @@ int func fntScale(px:int) {
     return fntDivFix(px * 64, FNT_UPEM)
 }
 
+// Synthetic bold (runtime.md phase 7, slice 8). FreeType's
+// FT_GlyphSlot_Embolden thickens an outline by px/24 -- in 26.6, with the
+// division in integers -- and adds the same to the glyph's advance and to
+// the height of its top. text.f sets this, in 26.6, for a face asked to be
+// bold that has no bold, and back to 0 after.
+int FNT_EMBOLDEN = 0
+
+// The 26.6 strength of synthetic bold at `px`.
+int func fntEmboldenFor(px:int) {
+    return Math.floorDiv(px * 64, 24)
+}
+
 // A glyph's advance at `px`, in whole pixels, as Cairo rounds it.
 int func fntAdvancePx(g:int, px:int) {
-    return (fntMulFix(fntAdvance(g), fntScale(px)) + 32) >> 6
+    return (fntMulFix(fntAdvance(g), fntScale(px)) + FNT_EMBOLDEN + 32) >> 6
 }
 
 // The code points of a text. Festina's text is UTF-8 and the language
@@ -844,6 +856,7 @@ int func fntTextHeight(s:text, px:int) {
                 k = k + 1
             }
             if hi != lo {
+                hi = hi + FNT_EMBOLDEN
                 // Device y grows downwards: the top is -hi, floored to
                 // the pixel grid; the bottom is -lo, ceiled.
                 int t = Math.floorDiv(0 - hi, 64)

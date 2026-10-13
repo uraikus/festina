@@ -19,27 +19,41 @@
 import font.f
 import raster.f
 
-bool TXT_OPENED = false
+// Which face is open (the id the runtime gave its bytes), and what came of
+// opening it. -1: none yet. The runtime may ask for another face between
+// two calls; the glyph cache below is keyed by face so none are mixed.
+int TXT_FACE = -1
 int TXT_ERR = 0
 
-bool func txtOpen(font:arr[int]) {
-    if !TXT_OPENED {
-        TXT_ERR = fntOpen(font)
-        TXT_OPENED = true
+// The two kinds of synthesized style, as the runtime passes them.
+int TXT_BOLD = 1
+int TXT_ITALIC = 2
+
+bool func txtOpen(font:arr[int], face:int, index:int) {
+    if TXT_FACE != face {
+        TXT_ERR = fntOpenFace(font, index)
+        TXT_FACE = face
     }
+    FNT_EMBOLDEN = 0
     return TXT_ERR == 0
 }
 
 // measureTextWidth / measureTextHeight, or -1 if the font would not
 // open -- which the caller answers by asking Cairo instead.
-int func festinaTextWidth(s:text, px:int, font:arr[int]) {
-    if !txtOpen(font) { return -1 }
-    return fntTextWidth(s, px)
+int func festinaTextWidth(s:text, px:int, font:arr[int], face:int, index:int, style:int) {
+    if !txtOpen(font, face, index) { return -1 }
+    if (style & TXT_BOLD) != 0 { FNT_EMBOLDEN = fntEmboldenFor(px) }
+    int w = fntTextWidth(s, px)
+    FNT_EMBOLDEN = 0
+    return w
 }
 
-int func festinaTextHeight(s:text, px:int, font:arr[int]) {
-    if !txtOpen(font) { return -1 }
-    return fntTextHeight(s, px)
+int func festinaTextHeight(s:text, px:int, font:arr[int], face:int, index:int, style:int) {
+    if !txtOpen(font, face, index) { return -1 }
+    if (style & TXT_BOLD) != 0 { FNT_EMBOLDEN = fntEmboldenFor(px) }
+    int h = fntTextHeight(s, px)
+    FNT_EMBOLDEN = 0
+    return h
 }
 
 // ---- the glyph cache ----
@@ -68,10 +82,77 @@ map[int] TXT_INDEX = {}
 arr[float] TXT_POOL = []
 int TXT_POOL_LIMIT = 4000000
 
+// The shear of synthetic italic, FreeType's FT_GlyphSlot_Oblique: x moves
+// right by 0.2126 (0x0366A in 16.16, about 12 degrees) of the height
+// above the baseline.
+float TXT_SHEAR = 0.2126
+
+// Turn every contour of a path round if the largest one is wound the
+// other way from rasEmitPoly's pieces (positive signed area in the
+// shoelace sum raster.f uses), so the glyph and a stroke of it can be one
+// non-zero fill.
+void func txtWindPositive(pts:arr[float], ends:arr[int]) {
+    int first = 0
+    int c = 0
+    float bestArea = 0.0
+    while c < ends.length {
+        int last = ends[c]
+        float area = 0.0
+        int i = first
+        while i < last {
+            int j = i + 1
+            if j == last { j = first }
+            area = area + ((pts[i * 2] * pts[(j * 2) + 1]) - (pts[j * 2] * pts[(i * 2) + 1]))
+            i = i + 1
+        }
+        if Math.abs(area) > Math.abs(bestArea) { bestArea = area }
+        first = last
+        c = c + 1
+    }
+    if bestArea >= 0.0 { return }
+    first = 0
+    c = 0
+    while c < ends.length {
+        int last = ends[c]
+        int lo = first
+        int hi = last - 1
+        while lo < hi {
+            float tx = pts[lo * 2]
+            float ty = pts[(lo * 2) + 1]
+            pts[lo * 2] = pts[hi * 2]
+            pts[(lo * 2) + 1] = pts[(hi * 2) + 1]
+            pts[hi * 2] = tx
+            pts[(hi * 2) + 1] = ty
+            lo = lo + 1
+            hi = hi - 1
+        }
+        first = last
+        c = c + 1
+    }
+}
+
+// Coverage of a set of contours (non-zero) into the glyph's box.
+void func txtCover(local:arr[float], ends:arr[int], filled:int, gw:int, gh:int) {
+    rasEnsureCov(gw)
+    if !rasPathExtent(local, gh) { return }
+    int row = RAS_Y0
+    while row < RAS_Y1 {
+        rasRowCoverage(row, gw, local, ends, RAS_NONZERO)
+        int c = 0
+        while c < gw {
+            float v = RAS_COV[c]
+            if v > 1.0 { v = 1.0 }
+            if v > TXT_POOL[filled + (row * gw) + c] { TXT_POOL[filled + (row * gw) + c] = v }
+            c = c + 1
+        }
+        row = row + 1
+    }
+}
+
 // Offset of the glyph's entry in TXT_POOL, rasterising it if it is not
-// there yet.
-int func txtGlyph(g:int, px:int, size:float) {
-    int key = (g * 8192) + px
+// there yet. `style` is the synthesized part: 1 bold, 2 italic.
+int func txtGlyph(g:int, px:int, size:float, face:int, style:int) {
+    int key = ((((face * 4) + style) * 65536 + g) * 8192) + px
     int have = TXT_INDEX[key]
     if have != null { return have }
 
@@ -87,6 +168,60 @@ int func txtGlyph(g:int, px:int, size:float) {
         TXT_INDEX[key] = at
         return at
     }
+
+    // For synthetic bold, the stroke of the glyph's outline is added to the
+    // glyph in the SAME path, and the whole is filled non-zero: the union
+    // of the two, exactly -- adding two coverages, or taking the larger,
+    // is wrong along the edge, where each covers part of a pixel. That
+    // needs the stroke's pieces (all wound one way, rasEmitPoly) and the
+    // glyph's outer contours wound the same way, so the glyph's are turned
+    // round when they are not; its holes follow, being wound the other way
+    // to its outer contours either way.
+    //
+    // Thickened by px/24, the amount FreeType's FT_GlyphSlot_Embolden
+    // uses, and moved up and right by half of it so the left edge and the
+    // baseline stay where they were, which is where FreeType keeps them.
+    if (style & TXT_BOLD) != 0 {
+        float strength = fntEmboldenFor(px).toFloat() / 64.0
+        txtWindPositive(pts, ends)
+        arr[int] closed = []
+        int c0 = 0
+        while c0 < ends.length {
+            closed.push(1)
+            c0 = c0 + 1
+        }
+        arr[float] outline = []
+        arr[int] outlineEnds = []
+        rasStrokeOutline(pts, ends, closed, strength, outline, outlineEnds)
+        int base = Math.floorDiv(pts.length, 2)
+        int k2 = 0
+        while k2 < outline.length {
+            pts.push(outline[k2])
+            pts.push(outline[k2 + 1])
+            k2 = k2 + 2
+        }
+        k2 = 0
+        while k2 < outlineEnds.length {
+            ends.push(base + outlineEnds[k2])
+            k2 = k2 + 1
+        }
+        float half = strength / 2.0
+        k2 = 0
+        while k2 < pts.length {
+            pts[k2] = pts[k2] + half
+            pts[k2 + 1] = pts[k2 + 1] - half
+            k2 = k2 + 2
+        }
+    }
+    if (style & TXT_ITALIC) != 0 {
+        int k1 = 0
+        while k1 < pts.length {
+            pts[k1] = pts[k1] - (pts[k1 + 1] * TXT_SHEAR)
+            k1 = k1 + 2
+        }
+    }
+
+    // The box of everything that will be filled.
     float lx = pts[0]
     float hx = lx
     float ly = pts[1]
@@ -104,14 +239,6 @@ int func txtGlyph(g:int, px:int, size:float) {
     int gw = (Math.floor(hx) + 1) - bx0
     int gh = (Math.floor(hy) + 1) - by0
 
-    // The glyph's points, moved into its own box.
-    arr[float] local = []
-    k = 0
-    while k < pts.length {
-        local.push(pts[k] - bx0.toFloat())
-        local.push(pts[k + 1] - by0.toFloat())
-        k = k + 2
-    }
     TXT_POOL.push(bx0.toFloat())
     TXT_POOL.push(by0.toFloat())
     TXT_POOL.push(gw.toFloat())
@@ -123,21 +250,15 @@ int func txtGlyph(g:int, px:int, size:float) {
         TXT_POOL.push(0.0)
         z = z + 1
     }
-    rasEnsureCov(gw)
-    if rasPathExtent(local, gh) {
-        int row = RAS_Y0
-        while row < RAS_Y1 {
-            rasRowCoverage(row, gw, local, ends, RAS_NONZERO)
-            int c = 0
-            while c < gw {
-                float v = RAS_COV[c]
-                if v > 1.0 { v = 1.0 }
-                if v > 0.0 { TXT_POOL[filled + (row * gw) + c] = v }
-                c = c + 1
-            }
-            row = row + 1
-        }
+    // The glyph's points, moved into its own box.
+    arr[float] local = []
+    k = 0
+    while k < pts.length {
+        local.push(pts[k] - bx0.toFloat())
+        local.push(pts[k + 1] - by0.toFloat())
+        k = k + 2
     }
+    txtCover(local, ends, filled, gw, gh)
     TXT_INDEX[key] = at
     return at
 }
@@ -152,9 +273,9 @@ int func txtGlyph(g:int, px:int, size:float) {
 // Each glyph's coverage is ADDED into the mask, saturating at full,
 // which is how Cairo builds the mask for a run of glyphs before it
 // composites: two glyphs that overlap are not unioned into one shape.
-arr[int] func festinaTextMask(s:text, px:int, font:arr[int]) {
+arr[int] func festinaTextMask(s:text, px:int, font:arr[int], face:int, index:int, style:int) {
     arr[int] out = []
-    if !txtOpen(font) {
+    if !txtOpen(font, face, index) {
         out.push(-1)
         return out
     }
@@ -164,7 +285,9 @@ arr[int] func festinaTextMask(s:text, px:int, font:arr[int]) {
     }
     arr[int] gids = []
     arr[float] pens = []
+    if (style & TXT_BOLD) != 0 { FNT_EMBOLDEN = fntEmboldenFor(px) }
     int width = fntLayout(s, px, 0.0, gids, pens)
+    FNT_EMBOLDEN = 0
     float size = px.toFloat()
 
     // Every glyph cached, then the union of their boxes -- which is
@@ -177,7 +300,7 @@ arr[int] func festinaTextMask(s:text, px:int, font:arr[int]) {
     int my1 = 0
     int i = 0
     while i < gids.length {
-        int off = txtGlyph(gids[i], px, size)
+        int off = txtGlyph(gids[i], px, size, face, style & 3)
         offs.push(off)
         int gw = Math.round(TXT_POOL[off + 2])
         int gh = Math.round(TXT_POOL[off + 3])

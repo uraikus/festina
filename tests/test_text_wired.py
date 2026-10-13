@@ -9,9 +9,10 @@ What is claimed, and how each claim is held to account:
   text.f computes, at the right offset. (Slices 3 and 4 already
   measured that coverage against FreeType, Cairo and the true outline;
   this is the claim that the wiring adds nothing and loses nothing.)
-- Everything else still goes to Cairo UNCHANGED: bold, italic, another
-  family, a scale or a rotation draw byte-identically whether or not
-  FESTINA_CAIRO_TEXT=1 sends everything to Cairo.
+- A scale or a rotation still goes to Cairo UNCHANGED: it draws
+  byte-identically whether or not FESTINA_CAIRO_TEXT=1 sends everything
+  to Cairo. (Bold, italic and other families were here too until phase 7,
+  slice 8, which draws them itself: tests/test_text_styles.py.)
 - Colour, fillAlpha and text's indifference to gradients are the C
   side's, as they were.
 - The font is linked only into programs that use text, and a
@@ -92,7 +93,7 @@ def _mask(tmp_path, cli_mod, text, px):
                     "    bytes.push(raw.byteAt(i))\n"
                     "    i = i + 1\n"
                     "}\n"
-                    f"arr[int] m = festinaTextMask('{text}', {px}, bytes)\n"
+                    f"arr[int] m = festinaTextMask('{text}', {px}, bytes, 0, 0, 0)\n"
                     "text out = ''\n"
                     "int k = 0\n"
                     "while k < m.length {\n"
@@ -183,9 +184,9 @@ class TestEverythingElseStaysWithCairo:
     is allowed -- which is what "not taken" means, observably."""
 
     @pytest.mark.parametrize("name,setup", [
-        ("bold", "font f = 'bold 20px'\nchangeFont(f)\n"),
-        ("italic", "font f = 'italic 20px'\nchangeFont(f)\n"),
-        ("another family", "font f = '20px serif'\nchangeFont(f)\n"),
+        # Bold, italic and other families were here until phase 7, slice 8
+        # gave them a path of their own (tests/test_text_styles.py): that
+        # is a re-baselining, decided in runtime.md, not a loosening.
         ("rotated", "changeFont(20, null, null)\na.rotate(10.0)\n"),
         ("scaled", "changeFont(20, null, null)\na.scale(2.0, 2.0)\n"),
     ])
@@ -314,7 +315,7 @@ class TestTheGlyphCache:
                 "int e = fntOpen(bytes)"]
         for n, (text, px) in enumerate(lines):
             body += [
-                f"arr[int] m{n} = festinaTextMask('{text}', {px}, bytes)",
+                f"arr[int] m{n} = festinaTextMask('{text}', {px}, bytes, 0, 0, 0)",
                 f"text o{n} = ''", f"int k{n} = 0",
                 f"while k{n} < m{n}.length {{ o{n} = `${{o{n}}} ${{m{n}[k{n}]}}` k{n} = k{n} + 1 }}",
                 f"log(o{n})",
@@ -384,16 +385,16 @@ class TestTheGlyphCache:
                 # glyphs empty the pool, instead of four million floats of 100 px
                 # ones (which took fifteen seconds to draw).
                 "TXT_POOL_LIMIT = 30000",
-                "arr[int] first = festinaTextMask('Handgloves 42', 20, bytes)",
+                "arr[int] first = festinaTextMask('Handgloves 42', 20, bytes, 0, 0, 0)",
                 "int cleared = 0",
                 "int size = 20",
                 "while size < 60 {",
                 "    int before = TXT_POOL.length",
-                "    arr[int] big = festinaTextMask('ABCDEFGHIJKLMNOPQRSTUVWXYZ', size, bytes)",
+                "    arr[int] big = festinaTextMask('ABCDEFGHIJKLMNOPQRSTUVWXYZ', size, bytes, 0, 0, 0)",
                 "    if TXT_POOL.length < before { cleared = cleared + 1 }",
                 "    size = size + 1",
                 "}",
-                "arr[int] second = festinaTextMask('Handgloves 42', 20, bytes)",
+                "arr[int] second = festinaTextMask('Handgloves 42', 20, bytes, 0, 0, 0)",
                 "log(cleared)",
                 "log(first.length == second.length)",
                 "int diff = 0",

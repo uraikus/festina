@@ -128,16 +128,17 @@ def _name_table(records):
     return struct.pack(">HHH", 0, len(records), 6 + 12 * len(records)) + bytes(recs) + bytes(strings)
 
 
-_BASE = None
+_BASES = {}
 
 
-def _font(family, weight=400, italic=False, names=None, mac_style=None, os2_len=96):
-    """DejaVu Sans with its identity replaced: name table, OS/2 weight and
-    slant, head.macStyle."""
-    global _BASE
-    if _BASE is None:
-        _BASE = _sfnt_tables(open(BUNDLED_SANS, "rb").read())
-    t = dict(_BASE)
+def _font(family, weight=400, italic=False, names=None, mac_style=None, os2_len=96, base=None):
+    """A font with its identity replaced -- name table, OS/2 weight and
+    slant, head.macStyle -- and the outlines of `base` (a path; the bundled
+    DejaVu Sans by default)."""
+    base = base or BUNDLED_SANS
+    if base not in _BASES:
+        _BASES[base] = _sfnt_tables(open(base, "rb").read())
+    t = dict(_BASES[base])
     style = ("Bold " if weight >= 600 else "") + ("Italic" if italic else "")
     t[b"name"] = _name_table(names or [(3, 1, 0x409, 1, family), (3, 1, 0x409, 2, style.strip() or "Regular")])
     os2 = bytearray(t[b"OS/2"][:os2_len].ljust(os2_len, b"\0"))

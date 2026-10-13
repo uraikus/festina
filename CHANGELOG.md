@@ -107,6 +107,22 @@ round-by-round design and implementation record predating 0.1 lives in
 
 ### Changed
 
+- **Text in any family, with real bold and italic, from the machine's own
+  font files — and `italic` finally slants.** `changeFont` and `font`
+  families are now looked up by reading the system's TrueType fonts and
+  collections themselves (Linux, macOS and Windows directories;
+  `FESTINA_FONT_DIRS` replaces them), not by asking Cairo and
+  fontconfig. A family can be a comma-separated list. `sans-serif` is
+  always the bundled DejaVu Sans; `serif` and `monospace` try a fixed list
+  of well-known families; **a family that is not found, or exists only as
+  an `.otf`, draws DejaVu Sans, silently.** A bold or italic the chosen face
+  lacks is synthesized from it (thickened by a 24th of the size; slanted
+  about 12 degrees), including on the bundled face: **`italic` text, which
+  drew upright on Linux, now slants, and `bold` text in the default family
+  is synthesized rather than the machine's own bold.** Text under a `scale`
+  or `rotate` is unchanged. See api.md ("Fonts, families and styles") and
+  runtime.md (phase 7, slice 8).
+
 - **Reference cycles are collected in batches.** A release that finds a
   cycle-capable value still referenced used to run a whole trial
   deletion on the spot — one full walk of everything it reaches, per

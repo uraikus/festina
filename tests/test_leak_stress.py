@@ -447,6 +447,9 @@ class TestLeakStress:
             # program draws: Cairo's text path was untestable here, its
             # fontconfig caches being process-lifetime.
             "draw_text_churn.f",
+            # runtime.md phase 7 slice 8: other families, the face index,
+            # synthesized bold and italic.
+            "text_faces_churn.f",
             # runtime.md phase 7 slice 4: every shape drawn through draw.f
             # -- the matrix, fill source and path arrays C builds and
             # releases each call, and draw.f's coverage globals.

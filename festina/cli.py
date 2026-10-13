@@ -903,9 +903,9 @@ def text_font_source():
         " * LICENSE-DejaVu, whose notices travel with the font. */\n"
         "#include <stdint.h>\n"
         '#include "festina_text_hooks.h"\n'
-        "void *festinaTextMask(const char *, int64_t, void *);\n"
-        "int64_t festinaTextWidth(const char *, int64_t, void *);\n"
-        "int64_t festinaTextHeight(const char *, int64_t, void *);\n"
+        "void *festinaTextMask(const char *, int64_t, void *, int64_t, int64_t, int64_t);\n"
+        "int64_t festinaTextWidth(const char *, int64_t, void *, int64_t, int64_t, int64_t);\n"
+        "int64_t festinaTextHeight(const char *, int64_t, void *, int64_t, int64_t, int64_t);\n"
         f"static const unsigned char festina_default_font[{len(data)}] = {{\n"
         + ",\n".join(rows) +
         "\n};\n"

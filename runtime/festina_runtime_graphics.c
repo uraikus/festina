@@ -561,22 +561,24 @@ static void festina_apply_font(cairo_t *cr) {
     cairo_set_font_size(cr, g_font_size);
 }
 
-/* ---- runtime.md phase 5, slice 6: text through font.f ----
+/* ---- runtime.md phase 5, slice 6, and phase 7, slice 8: text through font.f ----
  *
- * The default face -- sans-serif, regular, at a whole-pixel size -- is
- * drawn and measured by runtime/festina/text.f from the bundled DejaVu
- * Sans, unhinted and in greyscale (decisions.md #352), instead of by
- * Cairo and whatever font this machine's fontconfig picks. Everything
- * else stays with Cairo, unchanged: bold (the bold face is not
- * bundled), italic (which today draws upright on a default Linux
- * install -- runtime.md phase 5 -- and changing that is a separate
- * decision), any other family, and a transform that scales or rotates.
+ * Text is drawn and measured by runtime/festina/text.f from a TrueType
+ * face, unhinted and in greyscale (decisions.md #352), instead of by Cairo
+ * and whatever font this machine's fontconfig picks. Which face is decided
+ * here: 'sans-serif' (the default) is the bundled DejaVu Sans on every
+ * machine; any other family is looked up in the system's own font files
+ * (festina_fontscan.h), and one that is not there is the bundled face too.
+ * A bold or italic the chosen face lacks is synthesized by text.f.
+ * What stays with Cairo, until it is removed: a transform that scales or
+ * rotates, a size that is not whole pixels, and FESTINA_CAIRO_TEXT=1.
  *
  * text.f answers coverage; this side composites it with the same
  * source it always set, so colour, fillAlpha, and text's standing
  * indifference to gradients are unchanged. FESTINA_CAIRO_TEXT=1 sends
  * everything back to Cairo -- the comparison the tests draw against. */
 #include "festina_text_hooks.h"
+#include "festina_fontscan.h"   /* runtime.md phase 7 slice 8: which file a family means */
 #include "festina_draw_hooks.h"   /* runtime.md phase 7 slice 4: draw.f */
 
 static const FestinaTextHooks *g_text_hooks = NULL;
@@ -605,16 +607,8 @@ static void festina_text_unlock(void) {
     atomic_flag_clear_explicit(&g_text_lock, memory_order_release);
 }
 
-static int festina_text_ci_equal(const char *a, const char *b) {
-    while (*a && *b) {
-        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
-        a++;
-        b++;
-    }
-    return *a == *b;
-}
-
-/* Is the current font text.f's to draw? */
+/* Is the current font text.f's to draw? Every family and style is: what
+ * it cannot find it replaces with the bundled face. */
 static int festina_text_ours(void) {
     static atomic_int cairo_only = -1;       /* -1: environment not read yet */
     if (!g_text_hooks) return 0;
@@ -625,31 +619,119 @@ static int festina_text_ours(void) {
         atomic_store_explicit(&cairo_only, only, memory_order_relaxed);
     }
     if (only) return 0;
-    if (g_font_slant != CAIRO_FONT_SLANT_NORMAL) return 0;
-    if (g_font_weight != CAIRO_FONT_WEIGHT_NORMAL) return 0;
-    if (!festina_text_ci_equal(g_font_family, "sans-serif")) return 0;
     if (g_font_size < 1.0 || g_font_size > 4096.0 || g_font_size != floor(g_font_size)) return 0;
     return 1;
 }
 
-/* The font's bytes as the arr[int] text.f reads, built once and never
- * freed: its refcount is the negative immortal sentinel, so no
- * Festina code that holds it -- font.f keeps it in a global -- ever
- * releases it. Called only with the text lock held. */
+/* A font's bytes as the arr[int] text.f reads, built once and never
+ * freed: its refcount is the negative immortal sentinel, so no Festina
+ * code that holds it -- font.f keeps it in a global -- ever releases it. */
+static void *festina_text_payload(const unsigned char *bytes, int64_t n) {
+    char *raw = calloc(1, sizeof(int64_t) + 2 * sizeof(int64_t));
+    int64_t *data = malloc((size_t)(n ? n : 1) * sizeof(int64_t));
+    if (!raw || !data) { free(raw); free(data); return NULL; }
+    *(int64_t *)raw = -1;
+    int64_t *header = (int64_t *)(raw + sizeof(int64_t));
+    for (int64_t i = 0; i < n; i++) data[i] = bytes[i];
+    header[0] = n;
+    memcpy(&header[1], &data, sizeof(int64_t *));
+    return header;
+}
+
+/* The bundled face. Called only with the text lock held. */
 static void *festina_text_font(void) {
     static void *payload = NULL;
     if (payload) return payload;
-    int64_t n = g_text_hooks->font_len;
-    char *raw = calloc(1, sizeof(int64_t) + 2 * sizeof(int64_t));
-    int64_t *data = malloc((size_t)(n ? n : 1) * sizeof(int64_t));
-    if (!raw || !data) festina_fail("out of memory loading the bundled font");
-    *(int64_t *)raw = -1;
-    int64_t *header = (int64_t *)(raw + sizeof(int64_t));
-    for (int64_t i = 0; i < n; i++) data[i] = g_text_hooks->font[i];
-    header[0] = n;
-    memcpy(&header[1], &data, sizeof(int64_t *));
-    payload = header;
+    payload = festina_text_payload(g_text_hooks->font, g_text_hooks->font_len);
+    if (!payload) festina_fail("out of memory loading the bundled font");
     return payload;
+}
+
+/* The system faces loaded so far, each kept for the life of the process:
+ * a program uses a handful, and a face's glyph cache lives in text.f
+ * against the id given here. A face text.f could not open is marked, and
+ * is the bundled face from then on. */
+#define FESTINA_TEXT_MAX_FACES 16
+static struct {
+    const FestinaFontFace *face;
+    void *payload;
+    int bad;
+} g_text_loaded[FESTINA_TEXT_MAX_FACES];
+static int g_text_loaded_count = 0;
+static int64_t g_text_loaded_bytes = 0;
+
+/* What text.f is to be handed for the current font. */
+typedef struct {
+    void *payload;
+    int64_t id, index, style;
+    int slot;                  /* index in g_text_loaded, or -1 for the bundled face */
+} FestinaTextFace;
+
+/* Resolve the current family and style to a face. The text lock is held. */
+static FestinaTextFace festina_text_face(void) {
+    int bold = g_font_weight == CAIRO_FONT_WEIGHT_BOLD;
+    int italic = g_font_slant != CAIRO_FONT_SLANT_NORMAL;
+    static char last_family[sizeof(g_font_family)];
+    static int last_bold = -1, last_italic = -1;
+    static FestinaFontChoice choice;
+    if (last_bold != bold || last_italic != italic || strcmp(last_family, g_font_family) != 0) {
+        choice = festina_font_resolve(g_font_family, bold, italic);
+        snprintf(last_family, sizeof(last_family), "%s", g_font_family);
+        last_bold = bold;
+        last_italic = italic;
+    }
+    FestinaTextFace out;
+    out.slot = -1;
+    out.id = 0;
+    out.index = 0;
+    out.payload = NULL;
+    out.style = (choice.synth_bold ? 1 : 0) | (choice.synth_italic ? 2 : 0);
+    if (!choice.bundled) {
+        int slot = -1;
+        for (int i = 0; i < g_text_loaded_count; i++)
+            if (g_text_loaded[i].face == choice.face) { slot = i; break; }
+        if (slot < 0 && g_text_loaded_count < FESTINA_TEXT_MAX_FACES) {
+            size_t n = 0;
+            unsigned char *bytes = festina_font_read_file(choice.face->path, &n);
+            void *payload = NULL;
+            if (bytes && g_text_loaded_bytes + (int64_t)n * 8 <= (int64_t)512 * 1024 * 1024)
+                payload = festina_text_payload(bytes, (int64_t)n);
+            free(bytes);
+            slot = g_text_loaded_count++;
+            g_text_loaded[slot].face = choice.face;
+            g_text_loaded[slot].payload = payload;
+            g_text_loaded[slot].bad = payload == NULL;
+            if (payload) g_text_loaded_bytes += (int64_t)n * 8;
+        }
+        if (slot >= 0 && !g_text_loaded[slot].bad) {
+            out.slot = slot;
+            out.id = slot + 1;
+            out.index = choice.face->face;
+            out.payload = g_text_loaded[slot].payload;
+            return out;
+        }
+        /* not loadable: the bundled face, with the style asked for synthesized */
+        out.style = (bold ? 1 : 0) | (italic ? 2 : 0);
+    }
+    out.payload = festina_text_font();
+    return out;
+}
+
+/* Run a text.f entry point on the current face; a face text.f cannot open
+ * is marked bad and the call is made again on the bundled face. */
+static int64_t festina_text_measure(int height, const char *text) {
+    festina_text_lock();
+    FestinaTextFace f = festina_text_face();
+    int64_t (*fn)(const char *, int64_t, void *, int64_t, int64_t, int64_t) =
+        height ? g_text_hooks->height : g_text_hooks->width;
+    int64_t v = fn(text, (int64_t)g_font_size, f.payload, f.id, f.index, f.style);
+    if (v < 0 && f.slot >= 0) {
+        g_text_loaded[f.slot].bad = 1;
+        f = festina_text_face();
+        v = fn(text, (int64_t)g_font_size, f.payload, f.id, f.index, f.style);
+    }
+    festina_text_unlock();
+    return v;
 }
 
 /* Draw `text` with its pen at (x, y) on `cr`, whose source is already
@@ -663,7 +745,18 @@ static int festina_text_draw(cairo_t *cr, const cairo_matrix_t *m, const char *t
     if (m && (m->xx != 1.0 || m->yy != 1.0 || m->xy != 0.0 || m->yx != 0.0 ||
               m->x0 != floor(m->x0) || m->y0 != floor(m->y0))) return 0;
     festina_text_lock();
-    int64_t *arr = g_text_hooks->mask(text, (int64_t)g_font_size, festina_text_font());
+    FestinaTextFace face = festina_text_face();
+    int64_t *arr = g_text_hooks->mask(text, (int64_t)g_font_size, face.payload, face.id, face.index, face.style);
+    if (arr && arr[0] == 1 && face.slot >= 0) {
+        int64_t *probe;
+        memcpy(&probe, &arr[1], sizeof(probe));
+        if (probe[0] == -1) {                       /* text.f could not open this face */
+            festina_release_array(arr);
+            g_text_loaded[face.slot].bad = 1;
+            face = festina_text_face();
+            arr = g_text_hooks->mask(text, (int64_t)g_font_size, face.payload, face.id, face.index, face.style);
+        }
+    }
     festina_text_unlock();
     if (!arr) return 0;
     int64_t len = arr[0];
@@ -713,9 +806,7 @@ static cairo_t *festina_measure_context(void) {
 int64_t festina_measure_text_width(const char *text) {
     if (!text) text = "";
     if (festina_text_ours()) {
-        festina_text_lock();
-        int64_t w = g_text_hooks->width(text, (int64_t)g_font_size, festina_text_font());
-        festina_text_unlock();
+        int64_t w = festina_text_measure(0, text);
         if (w >= 0) return w;
     }
     cairo_t *cr = festina_measure_context();
@@ -731,9 +822,7 @@ int64_t festina_measure_text_width(const char *text) {
 int64_t festina_measure_text_height(const char *text) {
     if (!text) text = "";
     if (festina_text_ours()) {
-        festina_text_lock();
-        int64_t h = g_text_hooks->height(text, (int64_t)g_font_size, festina_text_font());
-        festina_text_unlock();
+        int64_t h = festina_text_measure(1, text);
         if (h >= 0) return h;
     }
     cairo_t *cr = festina_measure_context();

@@ -2504,20 +2504,42 @@ and `same` above are literally the same record. An empty literal
 (`font f = ''`) is rejected — it says nothing, and is far likelier to be
 a mistake than an intent.
 
-#### The default face
+#### Fonts, families and styles
 
 The default family, `sans-serif`, is **DejaVu Sans, bundled with the
 compiler** and linked into every program that draws or measures text.
-Regular text in it — no `bold`, no `italic` — at any whole-pixel size
-looks the same on every machine: the same font, anti-aliased in
-greyscale, not hinted, whatever fonts or font settings the machine has.
-A program that draws no text carries none of it.
-
-Everything else — `bold`, `italic`, and any other family — is found
-among the machine's installed fonts and drawn as before, so it can
-differ between machines. So can text drawn under a `scale` or `rotate`,
-in any face. (DejaVu Sans's licence travels with the font:
+Text in it, at any whole-pixel size, looks the same on every machine: the
+same font, anti-aliased in greyscale, not hinted, whatever fonts or font
+settings the machine has. A program that draws no text carries none of it.
+(DejaVu Sans's licence travels with the font:
 `runtime/fonts/LICENSE-DejaVu`.)
+
+**Other families** are looked up in the machine's own font files the first
+time one is asked for — TrueType (`.ttf`) and TrueType collections
+(`.ttc`), in the system's font directories — by the family's name, ignoring
+upper and lower case. A family can be a list, `'Helvetica, Arial,
+sans-serif'`, tried in order. The generic names behave like this:
+
+| | |
+|---|---|
+| `sans-serif` | always the bundled DejaVu Sans |
+| `serif` | the first found of Times New Roman, Liberation Serif, DejaVu Serif, Noto Serif, Times; else DejaVu Sans |
+| `monospace` | the first found of Courier New, Menlo, Consolas, Liberation Mono, DejaVu Sans Mono, Noto Sans Mono, Courier; else DejaVu Sans |
+
+**A family that is not found draws DejaVu Sans, silently** — also when it
+is installed only as an OpenType/CFF (`.otf`) font, which is not read. A
+program that must have a particular face should ship it and name its
+directory in `FESTINA_FONT_DIRS` (a list of directories, separated by `:`,
+or `;` on Windows), which replaces the system's.
+
+**Bold and italic.** A family's real bold or italic face is used when it
+has one. When it does not, the one it lacks is **synthesized** from the
+face that is there: bold thickens the outline by a 24th of the size, italic
+slants it by about 12 degrees. This applies to the bundled face as well, so
+`changeFont(20, 'italic', null)` slants. (It used to draw upright on Linux.)
+
+Text drawn under a `scale` or `rotate` is still the system's, and can
+differ between machines.
 
 ### Computing a color or font at runtime
 

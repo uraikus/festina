@@ -16,10 +16,15 @@
 typedef struct {
     /* text.f's festinaTextMask / festinaTextWidth / festinaTextHeight,
      * compiled from Festina: `text` is the UTF-8 string, `px` the size,
-     * `font` the font's bytes as a Festina arr[int]. */
-    void *(*mask)(const char *text, int64_t px, void *font);
-    int64_t (*width)(const char *text, int64_t px, void *font);
-    int64_t (*height)(const char *text, int64_t px, void *font);
+     * `font` the font's bytes as a Festina arr[int]. `face` is an id the
+     * runtime gives each distinct face it hands over (0 is the bundled
+     * one) so text.f never mixes two faces' open state or glyph cache;
+     * `index` is the face's number inside a collection (0 for a plain
+     * font); `style` is what to synthesize: 1 bold, 2 italic (runtime.md,
+     * phase 7, slice 8). */
+    void *(*mask)(const char *text, int64_t px, void *font, int64_t face, int64_t index, int64_t style);
+    int64_t (*width)(const char *text, int64_t px, void *font, int64_t face, int64_t index, int64_t style);
+    int64_t (*height)(const char *text, int64_t px, void *font, int64_t face, int64_t index, int64_t style);
     const unsigned char *font;
     int64_t font_len;
 } FestinaTextHooks;
