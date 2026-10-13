@@ -1351,7 +1351,7 @@ present every slice compares against it, byte for byte where possible:
 7. ✅ presentation: `XPutImage`, and the window seam speaking a plain
    surface (the Win32 and macOS backends already did) -- see "Slice 7,
    presentation"
-8. non-default text (decision 2)
+8. ◐ non-default text (decision 2): families found by scanning the system's fonts, with the fallbacks decided below -- see "Slice 8, non-default text"
 9. PNG encode (phase 6, gated on building a `blob` from bytes), then
    delete Cairo from the link line, `setup.md`, CI's package lists and
    the `FESTINA_CAIRO_TEXT` switch
@@ -1934,6 +1934,69 @@ removed in slice 9, and `libx11-dev` is the only one of the two that stays.)
 - *Speed.* A frame -- draw and present, 800x600, Xvfb -- is 0.55-0.7 ms for
   Cairo and for this, within the noise of one another: the cost is the
   socket, not the conversion.
+
+**Slice 8, non-default text.** *Specified here; the four questions it
+left open were put to the user before anything was built, and answered
+(2026-10-13), each with the recommended option.*
+
+Decisions, answered:
+
+1. **A family that is not found** -- not installed, or installed only in a
+   file this runtime cannot read -- **draws the bundled DejaVu Sans,
+   silently.** No warning, no error. (Today the answer is whatever the OS
+   substitutes: `fc-match` on this machine turns "Arial" into Liberation
+   Sans and a bold sans-serif into Inter Bold, so the picture already
+   varies by machine.)
+2. **Bold or italic asked of a face that is not there is synthesized,**
+   both: bold by thickening the regular outline, italic by a shear of about
+   12 degrees, computed from the outline the way FreeType's embolden and
+   oblique do. **Italic therefore becomes visible for the first time**:
+   Cairo's toy API draws it upright on Linux (measured byte-identical to
+   upright, runtime.md phase 5) although api.md says it sets the slant. A
+   family that has the real face is drawn with it and nothing is
+   synthesized.
+3. **Font files read: TrueType, and TrueType collections.** `.ttc` support
+   is added to font.f (macOS' Helvetica and Menlo, some Windows fonts are
+   collections). **CFF/OpenType (`.otf`, e.g. Inter) stays refused**, so a
+   family that exists only as `.otf` is "not found" and takes decision 1.
+4. **Generic names.** `sans-serif` is always the bundled DejaVu Sans, as
+   the default text already is, on every machine. `serif` and `monospace`
+   try a short fixed list per platform (below), then decision 1. Nothing
+   asks fontconfig, DirectWrite or CoreText.
+
+What follows from them, written down so the tests can be written first:
+
+- *The scan is lazy and in C.* Nothing is read until a program asks for a
+  family other than `sans-serif`. Then the platform's font directories are
+  walked once per process -- Linux `/usr/share/fonts`,
+  `/usr/local/share/fonts`, `~/.fonts`, `~/.local/share/fonts`; macOS
+  `/System/Library/Fonts`, `/Library/Fonts`, `~/Library/Fonts`; Windows
+  `%WINDIR%\Fonts` and `%LOCALAPPDATA%\Microsoft\Windows\Fonts` -- and
+  for each `.ttf`/`.ttc` only the table directory and the `name`, `OS/2`
+  and `head` tables are read (a few kilobytes by `pread`, not the file).
+  `FESTINA_FONT_DIRS` (a path list) replaces the directories: the test
+  hook, and a way to point a program at its own fonts. The scan lives in
+  C because it is platform plumbing (directory walking, range reads) and
+  Festina has neither; text.f still does everything about the glyphs.
+- *Matching.* A family is its typographic name (name ID 16, else ID 1),
+  compared case-insensitively. A request is `family, style`; the face
+  chosen among a family's is the one nearest the requested weight (400, or
+  700 for bold) with the requested italic-ness, and bold/italic the chosen
+  face lacks are synthesized (decision 2). A family *list* (`'Arial,
+  Helvetica, sans-serif'`) tries each in turn, which is what a CSS-minded
+  user would expect of the string; the first that is found wins.
+- *Generic lists.* `serif`: Times New Roman, Liberation Serif, DejaVu
+  Serif, Noto Serif, Times. `monospace`: Courier New, Menlo, Consolas,
+  Liberation Mono, DejaVu Sans Mono, Noto Sans Mono, Courier.
+- *What text.f needs.* To draw more than one font it must be told which
+  font the bytes it is given are (a face id, so its open-font state and its
+  glyph cache never mix two faces), and which of bold and italic to
+  synthesize. The size limits stay as they are (whole pixels, 1-4096); a
+  rotating or scaling transform still goes to Cairo until slice 9 moves it.
+  A file over 16 MB is not loaded (a CJK face, say): "not found".
+- *What is not decided and not built:* aliases (Arial to Liberation Sans, as
+  fontconfig does), fallback glyphs for characters a face lacks (glyph 0,
+  as now), and hinting.
 
 **What removing Cairo buys, and what it does not.** `libcairo2-dev`
 leaves `setup.md`'s graphics tier, along with MSYS2's cairo (and the
